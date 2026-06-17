@@ -3,6 +3,24 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.14.0
+
+Scripted, idempotent deploy step for installed `tg` checkouts.
+
+- **New `scripts/deploy.sh`** — updates the checkout the `tg` symlink points at
+  (resolved from PATH, or `--checkout DIR`) by fast-forwarding it to
+  `origin/<branch>`. `tg` is a committed Bun script with no build step, so the
+  deploy is just a guarded `git pull --ff-only`. Idempotent (no-op when up to
+  date), refuses a dirty tree (exit 1) and a non-fast-forward divergence
+  (exit 2), and `--dry-run` reports what would land without changing anything.
+- **tg-ctl-aware**: detects when a deploy changes daemon code (the `tg-ctl` entry
+  or anything under `features/`, which the daemon imports) and tells you to
+  restart the running daemon (which drops its pane/cwd/session registration);
+  `--restart-ctl` does the stop/start automatically. `tg` itself needs no restart.
+- **README "Update / deploy" section** documents the step. Closes the ROADMAP
+  "tg-cli #36 merged but NOT deployed" gap — there is now a documented, scripted
+  way to deploy a merged change to a live checkout.
+
 ## 1.13.0
 
 `tg#<id>` message-ref convention + GitHub-anchor line specs.

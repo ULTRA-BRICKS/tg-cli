@@ -67,6 +67,32 @@ TG_BOT_TOKEN=<your bot token from @BotFather>
 TG_CHAT_ID=<your chat or user ID>
 ```
 
+### Update / deploy a merged change
+
+`tg` is a committed Bun script run directly via the symlink (`tg` → `<checkout>/tg`),
+so the checked-out file **is** the running binary — there is no build step. Deploying a
+merged change is a fast-forward `git pull` in the checkout the symlink points at:
+```bash
+scripts/deploy.sh                  # update the checkout the `tg` on PATH points at
+scripts/deploy.sh --dry-run        # show what would land, change nothing (always safe)
+scripts/deploy.sh --checkout DIR   # update a specific checkout
+```
+When up to date the script is a no-op; otherwise it advances the checkout's `HEAD` to
+`origin/<branch>`. It refuses to pull over tracked local changes (untracked files such
+as a stray `node_modules` do not block it — though `git`'s own fast-forward will still
+abort if an incoming path collides with an untracked file) and refuses a
+non-fast-forward divergence. `tg` itself needs no restart — the next invocation reads
+the new file. Exit codes: `0` up-to-date or deployed, `1` usage/environment error,
+`2` non-fast-forward (needs a human).
+
+> **`tg-ctl` daemon:** the inbound control daemon (`tg-ctl run`) loads its code into
+> memory at start, so a deploy that changes daemon code (the `tg-ctl` entry or anything
+> under `features/`, which the daemon imports) only takes effect after a restart — which
+> **drops the daemon's pane/cwd/session registration**. `deploy.sh` detects this and prints exactly what to restart (re-binding
+> the same pane); pass `--restart-ctl` to stop/start it automatically (re-register the
+> pane afterwards). A plain `curl … | install.sh` re-run also refreshes a clone (it does
+> `git pull --ff-only`), but does not handle the daemon.
+
 ---
 
 ## Outbound — agents push to Telegram
