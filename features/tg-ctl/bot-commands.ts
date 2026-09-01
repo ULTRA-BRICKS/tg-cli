@@ -37,6 +37,8 @@ export const BOT_COMMANDS: readonly BotCommand[] = [
   { command: 'status', description: 'Report daemon state' },
   { command: 'limit', description: 'Show latest agent usage limits: /limit [agent]' },
   { command: 'tasks', description: 'Task board: attention default, filters, pages' },
+  { command: 'daily', description: 'What-shipped report: merged PRs since last run (rig daily)' },
+  { command: 'usage', description: 'Token/cost usage report: /usage [day|week|month] (rig usage)' },
 ];
 
 export function botCommandNames(): string[] {
