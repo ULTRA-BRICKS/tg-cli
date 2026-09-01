@@ -45,6 +45,15 @@ import {
   type AutostartKind,
   type ProbedLaunchdJob,
 } from "./features/tg-ctl/autostart"
+import {
+  USAGE_SCHEDULE_LAUNCHD_LABEL,
+  buildUsageScheduleDisablePlan,
+  buildUsageScheduleEnablePlan,
+  isEndOfMonth,
+  isEndOfWeek,
+  usageScheduleLaunchdPlistPath,
+  type UsageScheduleEnv,
+} from "./features/tg-ctl/usage-schedule"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { codexUsageTranscriptPath, latestCodexUsageTelemetryPayload } from "./features/tg-ctl/codex-usage"
 import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
@@ -1803,6 +1812,102 @@ function disableAutostart(ctx: Ctx): number {
   return 0
 }
 
+// --- /usage scheduled push (end-of-week / end-of-month) ---
+
+function usageScheduleEnv(ctx: Ctx): UsageScheduleEnv {
+  return {
+    home: ctx.home,
+    binPath: resolveDeployedBin(ctx.home),
+    bunPath: process.execPath,
+    logPath: ctx.paths.log,
+  }
+}
+
+// `tg-ctl usage-schedule enable [--dry-run]` — install the launchd job that fires
+// `usage-schedule-check` daily at 23:50; `--dry-run` prints the plan and touches nothing
+// (mirrors enableAutostart's own --dry-run contract). launchd (macOS) only — see
+// usage-schedule.ts's SCOPE note.
+function enableUsageSchedule(ctx: Ctx, dryRun: boolean): number {
+  if (process.platform !== "darwin") {
+    console.error("tg-ctl: usage-schedule is only implemented for launchd (macOS) — not supported on this OS.")
+    return EXIT_AUTOSTART_FAILED
+  }
+  const env = usageScheduleEnv(ctx)
+  const plan = buildUsageScheduleEnablePlan(env)
+  if (dryRun) {
+    console.log(`tg-ctl: [dry-run] usage-schedule label: ${USAGE_SCHEDULE_LAUNCHD_LABEL}`)
+    console.log(`tg-ctl: [dry-run] would write ${plan.file.path}`)
+    for (const cmd of plan.commands) console.log(`tg-ctl: [dry-run] would run: ${cmd.argv.join(" ")}`)
+    return 0
+  }
+  try {
+    mkdirSync(dirname(plan.file.path), { recursive: true })
+    writeFileSync(plan.file.path, plan.file.content, { mode: plan.file.mode })
+  } catch (err) {
+    console.error(`tg-ctl: writing ${plan.file.path} failed: ${err}`)
+    return EXIT_AUTOSTART_FAILED
+  }
+  let activated = true
+  for (const cmd of plan.commands) {
+    if (!runAutostartCommand(cmd)) activated = false
+  }
+  if (!activated) {
+    console.error("tg-ctl: usage-schedule launchctl command failed — the unit file is on disk but not loaded.")
+    return EXIT_AUTOSTART_FAILED
+  }
+  console.log(`tg-ctl: usage-schedule enabled — ${USAGE_SCHEDULE_LAUNCHD_LABEL} at ${plan.file.path}. Fires daily at 23:50, sends a report only on the actual end-of-week/end-of-month day.`)
+  return 0
+}
+
+function disableUsageSchedule(ctx: Ctx): number {
+  if (process.platform !== "darwin") {
+    console.log("tg-ctl: usage-schedule was never installed on this OS — nothing to remove.")
+    return 0
+  }
+  const plan = buildUsageScheduleDisablePlan(ctx.home)
+  if (!existsSync(plan.filePath)) {
+    console.log("tg-ctl: usage-schedule is not installed — nothing to remove.")
+    return 0
+  }
+  const ok = runAutostartCommand(plan.commands[0])
+  if (!ok) {
+    console.error("tg-ctl: usage-schedule deactivate failed — leaving the unit file in place.")
+    return EXIT_AUTOSTART_FAILED
+  }
+  try {
+    unlinkSync(plan.filePath)
+  } catch (err) {
+    console.error(`tg-ctl: removing ${plan.filePath} failed: ${err}`)
+    return EXIT_AUTOSTART_FAILED
+  }
+  console.log("tg-ctl: usage-schedule disabled.")
+  return 0
+}
+
+// The job the installed launchd unit actually invokes once a day. A no-op on every day
+// that is neither end-of-week nor end-of-month (both can be true the same day — both
+// reports are sent). TG_USAGE_SCHEDULE_DRY_RUN=1 logs what WOULD be sent instead of
+// calling `rig usage`/`tg` for real — the unit test suite and any manual smoke check use
+// this so a scheduled-report test run never actually pushes a message.
+async function runUsageScheduleCheck(now: Date, dryRun: boolean): Promise<number> {
+  const jobs: Array<["week" | "month", string]> = []
+  if (isEndOfWeek(now)) jobs.push(["week", "Weekly usage report"])
+  if (isEndOfMonth(now)) jobs.push(["month", "Monthly usage report"])
+  if (jobs.length === 0) return 0
+  for (const [period, title] of jobs) {
+    const body = await composeUsageReport(period)
+    if (dryRun) {
+      console.log(`tg-ctl: [dry-run] would send "${title}": ${body.slice(0, 200)}${body.length > 200 ? "…" : ""}`)
+      continue
+    }
+    const r = await spawnGuarded(["tg", "--format", "html", "--tag", "report", "--title", title, body], 30_000)
+    if (r.exitCode !== 0) {
+      console.error(`tg-ctl: usage-schedule: sending "${title}" failed (exit ${r.exitCode}): ${r.stderr.trim() || "no error output"}`)
+    }
+  }
+  return 0
+}
+
 // --- hook/client handoff over a local Unix socket ---
 
 const MAX_HOOK_REQUEST_BYTES = 64 * 1024
@@ -3550,6 +3655,112 @@ function composeLimitStatus(ctx: Ctx, agentFilter: string | null, now = Date.now
     lines.push(`- ${limit}: ${formatUsagePercent(rec.percent)}%${reset}${sampled}`)
   }
   return lines.join("\n")
+}
+
+// /daily — shells out to `rig daily` (rig-cli's own categorized what-shipped report
+// over merged PRs, source of truth `gh pr list --state merged`, never a ticket
+// status). Bare `rig daily` with no flags reports since each configured repo's own
+// saved watermark and advances it — exactly the semantics wanted for a repeatable
+// Telegram command (a second /daily right after the first reports "nothing new",
+// same as the CLI itself). 30s timeout: `gh pr list` across a couple of repos is
+// normally sub-second, but a slow/rate-limited GitHub API call must not wedge the
+// daemon's single event loop past a bounded ceiling (see spawnGuarded's own doc).
+async function composeDailyReport(): Promise<string> {
+  const r = await spawnGuarded(["rig", "daily"], 30_000)
+  if (r.exitCode === 127) {
+    return `daily: couldn't run \`rig\` (${r.stderr.trim() || "not found on PATH"}). Is rig-cli installed and on this daemon's PATH?`
+  }
+  if (r.exitCode === 124) {
+    return "daily: `rig daily` timed out after 30s (GitHub API slow/rate-limited?) — try again shortly."
+  }
+  if (r.exitCode !== 0) {
+    return `daily: \`rig daily\` failed (exit ${r.exitCode}): ${r.stderr.trim() || "no error output"}`
+  }
+  const report = r.stdout.trim()
+  return report || "daily: nothing new since the last report."
+}
+
+// Compact K/M/B suffix formatting for token counts — `rig usage`'s raw totals
+// run into the billions and a bare number is unreadable in a chat message.
+function formatTokenCount(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(2)}B`
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+  return String(n)
+}
+
+interface UsagePeriodTotals {
+  input_tokens: number
+  output_tokens: number
+  cache_creation_input_tokens: number
+  cache_read_input_tokens: number
+  total_tokens: number
+}
+
+interface UsagePeriodReport {
+  period: string
+  label: string
+  totals: UsagePeriodTotals
+  estimated_cost_usd: number | null
+  all_models_unpriced: boolean
+  by_model: Record<string, { totals: UsagePeriodTotals; estimated_cost_usd: number | null }>
+}
+
+function formatUsagePeriod(p: UsagePeriodReport): string {
+  const t = p.totals
+  const cost = p.estimated_cost_usd === null ? "n/a (unpriced model)" : `~$${p.estimated_cost_usd.toFixed(2)}`
+  const lines = [
+    `${p.period} ${p.label}: ${formatTokenCount(t.total_tokens)} tokens, ${cost}`,
+    `  in ${formatTokenCount(t.input_tokens)} · out ${formatTokenCount(t.output_tokens)} · cache-write ${formatTokenCount(t.cache_creation_input_tokens)} · cache-read ${formatTokenCount(t.cache_read_input_tokens)}`,
+  ]
+  const models = Object.entries(p.by_model)
+    .filter(([name, m]) => name !== "<synthetic>" && m.totals.total_tokens > 0)
+    .sort((a, b) => (b[1].estimated_cost_usd ?? 0) - (a[1].estimated_cost_usd ?? 0))
+    .slice(0, 5)
+  if (models.length > 0) {
+    const byModel = models
+      .map(([name, m]) => `${name} ${m.estimated_cost_usd === null ? "n/a" : `$${m.estimated_cost_usd.toFixed(2)}`}`)
+      .join(", ")
+    lines.push(`  top models: ${byModel}`)
+  }
+  return lines.join("\n")
+}
+
+// /usage [day|week|month] — shells out to `rig usage --json`, rig-cli's own
+// streaming aggregation over ~/.claude/projects + every ~/.claude-accounts/account-*
+// (see rig-cli's riglib/usage.py). Cost is a HYPOTHETICAL estimate at published API
+// list prices — these are Claude.ai subscription accounts, never a real bill; that
+// disclaimer is threaded through from `rig usage` itself and repeated here so a lone
+// forwarded chat message still carries it. No period arg mirrors the CLI's own
+// default (both current week AND current month in one report). 30s timeout matches
+// composeDailyReport's own ceiling — this is a local, hermetic file scan, not a
+// network call, but a very large/first-run ~/.claude/projects tree could still take
+// a few seconds and must not wedge the daemon's single event loop past a bound.
+async function composeUsageReport(period: "day" | "week" | "month" | null): Promise<string> {
+  const argv = period ? ["rig", "usage", "--json", "--period", period] : ["rig", "usage", "--json"]
+  const r = await spawnGuarded(argv, 30_000)
+  if (r.exitCode === 127) {
+    return `usage: couldn't run \`rig\` (${r.stderr.trim() || "not found on PATH"}). Is rig-cli installed and on this daemon's PATH?`
+  }
+  if (r.exitCode === 124) {
+    return "usage: `rig usage` timed out after 30s — try again shortly."
+  }
+  if (r.exitCode !== 0) {
+    return `usage: \`rig usage\` failed (exit ${r.exitCode}): ${r.stderr.trim() || "no error output"}`
+  }
+  let parsed: { disclaimer?: unknown; periods?: Record<string, UsagePeriodReport> }
+  try {
+    parsed = JSON.parse(r.stdout)
+  } catch {
+    return "usage: couldn't parse `rig usage --json` output (unexpected shape) — the command may have changed."
+  }
+  const periods = parsed.periods && typeof parsed.periods === "object" ? Object.values(parsed.periods) : []
+  if (periods.length === 0) {
+    return "usage: couldn't parse `rig usage --json` output (no period data) — the command may have changed."
+  }
+  const disclaimer = typeof parsed.disclaimer === "string" ? parsed.disclaimer : null
+  const body = periods.map(formatUsagePeriod).join("\n\n")
+  return disclaimer ? `${body}\n\n${disclaimer}` : body
 }
 
 function parseUsageWarningRecords(blob: string | null, now: number): UsageWarningRecord[] {
@@ -7732,6 +7943,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "limit-status":
         await sendMessage(ctx, composeLimitStatus(ctx, action.agent), replyContext(action.threadId))
         return true
+      case "daily-report":
+        await sendMessage(ctx, await composeDailyReport(), replyContext(action.threadId))
+        return true
+      case "usage-report":
+        await sendMessage(ctx, await composeUsageReport(action.period), replyContext(action.threadId))
+        return true
       case "tasks":
         await runTasksCommand(ctx, action)
         return true
@@ -8106,7 +8323,7 @@ if (import.meta.main) {
   }
   // Internal one-shot child spawned by `harness-event`; intentionally absent
   // from USAGE and guarded by persisted retry state before it can inject text.
-  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event", "codex-usage-hook", "auto-continue-once"].includes(cmd)) {
+  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event", "codex-usage-hook", "auto-continue-once", "usage-schedule", "usage-schedule-check"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
   }
@@ -8126,6 +8343,13 @@ if (import.meta.main) {
   const fileEnv = loadEnv(join(configDir, ".env"))
   const env = { ...fileEnv, ...process.env }
 
+  // usage-schedule-check is a LOCAL date check that shells out to `rig`/`tg` directly (no
+  // Bot API call via ctx) — runs before the bot-token gate, same reasoning as voice-setup.
+  // `tg` itself owns bot-token resolution for the actual send.
+  if (cmd === "usage-schedule-check") {
+    const dryRun = env.TG_USAGE_SCHEDULE_DRY_RUN === "1" || process.argv.includes("--dry-run")
+    process.exit(await runUsageScheduleCheck(new Date(), dryRun))
+  }
   // voice-setup is a LOCAL probe + config write — no Telegram I/O, so it runs
   // before the bot-token gate (a user may set up voice before configuring creds).
   if (cmd === "voice-setup") {
@@ -8180,6 +8404,13 @@ if (import.meta.main) {
   }
   if (cmd === "disable") {
     process.exit(disableAutostart(ctx))
+  }
+  if (cmd === "usage-schedule") {
+    const sub = process.argv[3]
+    if (sub === "enable") process.exit(enableUsageSchedule(ctx, process.argv.includes("--dry-run")))
+    if (sub === "disable") process.exit(disableUsageSchedule(ctx))
+    console.error("usage: tg-ctl usage-schedule enable|disable [--dry-run]")
+    process.exit(1)
   }
   if (cmd === "status") {
     console.log(composeStatus(ctx, null))

@@ -343,7 +343,7 @@ export function autostartStatusLine(kind: AutostartKind, ownUnitInstalled: boole
 // XML-escape a string for safe inlining in plist <string> values (text + attribute safe).
 // Order matters: `&` first so we don't double-escape the entities we just produced (mirrors the
 // lib's _xml_escape).
-function xmlEscape(s: string): string {
+export function xmlEscape(s: string): string {
   return s
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
