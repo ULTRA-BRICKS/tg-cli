@@ -422,6 +422,36 @@ test('/limit [agent] → limit-status', () => {
   ]);
 });
 
+test('/daily → daily-report', () => {
+  const r = stepUpdates([upd(1, { text: '/daily' })], makeOpts());
+  expect(r.actions).toEqual([{ kind: 'daily-report' }, { kind: 'ack', messageId: 1 }]);
+});
+
+test('/usage → usage-report with no period', () => {
+  const r = stepUpdates([upd(1, { text: '/usage' })], makeOpts());
+  expect(r.actions).toEqual([{ kind: 'usage-report', period: null }, { kind: 'ack', messageId: 1 }]);
+});
+
+test('/usage week|month|day → usage-report with the parsed period', () => {
+  expect(stepUpdates([upd(1, { text: '/usage week' })], makeOpts()).actions).toEqual([
+    { kind: 'usage-report', period: 'week' },
+    { kind: 'ack', messageId: 1 },
+  ]);
+  expect(stepUpdates([upd(2, { text: '/usage month' })], makeOpts()).actions).toEqual([
+    { kind: 'usage-report', period: 'month' },
+    { kind: 'ack', messageId: 2 },
+  ]);
+  expect(stepUpdates([upd(3, { text: '/usage DAY' })], makeOpts()).actions).toEqual([
+    { kind: 'usage-report', period: 'day' },
+    { kind: 'ack', messageId: 3 },
+  ]);
+});
+
+test('/usage garbage → usage-report with a null period (not a crash)', () => {
+  const r = stepUpdates([upd(1, { text: '/usage nonsense' })], makeOpts());
+  expect(r.actions).toEqual([{ kind: 'usage-report', period: null }, { kind: 'ack', messageId: 1 }]);
+});
+
 test('/tasks carries reply target for scoped board lookup', () => {
   const r = stepUpdates(
     [
