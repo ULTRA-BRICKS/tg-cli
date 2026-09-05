@@ -28,6 +28,7 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     usageLatest: join(configDir, `${base}.usage-latest.json`),
     deferred: join(configDir, `${base}.deferred.json`),
     lastUserTarget: join(configDir, `${base}.last-user-target.json`),
+    usageSchedule: join(configDir, `${base}.usage-schedule.json`),
   };
 }
 

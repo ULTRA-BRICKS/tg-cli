@@ -161,6 +161,8 @@ export type Action =
   | { kind: 'kill-agent' } // /kill — SIGINT to the registered pane's agent pid
   | { kind: 'status'; threadId?: number | null } // /status — entrypoint composes the reply
   | { kind: 'limit-status'; agent: string | null; threadId?: number | null } // /limit [agent] — latest usage/rate-limit telemetry
+  | { kind: 'daily-report'; threadId?: number | null } // /daily — `rig daily`'s categorized what-shipped report over merged PRs
+  | { kind: 'usage-report'; period: 'day' | 'week' | 'month' | null; threadId?: number | null } // /usage [day|week|month] — `rig usage`'s token/cost report
   // /tasks [<agent>] [<status>] and task-board callbacks — entrypoint resolves
   // the agent→project scope, spawns task-cli + gh, composes a rich-HTML board
   // with filters/pagination, sends it (#115/#178).
@@ -458,6 +460,7 @@ export interface CtlPaths {
   usageLatest: string; // latest supported usage/rate-limit telemetry for /limit
   deferred: string; // durable defer-while-waiting backlog (restored on reload, no message loss)
   lastUserTarget: string; // pane of the CTO's own last resolved inbound delivery (tg-cli#78 anchor fix)
+  usageSchedule: string; // watermark of the last week/month period reported via the /usage scheduled push (#290)
 }
 
 // --- forum topics (docs/specs/tg-forum-topics.md) ---

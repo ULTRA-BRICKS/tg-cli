@@ -509,6 +509,12 @@ function textAction(
       const p = parseTasksCommand(text);
       return { kind: 'tasks', agent: p.agent, status: p.status, replyToMessageId, threadId };
     }
+    if (cmd === '/daily') return { kind: 'daily-report', ...topic };
+    if (cmd === '/usage') {
+      const rest = text.slice(verb.length).trim().toLowerCase();
+      const period = rest === 'day' || rest === 'week' || rest === 'month' ? rest : null;
+      return { kind: 'usage-report', period, ...topic };
+    }
     if (cmd === '/agent') {
       const p = parseAgentCommand(text);
       return { kind: 'agent-route', selector: p.selector, rest: p.rest, all: p.all, from: name, messageId, ...topic };
@@ -594,7 +600,7 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
     // a bound topic — they control the daemon, not the topic agent. /stop and /kill are NOT
     // intercepted: they must still reach the topic's pane (kill/escape the harness session).
     // Using an explicit set (not isDaemonSlashCommand) to avoid over-intercepting.
-    const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks', '/limit']);
+    const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks', '/limit', '/daily', '/usage']);
     const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, '');
     if (TOPIC_GLOBAL_CMDS.has(verb)) return [textAction(text, name, opts, m.message_id, m.reply_to_message?.message_id ?? null, threadId)];
     // A `!shell` passthrough is VERBATIM into the topic pane (harness `!` convention): no wrap and
