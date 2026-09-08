@@ -33,6 +33,9 @@ export const DEFAULT_FEATURES: FeatureMap = {
   'code-as-pdf': true,
   'attach-denylist': true,
   'recursive-attach': true,
+  // Enforces the tg-cli#208 message-fragmentation cap. `--no-feature
+  // flood-cap` or `features.flood-cap: false` in config.yaml opts out.
+  'flood-cap': true,
   // cjk-guard rejects two "a garbled token slipped in" shapes: (1) an isolated
   // CJK/ideographic codepoint stuck mid-word into otherwise Latin/Cyrillic text
   // (the "hieroglyph in a normal word" bug); (2) a homoglyph/mojibake garbage

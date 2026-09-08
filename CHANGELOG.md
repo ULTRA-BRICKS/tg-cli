@@ -3,6 +3,27 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.46.1
+
+**Fix: a bad attachment or an oversized body no longer breaks or floods a send.**
+
+Minor bump (not a patch): the new flood cap can refuse a send that previously
+succeeded, so this is a behavior change, not a pure bugfix.
+
+- A disk attachment (auto-detected from a path mention, or an explicit
+  `--photo`/`--file`) that goes missing, gets truncated to empty, or loses read
+  permission between detection and send is now skipped with a stderr warning
+  naming the path and the reason — the primary text still delivers. Previously
+  Telegram's "file must be non-empty" rejection killed the WHOLE send, including
+  the text (tg-cli#207). If every attachment is bad and no text remains, the send
+  now refuses loudly (non-zero exit) instead of a silent no-op success.
+- A message long enough to fragment into more than 6 separate Telegram sends is
+  now refused up front, with a local error naming the exact character count and
+  the number of messages it would have produced, instead of silently flooding
+  the recipient with dozens of fragments. Override with `--no-feature
+  flood-cap`. Rich messages (tables/headings/lists/formulas) are unaffected —
+  they always send whole (tg-cli#208).
+
 ## 1.46.0
 
 **Agents running OUTSIDE tmux are visible and reachable (tg-cli#306).**

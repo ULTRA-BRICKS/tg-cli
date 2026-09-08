@@ -1,11 +1,12 @@
 #!/usr/bin/env bun
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
+import { accessSync, chmodSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join, resolve } from "path"
 // Explicit import (not the global `crypto`) so the multi-part groupId token
 // doesn't depend on a runtime global being present — review: tg-cli#131 f/u.
 import { randomUUID } from "node:crypto"
 import { BOM_MAX_BYTES, maybeAddBom } from "./features/auto-attach/encoding"
+import { checkAttachmentFile, type FileCheckDeps } from "./features/auto-attach/file-check"
 import { findStrayCjk, formatStrayCjkError } from "./features/cli/cjk-guard"
 import { findMixedScriptTokens, formatMixedScriptError } from "./features/cli/mixed-script-guard"
 import {
@@ -279,6 +280,23 @@ Code as PDF (feature, ON by default — toggle with --feature/--no-feature):
   the original file is attached unchanged. Markdown stays on the md-as-pdf path.
   Disable with --no-feature code-as-pdf.
 
+Missing/empty/unreadable attachments:
+  A disk attachment (auto-detected or explicit --photo/--file) that goes missing,
+  is truncated to 0 bytes, or loses read permission between detection and send is
+  skipped with a stderr warning naming the path and the reason — the rest of the
+  send (including the text) still goes out. No toggle: this is a correctness fix,
+  not an optional feature.
+
+Message-flood cap (feature flood-cap, ON by default — toggle with
+--feature/--no-feature):
+  A message that would fragment into more than 6 separate Telegram sends
+  (Telegram's ~4096-char message limit) is REFUSED before anything is sent, with
+  a local error naming the exact character count and the message count it would
+  have produced — instead of silently flooding the recipient with dozens of
+  fragments. Rich messages (--format html bodies using table/heading/list/formula
+  tags) are exempt — they always send whole. Override with --no-feature flood-cap
+  or features.flood-cap: false in ~/.config/tg-cli/config.yaml.
+
 Attachment encoding and extensionless files:
   Text documents containing non-ASCII UTF-8 get a BOM prepended to the
   UPLOADED COPY (the file on disk is untouched) so Telegram's preview detects
@@ -547,6 +565,7 @@ if (import.meta.main) {
   })
   const autoAttachOn = features["auto-attach"] !== false
   const attachDenylistOn = features["attach-denylist"] !== false
+  const floodCapOn = features["flood-cap"] !== false
 
   const args = flagResult.rest
   // Memoize the worktree-root enumeration: git is spawned at most once per
@@ -1611,6 +1630,33 @@ if (import.meta.main) {
     }
   }
 
+  // Real fs wiring for the pure checkAttachmentFile (tg-cli#207) — the
+  // entrypoint owns I/O, the feature module stays disk-free/testable. Defined
+  // here (BEFORE code-as-pdf/md-as-pdf) so a document that is already
+  // missing/empty/unreadable is dropped before conversion ever runs on it —
+  // otherwise a bad ORIGINAL source could be silently replaced by a generated
+  // PDF that passes validation on its own, never revalidating what the user
+  // actually pointed at. Reused unchanged at the transmit() call below.
+  const fileCheckDeps: FileCheckDeps = {
+    stat: (p) => statSync(p),
+    canRead: (p) => {
+      try {
+        accessSync(p, fsConstants.R_OK)
+        return true
+      } catch {
+        return false
+      }
+    },
+  }
+  plan.documents = plan.documents.filter((d) => {
+    if (d.source.kind !== "disk") return true
+    const result = checkAttachmentFile(d.source.path, fileCheckDeps)
+    if (result === "ok") return true
+    const reason = result === "missing" ? "file not found" : result === "empty" ? "file is empty" : "file is unreadable"
+    console.error(`tg: skipping attachment ${d.source.path}: ${reason}`)
+    return false
+  })
+
   // Shared deps for both PDF passes (code-as-pdf + md-as-pdf). Pure I/O thunks;
   // the feature modules stay pure and testable.
   const pdfTempDirs: string[] = [] // dirs to rm after transmit (both PDF passes)
@@ -1738,7 +1784,12 @@ if (import.meta.main) {
     messageThreadId,
     threadIdAdvisory,
   })
-  await transmit(plan, transport)
+  // fileCheckDeps: defined earlier (before code-as-pdf/md-as-pdf), reused here
+  // unchanged so the pre- and post-conversion checks agree on what "ok" means.
+  await transmit(plan, transport, {
+    checkFile: (path) => checkAttachmentFile(path, fileCheckDeps),
+    allowFlood: !floodCapOn,
+  })
 
   // Reaction lifecycle (tg-cli#114): an `--tag answer --reply-to <id>` send means
   // message <id> is now ANSWERED — flip its reaction to the done mark (👌, the

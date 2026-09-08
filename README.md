@@ -125,6 +125,12 @@ Markdown files (`*.md`, `*.markdown`) are silently converted to PDF via pandoc +
 
 File paths mentioned in the message text are detected and attached automatically (images as photos, everything else as documents). The path token stays in the caption verbatim — it's only detected and attached, never removed. Recursive search across the worktree finds files by bare name or path suffix — `BFS`, shallowest match wins, `node_modules`/`.git`/`dist`-style dirs pruned.
 
+A file that goes missing, gets truncated to empty, or loses read permission between detection and send (e.g. a log path mentioned before anything has been written to it yet) is silently skipped with a stderr warning naming the path and the reason — it never fails the whole send (tg-cli#207).
+
+### Message-flood cap
+
+A message long enough that Telegram's 4096-char limit would fragment it into more than 6 separate sends is refused up front, with a local error naming the exact character count and how many messages it would have produced — instead of silently flooding the recipient with dozens of fragments. Override with `--no-feature flood-cap` (tg-cli#208). Rich messages (`--format html` bodies using table/heading/list/formula tags) are unaffected — they always send whole.
+
 ### Secret-file denylist
 
 Secret-looking files are **never** attached: `.env` family, SSH private keys, `*.pem`/`*.key`/`*.p12`/`*.pfx`/`*.ppk`, credential rc-files (`.netrc`, `.npmrc`, `.git-credentials`, …), shell histories, `*.tfvars`, `credentials.json`/`client_secret*.json`, `kubeconfig`. Auto-detected mentions are silently skipped; an explicit `--file prod.env` is a hard error. Override: `--no-feature attach-denylist`.

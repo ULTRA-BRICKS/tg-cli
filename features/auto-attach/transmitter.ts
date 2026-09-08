@@ -15,8 +15,22 @@
 
 import { decodeHtmlEntities, stripHtmlTags } from '../render/html';
 import { isRichHtml, normalizeRichHtml, validateRichHtml } from '../render/rich';
+import type { FileCheckResult } from './file-check';
 import { splitMessage } from './split';
-import { CAPTION_LIMIT, MESSAGE_LIMIT, type Format, type SendItem, type SendPlan } from './types';
+import {
+  CAPTION_LIMIT,
+  FLOOD_CAP_MAX_MESSAGES,
+  MESSAGE_LIMIT,
+  type Format,
+  type SendItem,
+  type SendPlan,
+} from './types';
+
+export interface TransmitOptions {
+  checkFile?: (path: string) => FileCheckResult;
+  warn?: (message: string) => void;
+  allowFlood?: boolean;
+}
 
 export interface Transport {
   sendMessage(text: string, format: Format): Promise<void>;
@@ -86,6 +100,39 @@ async function sendText(text: string, format: Format, t: Transport): Promise<voi
   }
 }
 
+// tg-cli#208. Counts chunks with the SAME splitMessage(text, MESSAGE_LIMIT, format)
+// call `sendText` uses to actually send — keep the two call sites parameter-identical,
+// or the preflight count can silently drift from the real send count.
+function floodCapViolation(
+  text: string,
+  format: Format,
+): { charCount: number; messageCount: number } | null {
+  if (format === 'html' && isRichHtml(text)) return null;
+  const messageCount = splitMessage(text, MESSAGE_LIMIT, format).length;
+  if (messageCount <= FLOOD_CAP_MAX_MESSAGES) return null;
+  return { charCount: text.length, messageCount };
+}
+
+const FILE_CHECK_REASON: Record<Exclude<FileCheckResult, 'ok'>, string> = {
+  missing: 'file not found',
+  empty: 'file is empty',
+  unreadable: 'file is unreadable',
+};
+
+function filterSendableItems(
+  items: SendItem[],
+  checkFile: (path: string) => FileCheckResult,
+  warn: (message: string) => void,
+): SendItem[] {
+  return items.filter((item) => {
+    if (item.source.kind === 'memory') return true;
+    const result = checkFile(item.source.path);
+    if (result === 'ok') return true;
+    warn(`tg: skipping attachment ${item.source.path}: ${FILE_CHECK_REASON[result]}`);
+    return false;
+  });
+}
+
 // Send one media section (all photos OR all documents) in the order-preserving
 // shape Telegram supports: a single sendMediaGroup album for 2..10 items, a lone
 // sendPhoto/sendDocument for exactly 1 (a 1-item group is rejected by Telegram),
@@ -120,12 +167,12 @@ async function sendMediaSection(
   }
 }
 
-export async function transmit(plan: SendPlan, t: Transport): Promise<void> {
-  // PREFLIGHT rich text BEFORE any send. The sandwich sends photos first, so a
-  // rich body that fails limit-validation inside sendRich (which exits the
-  // process) would otherwise leave an orphaned photo already on the wire. Catch
-  // it here, before the first media send, so an invalid rich report sends
-  // NOTHING. Uses the same validateRichHtml (post-normalize) as the transport.
+// PREFLIGHT rich text BEFORE any send. The sandwich sends photos first, so a
+// rich body that fails limit-validation inside sendRich (which exits the
+// process) would otherwise leave an orphaned photo already on the wire. Catch
+// it here, before the first media send, so an invalid rich report sends
+// NOTHING. Uses the same validateRichHtml (post-normalize) as the transport.
+function preflightRichHtml(plan: SendPlan): void {
   for (const m of plan.textMessages) {
     if (m.format === 'html' && isRichHtml(m.text)) {
       const check = validateRichHtml(normalizeRichHtml(m.text));
@@ -135,9 +182,68 @@ export async function transmit(plan: SendPlan, t: Transport): Promise<void> {
       }
     }
   }
+}
 
-  const hasMedia = plan.photos.length > 0 || plan.documents.length > 0;
-  const riding = hasMedia ? captionCandidate(plan) : null;
+// tg-cli#208 preflight, same posture as preflightRichHtml above (before ANY
+// send, so a refused body sends NOTHING — no orphaned photo already on the
+// wire). Must run AFTER `riding` is decided: a message that rides as a media
+// caption is sent as ONE call regardless of its RAW length (a caption's own
+// bound is CAPTION_LIMIT on VISIBLE length, e.g. `visibleLength` collapses many
+// `<tg-emoji>` entities to a handful of visible chars) — checking splitMessage's
+// raw-length chunk count on that same text would false-positive-refuse a send
+// that was never actually going to fragment. `plan.textMessages` is, in
+// practice, at most one entry (buildSendPlan's invariant: a plan carries one
+// assembled caption/body) — each entry is checked independently, so if that
+// invariant ever changes, several just-under-cap messages could together still
+// flood without tripping this.
+function preflightFloodCap(
+  plan: SendPlan,
+  riding: { text: string; format: Format } | null,
+  allowFlood: boolean,
+  warn: (message: string) => void,
+): void {
+  if (allowFlood) return;
+  for (const m of plan.textMessages) {
+    if (riding && m === riding) continue;
+    const violation = floodCapViolation(m.text, m.format);
+    if (violation) {
+      warn(
+        `tg: refusing ${violation.charCount}-character message: it would send as ${violation.messageCount} messages; ` +
+          `use allowFlood: true or --no-feature flood-cap to allow it`,
+      );
+      process.exit(1);
+    }
+  }
+}
+
+export async function transmit(plan: SendPlan, t: Transport, opts: TransmitOptions = {}): Promise<void> {
+  const checkFile = opts.checkFile ?? ((): FileCheckResult => 'ok');
+  const warn = opts.warn ?? ((message: string) => console.error(message));
+
+  preflightRichHtml(plan);
+
+  const filteredPlan: SendPlan = {
+    ...plan,
+    photos: filterSendableItems(plan.photos, checkFile, warn),
+    documents: filterSendableItems(plan.documents, checkFile, warn),
+  };
+
+  if (
+    filteredPlan.photos.length === 0 &&
+    filteredPlan.documents.length === 0 &&
+    filteredPlan.textMessages.length === 0
+  ) {
+    // tg-cli#207: every attachment (if any) failed validation and no text
+    // remains. A silent success with zero transport calls would read to the
+    // caller as a delivered message when nothing actually went out — refuse
+    // loudly instead of a fake OK.
+    warn('tg: refusing to send — nothing survived validation (no photos, documents, or text)');
+    process.exit(1);
+  }
+
+  const hasMedia = filteredPlan.photos.length > 0 || filteredPlan.documents.length > 0;
+  const riding = hasMedia ? captionCandidate(filteredPlan) : null;
+  preflightFloodCap(filteredPlan, riding, opts.allowFlood === true, warn);
   // The text becomes a media caption only when it's a ride candidate. Otherwise
   // it is sent as separate (possibly split) message(s) in the sandwich middle.
   const captionText = riding ? riding.text : undefined;
@@ -146,19 +252,25 @@ export async function transmit(plan: SendPlan, t: Transport): Promise<void> {
   // Caption host SECTION: photos take priority over documents (matches the
   // pre-album behavior). The caption rides the first item of that section —
   // sendMediaSection puts it on the album's first item (or the lone item).
-  const captionOnPhotos = riding && plan.photos.length > 0;
-  const captionOnDocs = riding && plan.photos.length === 0 && plan.documents.length > 0;
+  const captionOnPhotos = riding && filteredPlan.photos.length > 0;
+  const captionOnDocs = riding && filteredPlan.photos.length === 0 && filteredPlan.documents.length > 0;
 
   // 1. Photos (album when >=2, single send when 1).
-  await sendMediaSection('photo', plan.photos, captionOnPhotos ? captionText : undefined, captionFormat, t);
+  await sendMediaSection('photo', filteredPlan.photos, captionOnPhotos ? captionText : undefined, captionFormat, t);
 
   // 2. Text — only as separate message(s) when it did NOT ride as a caption.
   if (!riding) {
-    for (const m of plan.textMessages) {
+    for (const m of filteredPlan.textMessages) {
       await sendText(m.text, m.format, t);
     }
   }
 
   // 3. Documents (album when >=2, single send when 1).
-  await sendMediaSection('document', plan.documents, captionOnDocs ? captionText : undefined, captionFormat, t);
+  await sendMediaSection(
+    'document',
+    filteredPlan.documents,
+    captionOnDocs ? captionText : undefined,
+    captionFormat,
+    t,
+  );
 }

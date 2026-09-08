@@ -87,6 +87,10 @@ tests can pass fakes.
   `resolveWindowAgentLabel` (`features/tg-ctl/agent-match.ts`).
 - `features/auto-attach/` — path detection → attach files, R1-R4 text rules, line-spec quotes,
   worktree-aware + recursive path resolution, transmitter with Telegram message/caption limits.
+  `transmitter.ts` also re-validates every disk attachment right before sending (`file-check.ts`
+  — missing/empty/unreadable is skipped with a warning, never fails the whole send, tg-cli#207)
+  and refuses a body that would fragment into more than `FLOOD_CAP_MAX_MESSAGES` separate sends
+  unless `allowFlood`/`--no-feature flood-cap` (tg-cli#208).
 - `features/autolink-tasks/` — detects Linear ticket codes in messages, resolves titles via the
   `linear` CLI, and rewrites text with hyperlinks.
 - `features/autolink-prs/` — detects GitHub `#N` refs, resolves them against the cwd repo via

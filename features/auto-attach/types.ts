@@ -44,3 +44,9 @@ export interface SendPlan {
 // Telegram hard limits (spec §Caption overflow / §Message splitting).
 export const CAPTION_LIMIT = 1024;
 export const MESSAGE_LIMIT = 4096;
+
+// tg-cli#208: a plain/basic-HTML body that would fragment into more than this
+// many separate Telegram sendMessage calls is refused rather than silently
+// flooding the recipient. Does not apply to rich bodies (sendRichMessage — never
+// split) or to a caption (bounded by CAPTION_LIMIT, far below this threshold).
+export const FLOOD_CAP_MAX_MESSAGES = 6;

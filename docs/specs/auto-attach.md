@@ -91,6 +91,62 @@ if a sentence ending with `:` immediately precedes the excerpt, take its start a
 filename base; auto-detect the extension from content (language detection → .ts/.tsx/.js/
 .py/.json/.md/.txt …). Mark as a fragment.
 
+## Attachment sanity checks (tg-cli#207 / tg-cli#208)
+
+Two transmitter-level safety nets that both run regardless of what put the plan together —
+auto-attach detection or an explicit `--photo`/`--file`. Only #208 has a `--no-feature` escape
+hatch; #207's file check is a plain correctness fix with no toggle (there is no "I want a
+corrupted send" use case to opt into):
+
+- **Missing/empty/unreadable disk attachments are skipped, never fail the send (#207).**
+  Detection and send are two different points in time — a path can pass the detection-time
+  `isFile()` check (e.g. an empty log file that exists but hasn't been written to yet) and then
+  be gone, still empty, or unreadable by the time `transmit()` uploads it. Telegram rejects an
+  empty/absent upload with a 400 ("file must be non-empty"), and that failure used to
+  `process.exit` the WHOLE send via `checkResponse` — killing the primary text message along
+  with the bad attachment. `transmit()` now re-validates every disk-sourced `SendItem` (photo or
+  document; in-memory items — R4 fragments, marker-injected copies — are never disk-backed and
+  always pass through) immediately before the photos→text→documents sandwich runs: missing, 0
+  bytes, or a failed read-access check each drop the item with a stderr warning naming the path
+  and the reason, and the rest of the plan (including the primary text) still goes out. If
+  filtering leaves the WHOLE plan empty (every attachment was bad and there is no text either),
+  `transmit()` refuses loudly (non-zero exit) instead of a silent `OK` that delivered nothing.
+  `features/auto-attach/file-check.ts` is the pure decision function (`checkAttachmentFile`)
+  with injected `stat`/`canRead` — the module stays disk-free per the repo's pure-feature-module
+  convention; the `tg` entrypoint wires the real `statSync`/`accessSync` check inline, and reuses
+  the SAME check a second time, EARLIER, right before `code-as-pdf`/`md-as-pdf` conversion: a bad
+  ORIGINAL source is dropped before conversion is even attempted, so it can never be silently
+  replaced by a generated PDF that then passes validation on its own merits without the source
+  ever being revalidated (review finding — a converted artifact is a DIFFERENT file from what the
+  user pointed at, and only the final artifact was checked before this second pass was added).
+  **Residual window (accepted, not eliminated):** the check runs once, right before the
+  sandwich starts — it narrows the TOCTOU gap from "whenever auto-attach scanned the body" down
+  to "milliseconds before the upload," but does not make it atomic with each individual upload.
+  A file that vanishes DURING the photos section (mid-send, before the documents section
+  reaches it) still reaches `sendDocument` unrevalidated. Fully eliminating that would mean
+  re-checking (and re-deciding the caption-riding / album-size sandwich) immediately before each
+  individual transport call rather than once upfront — a larger restructuring not undertaken
+  here; the reported bug (a long detection-to-send gap) is fixed, this narrower in-flight window
+  is a known, accepted follow-up. Also tracked separately (tg-cli#228): a preflight refusal (rich
+  HTML or flood cap) calls `process.exit` directly, so if a code/markdown attachment was already
+  rendered to a temp PDF before the refusal, that temp directory leaks — pre-existing shape (the
+  rich-HTML preflight had it first), not introduced here, but worth closing properly.
+
+- **A body that would fragment into more than 6 Telegram messages is refused (#208).** The
+  generic >4096 splitter (`splitMessage`) has no ceiling on how many chunks it produces — an
+  oversized body (e.g. an accidental shell command-substitution bug that ballooned a report from
+  1.4KB to 34KB) silently fragments into dozens of separate sends, which reads to the recipient
+  as an incoherent flood. `transmit()` now preflights every non-rich text message (same posture
+  as the existing rich-HTML preflight — before ANY send, so nothing goes out orphaned): if
+  `splitMessage(...).length` would exceed `FLOOD_CAP_MAX_MESSAGES` (6, `features/auto-attach/
+  types.ts`), it refuses with a local error naming the exact character count and message count,
+  instead of sending. Rich bodies (`sendRichMessage`) are exempt — they are sent WHOLE and never
+  split. Override with `--no-feature flood-cap` / `features.flood-cap: false` (maps to
+  `TransmitOptions.allowFlood`); also documented in `tg --help`.
+  `plan.textMessages` is, in practice, always at most one entry (`buildSendPlan`'s invariant), so
+  checking each message independently is equivalent to checking the plan as a whole — see the
+  comment at `preflightFloodCap` if that invariant ever changes.
+
 ## Architecture (do it right, reliable)
 1. `features/auto-attach/` — pure extraction: path+line-spec parsing, content-dup detection,
    excerpt detection, AST-aware snippet extraction + shift-tab, filename inference, marker
@@ -112,6 +168,12 @@ filename base; auto-detect the extension from content (language detection → .t
 - caption > 1024 → separate text message.
 - text > 4096 → HTML-safe split (tags balanced per chunk, multibyte intact).
 - ordering photos→text→files.
+- tg-cli#207: `checkAttachmentFile` missing/empty/unreadable/ok classification (pure, injected
+  deps + a real-fs integration pass); `transmit()` skips a bad disk attachment and still delivers
+  the text, with a warning naming the path + reason.
+- tg-cli#208: `transmit()` refuses a plain/basic-HTML body that would split into more than
+  `FLOOD_CAP_MAX_MESSAGES`, naming the char/message counts; exactly-at-cap is not refused;
+  `allowFlood` bypasses it; a rich body is exempt regardless of length.
 - feature config.yaml + `--feature`/`--no-feature`; auto-attach default ON; OFF path.
 - in-memory FS: no stray files left on disk.
 

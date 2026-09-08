@@ -345,3 +345,277 @@ test('invalid rich HTML + a photo: NOTHING is sent (preflight before media)', as
     process.exit = origExit;
   }
 });
+
+// --- tg-cli#207: a missing/empty/unreadable disk attachment must never fail
+// the whole send. `transmit` accepts an injected `checkFile` (defaults to a
+// permissive 'ok' pass-through, so every test above that never passes it keeps
+// today's behavior byte-for-byte) + `warn` (defaults to console.error). A
+// disk item that fails the check is dropped from the plan and the send
+// continues with whatever survives — the primary text always goes out. ---
+
+test('tg-cli#207: a missing disk photo is skipped, the text still delivers', async () => {
+  const { t, calls } = fakeTransport();
+  const warnings: string[] = [];
+  await transmit(
+    plan({ photos: [photo('/missing.png')], textMessages: [{ text: 'status update', format: 'plain' }] }),
+    t,
+    { checkFile: () => 'missing', warn: (m) => warnings.push(m) },
+  );
+  expect(calls.map((c) => c.method)).toEqual(['sendMessage']);
+  expect((calls[0].args as { text: string }).text).toBe('status update');
+  expect(warnings.some((w) => w.includes('/missing.png'))).toBe(true);
+});
+
+test('tg-cli#207: an empty disk document is skipped, the text still delivers', async () => {
+  const { t, calls } = fakeTransport();
+  const warnings: string[] = [];
+  await transmit(
+    plan({ documents: [doc('/empty.log')], textMessages: [{ text: 'see /empty.log', format: 'plain' }] }),
+    t,
+    { checkFile: () => 'empty', warn: (m) => warnings.push(m) },
+  );
+  expect(calls.map((c) => c.method)).toEqual(['sendMessage']);
+  expect(warnings.some((w) => w.includes('/empty.log') && /empty/i.test(w))).toBe(true);
+});
+
+test('tg-cli#207: an unreadable disk attachment is skipped with a distinct reason', async () => {
+  const { t, calls } = fakeTransport();
+  const warnings: string[] = [];
+  await transmit(plan({ documents: [doc('/locked.pdf')], textMessages: [{ text: 'note', format: 'plain' }] }), t, {
+    checkFile: () => 'unreadable',
+    warn: (m) => warnings.push(m),
+  });
+  expect(calls.map((c) => c.method)).toEqual(['sendMessage']);
+  expect(warnings[0]).toContain('/locked.pdf');
+  expect(warnings[0]).toMatch(/unreadable/i);
+});
+
+test('tg-cli#207: a mix of good + bad attachments sends only the good ones', async () => {
+  const { t, calls } = fakeTransport();
+  const check = (p: string): 'ok' | 'missing' => (p === '/bad.pdf' ? 'missing' : 'ok');
+  await transmit(
+    plan({ documents: [doc('/good.pdf'), doc('/bad.pdf')], textMessages: [{ text: 'report', format: 'plain' }] }),
+    t,
+    { checkFile: check, warn: () => {} },
+  );
+  // Only one surviving document → a lone sendDocument (not a 2-item album), the
+  // short caption rides it.
+  expect(calls.map((c) => c.method)).toEqual(['sendDocument']);
+  expect(calls[0].args.caption).toBe('report');
+  const item = calls[0].args.item as SendItem;
+  expect(item.source.kind === 'disk' && item.source.path).toBe('/good.pdf');
+});
+
+test('tg-cli#207: with no checkFile injected, disk attachments pass through unchanged (default = ok)', async () => {
+  const { t, calls } = fakeTransport();
+  await transmit(plan({ photos: [photo('/a.png')], textMessages: [{ text: 'x', format: 'plain' }] }), t);
+  expect(calls.map((c) => c.method)).toEqual(['sendPhoto']);
+});
+
+test('tg-cli#207: an in-memory item (R4 fragment) is never checked, even when checkFile always says "missing"', async () => {
+  const { t, calls } = fakeTransport();
+  const memoryDoc: SendItem = { type: 'document', source: { kind: 'memory', filename: 'frag.ts', content: 'x' } };
+  await transmit(
+    plan({ documents: [memoryDoc], textMessages: [{ text: 'note', format: 'plain' }] }),
+    t,
+    { checkFile: () => 'missing', warn: () => {} },
+  );
+  // The memory item survives regardless of checkFile — it has no disk path to check.
+  expect(calls.map((c) => c.method)).toEqual(['sendDocument']);
+});
+
+test('tg-cli#207: filtering the photo host migrates the caption to the surviving document section', async () => {
+  const { t, calls } = fakeTransport();
+  await transmit(
+    plan({
+      photos: [photo('/bad.png')],
+      documents: [doc('/good.pdf')],
+      textMessages: [{ text: 'note', format: 'plain' }],
+    }),
+    t,
+    { checkFile: (p) => (p === '/bad.png' ? 'missing' : 'ok'), warn: () => {} },
+  );
+  // The photo was dropped, so no sendPhoto — the caption rides the sole surviving document.
+  expect(calls.map((c) => c.method)).toEqual(['sendDocument']);
+  expect(calls[0].args.caption).toBe('note');
+});
+
+test('tg-cli#207: filtering 3 documents down to 2 still forms a sendMediaGroup album', async () => {
+  const { t, calls } = fakeTransport();
+  await transmit(
+    plan({
+      documents: [doc('/a.pdf'), doc('/bad.pdf'), doc('/b.pdf')],
+      textMessages: [{ text: 'note', format: 'plain' }],
+    }),
+    t,
+    { checkFile: (p) => (p === '/bad.pdf' ? 'missing' : 'ok'), warn: () => {} },
+  );
+  expect(calls.map((c) => c.method)).toEqual(['sendMediaGroup']);
+  expect((calls[0].args.items as SendItem[]).length).toBe(2);
+  expect(calls[0].args.caption).toBe('note');
+});
+
+test('tg-cli#207: everything filtered out and no text left → refuses loudly instead of a silent no-op OK', async () => {
+  const { t, calls } = fakeTransport();
+  const capture = captureExitAndErrors();
+  try {
+    await expect(
+      transmit(plan({ documents: [doc('/bad.pdf')] }), t, { checkFile: () => 'missing', warn: () => {} }),
+    ).rejects.toThrow('__exit__');
+    expect(capture.getExitCode()).toBe(1);
+    expect(calls).toHaveLength(0);
+  } finally {
+    capture.restore();
+  }
+});
+
+// --- tg-cli#208: a body large enough to fragment into more than the flood
+// cap must be REFUSED before anything is sent (same preflight posture as the
+// invalid-rich-HTML case above), unless the caller opts in via
+// `allowFlood: true` (the --no-feature flood-cap escape hatch). Rich bodies
+// never split, so they are exempt regardless of length. ---
+
+function captureExitAndErrors(): {
+  errors: string[];
+  getExitCode: () => number | undefined;
+  restore: () => void;
+} {
+  const origExit = process.exit;
+  const origError = console.error;
+  const errors: string[] = [];
+  let exitCode: number | undefined;
+  process.exit = ((code?: number) => {
+    exitCode = code ?? 0;
+    throw new Error('__exit__');
+  }) as typeof process.exit;
+  console.error = (...args: unknown[]) => {
+    errors.push(args.join(' '));
+  };
+  return {
+    errors,
+    getExitCode: () => exitCode,
+    restore: () => {
+      process.exit = origExit;
+      console.error = origError;
+    },
+  };
+}
+
+test('tg-cli#208: a plain message that would fragment into 7 messages is refused', async () => {
+  const { t, calls } = fakeTransport();
+  const capture = captureExitAndErrors();
+  try {
+    // No spaces/newlines → splitMessage hard-cuts at exactly 4096 chars/chunk,
+    // so 4096*6 + 1 chars is deterministically 7 chunks (cap is 6).
+    const huge = 'y'.repeat(4096 * 6 + 1);
+    await expect(
+      transmit(plan({ photos: [photo('/a.png')], textMessages: [{ text: huge, format: 'plain' }] }), t),
+    ).rejects.toThrow('__exit__');
+    expect(capture.getExitCode()).toBe(1);
+    // Nothing sent at all — the photo did not go out orphaned.
+    expect(calls).toHaveLength(0);
+    const message = capture.errors.join('\n');
+    expect(message).toContain(String(huge.length));
+    expect(message).toMatch(/7/);
+  } finally {
+    capture.restore();
+  }
+});
+
+test('tg-cli#208: a caption-riding message is exempt even when its RAW length would split into 7+ chunks', async () => {
+  // review-cli round 2 finding: `<tg-emoji emoji-id="...">x</tg-emoji>` is ~53
+  // raw chars per entity but collapses to 1 VISIBLE char (visibleLength, same
+  // metric captionCandidate uses against CAPTION_LIMIT). 500 of them is >26000
+  // raw chars (7 splitMessage chunks) but only 500 visible chars — well under
+  // the 1024 caption limit, so this rides the photo as ONE caption and must
+  // NOT be refused by the flood cap, which only applies to text that is
+  // actually going out via the N-chunk sendText path.
+  const { t, calls } = fakeTransport();
+  const capture = captureExitAndErrors();
+  try {
+    const html = '<tg-emoji emoji-id="5274170649227600531">x</tg-emoji>'.repeat(500);
+    expect(html.length).toBeGreaterThan(4096 * 6);
+    await transmit(plan({ photos: [photo('/a.png')], textMessages: [{ text: html, format: 'html' }] }), t);
+    expect(calls.map((c) => c.method)).toEqual(['sendPhoto']);
+    expect(calls[0].args.caption).toBe(html);
+    expect(capture.getExitCode()).toBeUndefined();
+  } finally {
+    capture.restore();
+  }
+});
+
+test('tg-cli#208: the SAME heavy-entity body with NO media to ride still gets refused (exemption is not a blanket bypass)', async () => {
+  const { t, calls } = fakeTransport();
+  const capture = captureExitAndErrors();
+  try {
+    const html = '<tg-emoji emoji-id="5274170649227600531">x</tg-emoji>'.repeat(500);
+    await expect(transmit(plan({ textMessages: [{ text: html, format: 'html' }] }), t)).rejects.toThrow('__exit__');
+    expect(capture.getExitCode()).toBe(1);
+    expect(calls).toHaveLength(0);
+  } finally {
+    capture.restore();
+  }
+});
+
+test('tg-cli#208: exactly at the cap (6 messages) is NOT refused', async () => {
+  const { t, calls } = fakeTransport();
+  const capture = captureExitAndErrors();
+  try {
+    const atCap = 'y'.repeat(4096 * 6); // exactly 6 chunks
+    await transmit(plan({ textMessages: [{ text: atCap, format: 'plain' }] }), t);
+    const msgs = calls.filter((c) => c.method === 'sendMessage');
+    expect(msgs.length).toBe(6);
+    expect(capture.getExitCode()).toBeUndefined();
+  } finally {
+    capture.restore();
+  }
+});
+
+test('tg-cli#208: allowFlood bypasses the refusal and sends every fragment', async () => {
+  const { t, calls } = fakeTransport();
+  const capture = captureExitAndErrors();
+  try {
+    const huge = 'y'.repeat(50000);
+    await transmit(plan({ textMessages: [{ text: huge, format: 'plain' }] }), t, { allowFlood: true });
+    const msgs = calls.filter((c) => c.method === 'sendMessage');
+    expect(msgs.length).toBeGreaterThan(6);
+    expect(capture.getExitCode()).toBeUndefined();
+  } finally {
+    capture.restore();
+  }
+});
+
+test('tg-cli#208: a rich HTML body is exempt from the flood cap (never split)', async () => {
+  const { t, calls } = fakeTransport();
+  const capture = captureExitAndErrors();
+  try {
+    // Well past the 4096*6 flood threshold but under the rich 32768-char /
+    // 500-block budget — must still send WHOLE via sendRich, never refused.
+    const items = `<li>${'word '.repeat(20)}</li>`.repeat(230);
+    const html = '<ul>' + items + '</ul>';
+    expect(html.length).toBeGreaterThan(4096 * 6);
+    await transmit(plan({ textMessages: [{ text: html, format: 'html' }] }), t);
+    expect(calls.map((c) => c.method)).toEqual(['sendRich']);
+    expect(capture.getExitCode()).toBeUndefined();
+  } finally {
+    capture.restore();
+  }
+});
+
+test('tg-cli#208: a NON-rich HTML body (no table/heading/list/formula tags) over the cap is also refused', async () => {
+  const { t, calls } = fakeTransport();
+  const capture = captureExitAndErrors();
+  try {
+    // Basic HTML (only <b>, which is NOT a rich-only tag) — isRichHtml is false,
+    // so this must go through the SAME flood-cap check as plain text, not the
+    // rich exemption above.
+    const huge = '<b>' + 'z'.repeat(4096 * 6 + 1) + '</b>';
+    await expect(
+      transmit(plan({ textMessages: [{ text: huge, format: 'html' }] }), t),
+    ).rejects.toThrow('__exit__');
+    expect(capture.getExitCode()).toBe(1);
+    expect(calls).toHaveLength(0);
+  } finally {
+    capture.restore();
+  }
+});
