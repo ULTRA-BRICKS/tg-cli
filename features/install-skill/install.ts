@@ -193,6 +193,26 @@ plus the RICH tier (tables, headings, lists, formulas) auto-sent through the sam
 \`--format html\` — with a \`<table>\` example and the rich limits. Run it instead of
 guessing at markup. (\`tg --format-help\` is a back-compat alias for the same.)
 
+## Dictionary gate (banned wording — ALWAYS on, NO bypass)
+Every send — \`--title\`, body, and \`--photo\`/\`--file\` captions, for every tag and
+both formats, \`--dry-run\` included — is checked against the shared dictionary of
+banned words at \`~/.claude/DICT.json\` (path override: \`TG_DICT_PATH\`). A hit
+REFUSES the send (exit 1) and prints every match with the rule id, the matched
+text in context and the replacement to use: rewrite the wording and resend.
+There is no flag or env var to skip it. The text is matched as the reader sees it:
+under \`--format html\`, text inside \`<code>\`/\`<pre>\` is exempt (quoting a banned
+word to discuss it is fine) and other tags / entities are resolved before matching,
+so markup cannot hide a word; under plain format everything is literal, so
+\`<code>\` exempts nothing. Gated: \`--title\`, the \`--subagent\` label, body /
+caption, \`--table\` heading + rows (autolink-inlined external titles and a
+\`--file\` filename are not). A missing file at the DEFAULT path turns the gate off
+silently; an explicit \`TG_DICT_PATH\` that does not exist refuses; a malformed file (bad JSON / a regex that does not compile)
+refuses EVERY send, naming the file and rule, until it is fixed. File format:
+\`{"version":1,"rules":[{"id","pattern","flags":"iu","only_if_cyrillic"?,"replacement","why"}]}\`
+— \`pattern\` is a JS regex source (always compiled with \`u\`) whose \`\\b\` is Unicode-aware;
+\`only_if_cyrillic\` rules apply only when the message contains Cyrillic. Full
+description: \`tg help format\`.
+
 ## Code/config files → mobile PDF (\`--with-original\` / \`--no-pdf\`)
 Attaching a code/config file (\`.ts\`, \`.tsx\`, \`.json\`, \`.yaml\`, \`.toml\`, \`.py\`,
 \`.go\`, \`.rs\`, \`.sql\`, \`Dockerfile\`, …) renders it to a MOBILE,

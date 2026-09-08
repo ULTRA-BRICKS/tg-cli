@@ -127,6 +127,45 @@ Header badge (--tag / --title), composes with BOTH basic and rich sends:
 
   Escape hatch (genuine non-escalation / urgent edge case ONLY):
   ESCALATION_GATE_ENFORCE=0 downgrades the block to an advisory warning.
+
+DICTIONARY GATE (banned wording, ALWAYS on, NO bypass flag):
+  Every outgoing message — the --title, the body, and the caption of a
+  --photo/--file, for every --tag and both formats, --dry-run included — is
+  checked against the shared dictionary of banned words. A hit REFUSES the
+  send (exit 1) and prints every match: the rule id, the matched text with
+  ~20 chars of context, and the replacement to use. Rewrite the wording and
+  resend; there is no flag or env var to skip it (only the human editing the
+  file). The text is matched as the READER will see it: under --format html,
+  text inside <code>…</code> / <pre>…</pre> is EXEMPT (quoting a banned word
+  to discuss it is fine) and all other tags / entities are resolved before
+  matching, so markup cannot hide a word; under plain format everything is
+  literal text, so <code>…</code> exempts nothing there.
+
+  File: ~/.claude/DICT.json (override the path with TG_DICT_PATH, in the
+  environment or in ~/.config/tg-cli/.env).
+    MISSING file   → the gate is silently off — at the DEFAULT path only; an
+                     explicit TG_DICT_PATH that does not exist REFUSES to send
+                     (it is a misconfiguration, not an off-switch).
+    MALFORMED file (bad JSON, bad shape, a rule whose regex does not compile)
+                   → a warning naming the file (and the rule) and NOTHING is
+                     sent until it is fixed (fail closed).
+  Format (JSON):
+    {
+      "version": 1,
+      "rules": [
+        {
+          "id": "pochtit-as-fix",            // shown in the refusal
+          "pattern": "\\\\bпочт(?:ил[аио]?|…)\\\\b", // a JS regex source, JSON-escaped
+                                             //   (\\\\b in the file = regex \\b, which
+                                             //   is Unicode-aware: works on Cyrillic)
+          "flags": "iu",                     // optional; "u" is always added
+          "only_if_cyrillic": true,          // optional: apply only when the
+                                             //   message (title+body) has Cyrillic
+          "replacement": "починил / починен", // printed on a hit
+          "why": "There is no such verb."    // free text, for humans
+        }
+      ]
+    }
 `;
 
 export function formatHelp(): string {

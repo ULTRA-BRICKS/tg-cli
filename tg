@@ -9,6 +9,14 @@ import { BOM_MAX_BYTES, maybeAddBom } from "./features/auto-attach/encoding"
 import { checkAttachmentFile, type FileCheckDeps } from "./features/auto-attach/file-check"
 import { findStrayCjk, formatStrayCjkError } from "./features/cli/cjk-guard"
 import { findMixedScriptTokens, formatMixedScriptError } from "./features/cli/mixed-script-guard"
+import {
+  FAIL_CLOSED_NOTE,
+  checkDictionary,
+  formatDictionaryHits,
+  loadDictionary,
+  resolveDictionaryPath,
+  type DictionaryField,
+} from "./features/cli/dict-gate"
 import { formatScreenshotAttachError, mentionsScreenshot } from "./features/cli/screenshot-guard"
 import {
   applyFeatureFlags,
@@ -220,7 +228,7 @@ Options:
                        text becomes a heading above the table. Keep cells
                        ASCII/Cyrillic (double-width emoji/CJK misalign columns).
   --dry-run             validate/render the message through every local guard
-                       (escalation-format gate, cjk-guard, screenshot-guard, table conversion) and
+                       (escalation-format gate, cjk-guard, screenshot-guard, dictionary gate, table conversion) and
                        print the outcome — NO network call, NO credentials
                        required, NOTHING is sent. Use this to iterate against
                        the strict --tag decision format instead of
@@ -956,6 +964,15 @@ if (import.meta.main) {
   // a cell can push columns out of alignment — warn but still send.
   let caption: string
   let effectiveFormat: Format = format
+  // The agent-AUTHORED text for the dictionary gate below, each piece tagged
+  // with how Telegram will render it (the gate matches what the reader SEES).
+  // For a --table send that is the heading (in the caller's format) plus the
+  // raw stdin rows as PLAIN text (they are rendered escaped inside <pre>), NOT
+  // the rendered block — the gate exempts <pre>/<code> contents in HTML, and
+  // the table wrapper must not turn every cell into a quote. For a text send
+  // it is the caption in the caller's format; a pipe-table auto-conversion
+  // escapes the caller's plain text, so it stays plain here.
+  let dictFields: DictionaryField[]
   if (table) {
     const stdinRaw = await Bun.stdin.text()
     if (stdinRaw.trim() === "") {
@@ -981,8 +998,18 @@ if (import.meta.main) {
     const heading = format === "html" ? rawHeading : escapeHtml(rawHeading)
     caption = heading ? `${heading}\n${rendered.html}` : rendered.html
     effectiveFormat = "html"
+    dictFields = [
+      { label: "table heading", text: rawHeading, format },
+      { label: "table rows", text: stdinRaw, format: "plain" },
+    ]
   } else {
     caption = decodeTextEscapes(rawCaption)
+    // Same implicit-HTML upgrade renderText uses later: a body that contains a
+    // Telegram-supported tag is sent as HTML even without --format html, so the
+    // dictionary must match what the reader SEES (tags stripped / <code> exempt).
+    // A non-tag like <скамейка> stays plain — detectHtmlTags ignores unknown tags.
+    const dictFormat = format === "html" || detectHtmlTags(caption) ? "html" : "plain"
+    dictFields = [{ label: items.length > 0 ? "caption" : "body", text: caption, format: dictFormat }]
     // Auto-convert a markdown pipe table typed directly in the body to a real
     // Telegram <table> (Telegram renders NO markdown tables — a `| a | b |` grid
     // arrives as plain text). Escalation messages, and the escalation gate's own
@@ -1068,6 +1095,59 @@ if (import.meta.main) {
     }
   }
 
+  // Dictionary gate (tg-cli#302, ALWAYS on, no bypass flag): refuse to send a
+  // message carrying a banned word from the shared dictionary
+  // (~/.claude/DICT.json, override: $TG_DICT_PATH), printing every hit with the
+  // rule id, the matched text in context and the replacement. Runs on the SAME
+  // agent-authored text as the guards above (the --title and the caption / the
+  // raw --table rows) and BEFORE the dry-run short-circuit, so --dry-run runs
+  // the identical check and a refusal never touches the network. A MISSING file
+  // disables the gate silently; a malformed / unreadable one refuses every send
+  // until fixed (fail closed — a silently dead gate is how the words leak). One
+  // readFileSync, ENOENT → absent: not existsSync-then-read (TOCTOU). Only
+  // ENOENT at the DEFAULT path means "absent": an EXPLICIT TG_DICT_PATH that
+  // does not exist, or ENOTDIR (a path component is a file), is a
+  // misconfiguration — and would otherwise be the agent's own off-switch — so
+  // it refuses. Reads the MERGED config env (`~/.config/tg-cli/.env` under the
+  // real environment), like every other TG_* setting.
+  // See features/cli/dict-gate.ts.
+  const dictLocation = resolveDictionaryPath(env)
+  if (dictLocation !== null) {
+    const dictPath = dictLocation.path
+    let dictRaw: string | null = null
+    try {
+      dictRaw = readFileSync(dictPath, "utf8")
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code
+      if (code === "ENOENT" && dictLocation.explicit) {
+        console.error(`Error: dictionary ${dictPath} (TG_DICT_PATH) does not exist. ${FAIL_CLOSED_NOTE}`)
+        process.exit(1)
+      }
+      if (code !== "ENOENT") {
+        console.error(`Error: dictionary ${dictPath} cannot be read (${code ?? String(e)}). ${FAIL_CLOSED_NOTE}`)
+        process.exit(1)
+      }
+    }
+    const dict = loadDictionary(dictRaw, dictPath)
+    if (dict.kind === "error") {
+      console.error(`Error: ${dict.message}`)
+      process.exit(1)
+    }
+    if (dict.kind === "ok") {
+      // The --title and the --subagent label are header text the agent
+      // authors; both are always plain (the header renderer escapes them).
+      const hits = checkDictionary(dict.rules, [
+        { label: "--title", text: title ?? "", format: "plain" },
+        { label: "--subagent", text: subagent ?? "", format: "plain" },
+        ...dictFields,
+      ])
+      if (hits.length > 0) {
+        console.error(formatDictionaryHits(hits, dictPath))
+        process.exit(1)
+      }
+    }
+  }
+
   // Close the --table bypass: the parse-time gate (features/cli/args.ts) skips a
   // --table send because the rows arrive on stdin, which parseArgs never sees.
   // So for an ESCALATION sent via --table, validate the FINAL rendered body here
@@ -1081,8 +1161,10 @@ if (import.meta.main) {
   // --- dry-run short-circuit --------------------------------------------
   // Everything above this point is LOCAL validation/rendering: the escalation-
   // format gate (parse-time + the --table final check just above), the
-  // cjk/mixed-script guard, the screenshot-attach gate, and the pipe-table→<table> conversion have all
-  // already run against the FINAL assembled `caption`. A failing gate above
+  // cjk/mixed-script guard, the screenshot-attach gate, the dictionary gate (on
+  // the agent-authored caption text / table rows / header labels), and the
+  // pipe-table→<table> conversion have all already run against the FINAL assembled
+  // `caption`. A failing gate above
   // already exits(1) without ever reaching here or touching the network — the
   // gap this flag closes is the PASSING case: a structurally-compliant message
   // (right tags/table/pros-cons/file-ref) used to fall straight through to the

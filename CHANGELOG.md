@@ -3,6 +3,27 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.49.0
+
+**Feature: dictionary gate — `tg` refuses to send a message containing a banned word from the shared dictionary, printing the replacement (tg-cli#302).**
+
+- Every outgoing message — the `--title`, the body, and `--photo`/`--file` captions, for every `--tag`
+  and both formats, `--dry-run` included — is checked against `~/.claude/DICT.json` (path override:
+  `TG_DICT_PATH`), the machine-readable twin of the "Dictionary" section of the global `CLAUDE.md`.
+  A hit refuses the send (exit 1, nothing sent) and prints every match with the rule id, the matched
+  text in ~20 chars of context, and the replacement. There is deliberately no bypass flag or env var.
+- The text is matched as the reader will see it: under `--format html`, `<code>`/`<pre>` contents are
+  exempt and every other tag / entity is resolved before matching, so markup cannot hide a word; under
+  plain format everything is literal text, so nothing is exempt there. Rules with `only_if_cyrillic` apply only when the
+  message contains Cyrillic. `\b` in a rule is rewritten to a Unicode-aware boundary at load time
+  (JS `\b` is ASCII-only, which would have left every Cyrillic stem rule dead).
+- Gated text: `--title`, the `--subagent` label, body / caption, `--table` heading + rows.
+- A missing dictionary at the default path disables the gate silently; an explicit `TG_DICT_PATH`
+  (environment or `~/.config/tg-cli/.env`) that does not exist refuses to send; a malformed one (bad JSON, bad shape, a regex that
+  does not compile) or an unreadable one refuses every send, naming the file and the rule, until fixed.
+- Documented in `tg help format`, the installed skill and the README. Tests run against a byte copy of
+  the real dictionary and prove stem-based catching of forms not listed in any pattern.
+
 ## 1.48.2
 
 **Fix (tg-cli#341): ACP initialize speaks NDJSON, not Content-Length.**

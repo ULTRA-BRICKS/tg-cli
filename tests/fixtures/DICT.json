@@ -1,0 +1,99 @@
+{
+  "version": 1,
+  "description": "Forbidden words in Alex-facing Russian text (Telegram reports, PR bodies, ticket summaries) with the replacement to use instead. Machine-readable twin of the Dictionary section in ~/.claude/CLAUDE.md. Rules are regexes over the WHOLE message (title + body); a rule with only_if_cyrillic applies only when the message contains Cyrillic text. Enforced by tg (refuses to send) and meant for any other agent-facing gate.",
+  "rules": [
+    {
+      "id": "pochtit-as-fix",
+      "pattern": "\\bпочт(?:ил[аио]?|или|ит(?:ся)?|[её]тся|ить|[её]нн?(?:ый|ая|ое|ые|ого|ой|ых|ым|ыми|а|о|ы)?|ен[аоы]?|ят(?:ся)?|им|ите|ишь)\\b",
+      "flags": "iu",
+      "replacement": "починил / починен / патчил / чинится / будет починено / применён",
+      "why": "There is no verb 'почтить' meaning 'to fix'. Ban is by stem, not by a list of forms — three earlier list-based bans leaked new forms (почтил, почтётся)."
+    },
+    {
+      "id": "chinyon",
+      "pattern": "\\bчин[её]н(?:а|о|ы|ый|ая|ое|ые|ого|ой|ых|ым)?\\b",
+      "flags": "iu",
+      "replacement": "починен / починена / починено",
+      "why": "'чинён' is not a word."
+    },
+    {
+      "id": "skameyka-for-bench",
+      "pattern": "скаме[йе]|скамь",
+      "flags": "iu",
+      "replacement": "бенч / бенчмарк; a provider taken out of rotation: забенчен / в бенче / исключён из ротации / отключён на время",
+      "why": "'bench' is never translated as a piece of furniture, not even figuratively."
+    },
+    {
+      "id": "land-landing-in-russian",
+      "pattern": "\\bland(?:ing|ed|s)?\\b",
+      "flags": "iu",
+      "only_if_cyrillic": true,
+      "replacement": "применяется / применён / влит / вливается / внедрён / вливание",
+      "why": "English 'land/landing' must not appear in Russian text about PRs, fixes or styles."
+    },
+    {
+      "id": "sit-lie-for-apply",
+      "pattern": "\\b(?:сел[аио]?|сели|сяд(?:ет|ут|у|ем|ете|ешь)|сесть|сад(?:ится|ятся|иться|ился|илась|илось|ились)|л[её]г(?:ла|ло|ли|ший|шая|шее|шие)?|лож(?:ится|атся|иться|ился|илась|илось|ились)|приземл[а-яё]*)\\b",
+      "flags": "iu",
+      "replacement": "применяется / применилась / применён / вступает в силу / влит",
+      "why": "Every form of сесть/садиться/лечь/ложиться/приземляться is banned for 'a change applies / a PR merges', in any context."
+    },
+    {
+      "id": "greyd-for-grading",
+      "pattern": "\\bгрейд[а-яё]*",
+      "flags": "iu",
+      "replacement": "оценивание / оценка / оценить",
+      "why": "'грейдить/грейдинг' is an invented transliteration."
+    },
+    {
+      "id": "props-as-props",
+      "pattern": "\\bпропс[а-яё]*",
+      "flags": "iu",
+      "replacement": "пропы / проп / пробросить пропы",
+      "why": "'пропсы' is wrong; the accepted form is 'пропы'."
+    },
+    {
+      "id": "kodyu-for-coding",
+      "pattern": "\\b(?:код(?:ю|ишь|им|ите)|кожу)\\b",
+      "flags": "iu",
+      "replacement": "прогаю / реализую / пишу / делаю",
+      "why": "'кодю/кожу' are banned verbs for 'I code'."
+    },
+    {
+      "id": "postchu-for-posting",
+      "pattern": "\\bпост(?:чу|лю|чишь|лишь|чит|лит|чим|лим)\\b",
+      "flags": "iu",
+      "replacement": "публикую / опубликовал",
+      "why": "'постчу/постлю' are banned."
+    },
+    {
+      "id": "zapah-koda-for-code-smell",
+      "pattern": "\\bзапах[а-яё]*\\s+код[а-яё]*",
+      "flags": "iu",
+      "replacement": "код смелл",
+      "why": "'code smell' is 'код смелл', never 'запах кода'."
+    },
+    {
+      "id": "fork-to-alex",
+      "pattern": "\\bфорк[а-яё]*|\\bfork(?:s|ed|ing)?\\b",
+      "flags": "iu",
+      "only_if_cyrillic": true,
+      "replacement": "субагент / субагенты (or just describe the work)",
+      "why": "Dispatched subagents are an implementation detail; never say 'fork' to Alex."
+    },
+    {
+      "id": "cynic-self-label",
+      "pattern": "\\bциник[а-яё]*|\\bцинич[а-яё]*",
+      "flags": "iu",
+      "replacement": "(drop it — never label your own tone)",
+      "why": "The tone is cynical; saying so is banned."
+    },
+    {
+      "id": "sycophancy-en",
+      "pattern": "you'?re absolutely right|great question|that'?s a great idea|great idea|excellent question",
+      "flags": "iu",
+      "replacement": "(drop it)",
+      "why": "Flattery phrases are banned."
+    }
+  ]
+}
