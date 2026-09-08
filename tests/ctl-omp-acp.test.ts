@@ -199,6 +199,73 @@ test('matchLiveOmp matches untitled omp by pid and unique cwd basename', () => {
   expect(matchLiveOmp('tg-cli', [untitled]).map((x) => x.pid)).toEqual([33378]);
 });
 
+test('matchLiveOmp: /agent landing hits unique conloca-landing cwd despite unrelated title', () => {
+  // Ask 108 / tg-cli#342: live Hyper omp is titled "Save requests…" in
+  // /Users/ultra/work/conloca-landing. Alex types /agent landing — exact title
+  // and exact basename both miss.
+  const landing: LiveOmpAgent = {
+    pid: 99240,
+    cwd: '/Users/u/work/conloca-landing',
+    sessionFile: null,
+    sessionId: '01land',
+    title: 'Save requests to memory/TodoList',
+    paneId: null,
+    tty: 'ttys021',
+  };
+  const rig: LiveOmpAgent = {
+    pid: 89653,
+    cwd: '/Users/u/xp/rig-cli',
+    sessionFile: null,
+    sessionId: '01rig',
+    title: 'Finish rig-zerobug session work',
+    paneId: null,
+    tty: 'ttys051',
+  };
+  const review: LiveOmpAgent = {
+    pid: 61335,
+    cwd: '/Users/u/xp/review-cli',
+    sessionFile: null,
+    sessionId: '01rev',
+    title: 'Fix rig ecosystem issues autonomously',
+    paneId: null,
+    tty: 'ttys032',
+  };
+  const fleet = [landing, rig, review];
+  expect(matchLiveOmp('landing', fleet).map((x) => x.pid)).toEqual([99240]);
+  expect(matchLiveOmp('conloca-landing', fleet).map((x) => x.pid)).toEqual([99240]);
+  expect(matchLiveOmp('rig-fable', fleet).map((x) => x.pid)).toEqual([89653]);
+  expect(matchLiveOmp('rig-cli', fleet).map((x) => x.pid)).toEqual([89653]);
+  // prefix of an undivided basename still must not route (dev → development)
+  const dev: LiveOmpAgent = { ...review, pid: 1, cwd: '/x/development', title: 'Working on tests' };
+  expect(matchLiveOmp('dev', [dev, landing]).map((x) => x.pid)).toEqual([]);
+  // two rig-* cwds: rig-fable is ambiguous, must not guess
+  const rigTools: LiveOmpAgent = { ...rig, pid: 2, cwd: '/Users/u/xp/rig-tools', title: 'Other rig' };
+  expect(matchLiveOmp('rig-fable', [rig, rigTools]).map((x) => x.pid)).toEqual([]);
+});
+
+test('matchLiveOmp: --name wins over title and cwd token', () => {
+  const named: LiveOmpAgent = {
+    pid: 9,
+    cwd: '/Users/u/work/conloca-landing',
+    sessionFile: null,
+    sessionId: null,
+    title: 'Save requests to memory/TodoList',
+    paneId: null,
+    tty: 'ttys021',
+    name: 'landing',
+  };
+  const other: LiveOmpAgent = {
+    pid: 10,
+    cwd: '/Users/u/work/landing-site',
+    sessionFile: null,
+    sessionId: null,
+    title: 'Other',
+    paneId: null,
+    tty: 'ttys022',
+  };
+  expect(matchLiveOmp('landing', [named, other]).map((x) => x.pid)).toEqual([9]);
+});
+
 test('mergeLiveOmpCandidates adds out-of-tmux omp to the picker; skips ones already in a pane', () => {
   const tmux = [
     {
@@ -236,7 +303,7 @@ test('mergeLiveOmpCandidates adds out-of-tmux omp to the picker; skips ones alre
   const untitled = merged.find((c) => c.paneId === 'omp:33378')!;
   expect(untitled.windowName).toBe('omp · 33378');
   expect(untitled.panePath).toBe('/Users/u/xp/tg-cli');
-  expect(distinctLabels([untitled])).toEqual(['omp · 33378']);
+  expect(distinctLabels([untitled])).toEqual(['omp · 33378 · tg-cli']);
 });
 
 test('preferOmpApiOverTmux is true for omp even when a pane exists — never send-keys', () => {

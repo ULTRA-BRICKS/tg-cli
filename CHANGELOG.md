@@ -3,6 +3,22 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.49.1
+
+**Telegram `/agent landing` and `/agent rig-fable` reach the live omp sessions (tg-cli#342).**
+
+Ask 108: those Hyper-tab omp processes were listed only by ephemeral titles
+(`Save requests to memory/TodoList`, `Finish rig-zerobug session work`), so
+`/agent landing` and `/agent rig-fable` reported no match.
+
+- **`matchWindows` / `matchLiveOmp`** also match a unique cwd project token
+  (`landing` -> `conloca-landing`) and a unique first segment of a hyphenated
+  selector (`rig-fable` -> `rig-cli`). A prefix of an undivided basename still
+  does not route (`dev` does not hit `development`). Ambiguous token sets stay unmatched.
+- **`--name`** on a live omp argv wins over title and cwd token.
+- **Picker labels** keep the title and append the project dir so the stable
+  names are visible next to the changing title.
+
 ## 1.49.0
 
 **Feature: dictionary gate — `tg` refuses to send a message containing a banned word from the shared dictionary, printing the replacement (tg-cli#302).**

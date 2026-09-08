@@ -187,7 +187,10 @@ original back with `tg replies`.
 ### Addressing a specific agent (v1.6.0)
 With several agents running, `/agent <window> <message>` routes to one of them.
 The window name is fuzzy-matched (phonetic, Cyrillic-aware), so `/agent апи deploy`
-finds the `api-bot` window. If the target is ambiguous or omitted, you get inline
+finds the `api-bot` window. Out-of-tmux omp is also addressed by a unique project
+token (`/agent landing` -> cwd `conloca-landing`) or a unique first segment
+(`/agent rig-fable` -> cwd `rig-cli`), and picker buttons show that project next
+to the session title. If the target is ambiguous or omitted, you get inline
 buttons grouped by tmux session; tap one to route. Bare `/agent` lists the agents.
 
 ### Agents outside tmux — two delivery channels (v1.46.0)

@@ -200,6 +200,53 @@ test('match: cwd tier is EXACT-only — neither fuzzy nor prefix silently routes
   expect(matchWindows('development', dev).matches[0]?.paneId).toBe('%A');
 });
 
+test('match: unique cwd token routes /agent landing to conloca-landing omp', () => {
+  // Ask 108: picker windowName is the ephemeral title; the stable name is the
+  // project token. Prefix of an undivided basename (dev/development) stays no-match.
+  const fleet = [
+    cand('omp:99240', 'omp', 99240, 'Save requests to memory/TodoList', 'omp', '/Users/u/work/conloca-landing'),
+    cand('omp:89653', 'omp', 89653, 'Finish rig-zerobug session work', 'omp', '/Users/u/xp/rig-cli'),
+    cand('omp:61335', 'omp', 61335, 'Fix rig ecosystem issues autonomously', 'omp', '/Users/u/xp/review-cli'),
+  ];
+  expect(matchWindows('landing', fleet).confident).toBe(true);
+  expect(matchWindows('landing', fleet).matches[0]?.paneId).toBe('omp:99240');
+  expect(matchWindows('rig-fable', fleet).confident).toBe(true);
+  expect(matchWindows('rig-fable', fleet).matches[0]?.paneId).toBe('omp:89653');
+  expect(matchWindows('dev', [
+    cand('omp:1', 'omp', 1, 'Working on tests', 'omp', '/x/development'),
+    cand('omp:2', 'omp', 2, 'Other', 'omp', '/x/server'),
+  ]).matches).toEqual([]);
+});
+
+test('match: omp --name alias wins over another pane whose window equals that name', () => {
+  // P1 on #345: handleAgentRoute runs matchWindows first. A titled pane "landing"
+  // must not steal /agent landing from a live omp started with --name landing.
+  const fleet = [
+    cand('%1', 's', 0, 'landing', 'claude', '/x/other'),
+    {
+      paneId: 'omp:9',
+      sessionName: 'omp',
+      windowIndex: 9,
+      windowName: 'Save requests to memory/TodoList',
+      agent: 'omp' as const,
+      panePath: '/Users/u/work/conloca-landing',
+      aliases: ['landing'],
+    },
+  ];
+  expect(matchWindows('landing', fleet).confident).toBe(true);
+  expect(matchWindows('landing', fleet).matches[0]?.paneId).toBe('omp:9');
+});
+
+test('labels: omp title keeps the cwd project token so landing/rig-cli are visible', () => {
+  const fleet = [
+    cand('omp:99240', 'omp', 99240, 'Save requests to memory/TodoList', 'omp', '/Users/u/work/conloca-landing'),
+    cand('omp:89653', 'omp', 89653, 'Finish rig-zerobug session work', 'omp', '/Users/u/xp/rig-cli'),
+  ];
+  const labels = distinctLabels(fleet);
+  expect(labels[0]).toContain('conloca-landing');
+  expect(labels[1]).toContain('rig-cli');
+});
+
 // FINDING (review): an ambiguous `/agent <sel>` with no message narrows the
 // picker to a SUBSET, but the user's follow-up command re-resolves against the
 // FULL fleet — so the daemon now verifies suggestSelector against the full live

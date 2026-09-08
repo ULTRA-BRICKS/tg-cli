@@ -33,7 +33,8 @@
 import { matchAgentCommand } from './discover';
 import type { AgentKind, PaneInfo, ProcInfo } from './types';
 import type { ButtonOption, ButtonRequest } from './questions';
-import type { AgentCandidate } from './agent-match';
+import { uniqueProjectSelectorHits, type AgentCandidate } from './agent-match';
+import { parseAgentNameFromCommand } from './unreachable';
 
 export interface LiveOmpAgent {
   pid: number;
@@ -44,6 +45,8 @@ export interface LiveOmpAgent {
   title: string | null;
   paneId: string | null;
   tty: string | null;
+  /** `--name` from the process argv when present (claude-rotate / omp). */
+  name?: string | null;
 }
 
 export interface OmpSessionMeta {
@@ -190,6 +193,7 @@ export function findLiveOmpAgents(
       title: null,
       paneId,
       tty: tty && tty !== '?' && tty !== '??' ? tty : null,
+      name: parseAgentNameFromCommand(p.command),
     });
   }
   return out;
@@ -204,6 +208,8 @@ export function liveOmpLabel(a: LiveOmpAgent): string {
 export function matchLiveOmp(selector: string, agents: LiveOmpAgent[]): LiveOmpAgent[] {
   const want = selector.trim().toLowerCase();
   if (!want) return [];
+  const byName = agents.filter((a) => (a.name ?? '').trim().toLowerCase() === want);
+  if (byName.length > 0) return byName;
   const exactTitle = agents.filter((a) => (a.title ?? '').trim().toLowerCase() === want);
   if (exactTitle.length > 0) return exactTitle;
   const idPrefix = agents.filter((a) => (a.sessionId ?? '').toLowerCase().startsWith(want));
@@ -216,7 +222,7 @@ export function matchLiveOmp(selector: string, agents: LiveOmpAgent[]): LiveOmpA
   });
   // Untitled sessions have no title/jsonl; only a unique cwd basename is safe.
   if (byCwd.length === 1) return byCwd;
-  return [];
+  return uniqueProjectSelectorHits(selector, agents, (a) => (a.cwd ? basename(a.cwd) : ''));
 }
 
 /** Synthetic picker pane id for an omp that is not a tmux pane. Inject routes this to ACP. */
@@ -283,6 +289,7 @@ export function ompAcpSpawnArgv(opts: { cwd: string; loadSession: boolean }): st
 }
 
 export function liveOmpToCandidate(a: LiveOmpAgent): AgentCandidate {
+  const name = (a.name ?? '').trim();
   return {
     paneId: liveOmpPaneId(a.pid),
     sessionName: 'omp',
@@ -290,6 +297,7 @@ export function liveOmpToCandidate(a: LiveOmpAgent): AgentCandidate {
     windowName: liveOmpLabel(a),
     agent: 'omp',
     panePath: a.cwd ?? undefined,
+    ...(name ? { aliases: [name] } : {}),
   };
 }
 
@@ -303,7 +311,11 @@ export function mergeLiveOmpCandidates(
   for (const a of live) {
     if (a.paneId) {
       const existing = out.find((c) => c.paneId === a.paneId);
-      if (existing?.agent === 'omp') existing.windowName = liveOmpLabel(a);
+      if (existing?.agent === 'omp') {
+        existing.windowName = liveOmpLabel(a);
+        const name = (a.name ?? '').trim();
+        if (name) existing.aliases = [name];
+      }
       continue;
     }
     extra.push(liveOmpToCandidate(a));
@@ -372,7 +384,7 @@ export function buildAcpInitialize(id: string | number): AcpRequest {
     method: 'initialize',
     params: {
       protocolVersion: 1,
-      clientInfo: { name: 'tg-ctl', version: '1.48.2' },
+      clientInfo: { name: 'tg-ctl', version: '1.49.1' },
       clientCapabilities: {},
     },
   };

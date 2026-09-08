@@ -18,6 +18,9 @@ export interface AgentCandidate {
   // human-meaningful distinguisher when several panes share a bare/numeric
   // window name (e.g. three `claude` sessions in window "4" → "rig", "3d-cli").
   panePath?: string;
+  // Extra exact /agent selectors (live omp `--name`). Checked BEFORE fuzzy
+  // window names so an explicit name is not stolen by another pane's title.
+  aliases?: string[];
 }
 
 // --- command parse ---
@@ -140,6 +143,43 @@ function strictScoreOf(selKey: string, name: string): number {
   return scoreOf(selKey, name) === 0 ? 0 : Infinity;
 }
 
+
+// Stable /agent tokens derived from a project dir basename. The full basename
+// is always a token; hyphen/underscore/dot pieces of length >= 4 are too, so
+// `landing` addresses `conloca-landing` without letting `dev` hit `development`
+// (that name has no separator, so its only token is itself).
+export function projectAddressTokens(project: string): string[] {
+  const base = project.trim().toLowerCase();
+  if (!base) return [];
+  const parts = base.split(/[-_.]+/).filter((p) => p.length >= 4);
+  return [...new Set([base, ...parts])];
+}
+
+// Unique project-dir hit for a typed selector. Exact/token match wins when it
+// names exactly one item; a hyphenated selector like `rig-fable` then falls
+// through to a unique FIRST segment (`rig` → `rig-cli`) so the Hyper-tab
+// names from ask 108 route. Ambiguous token/segment sets return nothing —
+// never guess.
+export function uniqueProjectSelectorHits<T>(
+  selector: string,
+  items: readonly T[],
+  projectOf: (item: T) => string,
+): T[] {
+  const want = selector.trim().toLowerCase();
+  if (!want) return [];
+  const tokenHits = items.filter((it) => projectAddressTokens(projectOf(it)).includes(want));
+  if (tokenHits.length === 1) return tokenHits;
+  if (tokenHits.length > 1) return [];
+  if (!/[-_.]/.test(want)) return [];
+  const head = want.split(/[-_.]+/)[0] ?? '';
+  if (head.length < 3) return [];
+  const headHits = items.filter((it) => {
+    const proj = projectOf(it).trim().toLowerCase();
+    return proj !== '' && proj.split(/[-_.]+/)[0] === head;
+  });
+  return headHits.length === 1 ? headHits : [];
+}
+
 // Fuzzy-match `selector` (phonetic) against the candidates, in TWO tiers so the
 // window name always takes precedence over the cwd:
 //   1. window NAMES only (fuzzy) — unchanged legacy behaviour. `/agent deploy`
@@ -154,6 +194,14 @@ function strictScoreOf(selKey: string, name: string): number {
 //      resonate into a different pane's cwd.
 // `confident` = the tied-best set is a single pane.
 export function matchWindows(selector: string, candidates: AgentCandidate[]): MatchResult {
+  const want = selector.trim().toLowerCase();
+  if (want) {
+    const named = candidates.filter((c) =>
+      (c.aliases ?? []).some((a) => a.trim().toLowerCase() === want),
+    );
+    if (named.length === 1) return { matches: named, confident: true };
+    if (named.length > 1) return { matches: named, confident: false };
+  }
   const selKey = phoneticKey(selector);
   if (!selKey) return { matches: [], confident: false };
   let matches = bestMatches(candidates, (c) => scoreOf(selKey, c.windowName));
@@ -161,6 +209,10 @@ export function matchWindows(selector: string, candidates: AgentCandidate[]): Ma
     // Tier 1 found nothing → no window name matched, so rank purely by the STRICT
     // cwd score (EXACT only).
     matches = bestMatches(candidates, (c) => strictScoreOf(selKey, cwdBasename(c.panePath)));
+  }
+  if (matches.length === 0) {
+    // Tier 3: unique project token / unique first segment (ask 108 landing, rig-fable).
+    matches = uniqueProjectSelectorHits(selector, candidates, (c) => cwdBasename(c.panePath));
   }
   return { matches, confident: matches.length === 1 };
 }
@@ -278,9 +330,16 @@ export function resolveWindowAgentLabel(
 // the pane id appended so the buttons are never two identical strings.
 export function distinctLabels(candidates: AgentCandidate[]): string[] {
   let labels = candidates.map((c) => {
-    // omp: the window is already the session title or "omp · <id/pid>".
-    // Never fall through to cwd basename ("tmp · omp").
-    if (c.agent === 'omp' && !isBareWindowName(c.windowName)) return c.windowName;
+    // omp: the window is the session title or "omp · <id/pid>". Keep that,
+    // but always show the cwd project token so /agent landing and /agent
+    // rig-cli remain visible when the title is an unrelated sentence.
+    if (c.agent === 'omp' && !isBareWindowName(c.windowName)) {
+      const project = cwdBasename(c.panePath);
+      if (project && !c.windowName.toLowerCase().includes(project.toLowerCase())) {
+        return `${c.windowName} · ${project}`;
+      }
+      return c.windowName;
+    }
     if (c.agent === 'omp') {
       const pid = c.paneId.startsWith('omp:') ? c.paneId.slice(4) : '';
       return pid ? `omp · ${pid}` : 'omp';

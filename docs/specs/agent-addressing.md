@@ -162,6 +162,12 @@ treated as non-distinguishing and the label leans on the cwd project dir instead
 - The cwd is an EXACT-only tie-breaker, and only when no window name matched — a
   fuzzy or even prefix window-name token never silently routes via someone else's
   cwd (a short `/agent dev` won't land in a `…/development` project).
+- After that exact cwd miss, a **unique project token** (hyphen/underscore/dot
+  piece of length >= 4, or the full basename) may route: `/agent landing` hits
+  the sole `conloca-landing` omp. A hyphenated selector with no token hit may
+  then use a **unique first segment** (`/agent rig-fable` -> sole `rig-cli`).
+  Ambiguous token/segment sets do not guess. Picker labels for omp append the
+  project dir so those names stay visible next to the session title.
 - Live end-to-end requires an inbound tap from the chat owner (the unit + step
   tests cover the logic; the button round-trip is the same mechanism as
   q→buttons, which has integration coverage).
