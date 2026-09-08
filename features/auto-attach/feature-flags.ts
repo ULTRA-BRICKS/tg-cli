@@ -44,6 +44,10 @@ export const DEFAULT_FEATURES: FeatureMap = {
   // `--no-feature cjk-guard` disables both. See features/cli/cjk-guard.ts and
   // features/cli/mixed-script-guard.ts.
   'cjk-guard': true,
+  // screenshot-guard blocks a send whose caption/--title mentions
+  // screenshot/скриншот with no photo attached (tg-cli#337). ON by default.
+  // `--no-feature screenshot-guard` opts out. See features/cli/screenshot-guard.ts.
+  'screenshot-guard': true,
   // pre-send-photo hooks (agents-hooks/v1). ON by default, but it is a TRUE
   // no-op unless ~/.agents/hooks/tg/ exists (one `stat`), so default-ON costs
   // nothing on machines with no descriptors. `--no-feature hooks` or

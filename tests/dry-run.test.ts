@@ -16,7 +16,7 @@ import { join } from 'path';
 // 10201/10202.
 //
 // `--dry-run` runs every local guard (escalation-format gate, cjk-guard,
-// pipe-table conversion) and prints the outcome, but MUST NEVER reach the
+// screenshot-guard, pipe-table conversion) and prints the outcome, but MUST NEVER reach the
 // network — proven here with a mock Bot-API server that records every
 // request it receives: a `--dry-run` send, compliant OR malformed, must
 // leave that recorder empty.

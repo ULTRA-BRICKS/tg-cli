@@ -143,6 +143,10 @@ One feature catches two "a garbled token slipped into the message" shapes on the
 
 **Mixed-script "garbage word".** A single **contiguous run of letters** where a foreign alphabet (Latin, Greek, …) is **sandwiched inside** Cyrillic — the homoglyph/mojibake signature (e.g. `почčesна`, meant `починена`) — is blocked, naming the offending token and its position. The trigger is **interleaving**: the run's script must switch **twice or more** (`…Cyr → Lat → Cyr…`). That is deliberately narrow so legitimate two-segment tokens pass — a message using both scripts across **separate words** (`влил PR`, `gh ship готово`, `dev-cli`), a Latin acronym **hyphen-joined** to a Cyrillic word (`PR-ревью`, `MCP-сервер`), a Latin acronym with a **glued** Cyrillic case/diminutive suffix (`IDшник`, `PRы`, `APIшка`), a pure-Cyrillic or pure-Latin word, accented Latin, and Cyrillic mixed only with digits/punctuation/emoji all pass. CJK letters are their own class, kept orthogonal to the stray-CJK check above.
 
+### Screenshot-attach gate (`screenshot-guard`)
+
+A message (or `--title`) that mentions **screenshot** or **скриншот** (any case) with **no photo attached** is a **hard error** before send. Attach the image with `tg --photo <path>` (or equivalent). Do not dodge by deleting the word — attach the screenshot. A send that already has `--photo` (or an auto-attached image) is allowed. Override: `--no-feature screenshot-guard`.
+
 ### Autolinks
 
 **Linear tickets** (`HYP-576` style) — verified via the `linear` CLI, title inlined or appended. Requires `brew install schpet/tap/linear` + `linear auth login`. Disable: `--no-feature autolink-tasks`.

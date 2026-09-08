@@ -3,6 +3,19 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.48.0
+
+**Feature (tg-cli#337): block a send that mentions screenshot/скриншот with no image attached.**
+
+- `tg "see screenshot foo.png"` (no `--photo`) is a hard error before transmit. The
+  error tells the sender to attach the image with `tg --photo`, and not to dodge by
+  deleting the word — attach the screenshot.
+- `tg --photo x.png "screenshot of …"` is allowed: a photo is already attached. A
+  `--photo` whose path is missing or empty does not count — that file is later
+  skipped and the caption would otherwise go out as text-only.
+- Case-insensitive English `screenshot` and Cyrillic `скриншот`. ON by default
+  (feature `screenshot-guard`); `--no-feature screenshot-guard` opts out.
+
 ## 1.47.0
 
 **tg-ctl controls live omp via ACP, not tmux send-keys (tg-cli#323).**

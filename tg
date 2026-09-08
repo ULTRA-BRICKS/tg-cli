@@ -9,6 +9,7 @@ import { BOM_MAX_BYTES, maybeAddBom } from "./features/auto-attach/encoding"
 import { checkAttachmentFile, type FileCheckDeps } from "./features/auto-attach/file-check"
 import { findStrayCjk, formatStrayCjkError } from "./features/cli/cjk-guard"
 import { findMixedScriptTokens, formatMixedScriptError } from "./features/cli/mixed-script-guard"
+import { formatScreenshotAttachError, mentionsScreenshot } from "./features/cli/screenshot-guard"
 import {
   applyFeatureFlags,
   parseFeatureConfig,
@@ -217,7 +218,7 @@ Options:
                        text becomes a heading above the table. Keep cells
                        ASCII/Cyrillic (double-width emoji/CJK misalign columns).
   --dry-run             validate/render the message through every local guard
-                       (escalation-format gate, cjk-guard, table conversion) and
+                       (escalation-format gate, cjk-guard, screenshot-guard, table conversion) and
                        print the outcome — NO network call, NO credentials
                        required, NOTHING is sent. Use this to iterate against
                        the strict --tag decision format instead of
@@ -327,6 +328,14 @@ Stray-CJK / mixed-script guard (feature cjk-guard, ON by default — toggle with
   an LLM occasionally emits. Two SEPARATE words (влил PR), a hyphen-joined
   compound (PR-ревью), and a glued acronym+suffix (IDшник) pass untouched.
   Override either check with --no-feature cjk-guard or features.cjk-guard: false.
+
+Screenshot-attach gate (feature screenshot-guard, ON by default — toggle with
+--feature/--no-feature):
+  A message (or --title) that mentions screenshot or скриншот (any case) with
+  NO photo/image attached is a HARD ERROR before send. Attach the image with
+  tg --photo <path> (or equivalent). Do not dodge by deleting the word —
+  attach the screenshot. A send that already has --photo (or an auto-attached
+  image) is allowed. Override with --no-feature screenshot-guard.
 
 Unknown flags:
   Unknown dashed tokens (e.g. --foo) are an ERROR: this help is printed to
@@ -586,6 +595,7 @@ if (import.meta.main) {
   // Stray-CJK guard (feature `cjk-guard`, ON by default): checked below on the
   // final decoded caption/title, right before send.
   const cjkGuardOn = features["cjk-guard"] !== false
+  const screenshotGuardOn = features["screenshot-guard"] !== false
   // Same flag the body-detection `detectTicketCodesExpanded` call below gates on — threaded so
   // the --title HYP-<id> guard honours a disabled feature identically to the body.
   const ticketAutolinkOn = features["autolink-tasks"] !== false
@@ -1028,6 +1038,34 @@ if (import.meta.main) {
     }
   }
 
+  // Screenshot-attach gate (feature `screenshot-guard`, ON by default): a
+  // caption/--title that mentions screenshot/скриншот with no photo attached
+  // is a hard error before dry-run/transmit (tg-cli#337). Runs HERE so
+  // --dry-run also catches it. A --photo (or auto-attached image) in `items`
+  // skips the gate — that path already has a file. Documents do not count.
+  // A photo item whose path is missing/empty is later skipped by
+  // checkAttachmentFile and the caption still goes out as text — that is
+  // NOT an attached image (review finding on tg-cli#337). Only a real
+  // on-disk non-empty photo file counts.
+  const hasAttachedPhoto = items.some((it) => {
+    if (it.type !== "photo") return false
+    try {
+      const st = statSync(it.path)
+      return st.isFile() && st.size > 0
+    } catch {
+      return false
+    }
+  })
+  if (screenshotGuardOn && !hasAttachedPhoto) {
+    for (const text of [caption, title ?? ""]) {
+      if (!text) continue
+      if (mentionsScreenshot(text)) {
+        console.error(`Error: ${formatScreenshotAttachError()}`)
+        process.exit(1)
+      }
+    }
+  }
+
   // Close the --table bypass: the parse-time gate (features/cli/args.ts) skips a
   // --table send because the rows arrive on stdin, which parseArgs never sees.
   // So for an ESCALATION sent via --table, validate the FINAL rendered body here
@@ -1041,7 +1079,7 @@ if (import.meta.main) {
   // --- dry-run short-circuit --------------------------------------------
   // Everything above this point is LOCAL validation/rendering: the escalation-
   // format gate (parse-time + the --table final check just above), the
-  // cjk/mixed-script guard, and the pipe-table→<table> conversion have all
+  // cjk/mixed-script guard, the screenshot-attach gate, and the pipe-table→<table> conversion have all
   // already run against the FINAL assembled `caption`. A failing gate above
   // already exits(1) without ever reaching here or touching the network — the
   // gap this flag closes is the PASSING case: a structurally-compliant message
