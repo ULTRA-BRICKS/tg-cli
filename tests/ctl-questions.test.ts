@@ -70,14 +70,13 @@ test('registrationAllowsHook: cwd comparison goes through the injected path reso
   expect(registrationAllowsHook(reg, { cwd: '/proj' }, resolver)).toBe(true);
 });
 
-test('questionCapability is explicit: claude/codex/opencode support buttons, pi/omp are limited', () => {
+test('questionCapability is explicit: claude/codex/opencode/omp support buttons, pi/aider are limited', () => {
   expect(questionCapability('claude')).toBe('buttons');
   expect(questionCapability('codex')).toBe('buttons');
   expect(questionCapability('opencode')).toBe('buttons');
+  expect(questionCapability('omp')).toBe('buttons');
   expect(questionCapability('pi')).toBe('unsupported');
-  // omp is deliberately the honest tmux floor (like pi/aider): detectable and
-  // injectable, but NO native question buttons until a hook integration exists.
-  expect(questionCapability('omp')).toBe('unsupported');
+  expect(questionCapability('aider')).toBe('unsupported');
 });
 
 test('HOOK_AGENT_KINDS accepts omp (ask --agent omp classifies as omp, not a claude fallback)', () => {

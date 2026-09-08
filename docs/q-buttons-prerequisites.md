@@ -102,7 +102,8 @@ question TEXT, `updatedInput` replaces wholesale — is unchanged in
 | Claude Code | ✅ buttons | ✅ buttons | needs the undocumented AskUserQuestion hook |
 | Codex | ❌ | ✅ buttons | manual `/hooks` trust; usage telemetry via Stop hook |
 | opencode | ✅ | ✅ | native, no tmux |
-| pi / aider / omp / gemini | ❌ | ❌ | tmux floor only; bot replies "limited" |
+| omp | ✅ buttons | ✅ buttons | ACP `session/request_permission`; never tmux digit inject |
+| pi / aider / gemini | ❌ | ❌ | tmux floor only; bot replies "limited" |
 
 ## Plan-approval (ExitPlanMode) forwarded as Proceed / Keep planning
 

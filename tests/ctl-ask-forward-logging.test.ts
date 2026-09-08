@@ -198,10 +198,7 @@ test('an unrecognized --agent value warns on hook stderr and falls back to claud
   expect(stderr).toContain('agent=claude'); // the drop line confirms the fallback kind
 });
 
-test('an omp question gets the same honest not-forwardable path (tmux floor)', async () => {
-  // End-to-end pin for the omp capability claim: an omp ask that passes the
-  // registration gate is dropped as not-forwardable (questionCapability('omp')
-  // === 'unsupported'), never silently given claude button semantics.
+test('an omp question is forwarded as buttons (ACP), never silently given claude hook semantics', async () => {
   const proc = ask({
     requestId: 'q_omp',
     cwd: '/some/other/registered/dir',
@@ -211,9 +208,10 @@ test('an omp question gets the same honest not-forwardable path (tmux floor)', a
     question: 'pick one',
     options: [{ label: 'A' }],
   });
-  const log = await waitForLog('req=q_omp');
-  expect(log).toContain('ask-forward dropped: reason=not-forwardable');
-  expect(log).toContain('agent=omp');
+  const log = await waitForLog('ask-forward posted: agent=omp');
+  expect(log).toContain('ask-forward posted: agent=omp kind=question req=q_omp');
+  expect(log).not.toContain('ask-forward dropped: reason=not-forwardable agent=omp');
+  proc.kill(9);
   await proc.exited;
 });
 

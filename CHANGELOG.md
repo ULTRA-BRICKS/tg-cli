@@ -3,6 +3,33 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.47.0
+
+**tg-ctl controls live omp via ACP, not tmux send-keys (tg-cli#323).**
+
+Alex 2026-09-07/08: harnesses that can be driven without tmux must work without it,
+and an omp pane plus the API at once must not fight over send-keys. PR 322's
+`omp --resume --print` path forks session history — this does not use it.
+
+- **Discovery** finds interactive omp from the process table (pid, session jsonl,
+  title from omp itself) whether or not a tmux pane exists. Worker helpers
+  (`__omp_worker_*`) are not the user session. Tmux still classifies kind=omp (243),
+  including a pane whose `pane_current_command` is a version string.
+- **Inject** uses ACP JSON-RPC (`initialize`, `session/new`, `session/prompt`) on
+  `omp acp --no-session --allow-home --cwd …`. Wrapped `[TG from …]` text, same as
+  other harnesses. If a tmux pane AND ACP both exist, ACP wins — never `send-keys`.
+- **Questions/permissions** from `session/request_permission` become Telegram
+  buttons; a tap replies with the JSON-RPC result, not a tmux digit.
+- An omp session outside tmux is no longer the Stop-hook inbox fallback.
+- Bare `/agent` lists every live omp as a tappable button (`omp:<pid>` → ACP).
+  Body is only `Pick an agent to send message:`. Label is the session title, or
+  `omp · <pid>` if untitled — never the cwd basename. No "Outside tmux (not tappable)" notice.
+
+Known bound: `session/load` against a running TUI's session file is not assumed to
+attach to that process (it may fork). Live Telegram proof of a TUI already in a
+pane is still outstanding; the unit/integration tests drive a fake/live `omp acp`
+child with `TMUX` unset.
+
 ## 1.46.2
 
 **Fix (tg-cli#316): `tg-ctl status` no longer lies "not running" while launchd owns a live daemon.**

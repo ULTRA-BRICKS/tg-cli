@@ -233,7 +233,7 @@ async function injectedTextFor(fixtureDir: string, text = 'fix the other thing',
   if (mode === 'auto') {
     expect(sent).toEqual([]); // no guard/error reply — the inject was attempted, not rejected
   } else {
-    expect(sent[0]?.text).toBe('Pick an agent:');
+    expect(sent[0]?.text).toBe('Pick an agent to send message:');
   }
   // A banner adds a newline, forcing inject.ts's multi-line load-buffer/paste-buffer path; the
   // plain single-line wrap (no banner) goes through send-keys -l instead — read back whichever

@@ -136,6 +136,29 @@ import {
   type UnreachableAgent,
 } from "./features/tg-ctl/unreachable"
 import {
+  acpPermissionReply,
+  acpPermissionToButtonRequest,
+  acpSessionIdFromResult,
+  acpSessionTitleFromUpdate,
+  buildAcpInitialize,
+  buildAcpSessionNew,
+  buildAcpSessionPrompt,
+  decodeAcpFrames,
+  describeLiveOmp,
+  encodeAcpFrame,
+  findLiveOmpAgents,
+  liveOmpLabel,
+  matchLiveOmp,
+  mergeLiveOmpCandidates,
+  optionIdForAnswer,
+  parseLsofJsonlPaths,
+  parseOmpSessionMeta,
+  pickPrimaryOmpSessionFile,
+  preferOmpApiOverTmux,
+  withOmpSession,
+  type LiveOmpAgent,
+} from "./features/tg-ctl/omp"
+import {
   DEFAULT_TASK_VIEW,
   TASK_STATES,
   TASKS_PAGE_SIZE,
@@ -922,7 +945,9 @@ function listAgentCandidates(): AgentCandidate[] {
     })
   }
   // A pane id is unique per tmux server; dedupe guards a merged/flaky snapshot.
-  return dedupeCandidates(out)
+  // Out-of-tmux omp join as paneId omp:<pid> so /agent can pick them; in-tmux
+  // omp already have a real pane row and are skipped by the merge.
+  return mergeLiveOmpCandidates(dedupeCandidates(out), listLiveOmpAgents())
 }
 
 // --- agents OUTSIDE tmux (tg-cli#306) ---
@@ -985,16 +1010,194 @@ function listUnreachableAgents(): UnreachableAgent[] {
   let agents: UnreachableAgent[] = []
   if (ttyByPid.size > 0) {
     const { panes, procs } = snapshot()
-    agents = findUnreachableAgents(panes, procs, ttyByPid).map((a) => ({ ...a, cwd: cwdOfPid(a.pid) }))
+    agents = findUnreachableAgents(panes, procs, ttyByPid)
+      .filter((a) => a.agent !== "omp")
+      .map((a) => ({ ...a, cwd: cwdOfPid(a.pid) }))
   }
   unreachableCache = { at: now, agents }
   return agents
 }
 
-// The no-agent reply, LISTING any agent that runs outside tmux (never the bare
-// "not in tmux" text while the agent is right there, unreachable for a reason).
+// `lsof -Fn` n-paths for a pid — used to find omp's primary session jsonl.
+function jsonlPathsOfPid(pid: number): string[] {
+  try {
+    const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(pid), "-Fn"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: SUBPROC_ENV,
+      timeout: LSOF_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    })
+    if (lsof.exitCode !== 0) return []
+    return parseLsofJsonlPaths(lsof.stdout.toString())
+  } catch {
+    return []
+  }
+}
+
+let liveOmpCache: { at: number; agents: LiveOmpAgent[] } | null = null
+function listLiveOmpAgents(): LiveOmpAgent[] {
+  const now = Date.now()
+  if (liveOmpCache && now - liveOmpCache.at < UNREACHABLE_SCAN_TTL_MS) return liveOmpCache.agents
+  const ttyByPid = readPidTtyMap()
+  const { panes, procs } = snapshot()
+  const agents = findLiveOmpAgents(panes, procs, ttyByPid).map((a) => {
+    const cwd = cwdOfPid(a.pid)
+    const files = jsonlPathsOfPid(a.pid)
+    const sessionFile = pickPrimaryOmpSessionFile(files)
+    let meta = null
+    if (sessionFile) {
+      try {
+        meta = parseOmpSessionMeta(readFileSync(sessionFile, "utf8").slice(0, 64_000))
+      } catch {
+        meta = null
+      }
+    }
+    return withOmpSession(a, { cwd, sessionFile, meta })
+  })
+  liveOmpCache = { at: now, agents }
+  return agents
+}
+
+type OmpAcpClient = {
+  proc: ReturnType<typeof Bun.spawn>
+  cwd: string
+  sessionId: string
+  buf: string
+  nextId: number
+  pending: Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>
+}
+
+const ompAcpClients = new Map<string, OmpAcpClient>()
+
+function writeAcp(client: OmpAcpClient, msg: object): void {
+  client.proc.stdin.write(encodeAcpFrame(msg))
+}
+
+function pumpAcpClient(client: OmpAcpClient, onPermission: (req: ButtonRequest) => void): void {
+  const stdout = client.proc.stdout
+  const reader = stdout.getReader()
+  const decoder = new TextDecoder()
+  const loop = async () => {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      client.buf += decoder.decode(value, { stream: true })
+      const { messages, rest } = decodeAcpFrames(client.buf)
+      client.buf = rest
+      for (const raw of messages) {
+        if (!raw || typeof raw !== "object") continue
+        const rec = raw as { id?: number; method?: string; result?: unknown; error?: { message?: string } }
+        if (typeof rec.id === "number" && client.pending.has(rec.id)) {
+          const wait = client.pending.get(rec.id)!
+          client.pending.delete(rec.id)
+          if (rec.error) wait.reject(new Error(rec.error.message ?? "ACP error"))
+          else wait.resolve(raw)
+          continue
+        }
+        const perm = acpPermissionToButtonRequest(raw)
+        if (perm) onPermission(perm)
+        const title = acpSessionTitleFromUpdate(raw)
+        if (title) log(`omp-acp: session title from omp: ${title}`)
+      }
+    }
+  }
+  void loop()
+}
+
+async function acpCall(client: OmpAcpClient, methodBuilder: (id: number) => object, timeoutMs: number): Promise<unknown> {
+  const id = client.nextId++
+  const msg = methodBuilder(id)
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      client.pending.delete(id)
+      reject(new Error(`ACP ${"method" in msg ? (msg as { method: string }).method : "call"} timed out`))
+    }, timeoutMs)
+    client.pending.set(id, {
+      resolve: (v) => {
+        clearTimeout(timer)
+        resolve(v)
+      },
+      reject: (e) => {
+        clearTimeout(timer)
+        reject(e)
+      },
+    })
+    writeAcp(client, msg)
+  })
+}
+
+let ompPermissionSink: ((req: ButtonRequest) => void) | null = null
+
+async function ensureOmpAcp(cwd: string): Promise<OmpAcpClient> {
+  const existing = ompAcpClients.get(cwd)
+  if (existing && existing.proc.exitCode === null) return existing
+  const proc = Bun.spawn(["omp", "acp", "--no-session", "--allow-home", `--cwd=${cwd}`], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env, TMUX: "" },
+  })
+  const client: OmpAcpClient = {
+    proc,
+    cwd,
+    sessionId: "",
+    buf: "",
+    nextId: 1,
+    pending: new Map(),
+  }
+  pumpAcpClient(client, (req) => {
+    ompPermissionSink?.(req)
+  })
+  await acpCall(client, (id) => buildAcpInitialize(id), 15_000)
+  const created = await acpCall(client, (id) => buildAcpSessionNew(id, cwd), 15_000)
+  const sessionId = acpSessionIdFromResult(created)
+  if (!sessionId) {
+    proc.kill()
+    throw new Error("omp acp session/new returned no sessionId")
+  }
+  client.sessionId = sessionId
+  ompAcpClients.set(cwd, client)
+  log(`omp-acp: session/new sessionId=${sessionId} cwd=${cwd}`)
+  return client
+}
+
+async function promptOmpAcp(cwd: string, text: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const client = await ensureOmpAcp(cwd)
+    await acpCall(client, (id) => buildAcpSessionPrompt(id, client.sessionId, text), 120_000)
+    return { ok: true }
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err)
+    log(`omp-acp: prompt failed cwd=${cwd}: ${error}`)
+    return { ok: false, error }
+  }
+}
+
+async function replyOmpAcpPermission(req: ButtonRequest, optionId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const reply = acpPermissionReply(req, optionId)
+  if (!reply || !req.omp) return { ok: false, error: "not an omp ACP permission" }
+  const client = [...ompAcpClients.values()].find((c) => c.sessionId === req.omp!.sessionId)
+  if (!client) return { ok: false, error: "omp ACP session is gone — not injecting into tmux" }
+  writeAcp(client, reply)
+  return { ok: true }
+}
+
+function liveOmpForPane(paneId: string, agentPid?: number): LiveOmpAgent | null {
+  const agents = listLiveOmpAgents()
+  return agents.find((a) => a.paneId === paneId || (agentPid !== undefined && a.pid === agentPid)) ?? null
+}
+
 function noAgentReplyNow(): string {
-  return noAgentReplyText(NO_AGENT_REPLY, listUnreachableAgents())
+  const live = listLiveOmpAgents()
+  const unreachable = listUnreachableAgents()
+  if (live.length > 0) {
+    const lines = live.map((a) => `  - ${describeLiveOmp(a)}`)
+    const ompBlock = `omp (ACP, never tmux send-keys):\n${lines.join("\n")}`
+    if (unreachable.length === 0) return ompBlock
+    return `${ompBlock}\n${noAgentReplyText("", unreachable)}`
+  }
+  return noAgentReplyText(NO_AGENT_REPLY, unreachable)
 }
 
 // Count the lines of a JSONL file (0 when absent/unreadable, or the key is unknown).
@@ -1490,6 +1693,11 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
     lines.push(`unreachable (not in tmux): ${unreachable.length}`)
     for (const a of unreachable) lines.push(`  - ${describeUnreachable(a, pendingInboxCount(ctx, unreachableKey(a)))}`)
     lines.push(`  ${UNREACHABLE_HINT}`)
+  }
+  const liveOmp = listLiveOmpAgents()
+  if (liveOmp.length > 0) {
+    lines.push(`omp (ACP): ${liveOmp.length}`)
+    for (const a of liveOmp) lines.push(`  - ${describeLiveOmp(a)}`)
   }
   const offsetMtime = fileMtimeMs(ctx.paths.offset)
   lines.push(
@@ -4755,6 +4963,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // chosen answer can still reach the pane it asked from. NOT in `pendingButtons`, so
   // it never defers its pane's inbound. Keyed by callbackRequestId, like the others.
   const abandonedButtons = new Map<string, AbandonedButton>()
+  ompPermissionSink = (req) => {
+    void (async () => {
+      const payload = buildButtonMessage(ctx.chatId, req)
+      const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
+      const key = callbackRequestId(req)
+      abandonedButtons.set(key, { req, messageId: messageId ?? null, at: Date.now() })
+      persistQuestions()
+      log(`omp-acp: posted permission/question ${describeAskRequest(req)} messageId=${messageId ?? "-"}`)
+    })()
+  }
   // The daemon is giving up on a retained entry (its retention window elapsed with
   // no reconnect and no delivery) — surface that instead of leaving the card
   // silently stuck on "hook disconnected"/"queued" forever (Alex tg requirement:
@@ -5645,26 +5863,50 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         await postSelectPicker(candidatesForPicker(found.candidates))
         return false
       }
+      if (found.reason === "no-agent" && deferText !== undefined && deferText.trim() !== "") {
+        const live = listLiveOmpAgents()
+        if (live.length === 1) {
+          const cwd = live[0].cwd ?? "/"
+          log(`inject: omp ACP sole session pid=${live[0].pid} title=${liveOmpLabel(live[0])} cwd=${cwd}`)
+          const result = await promptOmpAcp(cwd, deferText)
+          if (!result.ok) {
+            await sendMessage(ctx, result.error)
+            return false
+          }
+          return true
+        }
+      }
       await replyNoAgent()
       return false
     }
     const paneId = found.target.pane.paneId
     const textPreview = deferText?.slice(0, 60).replace(/\n/g, " ")
     log(`inject: target=${paneId} autoBind=${autoBind} text="${textPreview ?? "(key)"}"`)
-    // Record the CTO's own last-resolved target — ONLY for a genuine auto-bound
-    // inbound (autoBind=true means "no explicit human/reply anchor chose this,
-    // discoverForInject resolved it"), never for an explicit /agent target
-    // (autoBind=false uses discover(), skipped here), and ONLY once delivery is
-    // confirmed (a deferred message still unambiguously targets this pane; a
-    // failed inject below must NOT move the anchor to a pane that never actually
-    // received anything — codex/Opus review finding). This is what the NEXT
-    // ambiguous non-reply anchors against (tg-cli#78 fix above).
     const recordIfAutoBound = () => {
       if (autoBind) recordLastUserTarget(paneId, found.target.pane.panePath)
     }
-    // Defer a text message behind the pane's outstanding question OR an existing
-    // backlog (⏳); control verbs (Escape, no deferText) always go through to
-    // interrupt it.
+    if (preferOmpApiOverTmux(found.target.agent)) {
+      if (deferText === undefined) {
+        log(`inject: omp target=${paneId} — refusing tmux send-keys for a control verb`)
+        await sendMessage(ctx, "omp is controlled via ACP — not injecting keys into the pane")
+        return false
+      }
+      if (shouldDeferInbound(paneId)) {
+        markDeferredForAck(enqueueDeferred(paneId, deferText, sourceMessageId))
+        recordIfAutoBound()
+        return true
+      }
+      const cwd = found.target.pane.panePath || liveOmpForPane(paneId, found.target.agentPid)?.cwd || "/"
+      log(`inject: omp ACP pane=${paneId} cwd=${cwd} (not tmux send-keys)`)
+      const result = await promptOmpAcp(cwd, deferText)
+      if (!result.ok) {
+        log(`inject aborted: ${result.error}`)
+        await sendMessage(ctx, result.error)
+        return false
+      }
+      recordIfAutoBound()
+      return true
+    }
     if (deferText !== undefined && shouldDeferInbound(paneId)) {
       markDeferredForAck(enqueueDeferred(paneId, deferText, sourceMessageId))
       recordIfAutoBound()
@@ -5697,10 +5939,28 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // it here so `/agent <selector> <text>` gets the same `tg#<id>` tag as
     // every other inbound path.
     const wrapped = wrapInbound(ctx.cfg.injectWrap, from, msg, sourceMessageId ?? undefined)
+    if (paneId.startsWith("omp:")) {
+      const pid = Number(paneId.slice("omp:".length))
+      const live = listLiveOmpAgents().find((a) => a.pid === pid)
+      if (!live) return { ok: false, error: `omp ${paneId} is no longer running` }
+      const cwd = live.cwd ?? "/"
+      log(`injectToPane: omp ACP pane=${paneId} cwd=${cwd} (not tmux send-keys)`)
+      const res = await promptOmpAcp(cwd, wrapped)
+      return res.ok ? { ok: true } : { ok: false, error: res.error }
+    }
     if (shouldDeferInbound(paneId)) {
       const item = enqueueDeferred(paneId, wrapped, sourceMessageId)
       if (deferReactionViaAck) markDeferredForAck(item)
       return { ok: true, deferred: true, deferredItem: item }
+    }
+    const { panes, procs } = snapshot()
+    const pane = panes.find((p) => p.paneId === paneId)
+    const hosted = pane ? findAgentInPane(pane, procs) : null
+    if (hosted?.agent === "omp") {
+      const cwd = pane?.panePath || liveOmpForPane(paneId, hosted.pid)?.cwd || "/"
+      log(`injectToPane: omp ACP pane=${paneId} cwd=${cwd} (not tmux send-keys)`)
+      const res = await promptOmpAcp(cwd, wrapped)
+      return res.ok ? { ok: true } : { ok: false, error: res.error }
     }
     const res = await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
     return res.ok ? { ok: true } : { ok: false, error: res.error }
@@ -5835,11 +6095,41 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // silently wipe the CTO's anchor on every delivery through this path.
     cwd: string,
   ): Promise<boolean> => {
+    if (paneId.startsWith("omp:")) {
+      const pid = Number(paneId.slice("omp:".length))
+      const live = listLiveOmpAgents().find((a) => a.pid === pid)
+      if (!live) {
+        await sendMessage(ctx, `omp ${paneId} is no longer running`)
+        return false
+      }
+      const ompCwd = live.cwd ?? "/"
+      log(`injectPrewrapped: omp ACP pane=${paneId} cwd=${ompCwd} (not tmux send-keys)`)
+      const res = await promptOmpAcp(ompCwd, prewrappedText)
+      if (!res.ok) {
+        await sendMessage(ctx, res.error)
+        return false
+      }
+      recordLastUserTarget(paneId, ompCwd)
+      return true
+    }
     if (shouldDeferInbound(paneId)) {
       markDeferredForAck(enqueueDeferred(paneId, prewrappedText, sourceMessageId))
       // A media `/agent` caption is an explicit CTO routing choice, same as its
       // text equivalent — record the tg-cli#78 anchor (review finding: this path
       // was the one remaining explicit-routing gap).
+      recordLastUserTarget(paneId, cwd)
+      return true
+    }
+    const { panes, procs } = snapshot()
+    const pane = panes.find((p) => p.paneId === paneId)
+    const hosted = pane ? findAgentInPane(pane, procs) : null
+    if (hosted?.agent === "omp") {
+      log(`injectPrewrapped: omp ACP pane=${paneId} cwd=${cwd} (not tmux send-keys)`)
+      const res = await promptOmpAcp(cwd || "/", prewrappedText)
+      if (!res.ok) {
+        await sendMessage(ctx, res.error)
+        return false
+      }
       recordLastUserTarget(paneId, cwd)
       return true
     }
@@ -5865,6 +6155,24 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     messageId: number | null,
     out: Record<string, unknown> = {},
   ): Promise<boolean | null> => {
+    const ompHits = matchLiveOmp(selector, listLiveOmpAgents())
+    if (ompHits.length > 1) {
+      const lines = ompHits.map((a) => `  - ${describeLiveOmp(a)}`)
+      await sendMessage(ctx, `'${selector}' matches several omp sessions:\n${lines.join("\n")}`, out)
+      return false
+    }
+    if (ompHits.length === 1) {
+      const target = ompHits[0]
+      const cwd = target.cwd ?? "/"
+      log(`agent-route: selector="${selector}" → omp ACP pid=${target.pid} title=${liveOmpLabel(target)} cwd=${cwd}`)
+      const res = await promptOmpAcp(cwd, wrapped)
+      if (!res.ok) {
+        await sendMessage(ctx, res.error, out)
+        return false
+      }
+      await sendMessage(ctx, `→ ${liveOmpLabel(target)} · omp (ACP)`, out)
+      return true
+    }
     const agents = listUnreachableAgents()
     const hits = matchUnreachable(selector, agents)
     if (hits.length === 0) return null
@@ -5959,7 +6267,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
     const label = labelFor(liveTarget, liveFleet)
     log(`agent-select: next message → ${liveTarget.paneId}/${liveTarget.windowName}`)
-    if (shouldDeferInbound(liveTarget.paneId)) {
+    if (!liveTarget.paneId.startsWith("omp:") && shouldDeferInbound(liveTarget.paneId)) {
       markDeferredForAck(enqueueDeferred(liveTarget.paneId, prewrappedText, sourceMessageId))
       if (selected.messageId !== null) void editMessageText(ctx, selected.messageId, routedReply(label, true))
       // An armed one-shot route is the CTO's own prior explicit choice — record
@@ -5969,14 +6277,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return true
     }
     const text = withGitStateBanner(liveTarget.panePath, prewrappedText)
-    const res = await executeInjectSteps(buildTextInjectPlan(liveTarget.paneId, text))
-    if (!res.ok) {
-      await sendMessage(ctx, res.error, replyContext(selected.threadId))
-      if (selected.messageId !== null) void editMessageText(ctx, selected.messageId, `inject failed: ${res.error}`)
+    const ok = await injectPrewrappedToPane(liveTarget.paneId, text, sourceMessageId, liveTarget.panePath ?? "/")
+    if (!ok) {
+      if (selected.messageId !== null) void editMessageText(ctx, selected.messageId, "inject failed")
       return false
     }
     if (selected.messageId !== null) void editMessageText(ctx, selected.messageId, routedReply(label, false))
-    recordLastUserTarget(liveTarget.paneId, liveTarget.panePath)
     return true
   }
 
@@ -6000,17 +6306,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
     if (!action.all.trim()) {
-      // Bare `/agent`: show the tappable picker so the CTO can SELECT an agent
-      // (the buttons he asked for — "где кнопки?"), with distinct labels. Agents
-      // running OUTSIDE tmux are named in a notice above the buttons (tg-cli#306):
-      // they cannot be tapped (no pane to inject into), but they are not hidden.
+      // Bare `/agent`: tappable picker over EVERY live agent, including
+      // out-of-tmux omp (paneId omp:<pid> → ACP). No outside-tmux notice.
       log(`agent-route: bare /agent → picker over ${candidates.length} candidates`)
-      const outside = listUnreachableAgents()
-      const notice =
-        outside.length > 0
-          ? `Outside tmux (not tappable — use /agent <name> <text> to queue): ${outside.map((a) => `${unreachableLabel(a)} · ${a.agent}`).join(", ")}`
-          : undefined
-      return postAgentPicker(candidates, "", null, { armNextMessage: true, messageExtra: out, threadId: action.threadId ?? null, notice })
+      return postAgentPicker(candidates, "", null, { armNextMessage: true, messageExtra: out, threadId: action.threadId ?? null })
     }
 
     if (action.selector) {
@@ -6060,6 +6359,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           // pane — record it as the tg-cli#78 anchor (review finding: `/agent`
           // routing previously never updated it, unlike the ambiguous picker).
           recordLastUserTarget(target.paneId, target.panePath)
+          if (target.paneId.startsWith("omp:")) {
+            await sendMessage(ctx, routedReply(labelFor(target, candidates), res.deferred), out)
+          }
           return true
         }
         // Ambiguous: multiple matches — show picker over matched subset
@@ -6150,12 +6452,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // callback has no trailing ack, so it updates the source reaction directly.
     let res: { ok: boolean; error?: string; deferred?: boolean; deferredItem?: DeferredInbound }
     if (pending.prewrapped) {
-      if (shouldDeferInbound(target.paneId)) {
+      if (!target.paneId.startsWith("omp:") && shouldDeferInbound(target.paneId)) {
         const item = enqueueDeferred(target.paneId, pending.message, pending.sourceMessageId, pending.relatedReactionMessageId)
         res = { ok: true, deferred: true, deferredItem: item }
       } else {
-        const r = await executeInjectSteps(buildTextInjectPlan(target.paneId, pending.message))
-        res = r.ok ? { ok: true } : { ok: false, error: r.error }
+        const ok = await injectPrewrappedToPane(target.paneId, pending.message, pending.sourceMessageId, target.panePath ?? "/")
+        res = ok ? { ok: true } : { ok: false, error: "inject failed" }
       }
     } else {
       res = await injectToPane(target.paneId, action.from, pending.message, pending.sourceMessageId)
@@ -8008,7 +8310,34 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     action: Extract<Action, { kind: "answer-question" }>,
   ): Promise<boolean> => {
     const retained = abandonedButtons.get(action.requestId)
-    if (!retained || !retained.req.paneId) return false
+    if (!retained) return false
+    if (!retained.req.omp && !retained.req.paneId) return false
+    if (retained.req.omp) {
+      const answer = resolveButtonCallback(retained.req, { requestId: action.requestId, value: action.value })
+      if (answer.status !== "answered") return false
+      const optionId = optionIdForAnswer(retained.req, answer.value, answer.label)
+      const answeredAt = Date.now()
+      abandonedButtons.delete(action.requestId)
+      pruneAnsweredButtons(answeredButtons, answeredAt)
+      answeredButtons.set(action.requestId, { value: answer.value, label: answer.label, decision: answer.decision, at: answeredAt, delivery: "socket" })
+      persistQuestions()
+      const res = await replyOmpAcpPermission(retained.req, optionId)
+      if (!res.ok) {
+        answeredButtons.delete(action.requestId)
+        abandonedButtons.set(action.requestId, { req: retained.req, messageId: retained.messageId, at: retained.at })
+        persistQuestions()
+        await answerCallbackQuery(ctx, action.callbackQueryId, "could not reach omp ACP — tap again")
+        return true
+      }
+      await answerCallbackQuery(ctx, action.callbackQueryId, "✓ sent to the agent")
+      const cardId = retained.messageId ?? action.messageId
+      if (cardId !== null) {
+        void clearMessageKeyboard(ctx, cardId)
+        void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label))
+      }
+      log(`omp-acp: tap delivered via session/request_permission reply optionId=${optionId}`)
+      return true
+    }
     // A tap must come from THIS retained entry's OWN Telegram message — mirrors the
     // live-prompt path's same guard (case "answer-question" below). Without it, a
     // stale card reusing a deterministic callback key (callbackRequestId is a
@@ -8321,7 +8650,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     pruneAnsweredButtons(answeredButtons, answeredAt)
     answeredButtons.set(action.requestId, { value: answer.value, label: answer.label, decision: answer.decision, at: answeredAt, delivery: "pane" })
     persistQuestions()
-    const res = await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
+    const res = retained.req.omp
+      ? await replyOmpAcpPermission(retained.req, optionIdForAnswer(retained.req, answer.value, answer.label))
+      : retained.req.agent === "omp"
+        ? await promptOmpAcp((retained.req.cwd ?? "/") as string, wrapInbound(ctx.cfg.injectWrap, "tg", answer.label))
+        : await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
     if (!res.ok) {
       // The pane is unreachable (gone / no longer an agent). ROLL BACK the claim:
       // restore the retained entry (with its ORIGINAL `at`, so a failed attempt doesn't
@@ -8706,7 +9039,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // An agent running OUTSIDE tmux keeps the daemon alive too (tg-cli#306): idle-exiting
       // while one is up would make its queued inbox messages vanish exactly the way the
       // incident did. The same sweep acks what the Stop hook delivered since last poll.
-      if (listUnreachableAgents().length > 0) lastAgentSeenMs = Date.now()
+      if (listUnreachableAgents().length > 0 || listLiveOmpAgents().length > 0) lastAgentSeenMs = Date.now()
       await ackDeliveredInboxes(ctx)
       if (Date.now() - lastAgentSeenMs > ctx.cfg.idleExitMin * 60_000) {
         log(`no agent pane for ${ctx.cfg.idleExitMin} min — idle exit`)

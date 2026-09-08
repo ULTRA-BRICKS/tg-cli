@@ -268,7 +268,7 @@ test('buttons-only: no ▸ group header and no per-agent label line in the text'
   const labels = distinctLabels(dup);
   const bare = buildAgentSelectMessage(7, dup, 'tok', ''); // bare /agent picker
   // exactly the minimal prompt — nothing more
-  expect(bare.text).toBe('Pick an agent:');
+  expect(bare.text).toBe('Pick an agent to send message:');
   expect(bare.text).not.toContain('▸');
   // the distinct labels appear ONLY on the buttons, never duplicated in the text
   for (const label of labels) expect(bare.text).not.toContain(label);

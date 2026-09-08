@@ -95,13 +95,13 @@ export function matchAgentCommand(command: string): AgentKind | null {
   // 'omp' (e.g. /opt/homebrew/bin/omp). One row feeds every inbound gate
   // (findAgentInPane BFS, inject verify-pane, reply-route liveness) AND the
   // outbound ancestry branding (findAgentInAncestry). EXACT basename only:
-  // a merely-containing binary ('ompi-info') never matches. The residual
-  // impostor risk is a RACE, not static misconfiguration: a user alias/symlink
-  // named 'omp' (e.g. oh-my-posh) spawns a transient 'omp' child in every shell
-  // pane on every prompt render, and the BFS could catch it mid-render. Accepted
-  // for now (same posture as the equally short 'pi' row); if it bites in
-  // practice, the mitigation is requiring a persistent/foreground match.
-  if (base === 'omp') return 'omp';
+  // a merely-containing binary ('ompi-info') never matches. Worker helpers
+  // (`__omp_worker_daemon_broker`, `__omp_worker_js_eval_process`) share the
+  // same argv0 — they are not the user session (243 still matches the TUI).
+  if (base === 'omp') {
+    if (/\b__omp_worker_/.test(trimmed)) return null;
+    return 'omp';
+  }
   return null;
 }
 

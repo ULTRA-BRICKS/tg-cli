@@ -278,6 +278,13 @@ export function resolveWindowAgentLabel(
 // the pane id appended so the buttons are never two identical strings.
 export function distinctLabels(candidates: AgentCandidate[]): string[] {
   let labels = candidates.map((c) => {
+    // omp: the window is already the session title or "omp · <id/pid>".
+    // Never fall through to cwd basename ("tmp · omp").
+    if (c.agent === 'omp' && !isBareWindowName(c.windowName)) return c.windowName;
+    if (c.agent === 'omp') {
+      const pid = c.paneId.startsWith('omp:') ? c.paneId.slice(4) : '';
+      return pid ? `omp · ${pid}` : 'omp';
+    }
     const project = cwdBasename(c.panePath);
     if (isBareWindowName(c.windowName)) {
       // The window name is useless — lead with the project when we have one, else
@@ -421,7 +428,7 @@ export function buildAgentSelectMessage(
   // === '') decision exactly — a whitespace-only message is select-only too.
   const prompt = messagePreview.trim()
     ? `Route to which agent?\n“${truncate(messagePreview, 80)}”`
-    : 'Pick an agent:';
+    : 'Pick an agent to send message:';
   // A gone-target notice (if any) goes ABOVE the prompt so the human reads "the
   // agent you meant is gone" first, then the choice. Empty/whitespace notice is
   // ignored — never an orphan blank line.
