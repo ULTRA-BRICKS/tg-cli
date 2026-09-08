@@ -36,10 +36,16 @@ import {
   autostartUnitPath,
   buildDisablePlan,
   buildEnablePlan,
+  defaultConfigDir,
+  launchdJobConfigDir,
   launchdJobIsPersistent,
+  parseLaunchctlListJobs,
   parseLaunchctlListLabels,
   parseLaunchctlPrintArgv,
+  parseLaunchctlPrintEnvironment,
+  parseLaunchctlPrintPid,
   selectExternalLaunchdSupervisor,
+  selectLaunchdDaemonJob,
   type AutostartCommand,
   type AutostartEnv,
   type AutostartKind,
@@ -157,7 +163,7 @@ import {
 } from "./features/tg-ctl/schedule-store"
 import { normalizeRichHtml, validateRichHtml } from "./features/render/rich"
 import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
-import { botIdFromToken, ctlPaths, ownsPidFile, pidStatus, planLegacyLastUserTargetMigration, readPidFile } from "./features/tg-ctl/lock"
+import { botIdFromToken, ctlPaths, daemonRunState, daemonStatusLine, ownsPidFile, pidStatus, planLegacyLastUserTargetMigration, readPidFile } from "./features/tg-ctl/lock"
 import {
   abandonedLongOutageText,
   abandonedMultiText,
@@ -1439,15 +1445,15 @@ function singleRegisteredCwd(regs: Registration[]): string | null {
 }
 
 function composeStatus(ctx: Ctx, statusCwd: string | null): string {
+  const env = autostartEnv(ctx)
   const pid = readPidFile(readFileOrNull(ctx.paths.pid))
-  const alive = pidStatus(pid, kill0)
-  const lines: string[] = [
-    alive === "running"
-      ? `tg-ctl: running (pid ${pid}) — bot ${ctx.botId}`
-      : alive === "stale"
-        ? `tg-ctl: not running (stale pidfile, pid ${pid}) — bot ${ctx.botId}`
-        : `tg-ctl: not running — bot ${ctx.botId}`,
-  ]
+  const pidAlive = pid !== null && kill0(pid)
+  const lockPid = pidAlive ? null : lockHolderPid(ctx.paths.lock)
+  const hintPid = pidAlive ? pid : lockPid
+  const launchd = detectLaunchdDaemon(env, hintPid)
+  const lines: string[] = [daemonStatusLine(daemonRunState(pid, pidAlive, launchd, lockPid), ctx.botId)]
+
+
   // Show every LIVE registered session (the per-pane set), not just one — a
   // multi-session operator must SEE that all their panes are registered to
   // forward. Prune against the live snapshot so closed panes don't show as ghosts
@@ -1549,7 +1555,6 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
   // `ai.hyperide.tg-ctl` LaunchAgent). We check the own unit first (it carries the precise kind/label
   // and is cheap), then probe launchd for an external supervisor before declaring "NOT enabled" —
   // otherwise status lies while launchd keeps the daemon alive across reboots (tg-cli#88).
-  const env = autostartEnv(ctx)
   const kind = autostartKind(env)
   lines.push(composeAutostartLine(env, kind))
   return lines.join("\n")
@@ -1989,6 +1994,7 @@ function autostartUnitInstalled(env: AutostartEnv): boolean {
 // the caller skips that job instead of crashing.
 interface LaunchctlProbe {
   listLabels(): string[] | undefined
+  listJobs(): Array<{ pid: number | null; label: string }> | undefined
   printDump(label: string): string | undefined
 }
 
@@ -1998,11 +2004,19 @@ interface LaunchctlProbe {
 function realLaunchctlProbe(): LaunchctlProbe {
   const uid = process.getuid?.() ?? 0
   const domain = uid === 0 ? "system" : `gui/${uid}`
+  const listStdout = (): string | undefined => {
+    const r = Bun.spawnSync(["launchctl", "list"], { stdout: "pipe", stderr: "ignore" })
+    if (r.exitCode !== 0 || !r.stdout) return undefined
+    return new TextDecoder().decode(r.stdout)
+  }
   return {
     listLabels() {
-      const r = Bun.spawnSync(["launchctl", "list"], { stdout: "pipe", stderr: "ignore" })
-      if (r.exitCode !== 0 || !r.stdout) return undefined
-      return parseLaunchctlListLabels(new TextDecoder().decode(r.stdout))
+      const stdout = listStdout()
+      return stdout === undefined ? undefined : parseLaunchctlListLabels(stdout)
+    },
+    listJobs() {
+      const stdout = listStdout()
+      return stdout === undefined ? undefined : parseLaunchctlListJobs(stdout)
     },
     printDump(label) {
       const r = Bun.spawnSync(["launchctl", "print", `${domain}/${label}`], { stdout: "pipe", stderr: "ignore" })
@@ -2011,6 +2025,7 @@ function realLaunchctlProbe(): LaunchctlProbe {
     },
   }
 }
+
 
 // Probe launchd (macOS only) for an EXTERNAL job that supervises this tg-ctl binary — autostart wired
 // outside `tg-ctl enable` (e.g. rig's `ai.hyperide.tg-ctl` LaunchAgent). Returns the supervising
@@ -2040,6 +2055,65 @@ function detectExternalLaunchdSupervisor(env: AutostartEnv, probe: LaunchctlProb
     return undefined
   }
 }
+
+// Probe launchd for the job that is running THIS bot's daemon right now (tg-cli#316). Unlike
+// detectExternalLaunchdSupervisor this includes tg-ctl's own unit, requires a live pid, and matches
+// the job's config dir so a test HOME is not reported as ours. Read-only.
+//
+// Launchd is a LABEL on an already-proven per-bot process (`hintPid` from the pidfile or flock
+// holder). It must not invent "running" for a different bot token that shares the config dir
+// (review finding). No hint → no launchd claim.
+function detectLaunchdDaemon(
+  env: AutostartEnv,
+  hintPid: number | null,
+  probe: LaunchctlProbe = realLaunchctlProbe(),
+): { label: string; pid: number } | undefined {
+  if (env.platform !== "darwin") return undefined
+  if (!env.binPath) return undefined
+  if (hintPid === null) return undefined
+  try {
+    const listed = probe.listJobs()
+    if (!listed) return undefined
+    const labels = listed.filter((j) => j.pid === hintPid).map((j) => j.label)
+    if (labels.length === 0) return undefined
+    const jobs: ProbedLaunchdJob[] = []
+    for (const label of labels) {
+      const dump = probe.printDump(label)
+      if (dump === undefined) continue
+      jobs.push({
+        label,
+        argv: parseLaunchctlPrintArgv(dump),
+        persistent: launchdJobIsPersistent(dump),
+        pid: parseLaunchctlPrintPid(dump),
+        configDir: launchdJobConfigDir(parseLaunchctlPrintEnvironment(dump)),
+      })
+    }
+    return selectLaunchdDaemonJob(jobs, env.binPath, env.configDir, defaultConfigDir(env.home))
+  } catch {
+    return undefined
+  }
+}
+
+
+// Pid holding THIS config dir's flock, if any. The flock is the real singleton (spec §6); when
+// the pidfile and even the unix socket are gone, the lock holder is still the live daemon.
+// lsof -t names the holder. Do NOT skip process.pid: Telegram `/status` runs composeStatus
+// inside the daemon, so the holder IS us — that is the pid to report (review finding).
+function lockHolderPid(lockPath: string): number | null {
+  try {
+    const r = Bun.spawnSync(["lsof", "-t", lockPath], { stdout: "pipe", stderr: "ignore" })
+    if (r.exitCode !== 0 || !r.stdout) return null
+    for (const tok of new TextDecoder().decode(r.stdout).trim().split(/\s+/)) {
+      const pid = Number(tok)
+      if (pid > 0 && kill0(pid)) return pid
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+
 
 // The `autostart:` status line. Gathers the impure facts — own-unit file existence and (only when
 // that's absent, to skip the launchctl probe otherwise) the external-launchd-supervisor probe — then

@@ -166,8 +166,10 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
   open for the daemon's lifetime — the kernel releases the lock on ANY exit,
   including SIGKILL (verified working on this machine, contention included).
   A second start fails the `flock` → exits 0 (idempotent no-op). PID file
-  `tg-ctl.<botid>.pid` is purely informational for `status`/`stop`; stale
-  pidfile cleared via `kill -0`.
+  `tg-ctl.<botid>.pid` is purely informational; stale pidfile cleared via `kill -0`.
+  `tg-ctl status` must not treat a missing/stale pidfile as "not running" while the
+  flock is held or a launchd job supervises this binary (tg-cli#316).
+
 - **Launcher/daemon split (review F1, blocker):** `tg-ctl start` (and the lazy
   auto-start from `tg`) spawns the daemon with
   `{detached: true, stdio: ['ignore', logFd, logFd]}` + `unref()` and exits
@@ -196,7 +198,9 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
     No-op if already running.
   - `tg-ctl run` — internal: the daemon itself. flock first, then poll loop.
   - `tg-ctl stop` — read pidfile, `SIGTERM`, clean pidfile.
-  - `tg-ctl status` — running? mode? target pane? bot id? last update age?
+  - `tg-ctl status` — running? (pidfile, flock holder, launchd — not pidfile alone)
+    mode? target pane? bot id? last update age?
+
 - **Lazy auto-start from `tg`:** on `tg` invocation, auto-start `tg-ctl` **only if both hold**:
   - inside a tmux pane (`TMUX` set) with a detected AI agent, **and**
   - config `control.enabled: true`.

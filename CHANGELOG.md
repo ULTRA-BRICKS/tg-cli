@@ -3,6 +3,17 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.46.2
+
+**Fix (tg-cli#316): `tg-ctl status` no longer lies "not running" while launchd owns a live daemon.**
+The pidfile is informational (spec §6); a KeepAlive LaunchAgent (`ai.hyperide.tg-ctl`, pid 11062)
+can run for days after the pidfile is gone. Status now consults, in order: a live pidfile, the
+flock holder (`lsof` on `tg-ctl.<bot>.lock`), and a launchd job that supervises this binary for
+this config dir. A launchd-owned process is reported as `running (launchd, pid N) (job <label>)`
+even when the pidfile is missing or stale. `tg-ctl ask` is unchanged: it still talks to the unix
+socket and does not consult status, so a lying status can no longer be the reason a hatch skips
+the ask.
+
 ## 1.46.1
 
 **Fix: a bad attachment or an oversized body no longer breaks or floods a send.**

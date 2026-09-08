@@ -237,6 +237,14 @@ export interface ProbedLaunchdJob {
   label: string;
   argv: string[];
   persistent: boolean;
+  // The job's live pid, when the dump reported one (`pid = N`); undefined for a loaded-but-not-
+  // running job. Optional so the autostart selection — which does not care whether the job runs
+  // right now — can keep building jobs without it.
+  pid?: number;
+  // The tg-ctl config dir the job's process would resolve (its own $TG_CTL_CONFIG_DIR, else
+  // <its $HOME>/.config/tg-cli). undefined when the dump carried neither. Used to tell "the
+  // launchd job that serves THIS bot's config dir" from an unrelated tg-ctl job.
+  configDir?: string;
 }
 
 // Select the external launchd job that counts as autostart for this tg-ctl binary: the first one
@@ -252,20 +260,26 @@ export function selectExternalLaunchdSupervisor(jobs: ProbedLaunchdJob[], binPat
   return undefined;
 }
 
-// Parse the labels out of `launchctl list` output. Each data line is `PID\tStatus\tLabel`
-// (PID is `-` when not running) after a header line; we take the 3rd tab-separated field and skip
-// the `PID Status Label` header + blank lines. Pure so the caller's only impure step is the spawn.
-export function parseLaunchctlListLabels(stdout: string): string[] {
-  const labels: string[] = [];
+// Parse `launchctl list` rows. Each data line is `PID\tStatus\tLabel` (PID is `-` when not
+// running) after a header. Pure so the caller's only impure step is the spawn.
+export function parseLaunchctlListJobs(stdout: string): Array<{ pid: number | null; label: string }> {
+  const jobs: Array<{ pid: number | null; label: string }> = [];
   for (const line of stdout.split('\n')) {
     const fields = line.split('\t');
     if (fields.length < 3) continue;
     const label = fields[2].trim();
     if (!label || label === 'Label') continue;
-    labels.push(label);
+    const pidTok = fields[0].trim();
+    const pid = /^\d+$/.test(pidTok) ? Number(pidTok) : null;
+    jobs.push({ pid: pid !== null && pid > 0 ? pid : null, label });
   }
-  return labels;
+  return jobs;
 }
+
+export function parseLaunchctlListLabels(stdout: string): string[] {
+  return parseLaunchctlListJobs(stdout).map((j) => j.label);
+}
+
 
 // Does a `launchctl print` dump show the job as PERSISTENT — i.e. launchd will bring it back at
 // login? The dump carries a `properties = a | b | c` line listing flags like `keepalive` /
@@ -307,6 +321,77 @@ export function parseLaunchctlPrintArgv(stdout: string): string[] {
   }
   return argv;
 }
+
+// --- launchd-owned daemon detection (status-only, read-only) ------------------------------------
+//
+// `tg-ctl status` used to answer "is the daemon running?" from the PIDFILE alone. That lies
+// whenever launchd owns the process: rig's `ai.hyperide.tg-ctl` LaunchAgent has KeepAlive, so after
+// a relaunch the pidfile can be missing or stale while launchd's instance is alive — status then
+// reports "not running" for a daemon with days of uptime (tg-cli#316, live pid 11062).
+
+// Select the launchd job that is running THIS bot's daemon right now, or undefined when none is.
+// Unlike selectExternalLaunchdSupervisor this does NOT skip tg-ctl's own unit (a daemon started by
+// `tg-ctl enable` is launchd-owned too) and does NOT require persistence (a temporarily bootstrapped
+// job still runs the process); it DOES require a live pid.
+//
+// `ourConfigDir` is the config dir this invocation resolved, `ourDefaultConfigDir` the default for
+// this HOME. A job counts only when it serves the SAME config dir — otherwise a second bot's
+// LaunchAgent (or, in the test suite, the developer's own live daemon) would be reported as this
+// bot's daemon. When the dump carried no environment at all we fall back to "credit it only if we
+// ourselves are on the default config dir", which is the dir such a job would resolve.
+export function selectLaunchdDaemonJob(
+  jobs: ProbedLaunchdJob[],
+  binPath: string,
+  ourConfigDir: string,
+  ourDefaultConfigDir: string,
+): { label: string; pid: number } | undefined {
+  for (const job of jobs) {
+    if (job.pid === undefined || job.pid <= 0) continue;
+    if (!launchdJobSupervisesBin(job, binPath)) continue;
+    const serves = job.configDir !== undefined ? job.configDir === ourConfigDir : ourConfigDir === ourDefaultConfigDir;
+    if (serves) return { label: job.label, pid: job.pid };
+  }
+  return undefined;
+}
+
+// Parse the live pid out of one `launchctl print` dump (`\tpid = 11062`). undefined when the job
+// carries no pid line (loaded but not running) or the value is not a positive integer.
+export function parseLaunchctlPrintPid(stdout: string): number | undefined {
+  const line = stdout.split('\n').find((l) => /^\s*pid\s*=\s*\d+\s*$/.test(l));
+  if (line === undefined) return undefined;
+  const pid = Number(line.slice(line.indexOf('=') + 1).trim());
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+// Parse the environment a launchd job runs with out of one `launchctl print` dump. The dump carries
+// up to three blocks — `inherited environment`, `default environment` and `environment` (the plist's
+// own EnvironmentVariables) — each a `KEY => value` list. They are merged in the order they appear,
+// so the job-specific `environment` block wins, which is what the plist actually sets.
+export function parseLaunchctlPrintEnvironment(stdout: string): Record<string, string> {
+  const env: Record<string, string> = {};
+  const lines = stdout.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^\s*(?:inherited |default )?environment\s*=\s*\{/.test(lines[i])) continue;
+    for (i++; i < lines.length; i++) {
+      const trimmed = lines[i].trim();
+      if (trimmed === '}') break;
+      const arrow = trimmed.indexOf('=>');
+      if (arrow < 0) continue;
+      env[trimmed.slice(0, arrow).trim()] = trimmed.slice(arrow + 2).trim();
+    }
+  }
+  return env;
+}
+
+// The tg-ctl config dir a launchd job's process would resolve, from the environment the dump
+// reported: an explicit $TG_CTL_CONFIG_DIR, else the default under the job's own $HOME. undefined
+// when the dump carried neither (the caller then falls back to a default-dir comparison).
+export function launchdJobConfigDir(jobEnv: Record<string, string>): string | undefined {
+  const explicit = jobEnv.TG_CTL_CONFIG_DIR;
+  if (explicit) return explicit;
+  return jobEnv.HOME ? defaultConfigDir(jobEnv.HOME) : undefined;
+}
+
 
 // The launchd/systemd unit label/name for a status line. Defined for the kinds that HAVE a unit;
 // 'none' (the no-op fallback) installs no unit so callers must not ask — return '' there rather than

@@ -89,6 +89,69 @@ export function pidStatus(pid: number | null, kill0: (pid: number) => boolean): 
   return kill0(pid) ? 'running' : 'stale';
 }
 
+// The launchd job found running this daemon, as the caller probed it (see autostart.ts's
+// selectLaunchdDaemonJob). undefined when launchd runs no such job — or on a host without launchd.
+export interface LaunchdDaemon {
+  label: string;
+  pid: number;
+}
+
+// What the pidfile says about a daemon launchd is already known to be running: nothing useful
+// (absent, or the same pid), a pid that is dead, or a DIFFERENT live pid.
+export type PidfileNote = { kind: 'stale'; pid: number } | { kind: 'other-live'; pid: number };
+
+// Who owns the live daemon process.
+//   'launchd' — a launchd job runs it; `note` carries any pidfile disagreement so `status` can
+//               report a stale/mismatched pidfile WITHOUT calling the daemon down.
+//   'process' — no supervisor job, but a live pidfile or the flock holder proves a process is up.
+export type DaemonRunState =
+  | { kind: 'running'; owner: 'launchd'; pid: number; label: string; note?: PidfileNote }
+  | { kind: 'running'; owner: 'process'; pid: number }
+  | { kind: 'stale-pidfile'; pid: number }
+  | { kind: 'not-running' };
+
+// Decide the daemon's run state from independent sources of truth. The pidfile is informational
+// (spec §6); launchd and the flock holder are not. Precedence:
+//   1. a live launchd job that supervises this binary (owns the process across relaunches)
+//   2. a live pidfile pid
+//   3. a live lock-holder pid (socket and pidfile may both be gone; the flock is the singleton)
+//   4. a dead pidfile → stale
+//   5. nothing → not-running
+// Pure: the caller injects kill(0) as `pidAlive`, the launchd probe, and the lock-holder pid.
+export function daemonRunState(
+  pidfilePid: number | null,
+  pidAlive: boolean,
+  launchd: LaunchdDaemon | undefined,
+  lockHolderPid: number | null = null,
+): DaemonRunState {
+  if (launchd) {
+    const base = { kind: 'running' as const, owner: 'launchd' as const, pid: launchd.pid, label: launchd.label };
+    if (pidfilePid === null || pidfilePid === launchd.pid) return base;
+    return { ...base, note: pidAlive ? { kind: 'other-live', pid: pidfilePid } : { kind: 'stale', pid: pidfilePid } };
+  }
+  if (pidfilePid !== null && pidAlive) return { kind: 'running', owner: 'process', pid: pidfilePid };
+  if (lockHolderPid !== null && lockHolderPid > 0) return { kind: 'running', owner: 'process', pid: lockHolderPid };
+  if (pidfilePid !== null) return { kind: 'stale-pidfile', pid: pidfilePid };
+  return { kind: 'not-running' };
+}
+
+// The first line of `tg-ctl status`. A live launchd-owned daemon is never "not running", even
+// when the pidfile is missing or stale (tg-cli#316 — the 2026-09-08 pid 11062 lie).
+export function daemonStatusLine(state: DaemonRunState, botId: string): string {
+  const suffix = ` — bot ${botId}`;
+  if (state.kind === 'not-running') return `tg-ctl: not running${suffix}`;
+  if (state.kind === 'stale-pidfile') return `tg-ctl: not running (stale pidfile, pid ${state.pid})${suffix}`;
+  if (state.owner === 'process') return `tg-ctl: running (pid ${state.pid})${suffix}`;
+  const note =
+    state.note === undefined
+      ? ''
+      : state.note.kind === 'stale'
+        ? `; stale pidfile pid ${state.note.pid}`
+        : `; pidfile points at a different live pid ${state.note.pid}`;
+  return `tg-ctl: running (launchd, pid ${state.pid})${suffix} (job ${state.label}${note})`;
+}
+
+
 // Does the pidfile on disk belong to US? `cleanExit` (and any other shutdown
 // path) MUST gate its `unlink(pidfile)` on this. The bug it guards (tg#93): on a
 // launchd relaunch a daemon that is shutting down — or whose ownership a newer
