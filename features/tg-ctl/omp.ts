@@ -15,12 +15,16 @@
  *
  * ACP methods used (proven on omp 18.1.14, 2026-09-08):
  *   initialize                  → agentInfo.name "oh-my-pi"
- *   session/new {cwd, mcpServers:[]} → sessionId
+ *   session/new {cwd, mcpServers:[]} → sessionId (no live session jsonl)
+ *   session/load {cwd, mcpServers:[], sessionId} → the process-table session
  *   session/prompt {sessionId, prompt:[{type:"text", text}]}
  *   session/update              → session_info_update.title (name from omp)
  *   session/request_permission  → Telegram buttons; reply is the JSON-RPC result
  *                                 {outcome:{outcome:"selected", optionId}}
- * session/load against a running TUI session file is NOT assumed to attach.
+ *
+ * Out-of-tmux replies (tg-cli#339): `tg` stamps route paneId omp:<pid>; the
+ * daemon recognizes that origin and session/load-s the live session id, never
+ * tmux send-keys and never an ephemeral session/new --no-session sibling.
  */
 
 import { matchAgentCommand } from './discover';
@@ -217,6 +221,64 @@ export function liveOmpPaneId(pid: number): string {
   return `omp:${pid}`;
 }
 
+const LIVE_OMP_ORIGIN = /^omp:(\d+)$/;
+
+/** True when a routes.json paneId is the synthetic out-of-tmux omp origin. */
+export function isLiveOmpOriginId(paneId: string): boolean {
+  return LIVE_OMP_ORIGIN.test(paneId);
+}
+
+export function liveOmpPidFromOriginId(paneId: string): number | null {
+  const m = LIVE_OMP_ORIGIN.exec(paneId);
+  if (!m) return null;
+  const pid = Number(m[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+/**
+ * Origin id `tg` stamps on an outbound route. A real tmux pane wins; otherwise
+ * the omp ancestor pid so a Telegram reply can find a session with no pane.
+ */
+export function outboundOriginPaneId(opts: {
+  tmuxPane?: string | null;
+  ompAncestorPid?: number | null;
+}): string | null {
+  const pane = opts.tmuxPane?.trim();
+  if (pane) return pane;
+  const pid = opts.ompAncestorPid;
+  if (pid && pid > 0) return liveOmpPaneId(pid);
+  return null;
+}
+
+/** Live omp process that owns this origin — synthetic omp:<pid> or a tmux pane id. */
+export function matchLiveOmpOrigin(originPaneId: string, agents: LiveOmpAgent[]): LiveOmpAgent | null {
+  const pid = liveOmpPidFromOriginId(originPaneId);
+  if (pid !== null) return agents.find((a) => a.pid === pid) ?? null;
+  return agents.find((a) => a.paneId === originPaneId) ?? null;
+}
+
+/**
+ * An omp:<pid> origin identifies the live PROCESS, not a tmux pane. Pid match
+ * is enough — tg often runs from /tmp so recorded cwd is not the session cwd
+ * (Codex P1 on #340). Tmux pane origins still need the live cwd to equal the
+ * recorded send-path.
+ */
+export function ompReplyOriginMatches(
+  recognized: { paneId: string; cwd?: string },
+  live: LiveOmpAgent,
+): boolean {
+  const pid = liveOmpPidFromOriginId(recognized.paneId);
+  if (pid !== null) return pid === live.pid;
+  return Boolean(recognized.cwd && live.cwd && recognized.cwd === live.cwd);
+}
+
+/** argv after `omp`. Loading a live session must NOT pass --no-session (ephemeral sibling). */
+export function ompAcpSpawnArgv(opts: { cwd: string; loadSession: boolean }): string[] {
+  const args = ['acp', '--allow-home', `--cwd=${opts.cwd}`];
+  if (!opts.loadSession) args.splice(1, 0, '--no-session');
+  return args;
+}
+
 export function liveOmpToCandidate(a: LiveOmpAgent): AgentCandidate {
   return {
     paneId: liveOmpPaneId(a.pid),
@@ -330,7 +392,7 @@ export function buildAcpInitialize(id: string | number): AcpRequest {
     method: 'initialize',
     params: {
       protocolVersion: 1,
-      clientInfo: { name: 'tg-ctl', version: '1.47.0' },
+      clientInfo: { name: 'tg-ctl', version: '1.48.1' },
       clientCapabilities: {},
     },
   };
@@ -342,6 +404,15 @@ export function buildAcpSessionNew(id: string | number, cwd: string): AcpRequest
     id,
     method: 'session/new',
     params: { cwd, mcpServers: [] },
+  };
+}
+
+export function buildAcpSessionLoad(id: string | number, cwd: string, sessionId: string): AcpRequest {
+  return {
+    jsonrpc: '2.0',
+    id,
+    method: 'session/load',
+    params: { cwd, mcpServers: [], sessionId },
   };
 }
 

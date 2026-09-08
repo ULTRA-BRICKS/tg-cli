@@ -102,6 +102,8 @@ process.stdin.on("data", (chunk) => {
     if (logPath) fs.appendFileSync(logPath, json + "\\n");
     if (msg.method === "initialize") {
       process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentInfo: { name: "oh-my-pi" } } }));
+    } else if (msg.method === "session/load") {
+      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { sessionId: msg.params.sessionId } }));
     } else if (msg.method === "session/new") {
       process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "01fake-acp-session" } }));
       process.stdout.write(encode({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "01fake-acp-session", update: { sessionUpdate: "session_info_update", title: "ReviewFix" } } }));
@@ -184,7 +186,9 @@ test('Telegram text reaches fake omp ACP with TMUX unset; never tmux send-keys; 
 
   const acp = existsSync(acpLog) ? readFileSync(acpLog, 'utf8') : '';
   expect(acp).toContain('"method":"initialize"');
-  expect(acp).toContain('"method":"session/new"');
+  expect(acp).toContain('"method":"session/load"');
+  expect(acp).toContain('01a07d8e-c12c-7433-903d-e98726bfda37');
+  expect(acp).not.toContain('"method":"session/new"');
   expect(acp).toContain('"method":"session/prompt"');
   expect(acp).toContain('deploy now');
   expect(acp).toContain('[TG from Alex');

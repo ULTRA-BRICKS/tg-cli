@@ -75,7 +75,7 @@ the media receipt as a `/agent` command and does not prepend the reply anchor.
 ## Reply routing: recognized origin vs LRU/MRU picker (v1.6.0)
 
 `tg` records every outbound message id → `{paneId, cwd, ts}` into a bounded
-routes map (`features/tg-ctl/routes.ts`, `tg-ctl.<botid>.routes.json`, tmux-only,
+routes map (`features/tg-ctl/routes.ts`, `tg-ctl.<botid>.routes.json`, tmux pane or `omp:<pid>`
 last 300). The daemon's `handleReplyRoute`:
 
 - **Recognized** — the replied-to id maps to a pane that STILL hosts an agent →

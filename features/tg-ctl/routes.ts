@@ -13,7 +13,7 @@ import { resolve } from 'path';
 
 export interface Route {
   id: number; // Telegram message_id of an outbound message
-  paneId: string; // the tmux pane that produced it (`tg`'s TMUX_PANE)
+  paneId: string; // tmux pane, or omp:<pid> for an out-of-tmux omp origin
   cwd?: string;
   ts: number; // unix seconds (send time)
 }

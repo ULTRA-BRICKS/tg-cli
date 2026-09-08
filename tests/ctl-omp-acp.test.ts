@@ -9,14 +9,22 @@ import {
   acpPermissionToButtonRequest,
   acpSessionTitleFromUpdate,
   buildAcpInitialize,
+  buildAcpSessionLoad,
   buildAcpSessionNew,
   buildAcpSessionPrompt,
+  isLiveOmpOriginId,
+  liveOmpPidFromOriginId,
+  matchLiveOmpOrigin,
+  ompReplyOriginMatches,
+  ompAcpSpawnArgv,
+  outboundOriginPaneId,
   decodeAcpFrames,
   encodeAcpFrame,
   findLiveOmpAgents,
   isPrimaryOmpSessionFile,
   isOmpLiveSessionCommand,
   liveOmpLabel,
+  liveOmpPaneId,
   matchLiveOmp,
   mergeLiveOmpCandidates,
   parseLsofJsonlPaths,
@@ -332,3 +340,92 @@ test('acpPermissionToButtonRequest maps a question-shaped option list (ask tool)
   expect(req!.kind).toBe('question');
   expect(req!.options?.map((o) => o.label)).toEqual(['staging', 'prod']);
 });
+
+// --- out-of-tmux reply origin (tg-cli#339): routes must stamp omp:<pid>, ACP session/load ---
+
+test('outboundOriginPaneId stamps omp:<pid> when there is no tmux pane', () => {
+  expect(outboundOriginPaneId({ tmuxPane: null, ompAncestorPid: 7103 })).toBe('omp:7103');
+  expect(outboundOriginPaneId({ tmuxPane: '', ompAncestorPid: 7103 })).toBe('omp:7103');
+  expect(outboundOriginPaneId({ tmuxPane: '%4', ompAncestorPid: 7103 })).toBe('%4');
+  expect(outboundOriginPaneId({ tmuxPane: null, ompAncestorPid: null })).toBeNull();
+  expect(outboundOriginPaneId({})).toBeNull();
+});
+
+test('isLiveOmpOriginId / liveOmpPidFromOriginId parse the synthetic origin', () => {
+  expect(isLiveOmpOriginId('omp:7103')).toBe(true);
+  expect(liveOmpPidFromOriginId('omp:7103')).toBe(7103);
+  expect(isLiveOmpOriginId('%4')).toBe(false);
+  expect(liveOmpPidFromOriginId('%4')).toBeNull();
+  expect(liveOmpPidFromOriginId('omp:nope')).toBeNull();
+  expect(liveOmpPaneId(7103)).toBe('omp:7103');
+});
+
+test('matchLiveOmpOrigin finds the live process for an omp:<pid> reply origin', () => {
+  const live: LiveOmpAgent[] = [
+    {
+      pid: 7103,
+      cwd: '/Users/u/work/review-cli',
+      sessionFile: '/tmp/s.jsonl',
+      sessionId: '01a07d8e-c12c-7433-903d-e98726bfda37',
+      title: 'ReviewFix',
+      paneId: null,
+      tty: 'ttys004',
+    },
+    {
+      pid: 9000,
+      cwd: '/Users/u/other',
+      sessionFile: null,
+      sessionId: null,
+      title: 'Other',
+      paneId: '%1',
+      tty: 'ttys001',
+    },
+  ];
+  expect(matchLiveOmpOrigin('omp:7103', live)?.title).toBe('ReviewFix');
+  expect(matchLiveOmpOrigin('%1', live)?.pid).toBe(9000);
+  expect(matchLiveOmpOrigin('omp:1', live)).toBeNull();
+});
+
+test('buildAcpSessionLoad addresses the live session id, not session/new', () => {
+  const req = buildAcpSessionLoad(3, '/Users/u/work/review-cli', '01a07d8e-c12c-7433-903d-e98726bfda37');
+  expect(req.method).toBe('session/load');
+  expect(req.params).toEqual({
+    cwd: '/Users/u/work/review-cli',
+    mcpServers: [],
+    sessionId: '01a07d8e-c12c-7433-903d-e98726bfda37',
+  });
+  expect(JSON.stringify(req)).not.toContain('session/new');
+  expect(JSON.stringify(req)).not.toContain('send-keys');
+});
+
+test('ompAcpSpawnArgv drops --no-session when loading a live session', () => {
+  expect(ompAcpSpawnArgv({ cwd: '/proj', loadSession: true })).toEqual([
+    'acp',
+    '--allow-home',
+    '--cwd=/proj',
+  ]);
+  expect(ompAcpSpawnArgv({ cwd: '/proj', loadSession: false })).toEqual([
+    'acp',
+    '--no-session',
+    '--allow-home',
+    '--cwd=/proj',
+  ]);
+  expect(ompAcpSpawnArgv({ cwd: '/proj', loadSession: true }).includes('--no-session')).toBe(false);
+});
+
+test('ompReplyOriginMatches trusts omp:<pid> even when recorded cwd is /tmp', () => {
+  const live = {
+    pid: 7103,
+    cwd: '/Users/u/work/review-cli',
+    sessionFile: null,
+    sessionId: null,
+    title: 'ReviewFix',
+    paneId: null,
+    tty: 'ttys004',
+  };
+  expect(ompReplyOriginMatches({ paneId: 'omp:7103', cwd: '/tmp' }, live)).toBe(true);
+  expect(ompReplyOriginMatches({ paneId: 'omp:9999', cwd: '/tmp' }, live)).toBe(false);
+  expect(ompReplyOriginMatches({ paneId: '%1', cwd: '/Users/u/work/review-cli' }, { ...live, paneId: '%1' })).toBe(true);
+  expect(ompReplyOriginMatches({ paneId: '%1', cwd: '/tmp' }, { ...live, paneId: '%1' })).toBe(false);
+});
+

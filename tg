@@ -58,7 +58,9 @@ import { buildOutboundHistoryRecords, outboundHistoryText } from "./features/rep
 import { runReplies } from "./features/replies/cli"
 import { resolveWindowPanes } from "./features/replies/window"
 import { agentNameFromDisplayLine } from "./features/tg-ctl/agent-name"
-import { detectAgentViaAncestry, isProcessRunning } from "./features/branding/detect"
+import { detectAgentViaAncestry, detectOmpAncestorPid, isProcessRunning } from "./features/branding/detect"
+import { outboundOriginPaneId } from "./features/tg-ctl/omp"
+import { parseLsofCwd } from "./features/tg-ctl/unreachable"
 import { resolveWindowAgentLabel } from "./features/tg-ctl/agent-match"
 import { installSkill } from "./features/install-skill/install"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
@@ -1340,12 +1342,18 @@ if (import.meta.main) {
   const hasMsgRefs = rawMsgRefIds.length > 0
   const hasAutolink = hasTickets || hasRefs || hasMsgRefs
 
-  // Record an outbound message_id → this pane so the daemon can route a REPLY to
-  // the agent that produced it, and order the unrecognized-reply picker by
-  // LRU/MRU (docs/specs/reply-quotes.md). Best-effort, tmux-only; a corrupt or
-  // unwritable file just degrades the daemon to the picker.
+  // Record an outbound message_id → this origin so the daemon can route a REPLY
+  // to the agent that produced it, and order the unrecognized-reply picker by
+  // LRU/MRU (docs/specs/reply-quotes.md). Tmux pane if present; otherwise the
+  // omp ancestor pid as omp:<pid> so an out-of-tmux omp is still recognizable
+  // (tg-cli#339). A corrupt or unwritable file just degrades to the picker.
   const TMUX_PANE = process.env.TMUX_PANE
-  const ROUTES_PATH = TMUX_PANE
+  const ompAncestorPid = detectOmpAncestorPid()
+  const originPaneId = outboundOriginPaneId({
+    tmuxPane: TMUX_PANE,
+    ompAncestorPid,
+  })
+  const ROUTES_PATH = originPaneId
     ? ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).routes
     : null
   // The origin pane's tmux pane_current_path — the SAME quantity the daemon
@@ -1354,6 +1362,21 @@ if (import.meta.main) {
   // never matched the pane's project dir and every reply hit the picker. Returns
   // null when not in tmux / the query fails, so resolveRouteCwd degrades to cwd.
   const queryPanePath = (): string | null => {
+    if (!TMUX_PANE && ompAncestorPid) {
+      try {
+        const result = Bun.spawnSync(
+          ["lsof", "-a", "-p", String(ompAncestorPid), "-d", "cwd", "-Fn"],
+          { stdout: "pipe", stderr: "pipe" },
+        )
+        if (result.exitCode === 0) {
+          const cwd = parseLsofCwd(new TextDecoder().decode(result.stdout))
+          if (cwd) return cwd
+        }
+      } catch {
+        // lsof missing — fall back to process.cwd() in resolveRouteCwd
+      }
+      return null
+    }
     if (!TMUX_PANE) return null
     try {
       const result = Bun.spawnSync(
@@ -1376,7 +1399,7 @@ if (import.meta.main) {
   const outboundIds: number[] = []
   const recordRoute = (messageId: number): void => {
     outboundIds.push(messageId)
-    if (!ROUTES_PATH || !TMUX_PANE) return
+    if (!ROUTES_PATH || !originPaneId) return
     try {
       // Resolve the route cwd (a tmux display-message lookup) BEFORE taking the
       // lock — it's the slow part, and keeping it out of the critical section
@@ -1386,7 +1409,7 @@ if (import.meta.main) {
       // locked body is pure file I/O.
       const newRoute = {
         id: messageId,
-        paneId: TMUX_PANE,
+        paneId: originPaneId,
         cwd: resolveRouteCwd({ queryPanePath, fallbackCwd: process.cwd() }),
         ts: Math.floor(Date.now() / 1000),
       }

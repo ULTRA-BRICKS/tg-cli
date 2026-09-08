@@ -3,6 +3,26 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.48.1
+
+**Telegram replies reach live omp sessions that have no tmux pane (tg-cli#339).**
+
+Alex 2026-09-08: listing omp titles on `/agent` is not reply routing. A reply to an
+out-of-tmux omp, `/agent` pick then text, and plain inbound with no pane must land
+in that live process via process-table + ACP — never tmux send-keys.
+
+- **`tg` records routes outside tmux.** When there is no `TMUX_PANE` but an omp
+  ancestor, the outbound route paneId is `omp:<pid>` so a Telegram reply recognizes
+  that origin.
+- **`handleReplyRoute`** injects `omp:<pid>` origins via ACP (`session/load` of the
+  process-table session id, then `session/prompt`), not `send-keys` and not the
+  gone-pane picker.
+- **ACP attaches to the live session.** `omp acp` drops `--no-session` and calls
+  `session/load` when the jsonl session id is known; `session/new` remains only
+  for untitled/no-jsonl processes.
+- **Inbound without a pane:** a sole live omp is injected; several live agents
+  (including out-of-tmux omp) get the picker.
+
 ## 1.48.0
 
 **Feature (tg-cli#337): block a send that mentions screenshot/скриншот with no image attached.**

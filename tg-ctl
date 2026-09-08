@@ -141,6 +141,7 @@ import {
   acpSessionIdFromResult,
   acpSessionTitleFromUpdate,
   buildAcpInitialize,
+  buildAcpSessionLoad,
   buildAcpSessionNew,
   buildAcpSessionPrompt,
   decodeAcpFrames,
@@ -149,7 +150,10 @@ import {
   findLiveOmpAgents,
   liveOmpLabel,
   matchLiveOmp,
+  matchLiveOmpOrigin,
+  ompReplyOriginMatches,
   mergeLiveOmpCandidates,
+  ompAcpSpawnArgv,
   optionIdForAnswer,
   parseLsofJsonlPaths,
   parseOmpSessionMeta,
@@ -1129,10 +1133,21 @@ async function acpCall(client: OmpAcpClient, methodBuilder: (id: number) => obje
 
 let ompPermissionSink: ((req: ButtonRequest) => void) | null = null
 
-async function ensureOmpAcp(cwd: string): Promise<OmpAcpClient> {
-  const existing = ompAcpClients.get(cwd)
+type OmpAcpTarget = { cwd?: string | null; sessionId?: string | null; pid?: number }
+
+function ompAcpKey(agent: OmpAcpTarget): string {
+  if (agent.sessionId) return `session:${agent.sessionId}`
+  if (agent.pid) return `omp:${agent.pid}`
+  return `cwd:${agent.cwd ?? "/"}`
+}
+
+async function ensureOmpAcp(agent: OmpAcpTarget): Promise<OmpAcpClient> {
+  const cwd = agent.cwd || "/"
+  const key = ompAcpKey(agent)
+  const existing = ompAcpClients.get(key)
   if (existing && existing.proc.exitCode === null) return existing
-  const proc = Bun.spawn(["omp", "acp", "--no-session", "--allow-home", `--cwd=${cwd}`], {
+  const loadSession = Boolean(agent.sessionId)
+  const proc = Bun.spawn(["omp", ...ompAcpSpawnArgv({ cwd, loadSession })], {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -1150,6 +1165,18 @@ async function ensureOmpAcp(cwd: string): Promise<OmpAcpClient> {
     ompPermissionSink?.(req)
   })
   await acpCall(client, (id) => buildAcpInitialize(id), 15_000)
+  if (agent.sessionId) {
+    const loaded = await acpCall(client, (id) => buildAcpSessionLoad(id, cwd, agent.sessionId!), 15_000)
+    const sessionId = acpSessionIdFromResult(loaded) ?? agent.sessionId
+    if (!sessionId) {
+      proc.kill()
+      throw new Error("omp acp session/load returned no sessionId")
+    }
+    client.sessionId = sessionId
+    ompAcpClients.set(key, client)
+    log(`omp-acp: session/load sessionId=${sessionId} cwd=${cwd} pid=${agent.pid ?? "?"}`)
+    return client
+  }
   const created = await acpCall(client, (id) => buildAcpSessionNew(id, cwd), 15_000)
   const sessionId = acpSessionIdFromResult(created)
   if (!sessionId) {
@@ -1157,19 +1184,21 @@ async function ensureOmpAcp(cwd: string): Promise<OmpAcpClient> {
     throw new Error("omp acp session/new returned no sessionId")
   }
   client.sessionId = sessionId
-  ompAcpClients.set(cwd, client)
+  ompAcpClients.set(key, client)
   log(`omp-acp: session/new sessionId=${sessionId} cwd=${cwd}`)
   return client
 }
 
-async function promptOmpAcp(cwd: string, text: string): Promise<{ ok: true } | { ok: false; error: string }> {
+async function promptOmpAcp(target: OmpAcpTarget | string, text: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const agent: OmpAcpTarget = typeof target === "string" ? { cwd: target } : target
+  const cwd = agent.cwd || "/"
   try {
-    const client = await ensureOmpAcp(cwd)
+    const client = await ensureOmpAcp(agent)
     await acpCall(client, (id) => buildAcpSessionPrompt(id, client.sessionId, text), 120_000)
     return { ok: true }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err)
-    log(`omp-acp: prompt failed cwd=${cwd}: ${error}`)
+    log(`omp-acp: prompt failed cwd=${cwd} session=${agent.sessionId ?? "-"}: ${error}`)
     return { ok: false, error }
   }
 }
@@ -5864,16 +5893,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return false
       }
       if (found.reason === "no-agent" && deferText !== undefined && deferText.trim() !== "") {
-        const live = listLiveOmpAgents()
-        if (live.length === 1) {
-          const cwd = live[0].cwd ?? "/"
-          log(`inject: omp ACP sole session pid=${live[0].pid} title=${liveOmpLabel(live[0])} cwd=${cwd}`)
-          const result = await promptOmpAcp(cwd, deferText)
-          if (!result.ok) {
-            await sendMessage(ctx, result.error)
-            return false
-          }
-          return true
+        const candidates = listAgentCandidates()
+        if (candidates.length === 1) {
+          log(`inject: no tmux pane, sole candidate ${candidates[0].paneId}/${candidates[0].windowName}`)
+          return injectPrewrappedToPane(candidates[0].paneId, deferText, sourceMessageId, candidates[0].panePath ?? "/")
+        }
+        if (candidates.length > 1) {
+          return postRoutePicker(candidates, deferText, undefined, sourceMessageId)
         }
       }
       await replyNoAgent()
@@ -5896,9 +5922,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         recordIfAutoBound()
         return true
       }
-      const cwd = found.target.pane.panePath || liveOmpForPane(paneId, found.target.agentPid)?.cwd || "/"
+      const live = liveOmpForPane(paneId, found.target.agentPid)
+      const cwd = found.target.pane.panePath || live?.cwd || "/"
       log(`inject: omp ACP pane=${paneId} cwd=${cwd} (not tmux send-keys)`)
-      const result = await promptOmpAcp(cwd, deferText)
+      const result = await promptOmpAcp(live ?? { cwd, pid: found.target.agentPid }, deferText)
       if (!result.ok) {
         log(`inject aborted: ${result.error}`)
         await sendMessage(ctx, result.error)
@@ -5945,7 +5972,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (!live) return { ok: false, error: `omp ${paneId} is no longer running` }
       const cwd = live.cwd ?? "/"
       log(`injectToPane: omp ACP pane=${paneId} cwd=${cwd} (not tmux send-keys)`)
-      const res = await promptOmpAcp(cwd, wrapped)
+      const res = await promptOmpAcp(live, wrapped)
       return res.ok ? { ok: true } : { ok: false, error: res.error }
     }
     if (shouldDeferInbound(paneId)) {
@@ -5957,9 +5984,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const pane = panes.find((p) => p.paneId === paneId)
     const hosted = pane ? findAgentInPane(pane, procs) : null
     if (hosted?.agent === "omp") {
-      const cwd = pane?.panePath || liveOmpForPane(paneId, hosted.pid)?.cwd || "/"
+      const live = liveOmpForPane(paneId, hosted.pid)
+      const cwd = pane?.panePath || live?.cwd || "/"
       log(`injectToPane: omp ACP pane=${paneId} cwd=${cwd} (not tmux send-keys)`)
-      const res = await promptOmpAcp(cwd, wrapped)
+      const res = await promptOmpAcp(live ?? { cwd, pid: hosted.pid }, wrapped)
       return res.ok ? { ok: true } : { ok: false, error: res.error }
     }
     const res = await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
@@ -6104,7 +6132,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
       const ompCwd = live.cwd ?? "/"
       log(`injectPrewrapped: omp ACP pane=${paneId} cwd=${ompCwd} (not tmux send-keys)`)
-      const res = await promptOmpAcp(ompCwd, prewrappedText)
+      const res = await promptOmpAcp(live, prewrappedText)
       if (!res.ok) {
         await sendMessage(ctx, res.error)
         return false
@@ -6124,8 +6152,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const pane = panes.find((p) => p.paneId === paneId)
     const hosted = pane ? findAgentInPane(pane, procs) : null
     if (hosted?.agent === "omp") {
+      const live = liveOmpForPane(paneId, hosted.pid)
       log(`injectPrewrapped: omp ACP pane=${paneId} cwd=${cwd} (not tmux send-keys)`)
-      const res = await promptOmpAcp(cwd || "/", prewrappedText)
+      const res = await promptOmpAcp(live ?? { cwd: cwd || "/", pid: hosted.pid }, prewrappedText)
       if (!res.ok) {
         await sendMessage(ctx, res.error)
         return false
@@ -6165,7 +6194,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const target = ompHits[0]
       const cwd = target.cwd ?? "/"
       log(`agent-route: selector="${selector}" → omp ACP pid=${target.pid} title=${liveOmpLabel(target)} cwd=${cwd}`)
-      const res = await promptOmpAcp(cwd, wrapped)
+      const res = await promptOmpAcp(target, wrapped)
       if (!res.ok) {
         await sendMessage(ctx, res.error, out)
         return false
@@ -6515,6 +6544,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const routes = parseRoutes(readFileOrNull(ctx.paths.routes))
     const recognized = recognizeRoute(routes, action.replyToMessageId)
     const injectVerbatim = async (paneId: string): Promise<boolean> => {
+      const live = matchLiveOmpOrigin(paneId, listLiveOmpAgents())
+      if (live) {
+        const res = await promptOmpAcp(live, action.injectText)
+        if (!res.ok) {
+          await sendMessage(ctx, res.error)
+          return false
+        }
+        await setSeenReactions(null, relatedReactionMessageId)
+        return true
+      }
       if (shouldDeferInbound(paneId)) {
         markDeferredForAck(enqueueDeferred(paneId, action.injectText, action.messageId, relatedReactionMessageId))
         return true
@@ -6578,6 +6617,17 @@ async function runDaemon(ctx: Ctx): Promise<never> {
 
     const msgPreview = action.injectText.slice(0, 60).replace(/\n/g, " ")
     if (recognized) {
+      const liveHit = matchLiveOmpOrigin(recognized.paneId, listLiveOmpAgents())
+      if (liveHit) {
+        // omp:<pid> is the live process (pid identity). Do not require cwd match:
+        // tg often runs from /tmp while liveHit.cwd is the session dir (Codex P1 #340).
+        if (ompReplyOriginMatches(recognized, liveHit)) {
+          log(`reply-route: replyTo=${action.replyToMessageId} → ${recognized.paneId} omp ACP pid=${liveHit.pid} msg="${msgPreview}"`)
+          const delivered = await injectVerbatim(recognized.paneId)
+          if (delivered) recordLastUserTarget(recognized.paneId, liveHit.cwd ?? "/")
+          return delivered
+        }
+      }
       const { panes, procs } = snapshot()
       const pane = panes.find((p) => p.paneId === recognized.paneId)
       // Route to the origin pane ONLY if it still hosts an agent AND is still the
@@ -8653,7 +8703,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const res = retained.req.omp
       ? await replyOmpAcpPermission(retained.req, optionIdForAnswer(retained.req, answer.value, answer.label))
       : retained.req.agent === "omp"
-        ? await promptOmpAcp((retained.req.cwd ?? "/") as string, wrapInbound(ctx.cfg.injectWrap, "tg", answer.label))
+        ? await promptOmpAcp(liveOmpForPane(paneId) ?? { cwd: retained.req.cwd ?? "/" }, wrapInbound(ctx.cfg.injectWrap, "tg", answer.label))
         : await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
     if (!res.ok) {
       // The pane is unreachable (gone / no longer an agent). ROLL BACK the claim:
