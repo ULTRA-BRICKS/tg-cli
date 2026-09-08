@@ -11,7 +11,9 @@
  * Past bugs: PR 322 used `omp --resume --print`, which forks the session
  * parent-chain. Do not revive that. `omp join` is a collab relay, not local
  * attach. RPC `--mode=rpc` is NDJSON `{type:"prompt", message}` — we speak
- * ACP JSON-RPC instead (proven live).
+ * ACP JSON-RPC instead. Framing is NDJSON (one JSON-RPC object per line);
+ * LSP Content-Length makes `omp acp` exit 0 with empty stdout (tg-cli#341,
+ * the 15s initialize timeout).
  *
  * ACP methods used (proven on omp 18.1.14, 2026-09-08):
  *   initialize                  → agentInfo.name "oh-my-pi"
@@ -25,6 +27,7 @@
  * Out-of-tmux replies (tg-cli#339): `tg` stamps route paneId omp:<pid>; the
  * daemon recognizes that origin and session/load-s the live session id, never
  * tmux send-keys and never an ephemeral session/new --no-session sibling.
+ *
  */
 
 import { matchAgentCommand } from './discover';
@@ -338,46 +341,23 @@ export function describeLiveOmp(a: LiveOmpAgent): string {
   return `${liveOmpLabel(a)} · omp — ACP (${parts.join(', ')})`;
 }
 
-// --- ACP framing (LSP-style Content-Length JSON-RPC over stdio) ---
+// --- ACP framing (NDJSON JSON-RPC over stdio; omp 18.1.14) ---
 
 export function encodeAcpFrame(message: object): string {
-  const json = JSON.stringify(message);
-  return `Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`;
+  return `${JSON.stringify(message)}\n`;
 }
 
 export function decodeAcpFrames(chunk: string): { messages: unknown[]; rest: string } {
   const messages: unknown[] = [];
   let rest = chunk;
   while (rest.length > 0) {
-    const headerEnd = rest.search(/\r?\n\r?\n/);
-    if (headerEnd < 0) break;
-    const header = rest.slice(0, headerEnd);
-    const match = /Content-Length:\s*(\d+)/i.exec(header);
-    if (!match) {
-      // Tolerate a stray NDJSON line (not used for ACP, but don't hang).
-      const nl = rest.indexOf('\n');
-      if (nl < 0) break;
-      const line = rest.slice(0, nl).trim();
-      rest = rest.slice(nl + 1);
-      if (line.startsWith('{')) {
-        try {
-          messages.push(JSON.parse(line));
-        } catch {
-          /* drop */
-        }
-      }
-      continue;
-    }
-    const len = Number(match[1]);
-    const sepLen = rest.slice(headerEnd, headerEnd + 4).startsWith('\r\n\r\n') ? 4 : 2;
-    const bodyStart = headerEnd + sepLen;
-    const body = rest.slice(bodyStart);
-    const bodyBytes = Buffer.from(body, 'utf8');
-    if (bodyBytes.length < len) break;
-    const json = bodyBytes.subarray(0, len).toString('utf8');
-    rest = bodyBytes.subarray(len).toString('utf8');
+    const nl = rest.indexOf('\n');
+    if (nl < 0) break;
+    const line = rest.slice(0, nl).replace(/\r$/, '').trim();
+    rest = rest.slice(nl + 1);
+    if (!line.startsWith('{')) continue;
     try {
-      messages.push(JSON.parse(json));
+      messages.push(JSON.parse(line));
     } catch {
       /* drop malformed */
     }
@@ -392,7 +372,7 @@ export function buildAcpInitialize(id: string | number): AcpRequest {
     method: 'initialize',
     params: {
       protocolVersion: 1,
-      clientInfo: { name: 'tg-ctl', version: '1.48.1' },
+      clientInfo: { name: 'tg-ctl', version: '1.48.2' },
       clientCapabilities: {},
     },
   };

@@ -249,16 +249,95 @@ test('questionCapability(omp) is buttons — ACP request_permission, not the tmu
   expect(questionCapability('omp')).toBe('buttons');
 });
 
-// --- ACP JSON-RPC (proven on omp 18.1.14: initialize, session/new, session/prompt) ---
+// --- ACP JSON-RPC (omp 18.1.14 speaks NDJSON, not LSP Content-Length) ---
 
-test('encodeAcpFrame / decodeAcpFrames round-trip Content-Length JSON-RPC', () => {
+async function acpInitializeOnce(
+  proc: {
+    stdin: { write: (chunk: string) => unknown };
+    stdout: ReadableStream<Uint8Array>;
+  },
+): Promise<unknown> {
+  proc.stdin.write(encodeAcpFrame(buildAcpInitialize(1)));
+  const reader = proc.stdout.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (value) buf += decoder.decode(value, { stream: true });
+    const { messages, rest } = decodeAcpFrames(buf);
+    buf = rest;
+    for (const raw of messages) {
+      if (!raw || typeof raw !== 'object') continue;
+      const rec = raw as { id?: unknown; result?: unknown };
+      if (rec.id === 1 && rec.result) return raw;
+    }
+    if (done) throw new Error('ACP initialize timed out');
+  }
+}
+
+test('encodeAcpFrame / decodeAcpFrames round-trip NDJSON JSON-RPC', () => {
   const req = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1 } };
   const framed = encodeAcpFrame(req);
-  expect(framed.startsWith('Content-Length:')).toBe(true);
+  expect(framed.startsWith('{')).toBe(true);
+  expect(framed.endsWith('\n')).toBe(true);
+  expect(framed).not.toContain('Content-Length');
   const { messages, rest } = decodeAcpFrames(framed);
   expect(rest).toBe('');
   expect(messages).toEqual([req]);
 });
+
+test('decodeAcpFrames parses a single NDJSON line without a blank line', () => {
+  const line = '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}\n';
+  const { messages, rest } = decodeAcpFrames(line);
+  expect(rest).toBe('');
+  expect(messages).toEqual([{ jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } }]);
+});
+
+test(
+  'client helper completes initialize against an NDJSON ACP child with TMUX unset',
+  async () => {
+    const fake = `
+let buf = "";
+process.stdin.on("data", (chunk) => {
+  buf += chunk.toString("utf8");
+  for (;;) {
+    const nl = buf.indexOf("\\n");
+    if (nl < 0) break;
+    const line = buf.slice(0, nl).trim();
+    buf = buf.slice(nl + 1);
+    if (!line.startsWith("{")) continue;
+    let msg;
+    try { msg = JSON.parse(line); } catch { continue; }
+    if (msg.method === "initialize") {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { protocolVersion: 1, agentInfo: { name: "oh-my-pi" } },
+      }) + "\\n");
+    }
+  }
+});
+process.stdin.resume();
+`;
+    const proc = Bun.spawn([process.execPath, '-e', fake], {
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { ...process.env, TMUX: '' },
+    });
+    try {
+      const result = await acpInitializeOnce(proc);
+      expect(result).toEqual({
+        jsonrpc: '2.0',
+        id: 1,
+        result: { protocolVersion: 1, agentInfo: { name: 'oh-my-pi' } },
+      });
+    } finally {
+      proc.kill();
+    }
+  },
+  1000,
+);
 
 test('buildAcpSessionPrompt is session/prompt with text parts — never a tmux argv', () => {
   const wrapped = wrapInbound('[TG from {name} {id}] {msg}', 'Alex', 'deploy now', 10);

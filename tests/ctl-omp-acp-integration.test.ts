@@ -78,25 +78,17 @@ const fs = require("fs");
 const logPath = process.env.OMP_ACP_LOG;
 if (!process.argv.includes("acp")) process.exit(0);
 function encode(msg) {
-  const json = JSON.stringify(msg);
-  return "Content-Length: " + Buffer.byteLength(json, "utf8") + "\\r\\n\\r\\n" + json;
+  return JSON.stringify(msg) + "\\n";
 }
 let buf = "";
 process.stdin.on("data", (chunk) => {
   buf += chunk.toString("utf8");
   while (true) {
-    const headerEnd = buf.search(/\\r?\\n\\r?\\n/);
-    if (headerEnd < 0) break;
-    const header = buf.slice(0, headerEnd);
-    const m = /Content-Length:\\s*(\\d+)/i.exec(header);
-    if (!m) break;
-    const len = Number(m[1]);
-    const sep = buf.slice(headerEnd, headerEnd + 4).startsWith("\\r\\n\\r\\n") ? 4 : 2;
-    const bodyStart = headerEnd + sep;
-    const bodyBuf = Buffer.from(buf.slice(bodyStart), "utf8");
-    if (bodyBuf.length < len) break;
-    const json = bodyBuf.subarray(0, len).toString("utf8");
-    buf = bodyBuf.subarray(len).toString("utf8");
+    const nl = buf.indexOf("\\n");
+    if (nl < 0) break;
+    const json = buf.slice(0, nl).trim();
+    buf = buf.slice(nl + 1);
+    if (!json.startsWith("{")) continue;
     let msg;
     try { msg = JSON.parse(json); } catch { continue; }
     if (logPath) fs.appendFileSync(logPath, json + "\\n");

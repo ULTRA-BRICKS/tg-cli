@@ -3,6 +3,18 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.48.2
+
+**Fix (tg-cli#341): ACP initialize speaks NDJSON, not Content-Length.**
+
+Live omp 18.1.14 `omp acp` answers one JSON-RPC object per line. Sending LSP
+Content-Length made the child exit 0 with empty stdout, so Telegram `/agent`
+and replies failed with `ACP initialize timed out` (15s).
+
+- `encodeAcpFrame` writes NDJSON; `decodeAcpFrames` parses NDJSON lines so
+  `pumpAcpClient` / `acpCall` actually see the initialize result.
+- Fake `omp acp` servers in tests speak the same framing.
+
 ## 1.48.1
 
 **Telegram replies reach live omp sessions that have no tmux pane (tg-cli#339).**
