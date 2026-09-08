@@ -43,6 +43,50 @@ BLOCK_EXIT_CODE = 10
 HOOK_API = "agents-hooks/v1"
 REVIEW_TIMEOUT_S = 55
 
+# --- HYP-1120 live-hatch-approval bypass (narrowed scope, Alex tg#10233 "Option C") --
+#
+# HYP-1120 as originally filed asked for a GENERAL downgrade of this file's
+# unstyled/broken/blank-render veto from hard-block to warn-only, mirroring the
+# already-shipped selection-highlight downgrade below (tg-cli#163). An attempt to
+# implement that literal, wider scope was denied by an auto-mode security classifier
+# as "disabling this org's visual-proof validation gate for ALL cases" -- it would
+# have removed the ONLY safety net for a genuinely broken/unstyled/blank screenshot
+# with no replacement signal.
+#
+# Alex chose the narrower alternative instead (tg#10233, replying to the decision
+# request at tg#10231): the DEFAULT hard block stays EXACTLY as it was -- this section
+# only ADDS a one-time, per-send bypass for a send Alex has already live-approved over
+# Telegram. The motivating incident: PR #665's screenshot was live-approved by Alex via
+# hatch escalation, but this hook had no code path to consume that approval, so the
+# hard block still fired with no way to use the approval that was already given.
+#
+# Mechanism: this hook itself REQUESTS the live approval (mirrors every other
+# hatch-using gate in this org -- e.g. agent-tools' visual-proof-gate) via the shared
+# `agenttools_hatch_escalation` helper (agent-tools/lib, importable when agent-tools is
+# installed -- see _load_hatch_escalation). It reads the per-hook env var
+# (RIG_HATCH_REQUEST_PRE_SEND_PHOTO="<justification>") from the hook process
+# environment, and if present, synchronously calls `tg-ctl ask` and BLOCKS on Alex's
+# live Telegram reply before resolving. Unset (the default -- no env var) means "no
+# hatch requested", and the pre-existing unconditional block() path is untouched.
+#
+# APPROVAL SCOPE (test (c) below): a hatch approval is per-invocation of THIS hook
+# process -- there is no persistent store keyed by image/send that a later, unrelated
+# send could accidentally read. `tg-ctl ask`'s live Telegram round-trip is inherently
+# scoped to the ONE pending `tg-ctl ask` call this process makes; a different photo
+# send is a different hook process with its own env and its own (independent) ask.
+#
+# TIMEOUT BUDGET: HATCH_ASK_TIMEOUT_S must stay comfortably UNDER the descriptor's own
+# timeout_ms (review-visual.pre-send-photo.json, raised to 420000ms/7min for exactly
+# this) so this Python process always returns its OWN explicit block/allow decision
+# well before the descriptor's outer kill could fire -- a descriptor-level timeout
+# kill resolves via on_error:"open" (fail-open / ALLOW), which would silently let an
+# un-actioned hatch request bypass a genuinely broken render just by outlasting the
+# clock. Explicitly deciding (approved -> allow, denied/timed-out-at-tg-ctl-level ->
+# block) inside this process, well inside the descriptor's budget, is what keeps "no
+# response" resolving to the safe default (block), not the fail-open default.
+HATCH_HOOK_ID = "pre-send-photo"
+HATCH_ASK_TIMEOUT_S = 300.0
+
 
 def emit(decision: str, message: str | None = None) -> None:
     out = {"hook_api": HOOK_API, "decision": decision}
@@ -65,6 +109,52 @@ def allow(message: str | None = None) -> int:
 def block(message: str) -> int:
     emit("block", message)
     return BLOCK_EXIT_CODE
+
+
+def _load_hatch_escalation():
+    """Best-effort import of agent-tools' shared `agenttools_hatch_escalation`
+    helper. Returns None when it can't be imported (agent-tools not installed /
+    its lib/ not on sys.path on this machine) -- the live-approval bypass is a
+    pure ADDITION on top of the pre-existing hard block; its unavailability must
+    never weaken or change the default block-on-broken-render behavior. Matches
+    this file's existing fail-open-on-missing-tool pattern (see run_review_visual's
+    `shutil.which("review")` check) -- except here "tool missing" means "no bypass
+    is possible", not "allow", since the bypass is opt-in via env var, not the
+    hook's core function."""
+    try:
+        import agenttools_hatch_escalation as module
+    except ImportError:
+        return None
+    return module
+
+
+def _consume_live_hatch_approval(reason: str, *, cwd: str, image_path: str) -> int | None:
+    """Consume an already-requested live hatch approval for THIS pending photo
+    send (RIG_HATCH_REQUEST_PRE_SEND_PHOTO env var), if one was requested. See the
+    HYP-1120 module-level comment above HATCH_HOOK_ID for the full design.
+
+    Returns an exit code (0 allow / 10 block) when a hatch WAS requested (the env
+    var is present) -- the request itself decides allow vs. block via a live
+    `tg-ctl ask` round trip. Returns None when no hatch was requested at all, in
+    which case the caller must fall through to its own unconditional block()."""
+    hatch = _load_hatch_escalation()
+    if hatch is None:
+        return None
+    result = hatch.request_hatch_approval(
+        HATCH_HOOK_ID,
+        {"hook": HATCH_HOOK_ID, "image_path": image_path, "reason": reason},
+        cwd=cwd,
+        timeout_s=HATCH_ASK_TIMEOUT_S,
+    )
+    if not result.should_stop:
+        return None  # env var unset -- no hatch requested, normal block path
+    message = reason or "review visual: unstyled / broken render"
+    if result.approved:
+        note = f"pre-send-photo veto allowed via live hatch approval ({result.reason})"
+        warn(note)
+        return allow(note)
+    warn(f"pre-send-photo hatch escalation denied: {result.reason}")
+    return block(f"hatch escalation denied: {result.reason}\n{message}")
 
 
 # Telegram captions cap out around 1024 characters, but this hook is a defensive
@@ -651,9 +741,13 @@ def _warn_and_allow_selection_highlight(reason: str) -> int:
     return allow(reason or None)
 
 
-def decide_from_review_result(proc: subprocess.CompletedProcess) -> int:
+def decide_from_review_result(
+    proc: subprocess.CompletedProcess, *, cwd: str = "", image_path: str = ""
+) -> int:
     """Map a completed `review visual` run to the hook's allow/block decision
-    (architecture spec §7.3 verdict mapping)."""
+    (architecture spec §7.3 verdict mapping). `cwd`/`image_path` feed the
+    HYP-1120 live-hatch-approval bypass on the hard-block path -- see
+    _consume_live_hatch_approval."""
     # KEEP stdout parsing OUTSIDE run_review_visual's try above: json.JSONDecodeError
     # is itself a ValueError subclass. If a future edit folded
     # `parse_review_output(proc.stdout)` into that try, a malformed/empty JSON
@@ -675,7 +769,11 @@ def decide_from_review_result(proc: subprocess.CompletedProcess) -> int:
         # blocks below, unchanged.
         if _sole_blocking_module(verdict) == _SELECTION_HIGHLIGHT_MODULE:
             return _warn_and_allow_selection_highlight(reason)
-        return block(reason or "review visual: unstyled / broken render")
+        block_reason = reason or "review visual: unstyled / broken render"
+        hatch_decision = _consume_live_hatch_approval(block_reason, cwd=cwd, image_path=image_path)
+        if hatch_decision is not None:
+            return hatch_decision
+        return block(block_reason)
 
     # A zero exit with NON-EMPTY but UNPARSEABLE stdout is a broken/noisy review
     # binary, NOT a clean keep — warn and fail open (don't masquerade as keep).
@@ -800,7 +898,10 @@ def main() -> int:
     proc = run_review_visual(image_path, intent)
     if proc is None:
         return allow()
-    return decide_from_review_result(proc)
+    cwd = event.get("cwd")
+    return decide_from_review_result(
+        proc, cwd=cwd if isinstance(cwd, str) else "", image_path=image_path
+    )
 
 
 def parse_review_output(stdout: str) -> tuple[dict, bool]:
