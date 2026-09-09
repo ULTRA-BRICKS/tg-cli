@@ -109,6 +109,19 @@ test('parseOmpSessionMeta reads title and id from omp session jsonl, not cwd', (
   expect(meta.cwd).toBe('/Users/u/xp/review-cli');
 });
 
+
+test('parseOmpSessionMeta reads title_change after the former 64KB truncation boundary', () => {
+  const padding = '{"type":"message","content":"' + 'x'.repeat(70000) + '"}\n';
+  const jsonl = [
+    '{"type":"title","v":1,"title":"Stale Title","source":"auto"}',
+    padding,
+    '{"type":"title_change","title":"Fresh Title After Boundary"}',
+  ].join('\n');
+  expect(jsonl.length).toBeGreaterThan(64_000);
+  const meta = parseOmpSessionMeta(jsonl);
+  expect(meta.title).toBe('Fresh Title After Boundary');
+});
+
 test('parseLsofJsonlPaths collects n-paths ending in .jsonl', () => {
   const out = [
     'p7103',

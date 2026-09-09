@@ -1052,7 +1052,7 @@ function listLiveOmpAgents(): LiveOmpAgent[] {
     let meta = null
     if (sessionFile) {
       try {
-        meta = parseOmpSessionMeta(readFileSync(sessionFile, "utf8").slice(0, 64_000))
+        meta = parseOmpSessionMeta(readFileSync(sessionFile, "utf8"))
       } catch {
         meta = null
       }

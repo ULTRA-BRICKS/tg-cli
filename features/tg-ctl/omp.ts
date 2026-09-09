@@ -113,6 +113,13 @@ export function parseOmpSessionMeta(jsonl: string): OmpSessionMeta {
   for (const line of jsonl.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
+    if (
+      !trimmed.includes('"type":"session"') &&
+      !trimmed.includes('"type":"title"') &&
+      !trimmed.includes('"type":"title_change"')
+    ) {
+      continue;
+    }
     let rec: Record<string, unknown>;
     try {
       rec = JSON.parse(trimmed) as Record<string, unknown>;

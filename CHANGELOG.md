@@ -3,6 +3,18 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.49.2
+
+**Fix (tg-cli#358): omp session title in outbound `[window]` header and `/agent` picker.**
+
+- Outbound `tg` now prefers the live omp session jsonl title for the `[window]` bracket
+  when this process runs under an omp ancestor — including headless sessions with
+  `TMUX` unset — falling back to the tmux window name / cwd-basename label for every
+  other harness.
+- `tg-ctl` reads the full session jsonl when resolving omp agent labels; a
+  `title_change` record past the old 64KB scan window is no longer invisible to the
+  `/agent` picker.
+
 ## 1.49.1
 
 **Telegram `/agent landing` and `/agent rig-fable` reach the live omp sessions (tg-cli#342).**

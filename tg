@@ -67,7 +67,7 @@ import { runReplies } from "./features/replies/cli"
 import { resolveWindowPanes } from "./features/replies/window"
 import { agentNameFromDisplayLine } from "./features/tg-ctl/agent-name"
 import { detectAgentViaAncestry, detectOmpAncestorPid, isProcessRunning } from "./features/branding/detect"
-import { outboundOriginPaneId } from "./features/tg-ctl/omp"
+import { outboundOriginPaneId, parseLsofJsonlPaths, parseOmpSessionMeta, pickPrimaryOmpSessionFile } from "./features/tg-ctl/omp"
 import { parseLsofCwd } from "./features/tg-ctl/unreachable"
 import { resolveWindowAgentLabel } from "./features/tg-ctl/agent-match"
 import { installSkill } from "./features/install-skill/install"
@@ -810,13 +810,14 @@ if (import.meta.main) {
 
   const AI_EMOJI = detectAiEmoji()
 
-  // --- Tmux context → the `[window]` header label ---
-  // The agent identity for the header bracket. Reads the pane's tmux window name
-  // AND its cwd, then resolveWindowAgentLabel picks the meaningful one: a real
-  // user-chosen window name leads; a bare auto-rename default (a numeric index, a
-  // shell/launcher name, or Claude Code's "2.1.207" version string that tmux
-  // auto-rename stamps as the window name) falls back to the cwd project basename
-  // → `rig-cli`, not `2.1.207`. buildPrefix wraps the result in [] and styles it.
+  // --- Window label → the `[window]` header bracket ---
+  // The agent identity for the header bracket. When this process runs under a live
+  // omp ancestor (tmux or headless), the omp session jsonl title wins. Otherwise
+  // every non-omp harness is byte-identical to before: inside tmux,
+  // resolveWindowAgentLabel reads the pane's window name AND cwd (a real user-chosen
+  // window name leads; a bare auto-rename default falls back to the cwd project
+  // basename → `rig-cli`, not `2.1.207`); outside tmux the label is empty.
+  // buildPrefix wraps the result in [] and styles it.
   const getTmuxWindow = (): string => {
     if (!process.env.TMUX) return ""
     try {
@@ -837,6 +838,24 @@ if (import.meta.main) {
       // ignore — tmux not available or not in a pane
     }
     return ""
+  }
+
+  const getOmpSessionTitle = (ompPid: number | null): string => {
+    if (ompPid === null) return ""
+    try {
+      const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(ompPid), "-Fn"], {
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      if (lsof.exitCode !== 0) return ""
+      const paths = parseLsofJsonlPaths(new TextDecoder().decode(lsof.stdout))
+      const sessionFile = pickPrimaryOmpSessionFile(paths)
+      if (!sessionFile) return ""
+      const meta = parseOmpSessionMeta(readFileSync(sessionFile, "utf8"))
+      return meta.title ?? ""
+    } catch {
+      return ""
+    }
   }
 
   // --- Emoji helpers listing ---
@@ -870,16 +889,19 @@ if (import.meta.main) {
     console.log(`${MODEL || "(none)"}\t${AI_EMOJI || "(none)"}`)
     process.exit(0)
   }
-  // Resolve the tmux window label only from here on: the `--detect-agent` info
-  // action and the real send need it, but the emoji/model info flags above must
-  // NOT pay for a `tmux display-message` subprocess they never read.
-  const tmuxWindow = getTmuxWindow()
+  // Resolve the window label only from here on: the `--detect-agent` info action
+  // and the real send need it (omp session title when under omp, else tmux window
+  // name / cwd-basename fallback), but the emoji/model info flags above must NOT
+  // pay for ps/lsof/tmux subprocesses they never read.
+  const ompAncestorPid = detectOmpAncestorPid()
+  const windowAgentLabel = getOmpSessionTitle(ompAncestorPid) || getTmuxWindow()
   if (parsed.action === "detectAgent") {
-    // The auto `[window]` label this session's messages get with no flag — the
-    // resolved tmux window name (or its cwd-basename fallback), or "(none)"
-    // outside tmux. There is NO env-based subagent auto-detection anymore; a
-    // subagent self-labels with `--subagent <name>`.
-    console.log(tmuxWindow || "(none)")
+    // The auto `[window]` label this session's messages get with no flag — the omp
+    // session title when under omp, else the resolved tmux window name (or its
+    // cwd-basename fallback), or "(none)" when neither applies. There is NO
+    // env-based subagent auto-detection anymore; a subagent self-labels with
+    // `--subagent <name>`.
+    console.log(windowAgentLabel || "(none)")
     process.exit(0)
   }
 
@@ -923,7 +945,7 @@ if (import.meta.main) {
   // only. `--subagent <name>` (parsed to `subagent`) wins; the `TG_AGENT` env is
   // the same-precedence fallback for a subagent that sets it once in its shell.
   // The MAIN/orchestrator agent passes neither and gets NO second bracket — its
-  // identity is the `[window]` label (tmuxWindow) above. There is deliberately NO
+  // identity is the `[window]` label (windowAgentLabel) above. There is deliberately NO
   // env-based auto-detection: `CLAUDE_CODE_CHILD_SESSION` is not a reliable
   // main-vs-subagent signal, so a guessed `[subagent]` bracket is never emitted.
   const AGENT_LABEL = subagent || env.TG_AGENT?.trim() || undefined
@@ -1430,7 +1452,6 @@ if (import.meta.main) {
   // omp ancestor pid as omp:<pid> so an out-of-tmux omp is still recognizable
   // (tg-cli#339). A corrupt or unwritable file just degrades to the picker.
   const TMUX_PANE = process.env.TMUX_PANE
-  const ompAncestorPid = detectOmpAncestorPid()
   const originPaneId = outboundOriginPaneId({
     tmuxPane: TMUX_PANE,
     ompAncestorPid,
@@ -1605,7 +1626,7 @@ if (import.meta.main) {
   // substituting :helper: markers inside text we're about to remove. Line-spec
   // quotes are inserted AFTER this hook (anchored on the token) so the injected
   // <pre> can't flip the userHtml/escape decision below.
-  const prefix = buildPrefix({ aiEmoji: AI_EMOJI, model: MODEL, tmuxWindow, agentLabel: AGENT_LABEL, tag, title })
+  const prefix = buildPrefix({ aiEmoji: AI_EMOJI, model: MODEL, tmuxWindow: windowAgentLabel, agentLabel: AGENT_LABEL, tag, title })
   const renderText = (stripped: string, fmt: Format): { text: string; format: Format } => {
     const parsedCaption = parseEmojiHelpers(stripped)
     // buildPrefix already rendered the prefix to finished html/plain (its emoji
