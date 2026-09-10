@@ -153,6 +153,26 @@ test('not-registered question logs a distinct reason and posts nothing', async (
   await proc.exited; // a dropped request returns immediately
 });
 
+test('hatch permission with unmatched pane/cwd is not dropped not-registered', async () => {
+  // Non-tmux omp hatch: requestId hatch-*, kind permission, pane=-, cwd not in
+  // the registration set. The #67 not-registered gate must not swallow it.
+  const before = countSent('Allow hatch for no-long-inline-process');
+  const proc = ask({
+    requestId: 'hatch-no-long-inline-process-abc123def456',
+    cwd: '/Users/ultra/xp/rig-cli',
+    paneId: '-',
+    agent: 'claude',
+    kind: 'permission',
+    question: 'Allow hatch for no-long-inline-process?',
+  });
+  const log = await waitForLog('ask-forward posted: agent=claude kind=permission req=hatch-no-long-inline-process-abc123def456');
+  expect(log).not.toContain('reason=not-registered agent=claude kind=permission req=hatch-no-long-inline-process-abc123def456');
+  expect(log).toContain('ask-forward posted: agent=claude kind=permission req=hatch-no-long-inline-process-abc123def456');
+  expect(countSent('Allow hatch for no-long-inline-process')).toBe(before + 1);
+  proc.kill(9);
+  await proc.exited;
+});
+
 test('not-forwardable agent logs a distinct reason', async () => {
   const proc = ask({
     requestId: 'q_aider',

@@ -165,6 +165,16 @@ export function registrationSetAllowsHook(
   return regs.some((reg) => registrationAllowsHook(reg, req, resolvePath));
 }
 
+// Hatch permission asks (agent-tools hatch escalation) arrive from non-tmux omp
+// with pane=- and a cwd that is not in the registration set. The #67
+// not-registered gate would drop them before Telegram ever sees the card.
+// Kind AND prefix: a question that merely reuses `hatch-` is still gated.
+export function isHatchPermissionRequest(
+  req: Pick<ButtonRequest, 'kind' | 'requestId'>,
+): boolean {
+  return req.kind === 'permission' && req.requestId.startsWith('hatch-');
+}
+
 // Exhaustive over AgentKind on purpose: adding a new kind forces a deliberate
 // capability decision here (the compiler flags a missing case) instead of a
 // silent default — omp is ACP buttons (session/request_permission), not the

@@ -12,6 +12,7 @@ import {
   formatAgentHookOutput,
   parseButtonCallback,
   parseQuestionCloseCallback,
+  isHatchPermissionRequest,
   questionCapability,
   queuedDecisionCanAutoDeliver,
   queuedDecisionStillWaitingText,
@@ -68,6 +69,28 @@ test('registrationAllowsHook: cwd comparison goes through the injected path reso
   const reg = { cwd: '/proj/sub/..' };
   const resolver = (p: string) => p.replace('/sub/..', '');
   expect(registrationAllowsHook(reg, { cwd: '/proj' }, resolver)).toBe(true);
+});
+
+test('isHatchPermissionRequest: permission whose requestId starts with hatch- only', () => {
+  expect(isHatchPermissionRequest({
+    kind: 'permission',
+    requestId: 'hatch-no-long-inline-process-abc123',
+  })).toBe(true);
+  expect(isHatchPermissionRequest({
+    kind: 'permission',
+    requestId: 'hatch-',
+  })).toBe(true);
+  // A normal permission must still go through the registration gate.
+  expect(isHatchPermissionRequest(PERMISSION)).toBe(false);
+  // Kind matters: a question that merely reuses the prefix is not a hatch.
+  expect(isHatchPermissionRequest({
+    kind: 'question',
+    requestId: 'hatch-no-long-inline-process-abc123',
+  })).toBe(false);
+  expect(isHatchPermissionRequest({
+    kind: 'permission',
+    requestId: 'no-long-inline-process-hatch-abc',
+  })).toBe(false);
 });
 
 test('questionCapability is explicit: claude/codex/opencode/omp support buttons, pi/aider are limited', () => {

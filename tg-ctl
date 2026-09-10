@@ -202,6 +202,7 @@ import {
   callbackRequestId,
   collectQuestionAnswers,
   formatAgentHookOutput,
+  isHatchPermissionRequest,
   questionCapability,
   queuedDecisionCanAutoDeliver,
   queuedDecisionStillWaitingText,
@@ -3323,7 +3324,10 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
   // and an unrelated dead-pane entry can never match this req's paneId, so a
   // prune would only cost an extra tmux read on the hot forward path.
   const registrations = readRegistrations(ctx.paths)
-  if (!hookMatchesRegistration(registrations, req)) {
+  // Hatch permissions skip the pane/cwd registration set (tg-cli#333): non-tmux
+  // omp sessions are never registered, and hatch is the documented exception to
+  // no-long-inline-process. canForwardButtonRequest still runs below.
+  if (!isHatchPermissionRequest(req) && !hookMatchesRegistration(registrations, req)) {
     log(
       `ask-forward dropped: reason=not-registered ${describeAskRequest(req)} reg=${describeRegistration(registrations)}`,
     )
