@@ -3,6 +3,38 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.51.1
+
+**Fix (tg-cli#353): ACP `session/prompt` eviction no longer kills a healthy turn or a live permission prompt (P1 review-quorum finding on #352).**
+
+The 1.49.2 wedged-client eviction fix (tg-cli#353, shipped below) evicted + killed the cached ACP
+client on **any** `session/prompt` timeout. Two independent review passes on
+PR #352 (Opus-omp and Sonnet-omp, posted at
+https://github.com/alex-mextner/tg-cli/pull/352#issuecomment-5610743766)
+found this was too broad: `session/prompt` only resolves at *turn
+completion* per ACP semantics, so (a) a healthy turn still legitimately
+running past the timeout got killed mid-turn, and (b) worse, a
+still-outstanding `session/request_permission` — a human slowly answering a
+Telegram permission prompt, covered by the documented 12h
+`ABANDONED_PERMISSION_RETAIN_MS` "never lose the tap" guarantee — had its
+pipe destroyed, and `replyOmpAcpPermission` never respawns a client, so
+every later tap on that permission failed identically forever.
+
+- **`promptOmpAcp`** now evicts + kills the cached client only when **both**
+  no ACP traffic has arrived since the prompt was sent (`lastActivityAt` is
+  a proxy for "the child is still alive, not wedged") **and** no
+  `session/request_permission` reply is still owed on that client
+  (`pendingPermissions === 0`). A genuinely wedged session (no traffic, no
+  outstanding permission) is still reaped exactly as in 1.49.2.
+- `OmpAcpClient` tracks `lastActivityAt` (updated on every inbound ACP frame)
+  and `pendingPermissions` (incremented on each `session/request_permission`,
+  decremented when `replyOmpAcpPermission` writes the reply).
+- New regression test `ctl-omp-acp-prompt-evict-permission-pending.test.ts`
+  proves a session with an outstanding permission survives repeated
+  `session/prompt` timeouts against the same cached client, while the
+  existing `ctl-omp-acp-prompt-evict.test.ts` (zero traffic, zero pending
+  permissions) still gets reaped unmodified.
+
 ## 1.51.0
 
 **The asking side tells the truth about an approval card (tg-cli#317).**
@@ -64,6 +96,24 @@ the empty routing fields (`agent=claude pane=-`) for a request raised from a cod
 
 ## 1.49.2
 
+**A wedged ACP `session/prompt` no longer stays wedged forever (tg-cli#353, #346-adjacent).**
+
+The NDJSON framing fix (#346) made ACP `initialize`/`session/load` succeed, but a
+`session/prompt` call that never got a reply -- e.g. the target omp session
+already owned by another live process -- left the ACP child cached forever
+with `exitCode===null`. Every later reply into that same session reused the
+dead pipe and repeated the identical "ACP session/prompt timed out" failure.
+Live evidence: the same session id timed out 3x over 30 minutes under a
+daemon that already had the NDJSON fix, leaking a 35+ minute child holding
+90+ open sockets.
+
+- **`promptOmpAcp`** evicts the client from `ompAcpClients` and kills its
+  process on any session/prompt failure, so the next attempt spawns a fresh
+  child instead of reusing a permanently wedged pipe.
+- The prompt timeout is overridable via `TG_CTL_ACP_PROMPT_TIMEOUT_MS`
+  (defaults to the existing 120s) so tests can exercise the eviction path
+  without a 120s wait.
+
 **Fix (tg-cli#358): omp session title in outbound `[window]` header and `/agent` picker.**
 
 - Outbound `tg` now prefers the live omp session jsonl title for the `[window]` bracket
@@ -73,7 +123,6 @@ the empty routing fields (`agent=claude pane=-`) for a request raised from a cod
 - `tg-ctl` reads the full session jsonl when resolving omp agent labels; a
   `title_change` record past the old 64KB scan window is no longer invisible to the
   `/agent` picker.
-
 ## 1.49.1
 
 **Telegram `/agent landing` and `/agent rig-fable` reach the live omp sessions (tg-cli#342).**

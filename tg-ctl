@@ -1074,9 +1074,24 @@ type OmpAcpClient = {
   buf: string
   nextId: number
   pending: Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>
+  // Updated on every inbound ACP frame (a resolved call, a session/update, or
+  // a permission request) -- proof the child is alive, not wedged. Read by
+  // promptOmpAcp to tell "still working past the timeout" apart from a
+  // genuinely dead pipe.
+  lastActivityAt: number
+  // Count of session/request_permission calls this client has sent that no
+  // reply has been written back for yet. While > 0 a human may be mid-decision
+  // on a live Telegram permission prompt (the 12h ABANDONED_PERMISSION_RETAIN_MS
+  // guarantee) -- promptOmpAcp must never evict+kill the client that prompt
+  // depends on just because session/prompt itself also timed out.
+  pendingPermissions: number
 }
 
 const ompAcpClients = new Map<string, OmpAcpClient>()
+
+// Overridable only for tests (regression cover for the wedged-client evict
+// path in promptOmpAcp) -- production always gets the 120s default.
+const ACP_PROMPT_TIMEOUT_MS = Number(process.env.TG_CTL_ACP_PROMPT_TIMEOUT_MS) || 120_000
 
 function writeAcp(client: OmpAcpClient, msg: object): void {
   client.proc.stdin.write(encodeAcpFrame(msg))
@@ -1095,6 +1110,7 @@ function pumpAcpClient(client: OmpAcpClient, onPermission: (req: ButtonRequest) 
       client.buf = rest
       for (const raw of messages) {
         if (!raw || typeof raw !== "object") continue
+        client.lastActivityAt = Date.now()
         const rec = raw as { id?: number; method?: string; result?: unknown; error?: { message?: string } }
         if (typeof rec.id === "number" && client.pending.has(rec.id)) {
           const wait = client.pending.get(rec.id)!
@@ -1104,7 +1120,10 @@ function pumpAcpClient(client: OmpAcpClient, onPermission: (req: ButtonRequest) 
           continue
         }
         const perm = acpPermissionToButtonRequest(raw)
-        if (perm) onPermission(perm)
+        if (perm) {
+          client.pendingPermissions += 1
+          onPermission(perm)
+        }
         const title = acpSessionTitleFromUpdate(raw)
         if (title) log(`omp-acp: session title from omp: ${title}`)
       }
@@ -1164,6 +1183,8 @@ async function ensureOmpAcp(agent: OmpAcpTarget): Promise<OmpAcpClient> {
     buf: "",
     nextId: 1,
     pending: new Map(),
+    lastActivityAt: Date.now(),
+    pendingPermissions: 0,
   }
   pumpAcpClient(client, (req) => {
     ompPermissionSink?.(req)
@@ -1196,13 +1217,44 @@ async function ensureOmpAcp(agent: OmpAcpTarget): Promise<OmpAcpClient> {
 async function promptOmpAcp(target: OmpAcpTarget | string, text: string): Promise<{ ok: true } | { ok: false; error: string }> {
   const agent: OmpAcpTarget = typeof target === "string" ? { cwd: target } : target
   const cwd = agent.cwd || "/"
+  let client: OmpAcpClient | undefined
+  let promptSentAt = 0
   try {
-    const client = await ensureOmpAcp(agent)
-    await acpCall(client, (id) => buildAcpSessionPrompt(id, client.sessionId, text), 120_000)
+    client = await ensureOmpAcp(agent)
+    promptSentAt = Date.now()
+    await acpCall(client, (id) => buildAcpSessionPrompt(id, client!.sessionId, text), ACP_PROMPT_TIMEOUT_MS)
     return { ok: true }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err)
     log(`omp-acp: prompt failed cwd=${cwd} session=${agent.sessionId ?? "-"}: ${error}`)
+    // A timed-out/errored session/prompt does NOT by itself mean the ACP pipe
+    // is wedged: session/prompt only resolves at turn completion, so a
+    // healthy turn still running past ACP_PROMPT_TIMEOUT_MS -- or a human
+    // still deciding a live session/request_permission prompt (the
+    // documented 12h ABANDONED_PERMISSION_RETAIN_MS "never lose the tap"
+    // guarantee) -- looks identical to a dead pipe from this call alone.
+    // Only evict + kill when BOTH signals say otherwise: no ACP traffic at
+    // all since we sent the prompt (lastActivityAt didn't move), and no
+    // permission reply is still owed on this client. Genuine live evidence
+    // (2026-09-09): a session already owned by another live process timed out
+    // 3x over 30 min with zero traffic and no pending permission -- that
+    // case still gets evicted below so the next attempt spawns a clean
+    // process instead of reusing the dead pipe.
+    if (client) {
+      const hasPendingPermission = client.pendingPermissions > 0
+      const sawActivitySincePrompt = client.lastActivityAt > promptSentAt
+      if (!hasPendingPermission && !sawActivitySincePrompt) {
+        const key = ompAcpKey(agent)
+        if (ompAcpClients.get(key) === client) ompAcpClients.delete(key)
+        client.proc.kill()
+        log(`omp-acp: evicted wedged client cwd=${cwd} session=${agent.sessionId ?? "-"}`)
+      } else {
+        log(
+          `omp-acp: prompt timed out but not evicting cwd=${cwd} session=${agent.sessionId ?? "-"} ` +
+            `(pendingPermissions=${client.pendingPermissions}, activitySincePrompt=${sawActivitySincePrompt})`,
+        )
+      }
+    }
     return { ok: false, error }
   }
 }
@@ -1213,6 +1265,8 @@ async function replyOmpAcpPermission(req: ButtonRequest, optionId: string): Prom
   const client = [...ompAcpClients.values()].find((c) => c.sessionId === req.omp!.sessionId)
   if (!client) return { ok: false, error: "omp ACP session is gone — not injecting into tmux" }
   writeAcp(client, reply)
+  client.pendingPermissions = Math.max(0, client.pendingPermissions - 1)
+  client.lastActivityAt = Date.now()
   return { ok: true }
 }
 
