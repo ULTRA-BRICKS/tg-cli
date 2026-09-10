@@ -268,7 +268,7 @@ import { parseLastUserTarget, serializeLastUserTarget, type LastUserTarget } fro
 import { appendRecordsToBlob, parseHistory, type HistoryRecord } from "./features/replies/history"
 import { inboundHistoryRecords } from "./features/replies/inbound"
 import { agentNameForPane } from "./features/tg-ctl/agent-name"
-import { isLikelySlashCommand, stepUpdates } from "./features/tg-ctl/updates"
+import { isLikelySlashCommand, parsePendingBatch, serializePendingBatch, stepUpdates } from "./features/tg-ctl/updates"
 import {
   appendTopic,
   applyModelAnswer,
@@ -1233,52 +1233,23 @@ async function ensureOmpAcp(agent: OmpAcpTarget): Promise<OmpAcpClient> {
 async function promptOmpAcp(target: OmpAcpTarget | string, text: string): Promise<{ ok: true } | { ok: false; error: string }> {
   const agent: OmpAcpTarget = typeof target === "string" ? { cwd: target } : target
   const cwd = agent.cwd || "/"
-  let client: OmpAcpClient | undefined
-  let promptSentAt = 0
   try {
-    client = await ensureOmpAcp(agent)
-    promptSentAt = Date.now()
-    // 15s, not 120s (tg-cli#357): concurrent per-target dispatch already isolates a stuck target
-    // from every other one, but this call's OWN worst case still has to stay short — a live LLM
-    // turn should at least acknowledge receipt well within 15s, and a daemon-wide 120s bound was
-    // the root cause of the reported head-of-line-blocking incident.
-    await acpCall(
-      client,
-      (id) => buildAcpSessionPrompt(id, client!.sessionId, text),
-      Math.min(15_000, ACP_PROMPT_TIMEOUT_MS),
-    )
+    const client = await ensureOmpAcp(agent)
+    // Fire-and-forget (tg-cli#322, task-cli#138): the prior design awaited
+    // acpCall(...120_000) here, blocking Telegram delivery on the agent's real
+    // reply for up to two minutes — the root cause a rejected prior fix then
+    // papered over with a shutdown drain timer instead of removing the wait.
+    // The actual ask was just "get the message to the agent", not "wait for and
+    // surface the reply", so we write the NDJSON frame and return immediately.
+    // Whenever the real session/prompt response eventually arrives,
+    // pumpAcpClient's read loop finds no matching pending call for its id and
+    // drops it, same as any other unmatched ACP notification — nothing is
+    // awaiting it, so nothing hangs.
+    writeAcp(client, buildAcpSessionPrompt(client.nextId++, client.sessionId, text))
     return { ok: true }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err)
-    log(`omp-acp: prompt failed cwd=${cwd} session=${agent.sessionId ?? "-"}: ${error}`)
-    // A timed-out/errored session/prompt does NOT by itself mean the ACP pipe
-    // is wedged: session/prompt only resolves at turn completion, so a
-    // healthy turn still running past ACP_PROMPT_TIMEOUT_MS -- or a human
-    // still deciding a live session/request_permission prompt (the
-    // documented 12h ABANDONED_PERMISSION_RETAIN_MS "never lose the tap"
-    // guarantee) -- looks identical to a dead pipe from this call alone.
-    // Only evict + kill when BOTH signals say otherwise: no ACP traffic at
-    // all since we sent the prompt (lastActivityAt didn't move), and no
-    // permission reply is still owed on this client. Genuine live evidence
-    // (2026-09-09): a session already owned by another live process timed out
-    // 3x over 30 min with zero traffic and no pending permission -- that
-    // case still gets evicted below so the next attempt spawns a clean
-    // process instead of reusing the dead pipe.
-    if (client) {
-      const hasPendingPermission = client.pendingPermissions > 0
-      const sawActivitySincePrompt = client.lastActivityAt > promptSentAt
-      if (!hasPendingPermission && !sawActivitySincePrompt) {
-        const key = ompAcpKey(agent)
-        if (ompAcpClients.get(key) === client) ompAcpClients.delete(key)
-        client.proc.kill()
-        log(`omp-acp: evicted wedged client cwd=${cwd} session=${agent.sessionId ?? "-"}`)
-      } else {
-        log(
-          `omp-acp: prompt timed out but not evicting cwd=${cwd} session=${agent.sessionId ?? "-"} ` +
-            `(pendingPermissions=${client.pendingPermissions}, activitySincePrompt=${sawActivitySincePrompt})`,
-        )
-      }
-    }
+    log(`omp-acp: prompt delivery failed cwd=${cwd} session=${agent.sessionId ?? "-"}: ${error}`)
     return { ok: false, error }
   }
 }
@@ -9539,6 +9510,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
 
   log(`daemon up — pid ${process.pid}, bot ${ctx.botId}, offset ${offset}`)
 
+  let recoveryQueue: TgUpdate[] | null = null
+  {
+    const leftover = parsePendingBatch(readFileOrNull(ctx.paths.pendingBatch))
+    if (leftover.length > 0) {
+      log(`recovering ${leftover.length} update(s) from a pending batch left by a prior crash/kill`)
+      recoveryQueue = leftover
+    }
+  }
+
   for (;;) {
     // Graceful shutdown lands here BETWEEN batches — after the previous batch's
     // actions fully executed, before the next long-poll — so a reload never drops
@@ -9625,6 +9605,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         }
       }
 
+      let json: { ok: boolean; result?: TgUpdate[]; description?: string }
+      if (recoveryQueue !== null) {
+        json = { ok: true, result: recoveryQueue }
+        recoveryQueue = null
+      } else {
       // The idle long-poll is abortable by SIGTERM (beginGracefulShutdown) so a
       // reload doesn't wait out the 50s poll; the timeout is the normal ceiling.
       // Re-check shuttingDown AFTER creating the controller and pre-abort if set:
@@ -9657,7 +9642,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         await drainAwareSleep(5000)
         continue
       }
-      const json = (await resp.json()) as { ok: boolean; result?: TgUpdate[]; description?: string }
+      json = (await resp.json()) as { ok: boolean; result?: TgUpdate[]; description?: string }
       if (!json.ok || !Array.isArray(json.result)) {
         log(`getUpdates API error: ${json.description ?? "malformed response"}`)
         await drainAwareSleep(5000)
@@ -9665,6 +9650,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
       consecutive409 = 0
       warned409 = false
+      }
+
+      // Durably journal the raw batch BEFORE stepUpdates/offset-advance (tg-cli#322): if this
+      // write completes, ANY subsequent crash — including one back inside stepUpdates or during
+      // action dispatch — has a durable copy to replay via recoveryQueue on the next startup.
+      // Unconditional on the recovery path too: harmless idempotent rewrite of the same content.
+      if (json.result.length > 0) {
+        atomicWrite(ctx.paths.pendingBatch, serializePendingBatch(json.result))
+      }
 
       const step = stepUpdates(json.result, {
         cfg: ctx.cfg,
@@ -9704,9 +9698,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         },
       })
 
-      // At-most-once (spec §10): persist the offset BEFORE acting. A crash
-      // mid-action loses the message (the human resends); a replay would
-      // double-inject ghost prompts into a live agent session — strictly worse.
+      // The batch is durably journaled BEFORE this point (see the atomicWrite above), so
+      // persisting the offset here no longer risks losing the update if a kill lands during
+      // action dispatch: recovery-on-restart (recoveryQueue, top of runDaemon) replays the
+      // pending-batch file. Telegram will redeliver anything whose offset was never advanced —
+      // i.e. a crash before this line, including mid-write of the journal itself, which a POSIX
+      // atomic rename makes never partially-visible. Anything past this line is recoverable from
+      // OUR OWN journal instead of relying on Telegram redelivery.
       if (step.newOffset !== offset) {
         offset = step.newOffset
         writeFileSync(ctx.paths.offset, `${offset}\n`)
@@ -9816,6 +9814,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           })
         }),
       )
+
+      // The batch fully completed — the journal is no longer needed. Best-effort:
+      // if this unlink fails the next startup replays the same batch (idempotent/dedupe-tolerant
+      // downstream, matching the rest of the codebase's at-least-once handling, e.g. the Stop-hook
+      // inbox fallback).
+      if (json.result.length > 0) {
+        try {
+          unlinkSync(ctx.paths.pendingBatch)
+        } catch {}
+      }
     } catch (err) {
       // A SIGTERM-aborted long-poll surfaces here as an AbortError — that is a
       // clean graceful exit (no batch was in flight, since fetch never returned),

@@ -471,6 +471,9 @@ export interface CtlPaths {
   lastUserTarget: string; // pane of the CTO's own last resolved inbound delivery (tg-cli#78 anchor fix)
   usageSchedule: string; // watermark of the last week/month period reported via the /spend scheduled push (#290)
   dailyPending: string; // a /daily report whose Telegram send failed, re-delivered on the next /daily (#290)
+  pendingBatch: string; // durable local journal of a not-yet-fully-processed getUpdates batch —
+  // written BEFORE the offset advances so a crash between telling Telegram we have it and
+  // finishing the work can never lose it; see runDaemon recovery-on-startup
   awarenessNudge: string; // durable per-agent silence-nudge state (tg-ctl#363)
 }
 

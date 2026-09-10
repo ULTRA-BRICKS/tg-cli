@@ -467,13 +467,24 @@ delayed, or hung waiting for a button tap.
 - Bot token shared by `tg` (`sendMessage`) and `tg-ctl` (`getUpdates`): `sendMessage`
   does not conflict with the long-poll; only one `getUpdates` consumer is allowed →
   enforced by the singleton.
-- **Offset persistence & delivery semantics (added by review F4):** persist the
+- **Offset persistence & delivery semantics (revised, tg-cli#322):** persist the
   last-confirmed `update_id` per bot id in `~/.config/tg-cli/tg-ctl.<botid>.offset`,
   shared between modes so a future handover doesn't replay. Semantics:
-  **at-most-once** — advance the offset BEFORE acting on an update. A crash
-  between confirm and inject loses that message (the human notices no response
-  and resends); the alternative (at-least-once) double-injects ghost prompts
-  into a live agent session, which is strictly worse for a control channel.
+  **at-least-once** — the raw batch is durably journaled to
+  `~/.config/tg-cli/tg-ctl.<botid>.pending-batch.json` (atomic temp-file + rename)
+  BEFORE the offset advances, not after. A crash before that journal write means
+  the offset never advanced, so Telegram itself redelivers the update on the next
+  `getUpdates` call (an update is only consumed once `getUpdates` is called with
+  `offset > update_id` — failing to advance the offset redelivers indefinitely, up
+  to the 24h server retention window). A crash after the journal write but before
+  the batch's actions fully dispatch is recovered LOCALLY on the next daemon
+  startup, by replaying the leftover pending-batch file through the exact same
+  `stepUpdates` + action-dispatch path before normal polling resumes. Net effect:
+  delivery is at-least-once with idempotent/dedupe-tolerant downstream handling
+  (matching how the rest of the codebase already treats double-delivery, e.g. the
+  Stop-hook inbox fallback's own dedup checks) — replacing the previous
+  at-most-once design (advance the offset before acting; a crash mid-action
+  silently lost the message).
 - **Stale flood (review F4):** offset persistence does NOT stop the 24 h Telegram
   backlog accumulated while the daemon was down. Drop every inbound whose
   `message.date` is older than `control.staleness_sec` (default 300 s) and send

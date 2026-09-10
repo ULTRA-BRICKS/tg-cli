@@ -30,6 +30,7 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     lastUserTarget: join(configDir, `${base}.last-user-target.json`),
     usageSchedule: join(configDir, `${base}.usage-schedule.json`),
     dailyPending: join(configDir, `${base}.daily-pending.txt`),
+    pendingBatch: join(configDir, `${base}.pending-batch.json`),
     awarenessNudge: join(configDir, `${base}.awareness-nudge.json`),
   };
 }

@@ -6,11 +6,14 @@
 // never imports inject.ts (the entrypoint binds wrapInbound to the config
 // template).
 //
-// Delivery semantics are at-most-once (spec §10): the offset advances over
-// EVERY update — rejected senders and unsupported kinds included — so nothing
-// is ever replayed into a live agent session. Owner messages are NOT dropped by
-// age (#183): if Telegram delivered the update after daemon downtime, it is
-// still a real instruction and must reach the agent.
+// The entrypoint durably journals the raw batch (ctx.paths.pendingBatch, atomic
+// temp+rename) BEFORE persisting the offset returned here, so a crash before the
+// offset is written is recovered either by Telegram's own redelivery (offset
+// never advanced) or by replaying the journal on daemon startup (offset advanced,
+// journal not yet cleared) — see runDaemon. stepUpdates's own per-update offset
+// advance is no longer the sole loss-prevention point. Owner messages are NOT
+// dropped by age (#183): if Telegram delivered the update after daemon downtime,
+// it is still a real instruction and must reach the agent.
 
 import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatus } from './types';
 import { parseButtonCallback, parseQuestionCloseCallback } from './questions';
@@ -466,6 +469,24 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
     newOffset: updates.length ? maxId + 1 : opts.currentOffset,
     skippedStale: 0, // legacy field; owner inbound is no longer skipped by age (#183)
   };
+}
+
+// Durable local journal (tg-cli#322): the raw batch is written to
+// ctx.paths.pendingBatch BEFORE the offset advances, so a crash between "told
+// Telegram we have it" and "finished acting on it" is recovered by replaying
+// this file on the next startup instead of being silently lost.
+export function serializePendingBatch(updates: TgUpdate[]): string {
+  return `${JSON.stringify(updates)}\n`;
+}
+
+export function parsePendingBatch(content: string | null): TgUpdate[] {
+  if (content === null) return [];
+  try {
+    const parsed = JSON.parse(content);
+    return Array.isArray(parsed) ? (parsed as TgUpdate[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 function senderAllowed(sender: number | undefined, opts: StepOpts): boolean {

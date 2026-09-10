@@ -3,6 +3,14 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.52.5
+
+**Fix (tg-cli#322): fire-and-forget omp ACP delivery; journal getUpdates batches before offset advance.**
+
+- `promptOmpAcp` writes `session/prompt` without awaiting the turn (Telegram delivery no longer blocks up to 120s).
+- Daemon persists raw batches to `pending-batch.json` before advancing offset, with startup replay after crash/kill.
+- Builds on #362's concurrent per-target dispatch; journal unlink runs after the batch fully completes.
+
 ## 1.52.4
 
 **Fix (tg-cli#357): stop ACP action delivery head-of-line blocking across the agent fleet.**
