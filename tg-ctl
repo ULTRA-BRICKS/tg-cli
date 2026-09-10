@@ -4070,6 +4070,19 @@ function resolveLastUserTarget(ctx: Ctx, candidates: TargetPane[]): TargetPane |
   return routeMatchesPane({ recognizedCwd: anchor.cwd, panePath: hit.pane.panePath }) ? hit : null
 }
 
+// Same anchor lookup as resolveLastUserTarget, but against the merged
+// tmux+omp AgentCandidate view (listAgentCandidates()) instead of the
+// tmux-only TargetPane view — used by injectViaTarget's no-tmux-pane
+// fallback so the tg-cli#78 anchor also covers out-of-tmux omp agents
+// (tg-cli#369).
+function resolveLastUserTargetCandidate(ctx: Ctx, candidates: AgentCandidate[]): AgentCandidate | null {
+  const anchor = parseLastUserTarget(readFileOrNull(ctx.paths.lastUserTarget))
+  if (!anchor) return null
+  const hit = candidates.find((c) => c.paneId === anchor.paneId)
+  if (!hit) return null
+  return routeMatchesPane({ recognizedCwd: anchor.cwd, panePath: hit.panePath }) ? hit : null
+}
+
 // Resolve a `/tasks [<agent>]` selector to the relevant project dir. With no
 // selector, replies target the replied-to agent, otherwise the command uses the
 // same default target the daemon would route an inbound message to. Ambiguous
@@ -6193,6 +6206,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           return injectPrewrappedToPane(candidates[0].paneId, deferText, sourceMessageId, candidates[0].panePath ?? "/")
         }
         if (candidates.length > 1) {
+          if (autoBind) {
+            const anchored = resolveLastUserTargetCandidate(ctx, candidates)
+            if (anchored) {
+              log(`inject: no tmux pane, anchor bind ${anchored.paneId}/${anchored.windowName}`)
+              return injectPrewrappedToPane(anchored.paneId, deferText, sourceMessageId, anchored.panePath ?? "/")
+            }
+          }
           return postRoutePicker(candidates, deferText, undefined, sourceMessageId)
         }
       }

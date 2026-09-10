@@ -3,6 +3,19 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.52.2
+
+**Fix (tg-cli#369): non-reply auto-bind (tg-cli#78 anchor) now applies with 2+ out-of-tmux omp candidates.**
+
+- `injectViaTarget`'s no-tmux-pane fallback (`found.reason === "no-agent"`) now
+  consults the tg-cli#78 last-user-target anchor via a new
+  `resolveLastUserTargetCandidate` helper before falling back to the agent
+  picker, when 2+ live omp agents are running outside tmux and `autoBind` is
+  set. Previously it picked purely by candidate count and always re-posted the
+  picker for 2+ candidates, silently dropping the #78 guarantee for the
+  out-of-tmux-omp case.
+- New regression test `tests/ctl-omp-anchor-multicandidate.test.ts`.
+
 ## 1.52.1
 
 **Fix (tg-cli#349): the hatch approval retention fix now also covers the raw `UNSCOPED_ABANDON_MS` backstop timer, not just socket close.**
@@ -24,7 +37,6 @@ was killed early went through the already-fixed path.
   `TG_CTL_UNSCOPED_TIMEOUT_MS`) retires the entry. Fails against the pre-fix code (generic
   "expired — answer in terminal" text instead of the hatch-specific disconnect text) and passes
   with the fix.
-
 ## 1.52.0
 
 **Feature: tg-ctl active-silence nudge for tg-unaware agent sessions (tg-cli#363).**
@@ -146,7 +158,6 @@ and the agent was told a card visible in Telegram had never been sent.
 
 Not changed here: the 115-second hook budget / 110-second unscoped expiry (tg-cli#303) and
 the empty routing fields (`agent=claude pane=-`) for a request raised from a codex session.
-
 ## 1.50.0
 
 **Fix: tg-ctl asks once before falling back from private topics to flat `/new` spawns (tg-cli#181).**
