@@ -95,6 +95,30 @@ function readOptions(raw: unknown): ButtonOption[] | null {
   return out.length ? out : null;
 }
 
+// Tolerant readers for the grant protocol v1.1 additive subfields (tg-cli#398):
+// a present-but-malformed subfield is DROPPED (the field degrades to its
+// remaining valid parts, or undefined), never a rejection — an old daemon must
+// keep accepting a new lib's payload.
+function readAskOrigin(raw: unknown): ButtonRequest['origin'] {
+  const rec = asRecord(raw);
+  if (!rec) return undefined;
+  const out: NonNullable<ButtonRequest['origin']> = {};
+  if (typeof rec.agent === 'string' && rec.agent) out.agent = rec.agent;
+  if (typeof rec.sessionId === 'string' && rec.sessionId) out.sessionId = rec.sessionId;
+  if (typeof rec.subagent === 'string' && rec.subagent) out.subagent = rec.subagent;
+  return Object.keys(out).length ? out : undefined;
+}
+function readAskOperation(raw: unknown): ButtonRequest['operation'] {
+  const rec = asRecord(raw);
+  if (!rec) return undefined;
+  const out: NonNullable<ButtonRequest['operation']> = {};
+  if (typeof rec.kind === 'string' && rec.kind) out.kind = rec.kind;
+  if (typeof rec.fingerprint === 'string' && rec.fingerprint) out.fingerprint = rec.fingerprint;
+  if (typeof rec.cwd === 'string' && rec.cwd) out.cwd = rec.cwd;
+  if (typeof rec.repoRoot === 'string' && rec.repoRoot) out.repoRoot = rec.repoRoot;
+  return Object.keys(out).length ? out : undefined;
+}
+
 // Build a ButtonRequest from an already-known field set, folding in the env.
 // `promptTurnId`, when non-empty, rides along as ButtonRequest.promptTurnId —
 // the identity proof tg-ctl requires before auto-delivering a QUEUED
@@ -174,6 +198,16 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       // goes through — it must survive here or `critical:true` would silently
       // never reach the daemon at all.
       critical: p.critical === true ? true : undefined,
+      // Grant protocol v1.1 additive fields (tg-cli#398): carry them through
+      // tolerantly — the agent-tools lib ships independently of this daemon,
+      // so an old lib simply omits them (undefined) and malformed subfields
+      // are dropped, never a rejection. `operation` is OPAQUE here (the lib
+      // computes the fingerprint; the daemon only compares it, grants.ts).
+      hookId: typeof p.hookId === 'string' && p.hookId ? p.hookId : undefined,
+      timeoutMs:
+        typeof p.timeoutMs === 'number' && Number.isFinite(p.timeoutMs) && p.timeoutMs > 0 ? p.timeoutMs : undefined,
+      origin: readAskOrigin(p.origin),
+      operation: readAskOperation(p.operation),
     };
   }
 

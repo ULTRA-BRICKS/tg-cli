@@ -124,6 +124,7 @@ import {
   type InboxEntry,
 } from "./features/tg-ctl/inbox"
 import {
+  agentInboxKey,
   describeUnreachable,
   findUnreachableAgents,
   inboxKeyCollisions,
@@ -212,11 +213,12 @@ import {
   buildClaudeQuestionAnswerOutput,
   buildPostTimeoutQuestionMessage,
   callbackRequestId,
+  clampRequestTimeoutMs,
   collectQuestionAnswers,
   formatAgentHookOutput,
   hatchAbandonedLongOutageText,
   hatchAbandonedPermissionText,
-  hatchApprovalRecordedText,
+  hatchGrantApprovedText,
   hatchParseMode,
   hatchProactiveDecisionText,
   isHatchPermissionRequest,
@@ -244,6 +246,21 @@ import {
   planCriticalReminder,
   type DaemonCriticalState,
 } from "./features/tg-ctl/hatch-critical-reminder"
+import {
+  buildGraceRecord,
+  buildGrantRecord,
+  grantDenyReasonText,
+  hatchGrantNoticeText,
+  isGrantableRequest,
+  parseGrantStore,
+  pruneGrantStore,
+  pullGrant,
+  routeForRequest,
+  serializeGrantStore,
+  upsertGraceRecord,
+  verifyGrant,
+  type GrantStoreData,
+} from "./features/tg-ctl/grants"
 import {
   parseRegistrations,
   pruneRegistrations,
@@ -372,6 +389,17 @@ export const USAGE = `Usage:
   tg-ctl usage-schedule disable
                          # remove the scheduled usage-report launchd job
   tg-ctl ask             # internal: hook client, reads a ButtonRequest JSON from stdin
+                         # optional per-request timeoutMs field extends the wait,
+                         # capped at 15 min (agent-tools sends 600000 for hatch asks)
+  tg-ctl ask --verify-grant <approval_id> --hook <hook_id>
+                         # internal: consume a late-approval grant by its id
+                         # (single-use, bound to hook + operation + cwd); stdin
+                         # carries the normalized payload; replies allow/deny
+                         # hookSpecificOutput JSON on stdout, exit 0 always
+  tg-ctl ask --verify-grant --pull --hook <hook_id>
+                         # internal: consume an outstanding grant WITHOUT an id —
+                         # matched by hook + operation + the daemon-observed route
+                         # (for hooks with no env channel); same reply shape
   tg-ctl install-hooks   # wire q→buttons + StopFailure + Claude/Codex usage telemetry
                          #   (codex: delegates to rig when present — rig owns ~/.codex hooks)
   tg-ctl voice-setup     # discover a local Whisper (~/xp) → configure inbound voice→text
@@ -1437,6 +1465,63 @@ function queueToInbox(ctx: Ctx, key: string, entry: InboxEntry): void {
   const pending = join(dir, PENDING_FILE)
   appendFileSync(pending, serializeInboxEntry(entry), { mode: INBOX_FILE_MODE })
   tightenInboxModes(dir, pending)
+}
+
+// Route the late-approval grant notice (tg-cli#398) to the ask's origin WITHOUT
+// depending on a live permission menu or a tmux pane — the production failure
+// this exists to fix was exactly that dependency (the pane-injection path in
+// lateDeliverAbandonedQuestion logged `ask-late-deliver-permission-pane-skip
+// reason=no-menu` and dropped the delivery for headless hatch asks, ≥8
+// instances on 2026-09-10). Priority mirrors routeForRequest's identity order
+// (grants.ts): a real pane → omp ACP (origin.agent === "omp", preferring
+// origin.sessionId, else a live-agent match on subagent name / cwd basename —
+// session/load revives a persisted session even after its process exited) →
+// the Stop-hook inbox (the default route for paneless agents, THE shared
+// contract with agent-tools' inbox reader). Returns whether the notice was
+// DELIVERED on any channel; a Telegram ACP/inbox total failure is reported by
+// the caller on the card (the grant itself still stands — the token path
+// always works).
+async function routeGrantNotice(ctx: Ctx, req: ButtonRequest, text: string): Promise<boolean> {
+  if (req.paneId) {
+    try {
+      const res = await executeInjectSteps(buildTextInjectPlan(req.paneId, wrapInbound(ctx.cfg.injectWrap, "tg", text)))
+      return res.ok
+    } catch (err) {
+      log(`grant-notice pane route failed pane=${req.paneId}: ${err instanceof Error ? err.message : String(err)}`)
+      return false
+    }
+  }
+  if (req.origin?.agent === "omp") {
+    let target: OmpAcpTarget | null = null
+    if (req.origin.sessionId) target = { cwd: req.cwd, sessionId: req.origin.sessionId }
+    else {
+      const agents = listLiveOmpAgents()
+      const matched = req.origin.subagent ? matchLiveOmp(req.origin.subagent, agents) : []
+      const agent =
+        matched[0] ??
+        agents.find((a) => Boolean(a.cwd && req.cwd && basename(a.cwd) === basename(req.cwd))) ??
+        null
+      if (agent) target = { cwd: agent.cwd ?? req.cwd, sessionId: agent.sessionId, pid: agent.pid }
+    }
+    if (target) {
+      const res = await promptOmpAcp(target, text)
+      if (res.ok) return true
+      log(`grant-notice omp route failed (falling back to inbox) session=${target.sessionId ?? "-"}: ${res.error}`)
+    }
+  }
+  try {
+    queueToInbox(ctx, agentInboxKey(req.origin?.subagent ?? req.subagent ?? null, req.cwd ?? "/"), {
+      id: null,
+      ts: new Date().toISOString(),
+      from: "tg",
+      text,
+      wrapped: text,
+    })
+    return true
+  } catch (err) {
+    log(`grant-notice inbox route failed key-cwd=${req.cwd ?? "-"}: ${err instanceof Error ? err.message : String(err)}`)
+    return false
+  }
 }
 
 function listInboxKeys(ctx: Ctx): string[] {
@@ -3028,6 +3113,20 @@ const ABANDONED_PERMISSION_RETAIN_MS = (() => {
   return Number.isFinite(raw) && raw > 0 ? raw : 12 * 60 * 60_000
 })()
 
+// Grant protocol v1.1 windows (tg-cli#398): how long an EXPIRED hatch ask stays
+// addressable for a late Approve tap (grace), and how long a minted grant stays
+// consumable (grant TTL). Both default 24h; env-overridable so integration
+// tests can expire a grant/grace without a real 24h wait — production never
+// sets them. (Same override style as TG_CTL_UNSCOPED_TIMEOUT_MS.)
+const GRACE_WINDOW_MS = (() => {
+  const raw = Number(process.env.TG_CTL_GRACE_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 24 * 60 * 60_000
+})()
+const GRANT_TTL_MS = (() => {
+  const raw = Number(process.env.TG_CTL_GRANT_TTL_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 24 * 60 * 60_000
+})()
+
 // PURE — the single source of truth for "which retention window applies to
 // this entry's kind" (review finding, round 5: this ternary was duplicated
 // verbatim at 5+ call sites, risking future drift) and "is it past that
@@ -3088,43 +3187,13 @@ export function decideQueuedPermissionReconnect(
   return { kind: "deliver", queuedDecision: retained.queuedDecision }
 }
 
-// Find a retained hatch decision for `hookId` (see parseHatchHookId) that a
-// fresh retry (a NEW requestId, same hookId) can consume. Unlike
-// decideQueuedPermissionReconnect (keyed by exact requestId equality — the
-// reconnect-of-the-SAME-process case) this scans by hookId because a hatch
-// retry is always a genuinely NEW requestId/process, never a reconnect of the
-// old one.
-//
-// `cwd` (tg-cli#403 security review finding): hookId alone is NOT a safe
-// match key on its own — hook names (e.g. "block-reset-hard",
-// "block-devserver-primary") are short, conventional strings a rig/hook
-// framework encourages reusing verbatim ACROSS unrelated projects. Before
-// critical mode, a stale cross-project match was bounded by
-// ABANDONED_PERMISSION_RETAIN_MS (12h) — a real but narrow window. Critical
-// mode's Infinity retention (retainMsFor above) removes that bound entirely
-// for a critical entry, which would otherwise let a decision approved ONCE,
-// in ONE project, auto-apply FOREVER to any later, unrelated project that
-// happens to fire a same-named hatch hook. Scoping the match to the SAME cwd
-// (the project directory a hatch ask always carries — see
-// normalizeHookPayload's `cwd: … ?? env.cwd`, which is always a real
-// `process.cwd()` string) closes that cross-project blast radius while
-// leaving every legitimate same-project retry (the ONLY case this mechanism
-// exists for) unaffected.
-function findQueuedHatchDecision(
-  abandoned: Map<string, AbandonedButton>,
-  hookId: string,
-  cwd: string | undefined,
-  now: number,
-): { key: string; entry: AbandonedButton; queuedDecision: NonNullable<AbandonedButton["queuedDecision"]> } | null {
-  for (const [key, entry] of abandoned) {
-    if (!entry.queuedDecision) continue
-    if (parseHatchHookId(entry.req.requestId) !== hookId) continue
-    if (entry.req.cwd !== cwd) continue
-    if (isAbandonedExpired(entry.req.kind, entry.at, now, entry.req.critical)) continue
-    return { key, entry, queuedDecision: entry.queuedDecision }
-  }
-  return null
-}
+// REMOVED (tg-cli#398, grant protocol v1.1): findQueuedHatchDecision and the
+// handleHookSocketLine hatch short-circuit it fed. That mechanism authorized
+// ANY later operation behind the same hookId — exactly the over-broad silent
+// approval v1.1 forbids. A late Approve now mints a single-use,
+// operation-bound grant (grants.ts) and a plain retry WITHOUT a grant simply
+// posts a FRESH card (or consumes an outstanding grant via --verify-grant
+// --pull, route-bound).
 
 // How long a QUEUED permission decision can wait with no reconnect before the
 // human gets a PROACTIVE "still waiting to reconnect" notice — a NOTICE
@@ -3176,7 +3245,11 @@ function pruneAbandonedButtons(
   }
 }
 
-function normalizeButtonRequest(value: unknown): ButtonRequest | null {
+// Exported for tests (same pattern as retainMsFor/isAbandonedExpired above):
+// the AUTHORITATIVE socket/disk validator is the boundary the grant protocol's
+// additive fields (tg-cli#398) must survive, so tests/ctl-grants.test.ts pins
+// its tolerance contract directly instead of through a daemon round-trip.
+export function normalizeButtonRequest(value: unknown): ButtonRequest | null {
   if (!value || typeof value !== "object") return null
   const rec = value as Record<string, unknown>
   const requestId = typeof rec.requestId === "string" && rec.requestId ? rec.requestId : null
@@ -3253,7 +3326,41 @@ function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     // CLIENT-side counterpart lives in hook-normalize.ts's
     // normalizeHookPayload "already normalized" branch.
     critical: rec.critical === true ? true : undefined,
+    // Grant protocol v1.1 additive fields (tg-cli#398) — the AUTHORITATIVE
+    // socket/disk validator carries them tolerantly: unknown or malformed
+    // subfields are dropped, never a rejection, so an old lib ↔ new daemon
+    // (or vice versa) keep interoperating. `operation` is OPAQUE (the lib
+    // computes the fingerprint; this daemon only compares it, grants.ts).
+    hookId: typeof rec.hookId === "string" && rec.hookId ? rec.hookId : undefined,
+    timeoutMs:
+      typeof rec.timeoutMs === "number" && Number.isFinite(rec.timeoutMs) && rec.timeoutMs > 0 ? rec.timeoutMs : undefined,
+    origin: readAskAdditiveOrigin(rec.origin),
+    operation: readAskAdditiveOperation(rec.operation),
   }
+}
+
+// Subfield-tolerant readers for the v1.1 additive fields (tg-cli#398) — same
+// tolerance contract as hook-normalize.ts's readAskOrigin/readAskOperation,
+// duplicated at the authoritative boundary on purpose: the daemon MUST NOT
+// trust the client side's normalization for a socket/disk payload.
+function readAskAdditiveOrigin(raw: unknown): ButtonRequest["origin"] {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined
+  const rec = raw as Record<string, unknown>
+  const out: NonNullable<ButtonRequest["origin"]> = {}
+  if (typeof rec.agent === "string" && rec.agent) out.agent = rec.agent
+  if (typeof rec.sessionId === "string" && rec.sessionId) out.sessionId = rec.sessionId
+  if (typeof rec.subagent === "string" && rec.subagent) out.subagent = rec.subagent
+  return Object.keys(out).length ? out : undefined
+}
+function readAskAdditiveOperation(raw: unknown): ButtonRequest["operation"] {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined
+  const rec = raw as Record<string, unknown>
+  const out: NonNullable<ButtonRequest["operation"]> = {}
+  if (typeof rec.kind === "string" && rec.kind) out.kind = rec.kind
+  if (typeof rec.fingerprint === "string" && rec.fingerprint) out.fingerprint = rec.fingerprint
+  if (typeof rec.cwd === "string" && rec.cwd) out.cwd = rec.cwd
+  if (typeof rec.repoRoot === "string" && rec.repoRoot) out.repoRoot = rec.repoRoot
+  return Object.keys(out).length ? out : undefined
 }
 
 function canForwardButtonRequest(req: ButtonRequest): boolean {
@@ -3336,6 +3443,20 @@ interface QuestionRuntime {
   // a backlog. Must run AFTER the entry is deleted from `pending` so the per-pane
   // guard sees the real post-removal state.
   onUnscopedRelease: () => void
+  // Grant protocol v1.1 (tg-cli#398): the daemon-owned grant + grace store
+  // (in-memory mirror of the 0600 file at paths.grants; grants.ts). The daemon
+  // is the ONLY authority — clients never touch this file.
+  grants: GrantStoreData
+  // Persist the grant store (atomic 0600 write). FAIL-CLOSED, unlike the
+  // best-effort question persist: returns false on write failure, and every
+  // grant mutation (mint/consume) MUST roll its in-memory change back and
+  // deny/report rather than confirm a grant that a restart would replay or
+  // lose.
+  persistGrants: () => boolean
+  // A hatch permission ask EXPIRED (retired from `pending`, both paths —
+  // the unscoped backstop timer and the hook socket close): upsert its grace
+  // record so a late tap within GRACE_WINDOW_MS stays addressable.
+  onHatchExpired: (entry: PendingButton, pendingKey: string) => void
 }
 
 // A genuinely dead card: an UNSCOPED question (no pane to late-deliver to) that
@@ -3442,6 +3563,12 @@ function expireDeadCard(ctx: Ctx, entry: PendingButton): void {
 // re-breaking tg-cli#349 in the default scenario (review finding on #350,
 // which had only fixed the already-exited/socket-close case).
 function retireAbandonedEntry(ctx: Ctx, rt: QuestionRuntime, entry: PendingButton, pendingKey: string): void {
+  // Grant protocol v1.1 (tg-cli#398): an expiring HATCH permission becomes
+  // addressable for a late tap through its 24h grace record REGARDLESS of the
+  // retained/expired decision below (retention is 12h; grace outlives it, so a
+  // tap after the entry is pruned still mints a grant). Fail-soft with a loud
+  // log: grace loss degrades the feature but never authorizes anything.
+  if (entry.req.kind === "permission" && isHatchRequest(entry.req)) rt.onHatchExpired(entry, pendingKey)
   if (retainAbandonedQuestion(rt, entry, pendingKey)) {
     if (entry.req.kind === "question" && !entry.req.multiQuestion) {
       rt.onTerminalFallback(entry.req.paneId as string)
@@ -3554,7 +3681,10 @@ async function forwardAndPostQuestion(
         tgctl: "ask-status", state: "expired", messageId: entry.messageId, ageMs: Date.now() - entry.at,
       })
       socket.end("null\n")
-    }, UNSCOPED_ABANDON_MS)
+    // Contract §1 (tg-cli#398): a per-request timeoutMs (hatch asks carry
+    // 600000) overrides the unscoped-abandon default, clamped to the 15-min
+    // cap (clampRequestTimeoutMs). Absent → UNSCOPED_ABANDON_MS unchanged.
+    }, clampRequestTimeoutMs(req.timeoutMs, UNSCOPED_ABANDON_MS))
   }
   rt.pending.set(pendingKey, entry)
   const conn = armPendingSocketClose(ctx, rt, entry, pendingKey)
@@ -3653,9 +3783,26 @@ function startHookServer(ctx: Ctx, rt: QuestionRuntime): Server | null {
 }
 
 async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socket, line: string): Promise<void> {
+  // The verify-grant exchange (grant protocol v1.1, tg-cli#398) is NOT a
+  // ButtonRequest — it is dispatched by its marker BEFORE normalization so an
+  // old/normalized-looking payload can never be confused with a question
+  // forward. Cross-repo compatibility: an OLD daemon (no marker handling)
+  // receives this line, fails normalizeButtonRequest, and drops it as
+  // "unparsable-payload" with a `null` reply — the new lib's client fails
+  // CLOSED on that (deny), which is the correct self-healing behavior.
+  let parsedLine: unknown
+  try {
+    parsedLine = JSON.parse(line)
+  } catch {
+    parsedLine = undefined
+  }
+  if (parsedLine && typeof parsedLine === "object" && (parsedLine as { tgctl?: unknown }).tgctl === "verify-grant") {
+    await handleVerifyGrantRequest(ctx, rt, socket, parsedLine as Record<string, unknown>)
+    return
+  }
   let req: ButtonRequest | null = null
   try {
-    req = normalizeButtonRequest(JSON.parse(line))
+    req = parsedLine === undefined ? null : normalizeButtonRequest(parsedLine)
   } catch {
     // malformed hook payload: let the local agent UI take over
   }
@@ -3698,38 +3845,12 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
     return
   }
 
-  // Hatch retry short-circuit: a fresh RIG_HATCH_REQUEST_<HOOK_ID> attempt mints
-  // a brand-new requestId every time (see parseHatchHookId's doc comment,
-  // questions.ts), so the ordinary reconnect re-attach below (keyed by EXACT
-  // requestId equality) can never find a prior attempt for the same hatch. Look
-  // it up by hookId instead — if a PRIOR attempt for the SAME hook already got a
-  // human decision that couldn't be delivered (queued on socket close by
-  // armPendingSocketClose, or on tap by the permission tap handler below),
-  // apply it now instead of posting a brand-new card and making the human
-  // decide twice for what is, from their side, the exact same request.
-  const hookId = parseHatchHookId(req.requestId)
-  if (hookId !== null) {
-    const found = findQueuedHatchDecision(rt.abandoned, hookId, req.cwd, Date.now())
-    if (found) {
-      rt.abandoned.delete(found.key)
-      const answer: ButtonAnswer = {
-        status: "answered",
-        requestId: req.requestId,
-        label: found.queuedDecision.label,
-        value: found.queuedDecision.value,
-        decision: found.queuedDecision.decision,
-      }
-      const output = formatAgentHookOutput(req, answer)
-      socket.end(output === null ? "null\n" : `${JSON.stringify(output)}\n`)
-      rt.persist()
-      if (found.entry.messageId !== null) {
-        void clearMessageKeyboard(ctx, found.entry.messageId)
-        void editMessageText(ctx, found.entry.messageId, buildAnsweredQuestionText(found.entry.req, found.queuedDecision.label), undefined, hatchParseMode(found.entry.req))
-      }
-      log(`ask-forward hatch-queued-decision-delivered: hookId=${hookId} key=${found.key} label=${found.queuedDecision.label}`)
-      return
-    }
-  }
+  // REMOVED (tg-cli#398): the hatch retry short-circuit that auto-applied a
+  // queued tap to ANY retry behind the same hookId (see the note at the old
+  // findQueuedHatchDecision site). A plain hatch retry now simply forwards a
+  // FRESH card; a late human approval reaches the agent exclusively through
+  // the operation-bound, single-use grant consumed via the verify-grant
+  // protocol (handleVerifyGrantRequest, dispatched before normalization above).
 
   const pendingKey = callbackRequestId(req)
   if (rt.activeKeys.has(pendingKey)) {
@@ -3958,6 +4079,112 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
   await forwardAndPostQuestion(ctx, rt, req, socket, pendingKey)
 }
 
+// --- Grant protocol v1.1 (tg-cli#398): the verify-grant exchange ---
+//
+// The daemon is the ONLY grant authority. A `{"tgctl":"verify-grant",…}` line
+// (dispatched from handleHookSocketLine BEFORE normalization) carries:
+//   hookId     — RIG_HATCH_REQUEST_<HOOK_ID>'s hook id (required)
+//   approvalId — TOKEN path (contract §5): explicit id, route-agnostic (the
+//                agent was told the id out-of-band)
+//   pull: true — PULL path: no id; matched by hook_id + operation + ROUTE
+//                EQUALITY (routeForRequest recomputed from `payload`, never a
+//                client-sent route field). NO blank-route fallback.
+//   payload    — the normalized ask (carries the recomputed `operation`)
+// The reply is the SAME hookSpecificOutput allow/deny JSON shape a normal ask
+// reply uses (formatAgentHookOutput where the payload normalizes, a
+// PermissionRequest envelope otherwise), PLUS the original ask's `requestId`
+// at TOP level (the pinned shape the agent-tools lib reads; it also parses
+// hookSpecificOutput.requestId tolerantly) and `approvalId` on allow.
+
+// Deny envelope: constructed directly (not via formatAgentHookOutput) so the
+// deny REASON always reaches the caller — formatAgentHookOutput only conveys
+// a reason for a RELABELED deny (plan-approval), not a bare Approve/Reject.
+function buildVerifyGrantDeny(payloadReq: ButtonRequest | null, reasonText: string, requestId: string | null): Record<string, unknown> {
+  if (payloadReq?.permissionEvent === "PreToolUse") {
+    return {
+      requestId,
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reasonText },
+    }
+  }
+  return {
+    requestId,
+    hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: reasonText } },
+  }
+}
+
+function buildVerifyGrantAllow(payloadReq: ButtonRequest | null, grant: { approval_id: string; request_id: string }): Record<string, unknown> {
+  let out: unknown = null
+  if (payloadReq) {
+    const answer: ButtonAnswer = {
+      status: "answered",
+      requestId: grant.request_id,
+      label: "Approve",
+      value: "allow",
+      decision: "allow",
+    }
+    out = formatAgentHookOutput(payloadReq, answer)
+  }
+  if (!out || typeof out !== "object") {
+    out = { hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } }
+  }
+  return { requestId: grant.request_id, approvalId: grant.approval_id, ...(out as Record<string, unknown>) }
+}
+
+// Consume-on-allow, FAIL-CLOSED: mutate consumed_at and persist BEFORE
+// replying; if the atomic write fails the mutation is rolled back and the
+// reply is a DENY — otherwise a daemon restart would resurrect the grant as
+// unconsumed and permit a single-use replay (security invariant §6).
+async function handleVerifyGrantRequest(ctx: Ctx, rt: QuestionRuntime, socket: Socket, rec: Record<string, unknown>): Promise<void> {
+  const hookId = typeof rec.hookId === "string" && rec.hookId ? rec.hookId : null
+  const approvalId = typeof rec.approvalId === "string" && rec.approvalId ? rec.approvalId : null
+  const pull = rec.pull === true
+  const payloadReq = rec.payload ? normalizeButtonRequest(rec.payload) : null
+  const reply = (obj: Record<string, unknown>): void => {
+    socket.end(`${JSON.stringify(obj)}\n`)
+  }
+  if (!hookId || (!pull && !approvalId)) {
+    log(`grant-deny: reason=malformed-request hookId=${hookId ?? "-"} approvalId=${approvalId ?? "-"} pull=${pull}`)
+    reply(buildVerifyGrantDeny(payloadReq, "malformed verify-grant request (needs --hook <hook_id>, and an approval id or --pull)", null))
+    return
+  }
+  const now = Date.now()
+  const operation = payloadReq?.operation
+  // TOKEN path: explicit approval id, route-agnostic. PULL path: no id —
+  // matched by hook_id + operation + route equality, route recomputed
+  // daemon-side from the query payload's routing fields.
+  const outcome = pull
+    ? pullGrant(rt.grants.grants, hookId, operation, payloadReq ? routeForRequest(payloadReq) : null, now)
+    : verifyGrant(rt.grants.grants, approvalId!, hookId, operation, now)
+  if (outcome.kind === "deny") {
+    const existing = pull ? null : (rt.grants.grants.find((g) => g.approval_id === approvalId) ?? null)
+    log(
+      `grant-deny: via=${pull ? "pull" : "token"} hookId=${hookId} approvalId=${approvalId ?? "-"} reason=${outcome.reason}` +
+        ` cwd=${operation?.cwd ?? "-"} route=${pull ? (payloadReq ? routeForRequest(payloadReq) : null) ?? "-" : "(n/a)"}`,
+    )
+    // Top-level requestId (the pinned shape the lib reads): the ORIGINAL ask's
+    // when the grant is known, else the retry payload's own (the lib correlates
+    // either), never a missing key.
+    reply(
+      buildVerifyGrantDeny(
+        payloadReq,
+        grantDenyReasonText(outcome.reason, hookId),
+        existing?.request_id ?? payloadReq?.requestId ?? null,
+      ),
+    )
+    return
+  }
+  const grant = outcome.grant
+  grant.consumed_at = now
+  if (!rt.persistGrants()) {
+    grant.consumed_at = null
+    log(`grant-deny: via=${pull ? "pull" : "token"} approvalId=${grant.approval_id} reason=persist-failed — rolled back, NOT consumed`)
+    reply(buildVerifyGrantDeny(payloadReq, "grant store write failed — denying fail-closed (the grant was NOT consumed); retry", grant.request_id))
+    return
+  }
+  log(`grant-consume: via=${pull ? "pull" : "token"} approvalId=${grant.approval_id} hookId=${hookId} req=${grant.request_id}`)
+  reply(buildVerifyGrantAllow(payloadReq, grant))
+}
+
 // The agent kind the hook was installed for (`tg-ctl ask --agent codex`). Decides
 // how the raw payload is normalized + formatted. The accepted set is
 // HOOK_AGENT_KINDS (features/tg-ctl/types.ts) — an exhaustiveness-checked single
@@ -4024,6 +4251,85 @@ function parseAskStream(raw: string, how: "end" | "dropped" | "timeout"): AskAtt
   if (how !== "end") return { kind: how, raw: null, statuses }
   if (reply === undefined) return { kind: "dropped", raw: null, statuses }
   return { kind: "response", raw: reply, statuses }
+}
+
+// `tg-ctl ask --verify-grant <approval_id> --hook <hook_id>` (TOKEN path) or
+// `tg-ctl ask --verify-grant --pull --hook <hook_id>` (PULL path) — the grant
+// consume client (contract §5 + pull-model, tg-cli#398). stdin carries the
+// normalized payload (with the recomputed `operation`); the daemon answers
+// immediately. Modeled on hookAgentFromArgv's argv-scan style.
+interface VerifyGrantArgv {
+  approvalId?: string
+  pull: boolean
+  hookId?: string
+}
+function verifyGrantArgvFrom(args: string[]): VerifyGrantArgv | null {
+  const i = args.indexOf("--verify-grant")
+  if (i < 0) return null
+  const out: VerifyGrantArgv = { pull: args.includes("--pull") }
+  const maybeId = args[i + 1]
+  if (maybeId && !maybeId.startsWith("--")) out.approvalId = maybeId
+  const h = args.indexOf("--hook")
+  const hookId = h >= 0 ? args[h + 1] : undefined
+  if (hookId && !hookId.startsWith("--")) out.hookId = hookId
+  return out
+}
+
+// The verify-grant round-trip: one short socket exchange (the daemon answers
+// immediately — no human in the loop — so 30s is a generous ceiling), then
+// print the daemon's reply JSON VERBATIM on stdout. Exit 0 ALWAYS; the outcome
+// rides stderr. Fail CLOSED on any transport failure (daemon down, old daemon
+// that drops the unknown marker with `null`, timeout): a deny envelope on
+// stdout so the calling hook blocks the operation — never an empty stdout that
+// a lenient caller could misread as "no objection".
+async function verifyGrantDaemon(ctx: Ctx, argv: VerifyGrantArgv, stdinPayload: unknown): Promise<void> {
+  const denyUnreachable = (why: string): void => {
+    log(`verify-grant failed-closed: ${why}`)
+    console.log(
+      JSON.stringify({
+        requestId: null,
+        hookSpecificOutput: {
+          hookEventName: "PermissionRequest",
+          decision: { behavior: "deny", message: `tg-ctl grant verification failed closed: ${why}` },
+        },
+      }),
+    )
+  }
+  if (!argv.hookId || (!argv.pull && !argv.approvalId)) {
+    denyUnreachable("malformed invocation — need --hook <hook_id> and either --verify-grant <approval_id> or --verify-grant --pull")
+    return
+  }
+  const line = JSON.stringify({
+    tgctl: "verify-grant",
+    hookId: argv.hookId,
+    ...(argv.pull ? { pull: true } : { approvalId: argv.approvalId }),
+    payload: stdinPayload ?? null,
+  })
+  const attempt = await oneAskAttempt(ctx, line, 30_000)
+  if (attempt.kind === "response" && attempt.raw && attempt.raw !== "null") {
+    console.log(attempt.raw)
+    // Outcome on stderr (contract §5: exit 0 always, verdict rides stderr) —
+    // the human/lib reading the terminal sees WHY alongside the stdout JSON.
+    try {
+      const parsed = JSON.parse(attempt.raw) as { approvalId?: string; requestId?: string | null }
+      log(
+        parsed.approvalId
+          ? `grant consumed: approvalId=${parsed.approvalId} requestId=${parsed.requestId ?? "-"}`
+          : `grant denied: requestId=${parsed.requestId ?? "-"}`,
+      )
+    } catch {
+      log(`grant verify reply (unparsable): ${attempt.raw}`)
+    }
+    return
+  }
+  // An OLD daemon doesn't know the marker: it drops the line as
+  // unparsable-payload and replies `null` — fail closed (the correct
+  // self-healing behavior; the lib surfaces this as a deny).
+  denyUnreachable(
+    attempt.kind === "response"
+      ? "daemon declined the verify-grant request (older daemon without grant support)"
+      : `daemon unreachable (${attempt.kind})`,
+  )
 }
 
 // Overall hook budget. Kept UNDER the 120s the harness gives the hook process so the
@@ -4163,7 +4469,7 @@ function describeAskOutcome(req: ButtonRequest, attempt: AskAttempt): string {
     return `ask-forward expired: ${who} messageId=${expired.messageId ?? "-"} — ${where}; no decision within ${expired.ageMs}ms (daemon expiry, nobody tapped)`
   }
   if (posted && attempt.kind === "timeout") {
-    return `ask-forward timed-out: ${who} messageId=${posted.messageId} — posted to Telegram; no decision within this hook's ${ASK_TOTAL_TIMEOUT_MS}ms budget (the card stays answerable for late delivery)`
+    return `ask-forward timed-out: ${who} messageId=${posted.messageId} — posted to Telegram; no decision within this hook's ${clampRequestTimeoutMs(req.timeoutMs, ASK_TOTAL_TIMEOUT_MS)}ms budget (the card stays answerable for late delivery)`
   }
   if (posted) {
     // `attempt.kind` here is only ever "response" (an explicit `null` reply) or
@@ -4175,7 +4481,7 @@ function describeAskOutcome(req: ButtonRequest, attempt: AskAttempt): string {
   }
   if (dropped) return `ask-forward not-posted: ${who} — daemon declined: reason=${dropped.reason}`
   if (attempt.kind === "timeout") {
-    return `ask-forward timed-out: ${who} — no reply and no status line from the daemon within ${ASK_TOTAL_TIMEOUT_MS}ms`
+    return `ask-forward timed-out: ${who} — no reply and no status line from the daemon within ${clampRequestTimeoutMs(req.timeoutMs, ASK_TOTAL_TIMEOUT_MS)}ms`
   }
   if (attempt.kind === "dropped") return `ask-forward unreachable: ${who} — daemon socket closed or errored without a reply`
   return `ask-forward not-posted: ${who} — daemon declined or unreachable (no status line: a daemon older than tg-cli#317 cannot say which)`
@@ -4240,7 +4546,15 @@ async function askDaemon(ctx: Ctx): Promise<void> {
   // its own "remaining" into an actual setTimeout delay only inside oneAskAttempt,
   // which explicitly skips scheduling when the delay isn't finite (see its own doc
   // comment on the 32-bit setTimeout overflow clamp this guards against).
-  const deadline = reqs.some((r) => r.critical === true) ? Infinity : Date.now() + ASK_TOTAL_TIMEOUT_MS
+  //
+  // Contract §1 (tg-cli#398): for a non-critical request, a per-request
+  // timeoutMs (the agent-tools lib sends 600000 for hatch asks) extends the
+  // deadline instead, clamped to the 15-min cap; absent/invalid → the
+  // unchanged 115s default. (A hatch ask carrying 600000 still answers EARLY
+  // the moment a tap lands — the deadline is only the wait ceiling.)
+  const deadline = reqs.some((r) => r.critical === true)
+    ? Infinity
+    : Date.now() + clampRequestTimeoutMs(reqs[0].timeoutMs, ASK_TOTAL_TIMEOUT_MS)
 
   if (reqs.length === 1) {
     const req = reqs[0]
@@ -5739,6 +6053,53 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       log(`question persist failed: ${err}`)
     }
   }
+  // --- Late-approval grant protocol v1.1 (tg-cli#398): the daemon-owned stores ---
+  // Loaded BEFORE the question restore below: a hatch record that expired while the
+  // daemon was DOWN upserts its grace record at restore time (the second of the two
+  // retire paths), which needs this store live first. Each grace record's `req` is
+  // re-run through the AUTHORITATIVE normalizeButtonRequest — one that no longer
+  // validates (schema drift, corruption) is dropped fail-closed, never trusted from
+  // disk (parseGrantStore only shape-sniffs `req`; see its doc comment).
+  const grantsData = (() => {
+    const parsed = parseGrantStore(readFileOrNull(ctx.paths.grants), Date.now())
+    parsed.grace = parsed.grace.flatMap((g) => {
+      const req = normalizeButtonRequest(g.req)
+      if (!req || !(req.kind === "permission" && isHatchRequest(req))) return []
+      return [{ ...g, req }]
+    })
+    return parsed
+  })()
+  // FAIL-CLOSED persistence (unlike persistQuestions above): every grant mutation
+  // (mint/consume) MUST persist before it is confirmed, and a failed write means the
+  // mutation is rolled back — otherwise a daemon restart could resurrect a consumed
+  // grant as usable (single-use replay) or lose a confirmed one.
+  const persistGrants = (): boolean => {
+    try {
+      const now = Date.now()
+      // Prune the LIVE store too (serializeGrantStore only prunes its copy):
+      // keeps in-memory scans bounded and memory/disk consistent.
+      pruneGrantStore(grantsData, now)
+      atomicWrite(ctx.paths.grants, serializeGrantStore(grantsData, now))
+      return true
+    } catch (err) {
+      log(`grant persist failed: ${err}`)
+      return false
+    }
+  }
+  // A hatch permission ask EXPIRED (both live retire paths — the unscoped backstop
+  // timer and the hook socket close — converge on retireAbandonedEntry, which calls
+  // this): upsert its grace record so a late Approve tap stays addressable for
+  // GRACE_WINDOW_MS (24h), outliving the 12h abandoned retention. Fail-soft with a
+  // loud log: losing grace degrades the feature but never authorizes anything.
+  const onHatchExpired = (entry: PendingButton, pendingKey: string): void => {
+    const hookId = entry.req.hookId ?? parseHatchHookId(entry.req.requestId)
+    if (!hookId) return
+    upsertGraceRecord(
+      grantsData.grace,
+      buildGraceRecord(entry.req, pendingKey, hookId, routeForRequest(entry.req), entry.messageId, Date.now(), GRACE_WINDOW_MS),
+    )
+    if (!persistGrants()) log(`grace persist failed for ${pendingKey} — late taps on this card will not be addressable`)
+  }
   // Restore durable state on bootstrap. A restored scoped question lands in
   // `abandonedButtons` (no live socket) — a late tap injects to its pane, a reconnect
   // re-attaches. Restored scoped permissions land there too so a reconnecting hook can
@@ -5769,6 +6130,19 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (!req.paneId && !(req.kind === "permission" && isHatchRequest(req))) continue
       if (req.kind === "question" && !req.options?.length) continue
       if (isAbandonedExpired(req.kind, rec.at, nowRestore, req.critical)) {
+        // Grant protocol v1.1 (tg-cli#398): a hatch permission that expired while
+        // the daemon was DOWN never ran retireAbandonedEntry in THIS process —
+        // write its grace record here (the restore-time retire path; `rec.at` is
+        // its abandon/expiry moment). parseGrantStore prunes past-grace records
+        // on load, so an over-aged one simply never materializes.
+        const expiredHookId = req.kind === "permission" ? req.hookId ?? parseHatchHookId(req.requestId) : null
+        if (expiredHookId !== null) {
+          upsertGraceRecord(
+            grantsData.grace,
+            buildGraceRecord(req, callbackRequestId(req), expiredHookId, routeForRequest(req), rec.messageId, rec.at, GRACE_WINDOW_MS),
+          )
+          expiredOnRestore = true
+        }
         // Carry the queuedDecision through (same rule as the live-abandonedButtons
         // restore below): a tap that was never delivered before the daemon went
         // down for the whole retention window must still be NAMED in the give-up
@@ -5803,8 +6177,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // mutate and persist, AND count against MAX_RETAINED_QUESTIONS on a future
     // write, which could starve an actually-recent entry — or even a DIFFERENT
     // still-expired-but-not-yet-notified entry — of its own notice (review
-    // finding). Persist once now so the file matches memory immediately.
-    if (expiredOnRestore) persistQuestions()
+    // finding). Persist once now so the file matches memory immediately — and
+    // the grants file with it (the restore-time grace upserts above).
+    if (expiredOnRestore) {
+      persistQuestions()
+      persistGrants()
+    }
   }
   // /agent (and unrecognized-reply) selection awaiting a button tap: token →
   // message + candidate list. `prewrapped` = inject the message verbatim (a reply
@@ -6159,6 +6537,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     onRelease: onQuestionReleased,
     onTerminalFallback: onQuestionTerminalFallback,
     onUnscopedRelease,
+    grants: grantsData,
+    persistGrants,
+    onHatchExpired,
   }
   let hookServer: Server | null = null
   const cleanExit = (code: number): never => {
@@ -9117,6 +9498,141 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // the retained entry. Returns false when there is nothing to late-deliver (no
   // retained entry, or the tap doesn't resolve to an option), so the caller falls
   // back to the expired/already-answered toast.
+  // Grant protocol v1.1 (tg-cli#398): a late tap on an EXPIRED hatch card. This
+  // REPLACES the old silent queuedDecision mechanism for hatch requests, which
+  // authorized ANY later operation behind the same hookId. A late Approve inside
+  // the 24h grace window mints a single-use grant (bound to hook_id + operation
+  // fingerprint + cwd + the daemon-observed route), confirms on the card, and
+  // routes the contract's consume-instructions message to the origin (omp ACP /
+  // inbox — never a live permission menu, the exact no-menu skip this fixes); a
+  // tap beyond grace is told it is too late (the agent must re-request) and
+  // mints NOTHING. A belated Deny has nothing to deliver (no deny-grant exists
+  // in the contract) — it just retires the card. `expiredAt` is the ask's
+  // expiry moment (the grace anchor): the retained entry's `at` on the retained
+  // path, the grace record's `expiredAt` on the grace-only path.
+  const handleHatchLateTap = async (
+    action: Extract<Action, { kind: "answer-question" }>,
+    req: ButtonRequest,
+    cardId: number | null,
+    answer: ButtonAnswer,
+    expiredAt: number,
+  ): Promise<boolean> => {
+    const now = Date.now()
+    if (answer.decision === "deny") {
+      if (cardId !== null) {
+        void clearMessageKeyboard(ctx, cardId)
+        void editMessageText(ctx, cardId, buildAnsweredQuestionText(req, answer.label))
+      }
+      log(`hatch-late-deny: ${describeAskRequest(req)} key=${action.requestId} — expired ask, nothing to deliver`)
+      await answerCallbackQuery(ctx, action.callbackQueryId, "denied — the request had already expired; the agent must re-request")
+      return true
+    }
+    if (now >= expiredAt + GRACE_WINDOW_MS) {
+      // Beyond the 24h grace window: NO grant (contract §4's too-late branch).
+      // Retire the stale grace record so this card can never mint later.
+      const i = grantsData.grace.findIndex((g) => g.key === action.requestId)
+      if (i >= 0) {
+        grantsData.grace.splice(i, 1)
+        persistGrants()
+      }
+      if (cardId !== null) {
+        void clearMessageKeyboard(ctx, cardId)
+        void editMessageText(ctx, cardId, "too late — the 24h late-approval window has closed; the agent must request approval again")
+      }
+      log(`hatch-grant-too-late: ${describeAskRequest(req)} key=${action.requestId} ageMs=${now - expiredAt}`)
+      await answerCallbackQuery(ctx, action.callbackQueryId, "too late — the agent must re-request")
+      return true
+    }
+    // Fail-closed mint gate: a grant is useless unless it can be BOUND (an
+    // old-lib ask carries no hookId/operation fields — grants.ts's
+    // isGrantableRequest). Tell the user plainly instead of minting an
+    // unconsumable grant.
+    if (!isGrantableRequest(req)) {
+      if (cardId !== null) {
+        void clearMessageKeyboard(ctx, cardId)
+        void editMessageText(
+          ctx,
+          cardId,
+          "this expired request came from an older agent-tools version without grant fields — a late approval cannot be bound to it; the agent must re-request",
+        )
+      }
+      log(`hatch-grant-not-grantable: ${describeAskRequest(req)} key=${action.requestId} — no hookId/operation on the ask`)
+      await answerCallbackQuery(ctx, action.callbackQueryId, "cannot grant — the agent must re-request")
+      return true
+    }
+    let grant = grantsData.grants.find((g) => g.request_id === req.requestId) ?? null
+    if (grant && grant.consumed_at !== null) {
+      // Double-mint guard: this approval was already USED — never mint another.
+      if (cardId !== null) {
+        void clearMessageKeyboard(ctx, cardId)
+        void editMessageText(ctx, cardId, `grant ${grant.approval_id} was already used — grants are single-use; the agent must re-request`)
+      }
+      log(`hatch-grant-already-used: ${describeAskRequest(req)} key=${action.requestId} approvalId=${grant.approval_id}`)
+      await answerCallbackQuery(ctx, action.callbackQueryId, "a grant for this request was already used")
+      return true
+    }
+    if (!grant) {
+      const approvalId = `hgr-${Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => b.toString(16).padStart(2, "0")).join("")}`
+      grant = buildGrantRecord(req, approvalId, routeForRequest(req), now, GRANT_TTL_MS)
+      grantsData.grants.push(grant)
+      // Durable BEFORE confirming (single-use invariant): a failed write rolls
+      // the mint back — the user is told to tap again rather than being handed
+      // an approval a restart would lose.
+      if (!persistGrants()) {
+        grantsData.grants.pop()
+        log(`hatch-grant-mint-failed: ${describeAskRequest(req)} key=${action.requestId} — grant store write failed`)
+        await answerCallbackQuery(ctx, action.callbackQueryId, "could not record the grant — tap again")
+        return true
+      }
+      log(
+        `hatch-grant-minted: ${describeAskRequest(req)} key=${action.requestId} hookId=${grant.hook_id} approvalId=${grant.approval_id} route=${grant.route ?? "-"}`,
+      )
+    }
+    // An unconsumed grant already existed (a re-tap — e.g. after a delivery
+    // failure or a duplicate tap): RE-ROUTE the notice instead of minting.
+    const notice = hatchGrantNoticeText({
+      requestId: req.requestId,
+      question: req.question,
+      hookId: grant.hook_id,
+      approvalId: grant.approval_id,
+      approvedAt: grant.approved_at,
+      expiresAt: grant.expires_at,
+    })
+    const delivered = await routeGrantNotice(ctx, req, notice)
+    if (cardId !== null) {
+      void clearMessageKeyboard(ctx, cardId)
+      void editMessageText(ctx, cardId, hatchGrantApprovedText(req, grant.approval_id, delivered))
+    }
+    log(`hatch-grant-notice-${delivered ? "delivered" : "failed"}: approvalId=${grant.approval_id} route=${grant.route ?? "-"} key=${action.requestId}`)
+    await answerCallbackQuery(
+      ctx,
+      action.callbackQueryId,
+      delivered ? "✓ grant issued and sent to the agent" : "grant issued — could not reach the agent (the token path still works)",
+    )
+    return true
+  }
+
+  // A tap on an expired hatch card whose abandoned entry is GONE (pruned at the
+  // 12h retention, or the daemon restarted since) — the grace store (grants.ts)
+  // is what keeps it addressable through 24h. Only hatch asks ever grow grace
+  // records, so a non-hatch tap falls straight through to the existing toasts.
+  const handleGraceStoreTap = async (action: Extract<Action, { kind: "answer-question" }>): Promise<boolean> => {
+    const rec = grantsData.grace.find((g) => g.key === action.requestId)
+    if (!rec) return false
+    // Same own-card guard as the retained path: a stale card must not resolve a
+    // different record that happens to share the callback key.
+    if (rec.messageId !== null && action.messageId !== null && action.messageId !== rec.messageId) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+      return true
+    }
+    const answer = resolveButtonCallback(rec.req, { requestId: action.requestId, value: action.value })
+    if (answer.status !== "answered") {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+      return true
+    }
+    return handleHatchLateTap(action, rec.req, action.messageId ?? rec.messageId, answer, rec.expiredAt)
+  }
+
   const lateDeliverAbandonedQuestion = async (
     action: Extract<Action, { kind: "answer-question" }>,
   ): Promise<boolean> => {
@@ -9213,6 +9729,19 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // created with a decision the restore-time validator would reject.
       const answer = resolveButtonCallback(retained.req, { requestId: action.requestId, value: action.value })
       if (answer.status !== "answered") return false
+
+      // HATCH DIVERSION (grant protocol v1.1, tg-cli#398): a late tap on a
+      // retained hatch card mints a single-use, operation-bound GRANT and routes
+      // the consume instructions to the origin — it must NEVER record a
+      // queuedDecision (the removed mechanism authorized ANY later operation
+      // behind the same hookId, exactly what v1.1 forbids). The entry is
+      // resolved by the grant; drop it so a re-tap exercises the grace store
+      // (idempotent re-route of the existing grant, handleHatchLateTap).
+      if (parseHatchHookId(retained.req.requestId) !== null) {
+        abandonedButtons.delete(action.requestId)
+        persistQuestions()
+        return handleHatchLateTap(action, retained.req, retained.messageId ?? action.messageId, answer, retained.at)
+      }
       const label = resolveWindowAgentLabel(retained.req.windowName, retained.req.cwd)
       const paneId = retained.req.paneId
 
@@ -9377,12 +9906,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
 
       // Not delivered via pane-inject (unsupported agent kind, deferred pane,
       // no live/identity-matching menu, or unconfirmed injection) — already
-      // durably queued above; render the existing queued-decision UI.
+      // durably queued above; render the existing queued-decision UI. A HATCH
+      // entry never reaches here (the grant diversion above returned first) —
+      // this is exclusively the scoped-permission reconnect queue.
       const cardId = retained.messageId ?? action.messageId
-      // A hatch entry (see parseHatchHookId) has no live hook to ever reconnect
-      // to for THIS attempt — the card/toast text must say so plainly instead
-      // of the generic reconnect-or-terminal promise, which is impossible here.
-      const hookId = parseHatchHookId(retained.req.requestId)
       // The keyboard MUST ride along explicitly here too (see the disconnect-edit
       // comment in armPendingSocketClose) — "tap again to change it" is a lie if
       // THIS edit is what removes the buttons (review finding).
@@ -9393,9 +9920,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           // Card text reads `retained.req` — the toast below MUST read the SAME
           // object (never the incoming `req`/`action`), or queuedDecisionCanAutoDeliver's
           // "single source of truth" guarantee is only nominal (review finding).
-          hookId !== null
-            ? hatchApprovalRecordedText(retained.req, hookId, answer.label)
-            : queuedPermissionDecisionText(retained.req, label, answer.label),
+          queuedPermissionDecisionText(retained.req, label, answer.label),
           buildButtonMessage(ctx.chatId, retained.req).reply_markup,
           hatchParseMode(retained.req),
         )
@@ -9428,16 +9953,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
       log(`ask-permission-decision-queued: ${describeAskRequest(retained.req)} key=${action.requestId} label=${answer.label}`)
       // The ephemeral toast must make the SAME promise as the card text — both
-      // now branch on the SAME shared predicate (queuedDecisionCanAutoDeliver)
+      // branch on the SAME shared predicate (queuedDecisionCanAutoDeliver)
       // instead of independently re-deriving the same truthiness check, so they
       // can never silently drift apart again (Codex review finding + follow-up
       // review finding on this fix itself).
       await answerCallbackQuery(
         ctx,
         action.callbackQueryId,
-        hookId !== null
-          ? "recorded — will be applied automatically the next time the same hatch command is retried"
-          : queuedDecisionCanAutoDeliver(retained.req) ? "queued — will send once the hook reconnects" : "queued — tap again once it reconnects",
+        queuedDecisionCanAutoDeliver(retained.req) ? "queued — will send once the hook reconnects" : "queued — tap again once it reconnects",
       )
       return true
     }
@@ -9679,6 +10202,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           // instead of being dropped (this PR). Only if there is nothing to deliver
           // do we fall back to the toasts below.
           if (await lateDeliverAbandonedQuestion(action)) return true
+          // Grant protocol v1.1 (tg-cli#398): a tap on an expired HATCH card whose
+          // retained entry is gone (12h retention pruned it / daemon restarted) —
+          // the 24h grace store keeps it addressable, so a late Approve can still
+          // mint a grant. Non-hatch taps fall straight through.
+          if (await handleGraceStoreTap(action)) return true
           // If we ANSWERED it WITHIN the replay window the tap is on an already-
           // resolved card, not a truly-expired prompt — say so plainly instead of the
           // misleading "expired" (tg-cli#97). Gated on the same window as the hook-
@@ -10451,6 +10979,22 @@ if (import.meta.main) {
     process.exit(runInboxCommand(ctx, process.argv.slice(3)))
   }
   if (cmd === "ask") {
+    // Grant-protocol client (tg-cli#398): `--verify-grant <approval_id> --hook
+    // <hook_id>` (TOKEN path) or `--verify-grant --pull --hook <hook_id>` (PULL
+    // path) — stdin carries the normalized payload with the recomputed
+    // `operation`. Intercepted BEFORE askDaemon so the stdin payload flows to
+    // the verify exchange, not the question normalizer.
+    const verifyArgv = verifyGrantArgvFrom(process.argv.slice(3))
+    if (verifyArgv) {
+      let stdinPayload: unknown = null
+      try {
+        stdinPayload = JSON.parse(await readStdinText())
+      } catch {
+        stdinPayload = null // the daemon denies malformed payloads fail-closed
+      }
+      await verifyGrantDaemon(ctx, verifyArgv, stdinPayload)
+      process.exit(0)
+    }
     await askDaemon(ctx)
     process.exit(0)
   }

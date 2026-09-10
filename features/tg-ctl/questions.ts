@@ -23,6 +23,42 @@ export interface DecisionLabels {
   deny: string;
 }
 
+// --- Late-approval grant protocol v1.1 (tg-cli#398): additive ask-payload fields ---
+//
+// Both are OPTIONAL and normalized tolerantly at every boundary (an old daemon
+// drops them, an old lib never sends them — cross-repo compatibility note in
+// tg-ctl's verify-grant handler). `operation` is OPAQUE to tg-ctl: the
+// agent-tools lib computes the fingerprint; the daemon only compares it.
+
+// Where the ask came from, for routing a late-approval grant notice back and
+// (audit-only) provenance. Session-id matching for the grant pull-model is
+// SUBSUMED by route binding (grants.ts) — these fields ride the payload for
+// audit and routing hints, never as a security gate.
+export interface AskOrigin {
+  agent?: string;
+  sessionId?: string;
+  subagent?: string;
+}
+
+// The blocked operation the ask is about. `fingerprint` + `cwd` are what a
+// grant binds to (grants.ts's operationMatches); `repoRoot` is compared only
+// when BOTH sides carry it.
+export interface AskOperation {
+  kind?: string;
+  fingerprint?: string;
+  cwd?: string;
+  repoRoot?: string;
+}
+
+// Contract §1: a per-request `timeoutMs` is honored up to this cap; beyond it
+// the value is clamped, never rejected. Absent/invalid → the caller's
+// unchanged default (tg-ctl's 115s hook budget / 110s unscoped-abandon window).
+export const ASK_TIMEOUT_MAX_MS = 15 * 60_000;
+export function clampRequestTimeoutMs(timeoutMs: number | undefined, fallbackMs: number): number {
+  if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return fallbackMs;
+  return Math.min(timeoutMs, ASK_TIMEOUT_MAX_MS);
+}
+
 export interface OpencodeRequestRef {
   sessionId: string;
   requestId: string;
@@ -110,6 +146,24 @@ export interface ButtonRequest {
   // re-litigate it. Default/absent === false: every existing (non-critical)
   // call site is byte-for-byte unaffected.
   critical?: boolean;
+  // --- Late-approval grant protocol v1.1 additive fields (tg-cli#398) ---
+  // All optional; absent on every pre-v1.1 payload. Both normalizers
+  // (hook-normalize.ts's passthrough and tg-ctl's authoritative
+  // normalizeButtonRequest) carry them through tolerantly — unknown/malformed
+  // subfields are dropped, never a rejection, so an old lib and a new daemon
+  // (or vice versa) interoperate unchanged.
+  // The hatch hook's stable id (`RIG_HATCH_REQUEST_<HOOK_ID>`; also parseable
+  // from a hatch requestId — see parseHatchHookId). Carried explicitly so the
+  // verify-grant exchange binds without re-parsing requestIds.
+  hookId?: string;
+  // Per-request timeout the daemon should honor instead of its defaults,
+  // clamped to ASK_TIMEOUT_MAX_MS (clampRequestTimeoutMs). agent-tools sends
+  // 600000 for hatch asks so a card stays live 10 min.
+  timeoutMs?: number;
+  origin?: AskOrigin;
+  // OPAQUE: computed by the agent-tools lib; the daemon only compares it when
+  // consuming a grant (grants.ts).
+  operation?: AskOperation;
 }
 
 export interface ButtonMessagePayload {
@@ -161,12 +215,11 @@ const CLOSE_CALLBACK_PREFIX = 'tgqc';
 // minted as `hatch-<hookId>-<12 lowercase hex chars>` (agent_tools'
 // request_hatch_approval: `f"hatch-{hook_id}-{uuid.uuid4().hex[:12]}"`); the
 // hex suffix is random PER ATTEMPT, so two retries of the SAME hatch never
-// share a requestId — hookId is the one thing stable across retries, which is
-// what lets tg-ctl recognize "this is a retry of a request I already have a
-// human decision for" (handleHookSocketLine's hatch short-circuit) instead of
-// only ever matching by exact requestId equality (the reconnect re-attach
-// path above, which a hatch retry can never hit — a NEW random requestId every
-// time means `rt.abandoned.get(pendingKey)` never finds the prior attempt).
+// share a requestId. hookId is the one thing stable across retries — under the
+// late-approval grant protocol v1.1 (tg-cli#398, grants.ts) it is what a
+// verify-grant consume binds to (alongside the operation fingerprint/cwd and
+// the daemon-observed route), replacing the removed over-broad
+// silent-queuedDecision retry short-circuit.
 const HATCH_REQUEST_RE = /^hatch-(.+)-[0-9a-f]{12}$/;
 
 // Exported: the "is this the one delivery path a headless RIG_HATCH_REQUEST_*
@@ -190,7 +243,7 @@ export function isHatchRequest(req: Pick<ButtonRequest, 'requestId'>): boolean {
 // Mirrored here (three call sites below need lockstep spelling) so the retry
 // command shown to the human is byte-identical to what the hook itself
 // documents, not a re-derived spelling that could drift.
-function hatchEnvVarName(hookId: string): string {
+export function hatchEnvVarName(hookId: string): string {
   return `RIG_HATCH_REQUEST_${hookId.trim().toUpperCase().replace(/-/g, '_')}`;
 }
 
@@ -348,16 +401,13 @@ export function abandonedPermissionText(req: ButtonRequest, label: string): stri
 // Hatch counterpart to abandonedPermissionText: a RIG_HATCH_REQUEST_<hookId>
 // (see parseHatchHookId) has no pane to reconnect into and no terminal to
 // answer in — the requesting `tg-ctl ask` process already exited — so this
-// must NOT make either promise. Instead it names the one path that actually
-// works: retrying the exact same command with the same
-// RIG_HATCH_REQUEST_<HOOK_ID> env var, which handleHookSocketLine's hatch
-// short-circuit recognizes as the same hatch and answers immediately (see
-// hatchApprovalRecordedText for the post-tap version of this same message).
-// The caveat ("only if still current") matters because a retry may run long
-// after the original need — a stale auto-applied decision would be worse
-// than asking again.
+// must NOT make either promise. Under the late-approval grant protocol v1.1
+// (tg-cli#398) it says what IS true: the card stays tappable through the 24h
+// grace window, and an Approve tap mints a single-use grant (bound to the
+// exact command + directory + route) whose consume instructions are routed to
+// the requesting agent — no silent auto-approval of a later retry.
 export function hatchAbandonedPermissionText(req: ButtonRequest, hookId: string): string {
-  const status = `hatch request disconnected — the requesting command already gave up waiting, so there is no live process left to answer. A tap now IS recorded: retry the exact same command with the same ${hatchEnvVarName(hookId)}="<justification>" env var and it will be applied automatically with no new Telegram prompt. Only retry if the original need is still current.`;
+  const status = `hatch request disconnected — the requesting command already gave up waiting, so there is no live process left to answer. This card stays answerable for 24h: an Approve tap mints a one-time grant (bound to this exact command and directory) and sends the agent the exact retry instructions. Only approve if the original need is still current.`;
   return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
 }
 
@@ -411,23 +461,24 @@ export function queuedPermissionDecisionText(req: ButtonRequest, label: string, 
   return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
 }
 
-// Hatch counterpart to queuedPermissionDecisionText: a tap DID land for a
-// RIG_HATCH_REQUEST_<hookId> (see parseHatchHookId) whose requesting process
-// had already exited, so — unlike a scoped permission — there is no live hook
-// socket to deliver to and never will be for THIS attempt. The decision is
-// still recorded (findQueuedHatchDecision, tg-ctl) so a retry (a NEW
-// requestId, same hookId) is answered instantly instead of asking again.
-export function hatchApprovalRecordedText(req: ButtonRequest, hookId: string, decisionLabel: string): string {
-  const status = `recorded "${decisionLabel}" for hatch request ${hookId} — the requesting command already gave up waiting, so it could not be delivered. Retry the exact same command with the same ${hatchEnvVarName(hookId)}="<justification>" env var and it will be applied automatically with no new Telegram prompt. Only retry if the original need is still current.`;
+// Hatch late-APPROVE confirmation (grant protocol v1.1, tg-cli#398): the tap
+// minted a single-use grant (grants.ts) and the consume instructions were
+// routed to the requesting agent's route. The card names the approval id so
+// the human can correlate it with what the agent does next. `delivered` is
+// false when the routed message could NOT be delivered (total routing
+// failure) — the grant still stands (the token path always works), but the
+// card must not claim the agent was told.
+export function hatchGrantApprovedText(req: ButtonRequest, approvalId: string, delivered: boolean): string {
+  const status = delivered
+    ? `approved belatedly — grant ${approvalId} (single-use, 24h) issued and the consume instructions were sent to the requesting agent.`
+    : `approved belatedly — grant ${approvalId} (single-use, 24h) issued, but the consume instructions could NOT be delivered to the agent (no reachable route). The grant still works via the token path: retry with the RIG_HATCH_REQUEST_<HOOK>="approved:${approvalId}" env var.`;
   return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
 }
 
-// tg-cli#403: PROACTIVE counterpart to hatchApprovalRecordedText — pushed into a
+// tg-cli#403: PROACTIVE counterpart to hatchGrantApprovedText — pushed into a
 // still-LIVE agent session (promptOmpAcp) the moment a CRITICAL hatch decision
 // lands, rather than only ever being discoverable by re-reading the Telegram
-// card. Mirrors hatchApprovalRecordedText's exact retry-command phrasing (same
-// hatchEnvVarName call) so the two surfaces never disagree on how to retry —
-// deliberately concise (no buildQuestionText prefix): this lands as an
+// card. Deliberately concise (no buildQuestionText prefix): this lands as an
 // unsolicited chat message inside a live coding session, not a Telegram card,
 // so repeating the full original question text would be noise the agent didn't
 // ask for and already has in its own Telegram history.
@@ -467,15 +518,15 @@ export function abandonedLongOutageText(req: ButtonRequest, label: string, queue
   return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
 }
 
-// Hatch counterpart to abandonedLongOutageText: mirrors its two-branch shape
-// (a named queued decision vs. none) but drops the "answer in the terminal"
-// fallback — a headless hatch request never had one. Once the retention
-// window elapses with no retry, the decision (if any) is discarded; the next
-// attempt starts fresh and prompts again from scratch.
+// Hatch counterpart to abandonedLongOutageText, adjusted for the grant
+// protocol (tg-cli#398): the entry's 12h retention is over, but the 24h GRACE
+// window (grants.ts) may still be open — a tap past retention still mints a
+// grant from the grace record. So this never claims the card is dead, only
+// that no live delivery path remains and a grant is now the only channel.
 export function hatchAbandonedLongOutageText(req: ButtonRequest, hookId: string, queuedDecisionLabel?: string): string {
   const status = queuedDecisionLabel
     ? `hatch request ${hookId}: no retry arrived after a long wait — your recorded "${queuedDecisionLabel}" was never applied and this card is giving up on it. A fresh retry will prompt again from scratch.`
-    : `hatch request ${hookId}: no retry arrived after a long wait — this was never delivered. A fresh retry will prompt again from scratch.`;
+    : `hatch request ${hookId}: a long wait has passed with no decision. The card stays tappable until the 24h grace window closes — an Approve tap mints a one-time grant routed to the agent; past that, the agent must re-request.`;
   return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
 }
 
