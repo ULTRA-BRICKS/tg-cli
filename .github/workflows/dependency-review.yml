@@ -57,7 +57,7 @@ jobs:
           # so the gate only runs where dependency-review-action can actually work — instead
           # of letting the action hard-fail on an unsupported repo.
           code="$(gh api "repos/${GITHUB_REPOSITORY}/dependency-graph/sbom" \
-                    --silent -i 2>/dev/null | awk 'NR==1{print $2}')"
+                    --silent -i 2>/dev/null | awk 'NR==1{print $2}')" || true
           if [ "${code:-}" = "200" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
             echo "Dependency Graph is ENABLED — running the dependency-review gate."

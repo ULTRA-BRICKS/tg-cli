@@ -3,6 +3,17 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.52.3
+
+**Fix (ci): stop `dependency-review`'s SBOM preflight probe aborting under the runner's default `set -e`.**
+
+GitHub Actions' default Linux runner shell is `bash -e {0}`, which combined with the
+workflow's own `set -uo pipefail` aborted the preflight step's `code="$(gh api ... | awk
+...)"` assignment whenever `gh api` returned a non-2xx status — including the intentional
+"dependency graph disabled -> 404" path the probe exists to detect, not just transient
+blips. Appended `|| true` to that one assignment so the script always reaches its own
+if/else instead of aborting; no other behavior changes.
+
 ## 1.52.2
 
 **Fix (tg-cli#369): non-reply auto-bind (tg-cli#78 anchor) now applies with 2+ out-of-tmux omp candidates.**
