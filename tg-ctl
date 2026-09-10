@@ -212,7 +212,12 @@ import {
   callbackRequestId,
   collectQuestionAnswers,
   formatAgentHookOutput,
+  hatchAbandonedLongOutageText,
+  hatchAbandonedPermissionText,
+  hatchApprovalRecordedText,
   isHatchPermissionRequest,
+  isHatchRequest,
+  parseHatchHookId,
   questionCapability,
   queuedDecisionCanAutoDeliver,
   queuedDecisionStillWaitingText,
@@ -2935,6 +2940,26 @@ export function decideQueuedPermissionReconnect(
   return { kind: "deliver", queuedDecision: retained.queuedDecision }
 }
 
+// Find a retained hatch decision for `hookId` (see parseHatchHookId) that a
+// fresh retry (a NEW requestId, same hookId) can consume. Unlike
+// decideQueuedPermissionReconnect (keyed by exact requestId equality — the
+// reconnect-of-the-SAME-process case) this scans by hookId because a hatch
+// retry is always a genuinely NEW requestId/process, never a reconnect of the
+// old one.
+function findQueuedHatchDecision(
+  abandoned: Map<string, AbandonedButton>,
+  hookId: string,
+  now: number,
+): { key: string; entry: AbandonedButton; queuedDecision: NonNullable<AbandonedButton["queuedDecision"]> } | null {
+  for (const [key, entry] of abandoned) {
+    if (!entry.queuedDecision) continue
+    if (parseHatchHookId(entry.req.requestId) !== hookId) continue
+    if (isAbandonedExpired(entry.req.kind, entry.at, now)) continue
+    return { key, entry, queuedDecision: entry.queuedDecision }
+  }
+  return null
+}
+
 // How long a QUEUED permission decision can wait with no reconnect before the
 // human gets a PROACTIVE "still waiting to reconnect" notice — a NOTICE
 // threshold, not an expiry (Alex tg#9982: a queued tap must never be silently
@@ -3194,8 +3219,19 @@ function permissionPayloadMatches(a: ButtonRequest, b: ButtonRequest): boolean {
 // fall through to expiry.
 function retainAbandonedQuestion(rt: QuestionRuntime, entry: PendingButton, pendingKey: string): boolean {
   const { req } = entry
-  if (!req.paneId) return false
-  if (req.kind === "question" && !req.options?.length) return false
+  if (!req.paneId) {
+    // A hatch/RIG_HATCH_REQUEST_* permission has no pane to inject into or
+    // reconnect from (see parseHatchHookId's doc comment, questions.ts) — but
+    // a human decision on it must still survive the socket closing, so a
+    // LATER retry of the same hookId can consume it (handleHookSocketLine's
+    // hatch short-circuit) instead of the tap being thrown away. Every other
+    // unscoped kind (a plain question with no pane, or a multi-question set
+    // member) has no consumer for a retained entry at all and stays
+    // fall-through-to-expiry, unchanged.
+    if (req.kind !== "permission" || !isHatchRequest(req)) return false
+  } else if (req.kind === "question" && !req.options?.length) {
+    return false
+  }
   rt.abandoned.set(pendingKey, { req, messageId: entry.messageId, at: Date.now() })
   return true
 }
@@ -3212,12 +3248,69 @@ function expireDeadCard(ctx: Ctx, entry: PendingButton): void {
   }
 }
 
+// Both retirement paths — the raw UNSCOPED_ABANDON_MS backstop timer (the
+// requesting process is STILL CONNECTED, just past its abandon window — the
+// DOMINANT production case for a hatch permission, since a hook process's own
+// budget is ~120s, comfortably longer than the 110s default abandon window) and
+// the hook socket's 'close' handler (the process already exited) — must retire
+// a PendingButton through the SAME retain-or-expire decision. Before this was
+// unified, the raw timer called expireDeadCard(ctx, entry) unconditionally, so
+// for a still-connected hatch request it always won the race and destroyed the
+// card before the socket ever closed and retention could run — silently
+// re-breaking tg-cli#349 in the default scenario (review finding on #350,
+// which had only fixed the already-exited/socket-close case).
+function retireAbandonedEntry(ctx: Ctx, rt: QuestionRuntime, entry: PendingButton, pendingKey: string): void {
+  if (retainAbandonedQuestion(rt, entry, pendingKey)) {
+    if (entry.req.kind === "question" && !entry.req.multiQuestion) {
+      rt.onTerminalFallback(entry.req.paneId as string)
+      const abandoned = buildPostTimeoutQuestionMessage(ctx.chatId, entry.req)
+      if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandoned.text, abandoned.reply_markup)
+      else {
+        entry.finalText = abandoned.text
+        entry.finalReplyMarkup = abandoned.reply_markup
+      }
+    } else {
+      // A hatch entry's paneId is always undefined (see parseHatchHookId's
+      // doc comment, questions.ts) — rt.onRelease expects a REAL paneId, so
+      // calling it here for a hatch entry would release a pane that was
+      // never deferred in the first place. onUnscopedRelease is the correct
+      // release path for any paneless retained entry, hatch included.
+      if (entry.req.paneId) rt.onRelease(entry.req.paneId)
+      else rt.onUnscopedRelease()
+      const label = resolveWindowAgentLabel(entry.req.windowName, entry.req.cwd)
+      const hookId = parseHatchHookId(entry.req.requestId)
+      const abandonedText =
+        entry.req.kind === "permission"
+          ? hookId !== null
+            ? hatchAbandonedPermissionText(entry.req, hookId)
+            : abandonedPermissionText(entry.req, label)
+          : abandonedMultiText(entry.req, label)
+      // The keyboard MUST ride along explicitly (see editMessageText's own doc
+      // comment: omitting reply_markup DETACHES the current keyboard, it is not
+      // preserved) — otherwise this very edit removes the buttons the text just
+      // invited a tap on, breaking the whole abandoned-tap/queue feature at the
+      // moment it's needed (review finding). Mirrors the question branch above,
+      // which already passes `abandoned.reply_markup` for the same reason.
+      const abandonedMarkup = buildButtonMessage(ctx.chatId, entry.req).reply_markup
+      if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandonedText, abandonedMarkup)
+      else {
+        entry.finalText = abandonedText
+        entry.finalReplyMarkup = abandonedMarkup
+      }
+    }
+  } else {
+    if (entry.req.paneId) rt.onRelease(entry.req.paneId)
+    else rt.onUnscopedRelease()
+    expireDeadCard(ctx, entry)
+  }
+}
+
 // Arm the hook socket's 'close' handler for a freshly-forwarded or revived pending
 // question. On close (the agent's hook process exits, or its 120s budget elapses)
-// the entry leaves `pending` so it stops deferring the pane, then a SCOPED question
-// is RETAINED for late-delivery/reconnect (keyboard stays live) while a dead card is
-// expired. The pane's deferred backlog is released either way. Returns a getter
-// the caller uses to avoid double-ending a socket it still owns.
+// the entry leaves `pending` so it stops deferring the pane, then retireAbandonedEntry
+// converges it through the same retain-or-expire decision the raw UNSCOPED_ABANDON_MS
+// backstop timer uses. The pane's deferred backlog is released either way. Returns a
+// getter the caller uses to avoid double-ending a socket it still owns.
 function armPendingSocketClose(
   ctx: Ctx,
   rt: QuestionRuntime,
@@ -3231,38 +3324,7 @@ function armPendingSocketClose(
     clearTimeout(entry.timer)
     rt.pending.delete(pendingKey)
     rt.activeKeys.delete(pendingKey)
-    if (retainAbandonedQuestion(rt, entry, pendingKey)) {
-      if (entry.req.kind === "question" && !entry.req.multiQuestion) {
-        rt.onTerminalFallback(entry.req.paneId as string)
-        const abandoned = buildPostTimeoutQuestionMessage(ctx.chatId, entry.req)
-        if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandoned.text, abandoned.reply_markup)
-        else {
-          entry.finalText = abandoned.text
-          entry.finalReplyMarkup = abandoned.reply_markup
-        }
-      } else {
-        rt.onRelease(entry.req.paneId as string)
-        const label = resolveWindowAgentLabel(entry.req.windowName, entry.req.cwd)
-        const abandonedText =
-          entry.req.kind === "permission" ? abandonedPermissionText(entry.req, label) : abandonedMultiText(entry.req, label)
-        // The keyboard MUST ride along explicitly (see editMessageText's own doc
-        // comment: omitting reply_markup DETACHES the current keyboard, it is not
-        // preserved) — otherwise this very edit removes the buttons the text just
-        // invited a tap on, breaking the whole abandoned-tap/queue feature at the
-        // moment it's needed (review finding). Mirrors the question branch above,
-        // which already passes `abandoned.reply_markup` for the same reason.
-        const abandonedMarkup = buildButtonMessage(ctx.chatId, entry.req).reply_markup
-        if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandonedText, abandonedMarkup)
-        else {
-          entry.finalText = abandonedText
-          entry.finalReplyMarkup = abandonedMarkup
-        }
-      }
-    } else {
-      if (entry.req.paneId) rt.onRelease(entry.req.paneId)
-      else rt.onUnscopedRelease()
-      expireDeadCard(ctx, entry)
-    }
+    retireAbandonedEntry(ctx, rt, entry, pendingKey)
     rt.persist()
   })
   return { closed: () => socketClosed }
@@ -3288,8 +3350,7 @@ async function forwardAndPostQuestion(
       if (rt.pending.get(pendingKey) !== entry) return
       rt.pending.delete(pendingKey)
       rt.activeKeys.delete(pendingKey)
-      rt.onUnscopedRelease()
-      expireDeadCard(ctx, entry)
+      retireAbandonedEntry(ctx, rt, entry, pendingKey)
       rt.persist()
       writeAskStatus(socket, {
         tgctl: "ask-status", state: "expired", messageId: entry.messageId, ageMs: Date.now() - entry.at,
@@ -3437,6 +3498,39 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       `native question forwarding isn't available for \`${req.agent}\` — answer in the terminal`,
     )
     return
+  }
+
+  // Hatch retry short-circuit: a fresh RIG_HATCH_REQUEST_<HOOK_ID> attempt mints
+  // a brand-new requestId every time (see parseHatchHookId's doc comment,
+  // questions.ts), so the ordinary reconnect re-attach below (keyed by EXACT
+  // requestId equality) can never find a prior attempt for the same hatch. Look
+  // it up by hookId instead — if a PRIOR attempt for the SAME hook already got a
+  // human decision that couldn't be delivered (queued on socket close by
+  // armPendingSocketClose, or on tap by the permission tap handler below),
+  // apply it now instead of posting a brand-new card and making the human
+  // decide twice for what is, from their side, the exact same request.
+  const hookId = parseHatchHookId(req.requestId)
+  if (hookId !== null) {
+    const found = findQueuedHatchDecision(rt.abandoned, hookId, Date.now())
+    if (found) {
+      rt.abandoned.delete(found.key)
+      const answer: ButtonAnswer = {
+        status: "answered",
+        requestId: req.requestId,
+        label: found.queuedDecision.label,
+        value: found.queuedDecision.value,
+        decision: found.queuedDecision.decision,
+      }
+      const output = formatAgentHookOutput(req, answer)
+      socket.end(output === null ? "null\n" : `${JSON.stringify(output)}\n`)
+      rt.persist()
+      if (found.entry.messageId !== null) {
+        void clearMessageKeyboard(ctx, found.entry.messageId)
+        void editMessageText(ctx, found.entry.messageId, buildAnsweredQuestionText(found.entry.req, found.queuedDecision.label))
+      }
+      log(`ask-forward hatch-queued-decision-delivered: hookId=${hookId} key=${found.key} label=${found.queuedDecision.label}`)
+      return
+    }
   }
 
   const pendingKey = callbackRequestId(req)
@@ -5202,7 +5296,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const label = resolveWindowAgentLabel(entry.req.windowName, entry.req.cwd)
     if (entry.messageId !== null) {
       void clearMessageKeyboard(ctx, entry.messageId)
-      void editMessageText(ctx, entry.messageId, abandonedLongOutageText(entry.req, label, entry.queuedDecision?.label))
+      const hookId = parseHatchHookId(entry.req.requestId)
+      void editMessageText(
+        ctx,
+        entry.messageId,
+        hookId !== null
+          ? hatchAbandonedLongOutageText(entry.req, hookId, entry.queuedDecision?.label)
+          : abandonedLongOutageText(entry.req, label, entry.queuedDecision?.label),
+      )
     }
     log(`ask-abandoned-long-outage: ${describeAskRequest(entry.req)} key=${key}`)
   }
@@ -5386,7 +5487,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     let expiredOnRestore = false
     for (const rec of raw.questions) {
       const req = normalizeButtonRequest(rec.req)
-      if (!req || !req.paneId || (req.kind === "question" && !req.options?.length)) continue
+      if (!req) continue
+      if (!req.paneId && !(req.kind === "permission" && isHatchRequest(req))) continue
+      if (req.kind === "question" && !req.options?.length) continue
       if (isAbandonedExpired(req.kind, rec.at, nowRestore)) {
         // Carry the queuedDecision through (same rule as the live-abandonedButtons
         // restore below): a tap that was never delivered before the daemon went
@@ -8641,7 +8744,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   ): Promise<boolean> => {
     const retained = abandonedButtons.get(action.requestId)
     if (!retained) return false
-    if (!retained.req.omp && !retained.req.paneId) return false
+    // A hatch/RIG_HATCH_REQUEST_* permission (see parseHatchHookId) is
+    // retained with no paneId (retainAbandonedQuestion's paneless carve-out)
+    // specifically so a late tap here CAN still be recorded as a queuedDecision
+    // — this early "nothing to inject into" bail-out must not reject it before
+    // the permission branch below ever runs.
+    if (!retained.req.omp && !retained.req.paneId && !(retained.req.kind === "permission" && isHatchRequest(retained.req))) return false
     if (retained.req.omp) {
       const answer = resolveButtonCallback(retained.req, { requestId: action.requestId, value: action.value })
       if (answer.status !== "answered") return false
@@ -8893,6 +9001,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // no live/identity-matching menu, or unconfirmed injection) — already
       // durably queued above; render the existing queued-decision UI.
       const cardId = retained.messageId ?? action.messageId
+      // A hatch entry (see parseHatchHookId) has no live hook to ever reconnect
+      // to for THIS attempt — the card/toast text must say so plainly instead
+      // of the generic reconnect-or-terminal promise, which is impossible here.
+      const hookId = parseHatchHookId(retained.req.requestId)
       // The keyboard MUST ride along explicitly here too (see the disconnect-edit
       // comment in armPendingSocketClose) — "tap again to change it" is a lie if
       // THIS edit is what removes the buttons (review finding).
@@ -8903,7 +9015,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           // Card text reads `retained.req` — the toast below MUST read the SAME
           // object (never the incoming `req`/`action`), or queuedDecisionCanAutoDeliver's
           // "single source of truth" guarantee is only nominal (review finding).
-          queuedPermissionDecisionText(retained.req, label, answer.label),
+          hookId !== null
+            ? hatchApprovalRecordedText(retained.req, hookId, answer.label)
+            : queuedPermissionDecisionText(retained.req, label, answer.label),
           buildButtonMessage(ctx.chatId, retained.req).reply_markup,
         )
       }
@@ -8916,7 +9030,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       await answerCallbackQuery(
         ctx,
         action.callbackQueryId,
-        queuedDecisionCanAutoDeliver(retained.req) ? "queued — will send once the hook reconnects" : "queued — tap again once it reconnects",
+        hookId !== null
+          ? "recorded — will be applied automatically the next time the same hatch command is retried"
+          : queuedDecisionCanAutoDeliver(retained.req) ? "queued — will send once the hook reconnects" : "queued — tap again once it reconnects",
       )
       return true
     }

@@ -131,6 +131,53 @@ export type ButtonAnswer =
 const CALLBACK_PREFIX = 'tgq';
 const CLOSE_CALLBACK_PREFIX = 'tgqc';
 
+// A RIG_HATCH_REQUEST_* approval (agent-tools' agenttools_hatch_escalation,
+// cross-repo) is a ONE-SHOT, HEADLESS `permission` request: a Python hook
+// script builds it by hand (never a live harness), so it carries no `paneId`
+// (no tmux session to inject into or fall back to a terminal in) and no
+// `promptTurnId` (there is no per-invocation nonce source — see
+// ButtonRequest.promptTurnId — because it isn't normalized from a harness
+// hook payload at all). That combination means queuedDecisionCanAutoDeliver
+// is always false for it AND the generic "tap again once it reconnects" /
+// "answer in the terminal" fallbacks are both structurally impossible: the
+// requesting `tg-ctl ask` process already exited (it cannot reconnect — it
+// isn't a long-lived hook) and there never was a terminal. requestId is
+// minted as `hatch-<hookId>-<12 lowercase hex chars>` (agent_tools'
+// request_hatch_approval: `f"hatch-{hook_id}-{uuid.uuid4().hex[:12]}"`); the
+// hex suffix is random PER ATTEMPT, so two retries of the SAME hatch never
+// share a requestId — hookId is the one thing stable across retries, which is
+// what lets tg-ctl recognize "this is a retry of a request I already have a
+// human decision for" (handleHookSocketLine's hatch short-circuit) instead of
+// only ever matching by exact requestId equality (the reconnect re-attach
+// path above, which a hatch retry can never hit — a NEW random requestId every
+// time means `rt.abandoned.get(pendingKey)` never finds the prior attempt).
+const HATCH_REQUEST_RE = /^hatch-(.+)-[0-9a-f]{12}$/;
+
+// Exported: the "is this the one delivery path a headless RIG_HATCH_REQUEST_*
+// approval has" check is a stable domain concept consumed both here
+// (text builders below) and in tg-ctl (retainAbandonedQuestion's paneless
+// retention carve-out, the durable-state restore filter) — a shared boundary
+// name, not an inlineable one-off.
+export function parseHatchHookId(requestId: string): string | null {
+  const m = HATCH_REQUEST_RE.exec(requestId);
+  return m ? m[1] : null;
+}
+
+export function isHatchRequest(req: Pick<ButtonRequest, 'requestId'>): boolean {
+  return parseHatchHookId(req.requestId) !== null;
+}
+
+// The `RIG_HATCH_REQUEST_<HOOK_ID>` env var name for a parsed hookId — the SAME
+// canonicalization agent-tools' `hatch_env_var` applies (hook_id is passed
+// hyphenated, e.g. "block-reset-hard"; the env var uppercases and swaps
+// hyphens for underscores: `hook_id.strip().upper().replace("-", "_")`).
+// Mirrored here (three call sites below need lockstep spelling) so the retry
+// command shown to the human is byte-identical to what the hook itself
+// documents, not a re-derived spelling that could drift.
+function hatchEnvVarName(hookId: string): string {
+  return `RIG_HATCH_REQUEST_${hookId.trim().toUpperCase().replace(/-/g, '_')}`;
+}
+
 // Registration guard for incoming hook requests. paneId is authoritative: when
 // both sides know the pane, a mismatch REJECTS even if cwd/sessionName agree —
 // a second keyboard session in the same cwd must never block on Telegram.
@@ -251,6 +298,22 @@ export function abandonedPermissionText(req: ButtonRequest, label: string): stri
   return [buildQuestionText(req), status].join('\n\n');
 }
 
+// Hatch counterpart to abandonedPermissionText: a RIG_HATCH_REQUEST_<hookId>
+// (see parseHatchHookId) has no pane to reconnect into and no terminal to
+// answer in — the requesting `tg-ctl ask` process already exited — so this
+// must NOT make either promise. Instead it names the one path that actually
+// works: retrying the exact same command with the same
+// RIG_HATCH_REQUEST_<HOOK_ID> env var, which handleHookSocketLine's hatch
+// short-circuit recognizes as the same hatch and answers immediately (see
+// hatchApprovalRecordedText for the post-tap version of this same message).
+// The caveat ("only if still current") matters because a retry may run long
+// after the original need — a stale auto-applied decision would be worse
+// than asking again.
+export function hatchAbandonedPermissionText(req: ButtonRequest, hookId: string): string {
+  const status = `hatch request disconnected — the requesting command already gave up waiting, so there is no live process left to answer. A tap now IS recorded: retry the exact same command with the same ${hatchEnvVarName(hookId)}="<justification>" env var and it will be applied automatically with no new Telegram prompt. Only retry if the original need is still current.`;
+  return [buildQuestionText(req), status].join('\n\n');
+}
+
 // A Telegram tap landed while a permission's hook was disconnected (see
 // abandonedPermissionText): the decision can't be delivered yet (no live socket to
 // write the hook's JSON reply to), so it is QUEUED on the retained entry and
@@ -301,6 +364,17 @@ export function queuedPermissionDecisionText(req: ButtonRequest, label: string, 
   return [buildQuestionText(req), status].join('\n\n');
 }
 
+// Hatch counterpart to queuedPermissionDecisionText: a tap DID land for a
+// RIG_HATCH_REQUEST_<hookId> (see parseHatchHookId) whose requesting process
+// had already exited, so — unlike a scoped permission — there is no live hook
+// socket to deliver to and never will be for THIS attempt. The decision is
+// still recorded (findQueuedHatchDecision, tg-ctl) so a retry (a NEW
+// requestId, same hookId) is answered instantly instead of asking again.
+export function hatchApprovalRecordedText(req: ButtonRequest, hookId: string, decisionLabel: string): string {
+  const status = `recorded "${decisionLabel}" for hatch request ${hookId} — the requesting command already gave up waiting, so it could not be delivered. Retry the exact same command with the same ${hatchEnvVarName(hookId)}="<justification>" env var and it will be applied automatically with no new Telegram prompt. Only retry if the original need is still current.`;
+  return [buildQuestionText(req), status].join('\n\n');
+}
+
 // Same socket-close event, but for a multi-question SET MEMBER: a lone late answer
 // must NOT be delivered (the local dialog may be showing a DIFFERENT question of
 // the set, see ButtonRequest.multiQuestion) and, unlike a permission, there is no
@@ -330,6 +404,18 @@ export function abandonedLongOutageText(req: ButtonRequest, label: string, queue
   const status = queuedDecisionLabel
     ? `still no connection for ${label} after a long wait — your queued "${queuedDecisionLabel}" was never delivered and this card is giving up on it; answer directly in the terminal.`
     : `still no connection for ${label} after a long wait — this was never delivered over Telegram; answer directly in the terminal.`;
+  return [buildQuestionText(req), status].join('\n\n');
+}
+
+// Hatch counterpart to abandonedLongOutageText: mirrors its two-branch shape
+// (a named queued decision vs. none) but drops the "answer in the terminal"
+// fallback — a headless hatch request never had one. Once the retention
+// window elapses with no retry, the decision (if any) is discarded; the next
+// attempt starts fresh and prompts again from scratch.
+export function hatchAbandonedLongOutageText(req: ButtonRequest, hookId: string, queuedDecisionLabel?: string): string {
+  const status = queuedDecisionLabel
+    ? `hatch request ${hookId}: no retry arrived after a long wait — your recorded "${queuedDecisionLabel}" was never applied and this card is giving up on it. A fresh retry will prompt again from scratch.`
+    : `hatch request ${hookId}: no retry arrived after a long wait — this was never delivered. A fresh retry will prompt again from scratch.`;
   return [buildQuestionText(req), status].join('\n\n');
 }
 

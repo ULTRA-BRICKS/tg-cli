@@ -3,6 +3,28 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.52.1
+
+**Fix (tg-cli#349): the hatch approval retention fix now also covers the raw `UNSCOPED_ABANDON_MS` backstop timer, not just socket close.**
+
+#350's original fix made `retainAbandonedQuestion`/`expireDeadCard` retention reachable only
+from `armPendingSocketClose`'s socket `'close'` handler. A separate raw `UNSCOPED_ABANDON_MS`
+(110s) `setTimeout` in `forwardAndPostQuestion` also retires the same pending entry, and called
+`expireDeadCard` directly — bypassing retention. A hatch request's own requesting process stays
+connected for ~120s (its own hook budget), longer than the 110s default abandon window, so in
+the DEFAULT production scenario the raw timer fired first while the socket was still open,
+destroying the card before retention ever ran. Only the edge case where the process exited or
+was killed early went through the already-fixed path.
+
+- Extracted the retain-or-expire decision into a shared `retireAbandonedEntry`, called from both
+  the socket-close handler and the raw abandon timer, so both retirement paths converge on the
+  same retention check.
+- New regression test reproduces the default scenario exactly: the requesting process is never
+  killed and its socket never closes; only the raw backstop timer (shrunk via
+  `TG_CTL_UNSCOPED_TIMEOUT_MS`) retires the entry. Fails against the pre-fix code (generic
+  "expired — answer in terminal" text instead of the hatch-specific disconnect text) and passes
+  with the fix.
+
 ## 1.52.0
 
 **Feature: tg-ctl active-silence nudge for tg-unaware agent sessions (tg-cli#363).**
