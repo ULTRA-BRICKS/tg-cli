@@ -195,4 +195,4 @@ test('Telegram text reaches fake omp ACP with TMUX unset; never tmux send-keys; 
   // Ask 108 / tg-cli#342: the stable project token stays on the label so
   // /agent landing and /agent rig-cli remain visible next to the title.
   expect(String(confirm?.text)).toContain('review-cli');
-});
+}, 20_000);

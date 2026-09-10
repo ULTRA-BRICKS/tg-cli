@@ -75,6 +75,7 @@ import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/conf
 import { codexUsageTranscriptPath, latestCodexUsageTelemetryPayload } from "./features/tg-ctl/codex-usage"
 import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
 import { serializeDeferredStore, parseDeferredStore } from "./features/tg-ctl/deferred-store"
+import { TargetDispatchQueues, groupActionsByAckBoundary } from "./features/tg-ctl/concurrent-dispatch"
 import {
   findAgentInPane,
   panesWithRetry,
@@ -1237,7 +1238,15 @@ async function promptOmpAcp(target: OmpAcpTarget | string, text: string): Promis
   try {
     client = await ensureOmpAcp(agent)
     promptSentAt = Date.now()
-    await acpCall(client, (id) => buildAcpSessionPrompt(id, client!.sessionId, text), ACP_PROMPT_TIMEOUT_MS)
+    // 15s, not 120s (tg-cli#357): concurrent per-target dispatch already isolates a stuck target
+    // from every other one, but this call's OWN worst case still has to stay short — a live LLM
+    // turn should at least acknowledge receipt well within 15s, and a daemon-wide 120s bound was
+    // the root cause of the reported head-of-line-blocking incident.
+    await acpCall(
+      client,
+      (id) => buildAcpSessionPrompt(id, client!.sessionId, text),
+      Math.min(15_000, ACP_PROMPT_TIMEOUT_MS),
+    )
     return { ok: true }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err)
@@ -5279,6 +5288,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
   }
   const pendingButtons = new Map<string, PendingButton>()
+  // Per-resource-key concurrent dispatch (tg-cli#357): actions sharing a key (same topic
+  // thread, same pending token, same question requestId) still run strictly in enqueue order;
+  // actions with different keys run fully concurrently so one stuck target can never head-of-
+  // line-block delivery to any other target. See actionResourceKey below and concurrent-dispatch.ts.
+  const dispatchQueues = new TargetDispatchQueues()
   const activeButtonKeys = new Set<string>()
   // Answered-request replay cache (tg-cli#97): requestId → the answer just given,
   // so a re-forward of the same question within ANSWERED_REPLAY_MS replays it
@@ -9235,11 +9249,46 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return true
   }
 
+  // The shared-state key for actions that read-then-write a Map keyed by a shared identifier
+  // (tg-cli#357): actions carrying the same key still run strictly in enqueue order via
+  // dispatchQueues below (preserving every existing double-tap/race guard); `null` means the
+  // action touches no shared keyed state and is always safe to run fully concurrently.
+  const actionResourceKey = (action: Action): string | null => {
+    switch (action.kind) {
+      case "topic-new":
+      case "topic-answer":
+      case "topic-route":
+      case "topic-dead":
+      case "topic-close":
+      case "topic-reopen":
+      case "topic-model":
+      case "topic-path":
+      case "topic-respawn":
+        return `thread:${action.threadId}`
+      case "agent-callback":
+      case "agent-cancel":
+        return `token:${action.token}`
+      case "new-dir":
+      case "new-model":
+      case "new-retry":
+        return `token:${action.token}`
+      case "answer-question":
+      case "close-question-card":
+      case "post-timeout-question-reply":
+        return `req:${action.requestId}`
+      case "limit-continue":
+        return `pane:${action.paneId}`
+      default:
+        return null
+    }
+  }
+
   // Returns true when the action was handled successfully — the 'ack' case
-  // reads the PREVIOUS action's verdict to decide whether the source message
-  // earns its 👀 receipt (actions for one message are contiguous, ack last).
-  let lastActionOk = true
-  const executeAction = async (action: Action): Promise<boolean> => {
+  // reads the PRECEDING action's verdict (passed in, not a shared mutable variable — tg-cli#357:
+  // concurrent dispatch across different resource keys means a closure variable updated by another
+  // in-flight group could otherwise leak across groups) to decide whether the source message earns
+  // its 👀 receipt (actions for one message are contiguous, ack last).
+  const executeAction = async (action: Action, precedingOk: boolean): Promise<boolean> => {
     switch (action.kind) {
       case "reply":
         await sendMessage(ctx, action.text)
@@ -9460,7 +9509,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           if (!queuedReaction.shouldSend || queuedReaction.shouldSend()) {
             await setReaction(action.messageId, queuedReaction.emoji)
           }
-        } else if (lastActionOk) {
+        } else if (precedingOk) {
           await setSeenReaction(action.messageId)
         }
         return true
@@ -9741,14 +9790,32 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         )
       }
 
-      // STRICTLY SEQUENTIAL — one action fully completes (its persist + spawn) before the next
-      // starts. The forum-topics no-double-spawn guarantee relies on this: two `topic-model` taps
-      // in one batch are handled one-after-another, so the first reaches `bound` before the second's
-      // bound-guard reads the store. Parallelizing this (Promise.all) would let both load
-      // `awaiting-model` and both spawn — do NOT make action dispatch concurrent.
-      for (const action of step.actions) {
-        lastActionOk = await executeAction(action)
-      }
+      // Concurrent per-target dispatch (tg-cli#357, fixes the reported head-of-line-blocking
+      // incident: one wedged omp ACP session/prompt call froze delivery to every other agent
+      // sharing this daemon). Actions for one inbound message are grouped by their trailing
+      // `ack` boundary and run as one atomic, internally sequential unit — the forum-topics
+      // no-double-spawn guarantee (two `topic-model` taps for the SAME thread reach `bound`
+      // one-after-another) is preserved because same-key groups (actionResourceKey) still run
+      // through dispatchQueues in strict enqueue order. Groups with different keys (the common
+      // case: different messages routed to different agents) run fully concurrently via
+      // Promise.allSettled, so one group's stuck action can never delay or fail any other.
+      const actionGroups = groupActionsByAckBoundary(step.actions)
+      await Promise.allSettled(
+        actionGroups.map((group) => {
+          const key = group.reduce<string | null>((acc, a) => acc ?? actionResourceKey(a), null)
+          return dispatchQueues.run(key, async () => {
+            let ok = true
+            for (const action of group) {
+              try {
+                ok = await executeAction(action, ok)
+              } catch (err) {
+                log(`action ${action.kind} failed: ${err instanceof Error ? err.message : String(err)}`)
+                ok = false
+              }
+            }
+          })
+        }),
+      )
     } catch (err) {
       // A SIGTERM-aborted long-poll surfaces here as an AbortError — that is a
       // clean graceful exit (no batch was in flight, since fetch never returned),

@@ -3,6 +3,17 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.52.4
+
+**Fix (tg-cli#357): stop ACP action delivery head-of-line blocking across the agent fleet.**
+
+- Added a per-target concurrent dispatch queue (`features/tg-ctl/concurrent-dispatch.ts`) so each
+  target's actions are delivered independently instead of through one shared sequential loop.
+- Reduced the per-action delivery timeout from 120s to 15s so a stuck target fails fast instead of
+  blocking every other queued target.
+- Topic-thread actions remain serialized per thread after the main merge.
+- New regression coverage in `tests/ctl-concurrent-dispatch.test.ts`.
+
 ## 1.52.3
 
 **Fix (ci): stop `dependency-review`'s SBOM preflight probe aborting under the runner's default `set -e`.**
