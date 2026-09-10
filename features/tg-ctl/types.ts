@@ -344,6 +344,15 @@ export type Action =
   // A tap on the "Retry spawn" button (tnr:<token>) offered after a spawn FAILURE → re-run the
   // spawn with the pending session's already-chosen name/dir/harness/model (never re-asks).
   | { kind: 'new-retry'; callbackQueryId: string; token: string; messageId: number | null }
+  // A tap on the private-topic fallback prompt (tnf:<token>:continue|cancel) → either continue the
+  // same pending /new session without topic routing or cancel that spawn.
+  | {
+      kind: 'new-private-topic-fallback';
+      callbackQueryId: string;
+      token: string;
+      choice: 'continue' | 'cancel';
+      messageId: number | null;
+    }
   // A free-text message answering an in-flight flat-/new prompt (the awaiting-dir step — an
   // absolute path typed instead of tapping a button). `text` is the raw user text. The entrypoint
   // matches it to the SINGLE pending session in awaiting-dir (a flat chat has at most one /new in

@@ -14,8 +14,8 @@ import { parseTopics } from '../features/tg-ctl/topics';
 //   1. createForumTopic SUCCEEDS → daemon spawns via spawnTopicWindow (TG_TOPIC in argv),
 //      writes a `bound` binding in the topics store, and the forum_topic_created echo is
 //      silently swallowed (no re-flow started).
-//   2. private topics are disabled for the bot (`getMe.has_topics_enabled=false`) → graceful
-//      fallback to plain spawnNewWindow, plus a visible Telegram warning.
+//   2. private topics are disabled for the bot (`getMe.has_topics_enabled=false`) → ask once
+//      before falling back to plain spawnNewWindow.
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const SPAWNED_PANE = '%8';
@@ -158,6 +158,23 @@ function modelTap(id: number, token: string, modelId: string): unknown {
       from: { id: 1, first_name: 'Alex' },
       message: { message_id: id, chat: { id: 1 }, date: 0 },
       data: `tnm:${token}:${modelId}`,
+    },
+  };
+}
+
+function callbackTap(id: number, messageId: number, data: string, threadId?: number): unknown {
+  return {
+    update_id: id,
+    callback_query: {
+      id: `cb${id}`,
+      from: { id: 1, first_name: 'Alex' },
+      message: {
+        message_id: messageId,
+        chat: { id: 1 },
+        date: 0,
+        ...(threadId !== undefined ? { message_thread_id: threadId } : {}),
+      },
+      data,
     },
   };
 }
@@ -430,17 +447,21 @@ test(
   },
 );
 
-// --- Scenario 2: private topics disabled (graceful fallback + visible warning) ---
+// --- Scenario 2: private topics disabled (ask once before graceful fallback) ---
 
 test(
-  'private_topics: getMe.has_topics_enabled=false → warns, falls back to flat spawn, NO topic binding written',
+  'private_topics: getMe.has_topics_enabled=false → asks once before flat fallback',
   async () => {
     const { cfgDir, spawnLog } = makeCfgDir(true);
     const topicsFile = join(cfgDir, 'tg-ctl.123.topics.json');
+    writeFileSync(topicsFile, JSON.stringify([{ threadId: 77, name: 'source', status: 'bound', paneId: '%1', ts: nowSec() }]));
 
-    // The bot reports private-topic mode disabled, exactly like the live bot did.
-    const queue: unknown[][] = [[textMsg(20, `/new claude-default ${cfgDir} flatproj`)]];
+    // The first probe reports private-topic mode disabled, exactly like the live bot did.
+    // Later probes would report true: after the user explicitly taps Continue without topics,
+    // that choice must still be honored for this daemon run instead of racing into topic creation.
+    const queue: unknown[][] = [[topicTextMsg(20, 77, `/new claude-default ${cfgDir} flatproj`)]];
     const sends: Array<Record<string, unknown>> = [];
+    let getMeCalls = 0;
     let createTopicCalls = 0;
     const server = Bun.serve({
       port: 0,
@@ -453,7 +474,17 @@ test(
           return Response.json({ ok: true, result: [] });
         }
         if (url.pathname.endsWith('/getMe')) {
-          return Response.json({ ok: true, result: { id: 123, is_bot: true, username: 'bot', has_topics_enabled: false, allows_users_to_create_topics: false } });
+          getMeCalls += 1;
+          return Response.json({
+            ok: true,
+            result: {
+              id: 123,
+              is_bot: true,
+              username: 'bot',
+              has_topics_enabled: getMeCalls === 1 ? false : true,
+              allows_users_to_create_topics: false,
+            },
+          });
         }
         if (url.pathname.endsWith('/createForumTopic')) {
           createTopicCalls += 1;
@@ -486,7 +517,23 @@ test(
     });
     closeSync(logFd);
 
-    // Wait for flat spawn to happen.
+    await waitFor(() => sent(sends, 'Continue without topic routing?'));
+    expect(spawnArgvLog(spawnLog)).toHaveLength(0);
+    const prompts = sends.filter((s) => String(s.text ?? '').includes('Continue without topic routing?'));
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0].message_thread_id).toBe(77);
+    const promptMarkup = prompts[0].reply_markup as { inline_keyboard?: Array<Array<{ callback_data?: string }>> } | undefined;
+    const continueData = promptMarkup?.inline_keyboard?.flat().find((b) => b.callback_data?.includes(':continue'))?.callback_data;
+    expect(continueData).toBeTruthy();
+
+    queue.push([topicTextMsg(21, 77, `/new claude-default ${cfgDir} pending-second`)]);
+    await waitFor(() => sent(sends, 'private-topic fallback choice is already open'));
+    expect(spawnArgvLog(spawnLog)).toHaveLength(0);
+    expect(sends.filter((s) => String(s.text ?? '').includes('Continue without topic routing?'))).toHaveLength(1);
+
+    queue.push([callbackTap(22, Number(prompts[0].message_id ?? 901), continueData!, 77)]);
+
+    // Answering the one-time prompt continues the original /new as a flat spawn.
     await waitFor(() => spawnArgvLog(spawnLog).length > 0);
     const argv = spawnArgvLog(spawnLog);
 
@@ -496,22 +543,195 @@ test(
     expect(argv[0]).toContain('-n flatproj');
     expect(argv[0]).toContain(`-c ${cfgDir}`);
 
-    // NO binding written in the topics store.
-    await Bun.sleep(300);
-    if (existsSync(topicsFile)) {
-      const bindings = parseTopics(readFileSync(topicsFile, 'utf8'));
-      expect(bindings.length).toBe(0);
-    }
+    // NO new binding written in the topics store.
+    const bindings = parseTopics(readFileSync(topicsFile, 'utf8'));
+    expect(bindings.filter((b) => b.threadId !== 77)).toHaveLength(0);
+    expect(getMeCalls).toBe(1);
     expect(createTopicCalls).toBe(0);
-    // (topics file may not exist at all if nothing was written — both outcomes are correct)
 
-    // The user sees the reason; the fallback is no longer hidden in daemon logs.
-    await waitFor(() => sent(sends, 'getMe.has_topics_enabled=false'));
-    expect(sent(sends, 'getMe.has_topics_enabled=false')).toBe(true);
-    expect(sent(sends, 'This chat does not need to be converted to a forum')).toBe(true);
     // Confirmation message still sent (graceful — user gets their agent regardless).
     await waitFor(() => sent(sends, 'spawned `claude-default`'));
     expect(sent(sends, 'spawned `claude-default`')).toBe(true);
+    const confirmations = sends.filter((s) => String(s.text ?? '').includes('spawned `claude-default`'));
+    expect(confirmations.every((s) => s.message_thread_id === 77)).toBe(true);
+
+    queue.push([topicTextMsg(23, 77, `/new claude-default ${cfgDir} second`)]);
+    await waitFor(() => spawnArgvLog(spawnLog).length === 2);
+    expect(spawnArgvLog(spawnLog)).toHaveLength(2);
+    expect(getMeCalls).toBe(1);
+    const promptsAfterSecond = sends.filter((s) => String(s.text ?? '').includes('Continue without topic routing?'));
+    expect(promptsAfterSecond).toHaveLength(1);
+
+    daemon.kill();
+  },
+);
+
+test(
+  'private_topics: cancelling disabled-topic fallback does not authorize later flat spawn',
+  async () => {
+    const { cfgDir, spawnLog } = makeCfgDir(true);
+    const queue: unknown[][] = [[textMsg(24, `/new claude-default ${cfgDir} cancelme`)]];
+    const sends: Array<Record<string, unknown>> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname.endsWith('/getUpdates')) {
+          const batch = queue.shift();
+          if (batch) return Response.json({ ok: true, result: batch });
+          await Bun.sleep(60);
+          return Response.json({ ok: true, result: [] });
+        }
+        if (url.pathname.endsWith('/getMe')) {
+          return Response.json({ ok: true, result: { id: 123, is_bot: true, username: 'bot', has_topics_enabled: false } });
+        }
+        if (url.pathname.endsWith('/createForumTopic')) {
+          return Response.json({ ok: false, description: 'unexpected createForumTopic' }, { status: 500 });
+        }
+        if (url.pathname.endsWith('/sendMessage')) {
+          sends.push((await req.json()) as Record<string, unknown>);
+          return Response.json({ ok: true, result: { message_id: 900 + sends.length } });
+        }
+        if (url.pathname.endsWith('/answerCallbackQuery')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/editMessageReplyMarkup')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMessageReaction')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMyCommands')) return Response.json({ ok: true, result: true });
+        return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+      },
+    });
+    servers.push(server);
+
+    const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
+    const daemon: Subprocess = await spawnDaemon(reg, {
+      tgCtlPath: TG_CTL,
+      cfgDir,
+      env: {
+        PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
+        HOME: cfgDir,
+        TG_CTL_CONFIG_DIR: cfgDir,
+        TG_API_BASE: `http://127.0.0.1:${server.port}`,
+      },
+      logFd,
+    });
+    closeSync(logFd);
+
+    await waitFor(() => sent(sends, 'Continue without topic routing?'));
+    const prompts = sends.filter((s) => String(s.text ?? '').includes('Continue without topic routing?'));
+    const promptMarkup = prompts[0].reply_markup as { inline_keyboard?: Array<Array<{ callback_data?: string }>> } | undefined;
+    const cancelData = promptMarkup?.inline_keyboard?.flat().find((b) => b.callback_data?.includes(':cancel'))?.callback_data;
+    expect(cancelData).toBeTruthy();
+    queue.push([callbackTap(25, Number(prompts[0].message_id ?? 901), cancelData!)]);
+
+    await waitFor(() => sent(sends, 'cancelled — no agent was spawned'));
+    expect(spawnArgvLog(spawnLog)).toHaveLength(0);
+
+    queue.push([textMsg(26, `/new claude-default ${cfgDir} retry`)]);
+    await waitFor(() => sends.filter((s) => String(s.text ?? '').includes('Continue without topic routing?')).length === 2);
+    expect(sends.filter((s) => String(s.text ?? '').includes('Continue without topic routing?'))).toHaveLength(2);
+    expect(spawnArgvLog(spawnLog)).toHaveLength(0);
+
+    daemon.kill();
+  },
+);
+
+test(
+  'private_topics: a stale (already-consumed) fallback tap does not clobber a different session\'s live pending choice',
+  async () => {
+    const { cfgDir, spawnLog } = makeCfgDir(true);
+    const queue: unknown[][] = [[textMsg(30, `/new claude-default ${cfgDir} first`)]];
+    const sends: Array<Record<string, unknown>> = [];
+    const answers: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname.endsWith('/getUpdates')) {
+          const batch = queue.shift();
+          if (batch) return Response.json({ ok: true, result: batch });
+          await Bun.sleep(60);
+          return Response.json({ ok: true, result: [] });
+        }
+        if (url.pathname.endsWith('/getMe')) {
+          return Response.json({ ok: true, result: { id: 123, is_bot: true, username: 'bot', has_topics_enabled: false } });
+        }
+        if (url.pathname.endsWith('/createForumTopic')) {
+          return Response.json({ ok: false, description: 'unexpected createForumTopic' }, { status: 500 });
+        }
+        if (url.pathname.endsWith('/sendMessage')) {
+          sends.push((await req.json()) as Record<string, unknown>);
+          return Response.json({ ok: true, result: { message_id: 900 + sends.length } });
+        }
+        if (url.pathname.endsWith('/answerCallbackQuery')) {
+          const body = (await req.json()) as Record<string, unknown>;
+          answers.push(String(body.text ?? ''));
+          return Response.json({ ok: true, result: true });
+        }
+        if (url.pathname.endsWith('/editMessageReplyMarkup')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMessageReaction')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMyCommands')) return Response.json({ ok: true, result: true });
+        return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+      },
+    });
+    servers.push(server);
+
+    const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
+    const daemon: Subprocess = await spawnDaemon(reg, {
+      tgCtlPath: TG_CTL,
+      cfgDir,
+      env: {
+        PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
+        HOME: cfgDir,
+        TG_CTL_CONFIG_DIR: cfgDir,
+        TG_API_BASE: `http://127.0.0.1:${server.port}`,
+      },
+      logFd,
+    });
+    closeSync(logFd);
+
+    // Session A: fallback prompt, then CANCELLED (the legitimate way a token stops being live).
+    await waitFor(() => sent(sends, 'Continue without topic routing?'));
+    const promptA = sends.filter((s) => String(s.text ?? '').includes('Continue without topic routing?'))[0];
+    const markupA = promptA.reply_markup as { inline_keyboard?: Array<Array<{ callback_data?: string }>> } | undefined;
+    const staleContinueData = markupA?.inline_keyboard?.flat().find((b) => b.callback_data?.includes(':continue'))?.callback_data;
+    const cancelDataA = markupA?.inline_keyboard?.flat().find((b) => b.callback_data?.includes(':cancel'))?.callback_data;
+    expect(staleContinueData).toBeTruthy();
+    expect(cancelDataA).toBeTruthy();
+
+    queue.push([callbackTap(31, Number(promptA.message_id ?? 901), cancelDataA!)]);
+    await waitFor(() => sent(sends, 'cancelled — no agent was spawned'));
+    expect(spawnArgvLog(spawnLog)).toHaveLength(0);
+    expect(answers).toEqual(['cancelled']);
+
+    // Session B: a FRESH /new re-asks (state reset to "unknown" by the cancel above) and is now
+    // the one legitimate pending fallback decision.
+    queue.push([textMsg(32, `/new claude-default ${cfgDir} second`)]);
+    await waitFor(() => sends.filter((s) => String(s.text ?? '').includes('Continue without topic routing?')).length === 2);
+    expect(spawnArgvLog(spawnLog)).toHaveLength(0);
+
+    // Replay the STALE token from the already-cancelled session A (e.g. a duplicate Telegram
+    // delivery, or the user tapping session A's dangling keyboard). Its session is gone, so this
+    // must hit the "expired" branch WITHOUT touching session B's live "pending" decision.
+    queue.push([callbackTap(33, Number(promptA.message_id ?? 901), staleContinueData!)]);
+    await waitFor(() => answers.length === 2);
+    expect(answers[1]).toBe('expired — run /new again');
+    expect(spawnArgvLog(spawnLog)).toHaveLength(0);
+
+    // Session B must STILL be protected: a third /new must see "already open", not silently
+    // clobber B (the bug: the stale tap wrongly reset the global state, so this guard was
+    // skipped and B's live prompt was discarded out from under the user).
+    queue.push([textMsg(34, `/new claude-default ${cfgDir} third`)]);
+    await waitFor(() => sent(sends, 'private-topic fallback choice is already open'));
+    expect(sends.filter((s) => String(s.text ?? '').includes('Continue without topic routing?'))).toHaveLength(2);
+
+    // Session B's own prompt still answers normally afterwards — it was never corrupted.
+    const promptB = sends.filter((s) => String(s.text ?? '').includes('Continue without topic routing?'))[1];
+    const markupB = promptB.reply_markup as { inline_keyboard?: Array<Array<{ callback_data?: string }>> } | undefined;
+    const continueDataB = markupB?.inline_keyboard?.flat().find((b) => b.callback_data?.includes(':continue'))?.callback_data;
+    expect(continueDataB).toBeTruthy();
+    queue.push([callbackTap(35, Number(promptB.message_id ?? 902), continueDataB!)]);
+    await waitFor(() => spawnArgvLog(spawnLog).length > 0);
+    expect(spawnArgvLog(spawnLog)).toHaveLength(1);
+    expect(spawnArgvLog(spawnLog)[0]).toContain('-n second');
 
     daemon.kill();
   },

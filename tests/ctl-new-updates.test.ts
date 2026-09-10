@@ -83,6 +83,34 @@ test('tnp: tap → new-dir action carrying token + index + messageId', () => {
   expect(r.actions).toEqual([{ kind: 'new-dir', callbackQueryId: 'cb13', token: 'n1', index: 2, messageId: 130 }]);
 });
 
+test('tnf: tap → private-topic fallback action carrying token + choice + messageId', () => {
+  const r = stepUpdates([cbUpd(26, 'tnf:n1:continue')], makeOpts());
+  expect(r.actions).toEqual([
+    {
+      kind: 'new-private-topic-fallback',
+      callbackQueryId: 'cb26',
+      token: 'n1',
+      choice: 'continue',
+      messageId: 260,
+    },
+  ]);
+  const cancel = stepUpdates([cbUpd(27, 'tnf:n1:cancel')], makeOpts());
+  expect(cancel.actions).toEqual([
+    {
+      kind: 'new-private-topic-fallback',
+      callbackQueryId: 'cb27',
+      token: 'n1',
+      choice: 'cancel',
+      messageId: 270,
+    },
+  ]);
+});
+
+test('tnf: tap stays ordered with same-batch /new messages', () => {
+  const r = stepUpdates([upd(28, { text: '/new first' }), cbUpd(29, 'tnf:n1:continue')], makeOpts());
+  expect(r.actions.map((a) => a.kind)).toEqual(['new-command', 'ack', 'new-private-topic-fallback']);
+});
+
 test('plain message while a /new awaits its dir → new-answer', () => {
   const r = stepUpdates([upd(14, { text: '/Users/me/app' })], makeOpts({ newSessionAwaitingDir: () => true }));
   const a = r.actions.find((x) => x.kind === 'new-answer');

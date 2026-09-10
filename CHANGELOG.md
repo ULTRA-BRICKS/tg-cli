@@ -3,6 +3,17 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.50.0
+
+**Fix: tg-ctl asks once before falling back from private topics to flat `/new` spawns (tg-cli#181).**
+
+- When Bot API reports `getMe.has_topics_enabled=false`, tg-ctl now asks once
+  before continuing `/new` without topic routing, then remembers that choice for
+  later `/new` spawns in the same daemon run.
+- A stale/replayed fallback tap can no longer clobber a different session's
+  live pending fallback decision (`handleNewPrivateTopicFallback` only resets
+  the global state when nothing is actually awaiting an answer).
+
 ## 1.49.2
 
 **Fix (tg-cli#358): omp session title in outbound `[window]` header and `/agent` picker.**

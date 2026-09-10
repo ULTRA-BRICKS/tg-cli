@@ -280,6 +280,9 @@ import {
   buildNewHarnessKeyboard,
   buildNewModelKeyboard,
   buildNewRetryKeyboard,
+  buildNewPrivateTopicFallbackKeyboard,
+  NEW_PRIVATE_TOPIC_FALLBACK_CANCEL,
+  NEW_PRIVATE_TOPIC_FALLBACK_CONTINUE,
   nameCollides,
   parseNewCommand,
   rankNewDirChoices,
@@ -7542,17 +7545,25 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   }
 
   type PrivateTopicResult =
-    | { ok: true; threadId: number }
-    | { ok: false; message: string }
+    | { kind: "topic"; threadId: number }
+    | { kind: "fallback"; message?: string }
+    | { kind: "ask"; message: string }
+    | { kind: "waiting" }
+
+  let privateTopicFallbackState: "unknown" | "pending" | "accepted" = "unknown"
 
   const privateTopicWarning = (reason: string): string =>
     `tg-ctl private_topics is enabled, but ${reason}. This chat does not need to be converted to a forum. Spawning without a topic for now; after the bot capability/provisioning reports true, run \`tg-ctl restart\` and retry \`/new\`.`
+
+  const privateTopicFallbackPrompt = (reason: string): string =>
+    `tg-ctl private_topics is enabled, but ${reason}. Continue without topic routing?`
 
   // Create a private-chat topic via Bot API 9.4 `createForumTopic` and return the new
   // `message_thread_id`, or a user-visible failure reason (the daemon falls back to flat-chat behaviour).
   // Graceful: a failure is logged and returned to the caller so Telegram gets an explicit
   // capability diagnostic instead of hiding "chat is not a forum" in the daemon log.
   const createPrivateTopic = async (name: string): Promise<PrivateTopicResult> => {
+    if (privateTopicFallbackState === "accepted") return { kind: "fallback" }
     const me = await botPostResult(ctx, "getMe", {})
     if (me.ok) {
       const user = me.json.result
@@ -7560,9 +7571,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         const enabled = (user as { has_topics_enabled?: unknown }).has_topics_enabled
         if (enabled === false) {
           log("private chat topic create unavailable — getMe.has_topics_enabled=false")
-          return {
-            ok: false,
-            message: privateTopicWarning("Telegram Bot API currently reports `getMe.has_topics_enabled=false` for this bot, so `createForumTopic` cannot create a private-chat topic"),
+          if (privateTopicFallbackState === "pending") return { kind: "waiting" }
+          if (privateTopicFallbackState === "unknown") {
+            privateTopicFallbackState = "pending"
+            return {
+              kind: "ask",
+              message: privateTopicFallbackPrompt("Telegram Bot API currently reports `getMe.has_topics_enabled=false` for this bot, so `createForumTopic` cannot create a private-chat topic"),
+            }
           }
         }
       }
@@ -7571,7 +7586,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (!topicResp.ok) {
       log(`private chat topic create unavailable — createForumTopic: ${topicResp.description}`)
       return {
-        ok: false,
+        kind: "fallback",
         message: privateTopicWarning(`Telegram Bot API rejected \`createForumTopic\`: ${topicResp.description}`),
       }
     }
@@ -7579,7 +7594,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (!result || typeof result !== "object") {
       log("private chat topic create unavailable — createForumTopic returned no result object")
       return {
-        ok: false,
+        kind: "fallback",
         message: privateTopicWarning("Telegram Bot API returned no topic object from `createForumTopic`"),
       }
     }
@@ -7587,11 +7602,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (typeof threadId !== "number") {
       log("private chat topic create unavailable — createForumTopic returned no message_thread_id")
       return {
-        ok: false,
+        kind: "fallback",
         message: privateTopicWarning("Telegram Bot API returned no `message_thread_id` from `createForumTopic`"),
       }
     }
-    return { ok: true, threadId }
+    return { kind: "topic", threadId }
   }
 
   // Spawn a flat `/new` agent into a named tmux window and return the pane id, or a typed error.
@@ -7730,11 +7745,33 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // Private-chat topic: try to create a per-session topic BEFORE spawning so the window is born
     // with TG_TOPIC already set. Failure (capability/API error) → graceful flat fallback.
     const privateTopic = ctx.cfg.privateTopics ? await createPrivateTopic(session.name) : null
-    if (privateTopic?.ok) {
+    if (privateTopic?.kind === "topic") {
       return spawnNewSessionWithTopic(session, modelId, privateTopic.threadId, slug, promptMessageId)
     }
-    if (privateTopic && !privateTopic.ok) {
+    if (privateTopic?.kind === "ask") {
+      session.model = modelId
+      session.ts = Math.floor(Date.now() / 1000)
+      if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
+      const fallbackPromptMessageId = await sendMessage(ctx, privateTopic.message, {
+        ...out,
+        reply_markup: { inline_keyboard: buildNewPrivateTopicFallbackKeyboard(session.token) },
+      })
+      if (fallbackPromptMessageId === null) {
+        privateTopicFallbackState = "unknown"
+        session.status = "awaiting-model"
+        await askNewModel(session)
+        return false
+      }
+      session.status = "awaiting-private-topic-fallback"
+      session.promptMessageId = fallbackPromptMessageId
+      return false
+    }
+    if (privateTopic?.kind === "fallback" && privateTopic.message) {
       await sendMessage(ctx, privateTopic.message, out)
+    }
+    if (privateTopic?.kind === "waiting") {
+      await sendMessage(ctx, "private-topic fallback choice is already open — tap Continue without topics or Cancel this spawn.", out)
+      return false
     }
     // Flat spawn path (no private topic, or createForumTopic failed gracefully).
     const spawned = spawnNewWindow(slug, session.dir, modelId, session.task, spawnToken)
@@ -7796,19 +7833,29 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // piece is asked via buttons. A name collision with a live window is a non-fatal WARNING (tmux
   // allows dup names).
   const handleNewCommand = async (action: Extract<Action, { kind: "new-command" }>): Promise<boolean> => {
+    reapNewSessions()
     const out = replyContext(action.threadId)
     if (!action.name) {
       await sendMessage(ctx, "usage: /new [<harness>|<model>] [<dir>] <name> [<task>] — e.g. `/new codex /Users/you/app api fix the build`", out)
       return false
+    }
+    if (privateTopicFallbackState === "pending") {
+      const hasPendingFallback = [...pendingNew.values()].some((s) => s.status === "awaiting-private-topic-fallback")
+      if (hasPendingFallback) {
+        await sendMessage(ctx, "private-topic fallback choice is already open — tap Continue without topics or Cancel this spawn.", out)
+        return false
+      }
+      privateTopicFallbackState = "unknown"
     }
     // Name-uniqueness WARNING (issue #27): warn if the resulting window slug collides, don't block.
     const slug = slugifyTopicName(action.name, 0)
     if (nameCollides(slug, liveWindowNames())) {
       await sendMessage(ctx, `⚠️ a window named \`${slug}\` already exists — the new agent will share the name. Continuing.`, out)
     }
-    // A flat chat has at most ONE /new in flight (review #2): a second /new REPLACES any prior
-    // pending session, so a typed path can never be mis-applied to a stale earlier session that the
-    // user has visibly abandoned by starting over. Button taps are token-addressed and unaffected.
+    // A flat chat has at most ONE /new in flight (review #2): a second /new normally REPLACES any
+    // prior pending session, so a typed path can never be mis-applied to a stale earlier session.
+    // Exception: an open private-topic fallback confirmation is a live user decision, so it blocks
+    // replacement until Continue/Cancel or expiry (handled above).
     pendingNew.clear()
     // Validate a supplied dir up front; an invalid one is dropped (→ asked) rather than failing.
     let dir = action.dir
@@ -7993,6 +8040,38 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
     await answerCallbackQuery(ctx, action.callbackQueryId, "retrying…")
     return spawnNewSession(session, session.model, action.messageId)
+  }
+
+  const handleNewPrivateTopicFallback = async (action: Extract<Action, { kind: "new-private-topic-fallback" }>): Promise<boolean> => {
+    reapNewSessions()
+    const session = pendingNew.get(action.token)
+    if (!session || session.status !== "awaiting-private-topic-fallback" || !session.dir || !session.model) {
+      // A stale/reaped token must NOT clobber a DIFFERENT session's live pending fallback
+      // decision -- only fall back to "unknown" when nothing is actually awaiting an answer
+      // (mirrors the `hasPendingFallback` guard in handleNewCommand, tg-cli#181).
+      if (privateTopicFallbackState === "pending") {
+        const hasPendingFallback = [...pendingNew.values()].some((s) => s.status === "awaiting-private-topic-fallback")
+        if (!hasPendingFallback) privateTopicFallbackState = "unknown"
+      }
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired — run /new again")
+      return false
+    }
+    if (action.choice === NEW_PRIVATE_TOPIC_FALLBACK_CANCEL) {
+      privateTopicFallbackState = "unknown"
+      pendingNew.delete(action.token)
+      await answerCallbackQuery(ctx, action.callbackQueryId, "cancelled")
+      if (action.messageId !== null) await clearMessageKeyboard(ctx, action.messageId)
+      await sendMessage(ctx, "cancelled — no agent was spawned", replyContext(session.threadId))
+      return false
+    }
+    if (action.choice === NEW_PRIVATE_TOPIC_FALLBACK_CONTINUE) {
+      privateTopicFallbackState = "accepted"
+      await answerCallbackQuery(ctx, action.callbackQueryId, "starting without topics…")
+      if (action.messageId !== null) await clearMessageKeyboard(ctx, action.messageId)
+      return spawnNewSession(session, session.model, action.messageId)
+    }
+    await answerCallbackQuery(ctx, action.callbackQueryId, "expired — run /new again")
+    return false
   }
 
   // --- crash-window orphan reconcile (docs/specs/tg-forum-topics.md §9 increment 4) ---
@@ -9039,6 +9118,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return handleNewModel(action)
       case "new-retry":
         return handleNewRetry(action)
+      case "new-private-topic-fallback":
+        return handleNewPrivateTopicFallback(action)
       case "ack":
       {
         const queuedReaction = takeAckReaction(action.messageId)

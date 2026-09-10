@@ -5,16 +5,21 @@ import { describe, expect, test } from 'bun:test';
 import {
   MAX_NEW_DIR_CHOICES,
   NEW_DIR_CALLBACK_PREFIX,
+  NEW_PRIVATE_TOPIC_FALLBACK_CALLBACK_PREFIX,
+  NEW_PRIVATE_TOPIC_FALLBACK_CANCEL,
+  NEW_PRIVATE_TOPIC_FALLBACK_CONTINUE,
   NEW_MODEL_CALLBACK_PREFIX,
   buildNewDirKeyboard,
   buildNewHarnessKeyboard,
   buildNewModelKeyboard,
+  buildNewPrivateTopicFallbackKeyboard,
   nameCollides,
   parentDirs,
   parseNewCommand,
   parseNewDirCallback,
   parseNewHarnessCallback,
   parseNewModelCallback,
+  parseNewPrivateTopicFallbackCallback,
   rankNewDirChoices,
   resolveHarnessToken,
   resolveModelToken,
@@ -567,6 +572,22 @@ describe('flat /new callbacks', () => {
     expect(parseNewDirCallback('tnp:abc:x')).toBeNull();
     expect(parseNewDirCallback('tnp:abc:-1')).toBeNull();
   });
+  test('parseNewPrivateTopicFallbackCallback round-trips continue/cancel choices', () => {
+    expect(parseNewPrivateTopicFallbackCallback(`${NEW_PRIVATE_TOPIC_FALLBACK_CALLBACK_PREFIX}:abc:${NEW_PRIVATE_TOPIC_FALLBACK_CONTINUE}`)).toEqual({
+      token: 'abc',
+      choice: NEW_PRIVATE_TOPIC_FALLBACK_CONTINUE,
+    });
+    expect(parseNewPrivateTopicFallbackCallback(`${NEW_PRIVATE_TOPIC_FALLBACK_CALLBACK_PREFIX}:abc:${NEW_PRIVATE_TOPIC_FALLBACK_CANCEL}`)).toEqual({
+      token: 'abc',
+      choice: NEW_PRIVATE_TOPIC_FALLBACK_CANCEL,
+    });
+  });
+  test('parseNewPrivateTopicFallbackCallback rejects malformed choices', () => {
+    expect(parseNewPrivateTopicFallbackCallback('tnf:abc')).toBeNull();
+    expect(parseNewPrivateTopicFallbackCallback('tnf:abc:later')).toBeNull();
+    expect(parseNewPrivateTopicFallbackCallback('tnm:abc:continue')).toBeNull();
+    expect(parseNewPrivateTopicFallbackCallback(undefined)).toBeNull();
+  });
 });
 
 describe('keyboards', () => {
@@ -598,5 +619,11 @@ describe('keyboards', () => {
   });
   test('dir keyboard is empty for no choices', () => {
     expect(buildNewDirKeyboard('tok', [])).toEqual([]);
+  });
+  test('private-topic fallback keyboard offers continue and cancel callbacks', () => {
+    expect(buildNewPrivateTopicFallbackKeyboard('tok')).toEqual([
+      [{ text: 'Continue without topics', callback_data: 'tnf:tok:continue' }],
+      [{ text: 'Cancel this spawn', callback_data: 'tnf:tok:cancel' }],
+    ]);
   });
 });

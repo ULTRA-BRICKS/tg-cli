@@ -16,7 +16,7 @@ import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatu
 import { parseButtonCallback, parseQuestionCloseCallback } from './questions';
 import { isAgentCommand, parseAgentCallback, parseAgentCancelCallback, parseAgentCommand } from './agent-match';
 import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
-import { parseNewCommand, parseNewDirCallback, parseNewHarnessCallback, parseNewModelCallback, parseNewRetryCallback } from './new-command';
+import { parseNewCommand, parseNewDirCallback, parseNewHarnessCallback, parseNewModelCallback, parseNewRetryCallback, parseNewPrivateTopicFallbackCallback } from './new-command';
 import { parseTasksCallback, parseTasksCommand } from './tasks-command';
 import { parseContinueCallback } from './limits';
 import { botCommandNames } from './bot-commands';
@@ -233,6 +233,17 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
           callbackQueryId: cb.id,
           token: newDirCb.token,
           index: newDirCb.index,
+          messageId: cb.message?.message_id ?? null,
+        });
+        continue;
+      }
+      const newPrivateTopicFallbackCb = parseNewPrivateTopicFallbackCallback(cb.data);
+      if (newPrivateTopicFallbackCb) {
+        actions.push({
+          kind: 'new-private-topic-fallback',
+          callbackQueryId: cb.id,
+          token: newPrivateTopicFallbackCb.token,
+          choice: newPrivateTopicFallbackCb.choice,
           messageId: cb.message?.message_id ?? null,
         });
         continue;

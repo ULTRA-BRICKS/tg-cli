@@ -427,7 +427,8 @@ export function buildNewDirKeyboard(
 //   awaiting-model   — have name + dir + harness; asked for that harness's model (buttons)
 //   awaiting-retry   — have EVERY answer but the spawn FAILED; offered a single Retry button (a
 //                      failure never re-enters the questionnaire — the answers are all preserved)
-export type NewSessionStatus = 'awaiting-dir' | 'awaiting-harness' | 'awaiting-model' | 'awaiting-retry';
+//   awaiting-private-topic-fallback — private topic creation is unavailable; asked before flat fallback
+export type NewSessionStatus = 'awaiting-dir' | 'awaiting-harness' | 'awaiting-model' | 'awaiting-retry' | 'awaiting-private-topic-fallback';
 
 // One in-flight flat `/new` session, held in memory by the entrypoint (NOT persisted: a `/new`
 // that a daemon restart interrupts is simply abandoned — the user re-runs `/new`, far simpler
@@ -456,4 +457,38 @@ export interface NewSession {
   promptMessageId?: number | null;
   // Unix seconds the session was created/last advanced — used to expire abandoned sessions.
   ts: number;
+}
+
+export const NEW_PRIVATE_TOPIC_FALLBACK_CALLBACK_PREFIX = 'tnf';
+export const NEW_PRIVATE_TOPIC_FALLBACK_CONTINUE = 'continue';
+export const NEW_PRIVATE_TOPIC_FALLBACK_CANCEL = 'cancel';
+
+export interface ParsedNewPrivateTopicFallbackCallback {
+  token: string;
+  choice: typeof NEW_PRIVATE_TOPIC_FALLBACK_CONTINUE | typeof NEW_PRIVATE_TOPIC_FALLBACK_CANCEL;
+}
+
+export function parseNewPrivateTopicFallbackCallback(data: string | undefined): ParsedNewPrivateTopicFallbackCallback | null {
+  if (!data) return null;
+  const parts = data.split(':');
+  if (parts.length !== 3 || parts[0] !== NEW_PRIVATE_TOPIC_FALLBACK_CALLBACK_PREFIX || !parts[1]) return null;
+  if (parts[2] !== NEW_PRIVATE_TOPIC_FALLBACK_CONTINUE && parts[2] !== NEW_PRIVATE_TOPIC_FALLBACK_CANCEL) return null;
+  return { token: parts[1], choice: parts[2] };
+}
+
+export function buildNewPrivateTopicFallbackKeyboard(token: string): Array<Array<{ text: string; callback_data: string }>> {
+  return [
+    [
+      {
+        text: 'Continue without topics',
+        callback_data: `${NEW_PRIVATE_TOPIC_FALLBACK_CALLBACK_PREFIX}:${token}:${NEW_PRIVATE_TOPIC_FALLBACK_CONTINUE}`,
+      },
+    ],
+    [
+      {
+        text: 'Cancel this spawn',
+        callback_data: `${NEW_PRIVATE_TOPIC_FALLBACK_CALLBACK_PREFIX}:${token}:${NEW_PRIVATE_TOPIC_FALLBACK_CANCEL}`,
+      },
+    ],
+  ];
 }
