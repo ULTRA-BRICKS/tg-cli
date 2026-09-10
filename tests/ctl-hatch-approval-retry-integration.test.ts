@@ -287,20 +287,22 @@ test('HATCH RETRY (tg-cli#349): a tap after the requesting process exited is rec
 // default abandon window, so in the DEFAULT production scenario the raw timer fires
 // FIRST while the socket is still open — the fix above only ever protects the edge case
 // where the process exits/gets killed early. This test is the mirror image of 'HATCH
-// RETRY' above: `ask1` is NEVER killed and its socket NEVER closes; only the raw timer
-// (shrunk via TG_CTL_UNSCOPED_TIMEOUT_MS) retires the entry. Against the pre-fix code
-// this fails at the very first assertion below: the raw timer's unconditional
+// RETRY' above: `ask1` is NEVER killed by the test and its socket is never closed by a
+// client-side/premature death — retirement is driven purely by the raw timer (shrunk via
+// TG_CTL_UNSCOPED_TIMEOUT_MS), whose own socket.end() call closes the connection only
+// AFTER retireAbandonedEntry has already run (see forwardAndPostQuestion). Against the
+// pre-fix code this fails at the very first assertion below: the raw timer's unconditional
 // expireDeadCard call produces the generic EXPIRED_TERMINAL_TEXT card instead of the
 // hatch-specific disconnect text, before a human ever gets to tap anything.
-test('HATCH ABANDON-TIMER RACE (tg-cli#349, default scenario, no socket close): the raw UNSCOPED_ABANDON_MS backstop retains the entry, not just socket close', async () => {
+test('HATCH ABANDON-TIMER RACE (tg-cli#349, default scenario, process never killed): the raw UNSCOPED_ABANDON_MS backstop retains the entry, not just a client-initiated socket close', async () => {
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
   const daemon = await startDaemon(cfgDir, tg.port, { TG_CTL_UNSCOPED_TIMEOUT_MS: '300' });
 
-  // ask1's process is deliberately left running/connected for the ENTIRE test — no
-  // .kill(), no closed stdin past the initial write. The daemon's own hook socket
-  // stays open the whole time; only the raw abandon timer can retire this entry.
+  // ask1's process is deliberately never killed and its stdin is never closed by the
+  // test — the ONLY thing that can end this connection is the raw abandon timer itself,
+  // which retires the entry FIRST and only then closes the socket via socket.end().
   const ask1 = startAsk(cfgDir, tg.port, hatchRequest(HATCH_REQUEST_ID_1));
   expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
 
@@ -310,8 +312,9 @@ test('HATCH ABANDON-TIMER RACE (tg-cli#349, default scenario, no socket close): 
   expect(await until(() => tg.edits().some((e) => e.includes(HATCH_ENV_VAR)), 5000)).toBe(true);
   expect(tg.edits().some((e) => e.includes('expired — answer in terminal'))).toBe(false);
 
-  // A human taps Approve after the backstop timer retired the entry — the socket is
-  // STILL open at this point (ask1 has not exited).
+  // A human taps Approve after the backstop timer retired the entry. By now the timer's
+  // own socket.end() call has already run (see forwardAndPostQuestion) — the tap lands on
+  // the retained/persisted record, not on a socket the test itself is holding open.
   const allowData = tg.allowData()!;
   tg.push([tap(allowData, 801, 1)]);
   expect(await until(() => tg.answeredCbs().some((c) => c.text.includes('recorded')), 6000)).toBe(true);
