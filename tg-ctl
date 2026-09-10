@@ -3011,6 +3011,29 @@ function describeAskRequest(req: ButtonRequest): string {
   return `agent=${req.agent} kind=${req.kind} req=${req.requestId} subagent=${req.subagent ?? "-"} window=${req.windowName ?? "-"} pane=${req.paneId ?? "-"} cwd=${req.cwd ?? "-"} session=${req.sessionName ?? "-"}`
 }
 
+// An interim STATUS line the daemon writes to the hook socket BEFORE its final reply
+// (tg-cli#317). The final reply is unchanged (`null\n` or `<json>\n`), so a client that
+// predates this still works; a client that reads status lines can tell a card that was
+// POSTED and then expired from a request DROPPED at the door. Those two used to be one
+// bare `null`, and the asking side reported a card the human could see in Telegram as
+// "not-posted … daemon declined or unreachable" (messageId=14880, 2026-09-05).
+type AskStatusLine =
+  | { tgctl: "ask-status"; state: "posted"; messageId: number }
+  | { tgctl: "ask-status"; state: "dropped"; reason: string }
+  | { tgctl: "ask-status"; state: "expired"; messageId: number | null; ageMs: number }
+
+function writeAskStatus(socket: Socket, status: AskStatusLine): void {
+  if (socket.destroyed || socket.writableEnded) return
+  socket.write(`${JSON.stringify(status)}\n`)
+}
+
+// Decline a forward: the reason travels down the socket as a status line, then the
+// unchanged `null` reply. Every drop branch names its reason here AND in the daemon log.
+function dropAsk(socket: Socket, reason: string): void {
+  writeAskStatus(socket, { tgctl: "ask-status", state: "dropped", reason })
+  socket.end("null\n")
+}
+
 function describeRegistration(regs: Registration[]): string {
   if (regs.length === 0) return "none"
   return regs
@@ -3204,6 +3227,9 @@ async function forwardAndPostQuestion(
       rt.onUnscopedRelease()
       expireDeadCard(ctx, entry)
       rt.persist()
+      writeAskStatus(socket, {
+        tgctl: "ask-status", state: "expired", messageId: entry.messageId, ageMs: Date.now() - entry.at,
+      })
       socket.end("null\n")
     }, UNSCOPED_ABANDON_MS)
   }
@@ -3234,10 +3260,11 @@ async function forwardAndPostQuestion(
       }
     }
     rt.persist()
-    if (!conn.closed()) socket.end("null\n")
+    if (!conn.closed()) dropAsk(socket, "send-failed")
     return
   }
   log(`ask-forward posted: ${describeAskRequest(req)} messageId=${messageId}`)
+  if (!conn.closed()) writeAskStatus(socket, { tgctl: "ask-status", state: "posted", messageId })
   entry.messageId = messageId
   // If the socket closed DURING the send, the close handler may have retained an
   // abandoned entry with a null card id — backfill it now so late-delivery can edit
@@ -3314,7 +3341,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
     // the operator gets zero signal. Every drop below logs a distinct, greppable
     // `ask-forward` reason so a question that doesn't reach Telegram is visible.
     log(`ask-forward dropped: reason=unparsable-payload line=${describeHookLine(line)}`)
-    socket.end("null\n")
+    dropAsk(socket, "unparsable-payload")
     return
   }
 
@@ -3334,13 +3361,13 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
     log(
       `ask-forward dropped: reason=not-registered ${describeAskRequest(req)} reg=${describeRegistration(registrations)}`,
     )
-    socket.end("null\n")
+    dropAsk(socket, "not-registered")
     return
   }
 
   if (!canForwardButtonRequest(req)) {
     log(`ask-forward dropped: reason=not-forwardable ${describeAskRequest(req)}`)
-    socket.end("null\n")
+    dropAsk(socket, "not-forwardable")
     void sendMessage(
       ctx,
       `native question forwarding isn't available for \`${req.agent}\` — answer in the terminal`,
@@ -3351,7 +3378,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
   const pendingKey = callbackRequestId(req)
   if (rt.activeKeys.has(pendingKey)) {
     log(`ask-forward dropped: reason=duplicate-in-flight ${describeAskRequest(req)} key=${pendingKey}`)
-    socket.end("null\n")
+    dropAsk(socket, "duplicate-in-flight")
     return
   }
   // Idempotency across the answer boundary (tg-cli#97): the in-flight dedup above
@@ -3377,7 +3404,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
         // a still-blocked hook falls back to the terminal, where the pane injection
         // lands, so the agent gets the chosen option exactly once.
         log(`ask-forward already-pane-delivered: ${describeAskRequest(req)} key=${pendingKey} label=${prior.label}`)
-        socket.end("null\n")
+        dropAsk(socket, "already-pane-delivered")
         return
       }
       const replayAnswer: ButtonAnswer = {
@@ -3528,6 +3555,16 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       const entry: PendingButton = { req, socket, messageId: retained.messageId, at: Date.now() }
       rt.pending.set(pendingKey, entry)
       armPendingSocketClose(ctx, rt, entry, pendingKey)
+      // tg-cli#317 review finding: a reconnect landing HERE (the daemon reattaching
+      // an already-posted-but-undecided card after a restart or a transient socket
+      // drop) previously wrote no status line at all. If this new connection then
+      // also drops or times out with no tap, describeAskOutcome saw an empty
+      // `statuses` array and reported "unreachable"/"no status line" for a card
+      // that is genuinely live and answerable in Telegram — the exact incident
+      // this file exists to fix, recreated in the one path the first pass missed.
+      if (retained.messageId !== null) {
+        writeAskStatus(socket, { tgctl: "ask-status", state: "posted", messageId: retained.messageId })
+      }
       rt.persist()
       // The card is LIVE again — restore the original prompt text, which the
       // socket-close path replaced with "window closed …" (actively misleading
@@ -3588,7 +3625,34 @@ function tmuxDisplay(format: string): string | undefined {
 // reply (daemon down, restarting, or died mid-block); `timeout` is the overall
 // budget elapsing. The distinction is what makes reconnect safe: only `dropped` is
 // retried — a real "null" decline is honored, not looped.
-type AskAttempt = { kind: "response"; raw: string | null } | { kind: "dropped" } | { kind: "timeout" }
+type AskAttempt = { kind: "response" | "dropped" | "timeout"; raw: string | null; statuses: AskStatusLine[] }
+
+function parseAskStatus(line: string): AskStatusLine | null {
+  try {
+    const v = JSON.parse(line) as { tgctl?: unknown; state?: unknown }
+    if (v && typeof v === "object" && v.tgctl === "ask-status" && typeof v.state === "string") {
+      return v as AskStatusLine
+    }
+  } catch {}
+  return null
+}
+
+// Everything the daemon wrote before the socket went away: status lines (kept) and the
+// final reply (the LAST newline-terminated non-status line; `null` is a real decline).
+// `end` with no complete reply line is a drop (the daemon closed mid-block) — a status
+// line alone does not make a response, so the reconnect loop still resends.
+function parseAskStream(raw: string, how: "end" | "dropped" | "timeout"): AskAttempt {
+  const statuses: AskStatusLine[] = []
+  let reply: string | null | undefined
+  for (const line of raw.split("\n").slice(0, -1)) {
+    const status = parseAskStatus(line)
+    if (status) statuses.push(status)
+    else reply = line.trim() || null
+  }
+  if (how !== "end") return { kind: how, raw: null, statuses }
+  if (reply === undefined) return { kind: "dropped", raw: null, statuses }
+  return { kind: "response", raw: reply, statuses }
+}
 
 // Overall hook budget. Kept UNDER the 120s the harness gives the hook process so the
 // reconnect loop returns a real answer (or null) before the harness kills it.
@@ -3601,28 +3665,29 @@ const ASK_RECONNECT_BACKOFF_MS = 250
 function oneAskAttempt(ctx: Ctx, requestLine: string, timeoutMs: number): Promise<AskAttempt> {
   return new Promise<AskAttempt>((resolve) => {
     let done = false
-    const finish = (r: AskAttempt): void => {
+    let raw = ""
+    const finish = (how: "end" | "dropped" | "timeout"): void => {
       if (done) return
       done = true
       clearTimeout(timer)
-      resolve(r)
+      resolve(parseAskStream(raw, how))
     }
     const socket = createConnection(ctx.paths.socket)
-    let raw = ""
     const timer = setTimeout(() => {
       socket.destroy()
-      finish({ kind: "timeout" })
+      finish("timeout")
     }, timeoutMs)
     socket.setEncoding("utf8")
     socket.on("connect", () => socket.write(requestLine + "\n"))
     socket.on("data", (chunk) => {
       raw += chunk
     })
-    socket.on("error", () => finish({ kind: "dropped" }))
+    socket.on("error", () => finish("dropped"))
     // A complete reply always ends in a newline (the daemon's socket.end(`${out}\n`));
-    // EOF with no newline means the daemon closed without answering → a drop to retry.
-    socket.on("end", () => finish(raw.includes("\n") ? { kind: "response", raw: raw.trim() || null } : { kind: "dropped" }))
-    socket.on("close", () => finish({ kind: "dropped" }))
+    // EOF with no complete reply line means the daemon closed without answering → a drop
+    // to retry (parseAskStream decides, so an interim status line alone is not a reply).
+    socket.on("end", () => finish("end"))
+    socket.on("close", () => finish("dropped"))
   })
 }
 
@@ -3632,14 +3697,21 @@ function oneAskAttempt(ctx: Ctx, requestLine: string, timeoutMs: number): Promis
 // re-attaches the still-pending entry (no duplicate card) or replays the stored
 // answer. Bounded by the caller's deadline (shared across a multi-question
 // sequence); a real "null" decline returns immediately.
-async function requestHookAnswerWithReconnect(ctx: Ctx, requestLine: string, deadline: number): Promise<string | null> {
+async function requestHookAnswerWithReconnect(ctx: Ctx, requestLine: string, deadline: number): Promise<AskAttempt> {
   let announcedDrop = false
+  let last: AskAttempt = { kind: "timeout", raw: null, statuses: [] }
   for (;;) {
     const remaining = deadline - Date.now()
-    if (remaining <= 0) return null
+    if (remaining <= 0) return last
     const res = await oneAskAttempt(ctx, requestLine, remaining)
-    if (res.kind === "response") return res.raw
-    if (res.kind === "timeout") return null
+    if (res.kind !== "dropped") return { ...res, statuses: [...last.statuses, ...res.statuses] }
+    // ACCUMULATE, never replace (review finding, x2 independent reviewers): a `posted`
+    // status learned on an earlier attempt (daemon posted the card, then crashed
+    // mid-wait) must survive every later attempt that cannot even connect
+    // (`statuses: []` on ECONNREFUSED) — otherwise the deadline verdict below loses
+    // the one fact that proves the card is genuinely live in Telegram, reintroducing
+    // this file's own incident as "unreachable" for a card that was posted.
+    last = { ...res, statuses: [...last.statuses, ...res.statuses] }
     if (!announcedDrop) {
       log("ask reconnect: daemon socket dropped — resending requestId until it comes back")
       announcedDrop = true
@@ -3656,14 +3728,62 @@ async function requestHookAnswerWithReconnect(ctx: Ctx, requestLine: string, dea
 // UNSCOPED requests keep the single-attempt path — they aren't retained (no
 // pane to late-deliver to), so a resend after a restart would post a duplicate
 // card.
-async function askDaemonOnce(ctx: Ctx, req: ButtonRequest, deadline: number): Promise<string | null> {
+async function askDaemonOnce(ctx: Ctx, req: ButtonRequest, deadline: number): Promise<AskAttempt> {
   const requestLine = JSON.stringify(req)
   const reconnectable = Boolean(req.paneId) && (req.kind === "question" || req.kind === "permission")
   if (reconnectable) return requestHookAnswerWithReconnect(ctx, requestLine, deadline)
   const remaining = deadline - Date.now()
-  if (remaining <= 0) return null
-  const attempt = await oneAskAttempt(ctx, requestLine, remaining)
-  return attempt.kind === "response" ? attempt.raw : null
+  if (remaining <= 0) return { kind: "timeout", raw: null, statuses: [] }
+  return oneAskAttempt(ctx, requestLine, remaining)
+}
+
+type PostedStatus = Extract<AskStatusLine, { state: "posted" }>
+type DroppedStatus = Extract<AskStatusLine, { state: "dropped" }>
+type ExpiredStatus = Extract<AskStatusLine, { state: "expired" }>
+
+// The truthful client-side verdict for a request that produced no usable reply
+// (tg-cli#317). The asking agent reads this line — the agent-tools hatch helper forwards
+// hook stderr into its deny reason — so it must say what the daemon actually did: a card
+// that WAS posted is never reported as "not-posted", and a daemon expiry is an expiry.
+function describeAskOutcome(req: ButtonRequest, attempt: AskAttempt): string {
+  const who = `req=${req.requestId} agent=${req.agent} pane=${req.paneId ?? "-"}`
+  const posted = attempt.statuses.find((s): s is PostedStatus => s.state === "posted")
+  const dropped = attempt.statuses.find((s): s is DroppedStatus => s.state === "dropped")
+  const expired = attempt.statuses.find((s): s is ExpiredStatus => s.state === "expired")
+  // A reconnect that lands AFTER the human already tapped the card is answered —
+  // the daemon delivered the decision via pane injection (no live socket to answer
+  // on) and drops this stale resend with reason=already-pane-delivered (review
+  // finding: checked ahead of the generic `posted` branch below, which would
+  // otherwise report a real decision as "the daemon closed with no decision" —
+  // the exact class of false claim this file exists to eliminate).
+  if (dropped?.reason === "already-pane-delivered") {
+    return `ask-forward answered-via-pane: ${who} messageId=${posted?.messageId ?? "-"} — the human already answered this card; delivered directly to the pane, not through this hook`
+  }
+  if (expired) {
+    // The unscoped-abandon timer is armed BEFORE `sendMessage` resolves (review
+    // finding): if Telegram is slow and the timer fires first, `expired.messageId`
+    // is still null — no card was ever posted, and asserting "posted to Telegram"
+    // would be exactly the false claim tg-cli#317 exists to eliminate.
+    const where = expired.messageId !== null ? "posted to Telegram" : "the send to Telegram had not completed"
+    return `ask-forward expired: ${who} messageId=${expired.messageId ?? "-"} — ${where}; no decision within ${expired.ageMs}ms (daemon expiry, nobody tapped)`
+  }
+  if (posted && attempt.kind === "timeout") {
+    return `ask-forward timed-out: ${who} messageId=${posted.messageId} — posted to Telegram; no decision within this hook's ${ASK_TOTAL_TIMEOUT_MS}ms budget (the card stays answerable for late delivery)`
+  }
+  if (posted) {
+    // `attempt.kind` here is only ever "response" (an explicit `null` reply) or
+    // "dropped" ("timeout" was handled above) — spell those out rather than
+    // printing the bare internal enum (review finding: "(response)"/"(dropped)"
+    // is jargon to whoever reads the hook/daemon log this line is meant for).
+    const how = attempt.kind === "response" ? "explicit null reply" : "connection lost after posting"
+    return `ask-forward declined-after-post: ${who} messageId=${posted.messageId} — posted to Telegram; the daemon closed with no decision (${how})`
+  }
+  if (dropped) return `ask-forward not-posted: ${who} — daemon declined: reason=${dropped.reason}`
+  if (attempt.kind === "timeout") {
+    return `ask-forward timed-out: ${who} — no reply and no status line from the daemon within ${ASK_TOTAL_TIMEOUT_MS}ms`
+  }
+  if (attempt.kind === "dropped") return `ask-forward unreachable: ${who} — daemon socket closed or errored without a reply`
+  return `ask-forward not-posted: ${who} — daemon declined or unreachable (no status line: a daemon older than tg-cli#317 cannot say which)`
 }
 
 async function askDaemon(ctx: Ctx): Promise<void> {
@@ -3719,18 +3839,18 @@ async function askDaemon(ctx: Ctx): Promise<void> {
 
   if (reqs.length === 1) {
     const req = reqs[0]
-    const output = await askDaemonOnce(ctx, req, deadline)
+    const attempt = await askDaemonOnce(ctx, req, deadline)
+    const output = attempt.raw
     if (output && output !== "null") {
       // Repair a claude-question reply from a STALE RUNNING daemon that predates
       // `hookEventName` in the answer envelope (Claude Code discards the whole
       // hook output without it — tg#5741); anything else passes through verbatim.
       console.log(repairClaudeQuestionReply(req, output) ?? output)
     } else {
-      // The daemon declined (replied "null") or the connection failed / timed out,
-      // so nothing was forwarded and the harness UI takes over. The daemon already
-      // logs WHY it declined (ask-forward dropped: …); log here too in case the
-      // daemon was unreachable (no socket) and never got a chance to.
-      log(`ask-forward not-posted: req=${req.requestId} agent=${req.agent} pane=${req.paneId ?? "-"} — daemon declined or unreachable`)
+      // No usable reply: the harness UI takes over. Say exactly what happened — posted
+      // then expired, dropped (with the daemon's reason), timed out, or unreachable —
+      // because the asking agent acts on this line (tg-cli#317).
+      log(describeAskOutcome(req, attempt))
     }
     return
   }
@@ -3741,7 +3861,7 @@ async function askDaemon(ctx: Ctx): Promise<void> {
   // with no local dialog and no manual Enter (tg#5741). ALL-OR-NOTHING: any
   // decline/timeout emits nothing and the local UI re-asks everything (a partial
   // answers record would silently skip the unanswered questions).
-  const answers = await collectQuestionAnswers(reqs, (r) => askDaemonOnce(ctx, r, deadline))
+  const answers = await collectQuestionAnswers(reqs, (r) => askDaemonOnce(ctx, r, deadline).then((a) => a.raw))
   const toolInput = reqs[0].toolInput
   if (answers && toolInput) {
     console.log(JSON.stringify(buildClaudeQuestionAnswerOutput(toolInput, answers)))

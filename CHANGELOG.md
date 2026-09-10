@@ -3,6 +3,54 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.51.0
+
+**The asking side tells the truth about an approval card (tg-cli#317).**
+
+Incident 2026-09-05: an agent asked Alex for a one-time exception; the daemon posted the
+card (its log says `ask-forward posted … messageId=14880`), nobody tapped within the
+110-second unscoped window, and the daemon closed the hook socket with the same bare
+`null` it uses for a request it refuses at the door. The client logged "ask-forward
+not-posted … daemon declined or unreachable", the agent-tools hatch helper forwarded that,
+and the agent was told a card visible in Telegram had never been sent.
+
+- The daemon now writes an interim status line on the hook socket before its final reply:
+  `posted` (with the messageId), `dropped` (with the daemon's reason, e.g. `not-registered`),
+  or `expired` (messageId + age). The final reply is unchanged, so an older client keeps working.
+- `tg-ctl ask` reads those lines and logs the real outcome: `ask-forward expired …
+  posted to Telegram; no decision within Nms`, `ask-forward not-posted … daemon declined:
+  reason=<reason>`, `ask-forward timed-out …` (client budget, card posted), or
+  `ask-forward unreachable …` (no daemon). "not-posted" is never said about a posted card.
+- The daemon half activates when the running daemon is restarted; the client half is live
+  as soon as the file is checked out (`~/.files/bin/tg-ctl` is the repo file).
+- The reconnect re-attach path (a still-live card whose socket dropped and got resent
+  under the same requestId) now writes the same `posted` status line the fresh-forward
+  path writes, so a reconnect that then also drops or times out before a tap is reported
+  as `declined-after-post`/`timed-out … messageId=…`, never `unreachable`/`no status line`
+  for a card that is genuinely still live in Telegram (review finding: this was the one
+  path the original fix missed, and the more common one — it covers every ordinary
+  scoped permission/question, not just the paneless hatch case #317 was raised from).
+- The `expired` message no longer claims a card reached Telegram when the send was still
+  in flight: the unscoped-abandon timer can fire before `sendMessage` resolves, and
+  `messageId` staying `null` in that case now reads "the send to Telegram had not
+  completed" instead of asserting delivery that never happened (review finding).
+- The reconnect loop no longer discards an earlier `posted` status once a later
+  reconnect attempt can't even connect: it accumulates status truth across attempts
+  instead of replacing it, so a card posted on attempt 1 that then stays unreachable
+  for the rest of the hook budget is still reported as `declined-after-post`/
+  `timed-out … messageId=…`, not `unreachable` (review finding, independently found
+  by two reviewers — the daemon-stays-down-past-the-deadline case this file's own
+  "never unreachable for a live card" guarantee had missed).
+- A resend that lands after the human already answered via pane injection (the
+  daemon's `already-pane-delivered` drop) no longer reports `declined-after-post …
+  the daemon closed with no decision` — a real decision WAS made, just delivered
+  outside this socket. It now reports `answered-via-pane` (review finding: the
+  generic `posted` branch outranked this case, misreporting a genuine answer as
+  a non-decision).
+
+Not changed here: the 115-second hook budget / 110-second unscoped expiry (tg-cli#303) and
+the empty routing fields (`agent=claude pane=-`) for a request raised from a codex session.
+
 ## 1.50.0
 
 **Fix: tg-ctl asks once before falling back from private topics to flat `/new` spawns (tg-cli#181).**
