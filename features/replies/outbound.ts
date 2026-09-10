@@ -40,12 +40,14 @@ export function outboundHistoryText(body: string, attach: OutboundAttachments): 
 // to — that can be any chunk/item, not only the first. Recording only the
 // first id left later chunks unrecoverable (review: tg-cli#131). Falls back
 // to a single `message_id: null` record when the send reported no ids at all
-// (the `tg` entrypoint only calls this once TMUX_PANE is confirmed set, so in
-// practice this is a successful send whose API response carried no
-// message_id, not the outside-tmux case — that returns before ever reaching
-// here. Unchanged from before this fix). Ids are de-duplicated (order
-// preserved) so a caller that ever reports the same message_id twice (a
-// retry, a defensive double-record) still logs exactly one history row per
+// (the `tg` entrypoint only calls this once originPaneId is confirmed set — a
+// tmux pane if present, else the synthetic omp:<pid> origin for a headless
+// omp session (tg-cli#363) — so in practice this is a successful send whose
+// API response carried no message_id, not the no-origin-at-all case, which
+// returns before ever reaching here. Unchanged from before this fix). Ids
+// are de-duplicated (order preserved) so a caller that ever reports the
+// same message_id twice (a retry, a defensive double-record) still logs
+// exactly one history row per
 // real Telegram message, matching routes.ts's own dedupe-by-id invariant
 // (appendRoute) instead of a naive push.
 //

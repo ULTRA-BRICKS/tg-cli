@@ -4,7 +4,10 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 
 // tg-cli#339: outbound `tg` from an omp with no tmux pane must stamp routes.json
-// paneId omp:<pid> so a Telegram reply can find that live process.
+// paneId omp:<pid> so a Telegram reply can find that live process. tg-cli#363:
+// the SAME send must also land in history.jsonl (keyed by the same omp:<pid>
+// origin) — without it the daemon's awareness-nudge sweep has zero last-tg-sent
+// signal for exactly the headless-agent population it targets.
 
 const TG_SCRIPT = join(import.meta.dir, '..', 'tg');
 const dirs: string[] = [];
@@ -67,6 +70,16 @@ test('tg outbound with TMUX unset records route paneId omp:<pid>', async () => {
     expect(routes).toHaveLength(1);
     expect(routes[0].id).toBe(77);
     expect(routes[0].paneId).toMatch(/^omp:\d+$/);
+
+    const historyPath = join(configDir, 'tg-ctl.123.history.jsonl');
+    expect(existsSync(historyPath)).toBe(true);
+    const historyLines = readFileSync(historyPath, 'utf8').trim().split('\n');
+    expect(historyLines).toHaveLength(1);
+    const record = JSON.parse(historyLines[0]) as { direction: string; pane: string; text: string };
+    expect(record.direction).toBe('agent');
+    expect(record.pane).toMatch(/^omp:\d+$/);
+    expect(record.pane).toBe(routes[0].paneId);
+    expect(record.text).toBe('hello from omp no tmux');
   } finally {
     server.stop(true);
   }

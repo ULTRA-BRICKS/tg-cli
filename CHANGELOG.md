@@ -3,6 +3,48 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.52.0
+
+**Feature: tg-ctl active-silence nudge for tg-unaware agent sessions (tg-cli#363).**
+
+Alex has repeatedly asked agents to reliably use tg-cli. The `tg` skill's own
+triggers (finish a task, hit a question/blocker) only fire at a natural decision
+point — a long, heads-down working stretch never produces one, so passive skill
+discovery alone can't close the gap. This adds the ACTIVE side.
+
+- The `tg-ctl` daemon's poll loop now sweeps every live omp ACP session
+  (`listLiveOmpAgents`) and sends a short reminder — via the existing
+  `promptOmpAcp` channel, no tmux send-keys — once a session has gone an hour
+  with zero outbound `tg` traffic. At most one nudge per silence *episode*: a
+  key becomes eligible again only after a real `tg` send, then another full
+  hour of silence. Durable per-key state in a new `tg-ctl.<botid>.awareness-nudge.json`
+  file (same convention as `schedules`/`questions`), pure decision logic in
+  `features/tg-ctl/tg-awareness-nudge.ts`.
+- Fixed a gap this surfaced: `tg`'s outbound history writer
+  (`recordOutboundHistory`) previously gated on `TMUX_PANE` alone, so a
+  headless omp session (no tmux pane — exactly the nudge's target population)
+  never got an outbound `history.jsonl` record at all. Now gated on the same
+  `originPaneId` (tmux pane, else the synthetic `omp:<pid>` origin) already
+  used for outbound routing.
+- Review finding: a failed/dropped nudge delivery no longer permanently
+  forecloses the rest of that silence episode. `planAwarenessNudges` decides
+  who is due without marking anyone nudged; only a confirmed-successful send
+  now commits the "nudged" marker via the new `markAwarenessNudgeSent`, so a
+  transient `promptOmpAcp` failure (the exact busy/loaded-agent case this
+  feature targets) is retried on the next sweep instead of silently giving up
+  for the rest of the hour-plus silence stretch.
+- Review findings: a replacement session in the same key (a tmux pane whose
+  agent was restarted, e.g. Ctrl-C then a fresh `omp`) no longer inherits the
+  old session's nudge state — the store now tracks each key's last-observed
+  `sessionId` and resets `firstSeenAt`/the nudge markers when it changes,
+  instead of either silently suppressing the new session's own first nudge or
+  firing one immediately off a stale clock. Separately, a session's silence
+  clock can no longer be backdated by a stale `tg`-send record left under a
+  reused key (`silenceStart` is now clamped to never precede `firstSeenAt`),
+  and the daemon's "did the key set actually change" persistence check is now
+  a real set comparison (`AwarenessNudgePlan.keysChanged`) instead of a
+  length check that missed simultaneous add+remove churn.
+
 ## 1.51.1
 
 **Fix (tg-cli#353): ACP `session/prompt` eviction no longer kills a healthy turn or a live permission prompt (P1 review-quorum finding on #352).**

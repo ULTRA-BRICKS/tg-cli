@@ -1546,16 +1546,22 @@ if (import.meta.main) {
 
   // Append `agent` history record(s) for this send so `tg replies` can recall
   // what the agent sent (mirror of the daemon's inbound writer). Best-effort:
-  // tmux-only, swallow-all — history bookkeeping must never break a send. The
+  // swallow-all — history bookkeeping must never break a send. Gated on
+  // originPaneId (not TMUX_PANE) the SAME way ROUTES_PATH is above: a tmux
+  // pane if present, else the omp:<pid> synthetic origin, so an omp session
+  // with no tmux pane also gets a real outbound record — tg-cli#363's daemon
+  // nudge needs this as its last-tg-sent signal for exactly the headless
+  // population it targets, and before this fix that population wrote NOTHING
+  // here (the nudge would have had zero signal for its main target). The
   // text is the message body (or a [photo]/[document] placeholder for a
   // media-only send). One record is written per outbound message_id — see
   // `buildOutboundHistoryRecords` (features/replies/outbound.ts) for why.
   // Called AFTER transmit so the ids are known.
-  const HISTORY_PATH = TMUX_PANE
+  const HISTORY_PATH = originPaneId
     ? ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).history
     : null
   const recordOutboundHistory = (body: string): void => {
-    if (!HISTORY_PATH || !TMUX_PANE) return
+    if (!HISTORY_PATH || !originPaneId) return
     const text = outboundHistoryText(body, { photos: plan.photos.length, documents: plan.documents.length })
     if (text === null) return
     try {
@@ -1567,13 +1573,14 @@ if (import.meta.main) {
         outboundIds,
         text,
         Math.floor(Date.now() / 1000),
-        TMUX_PANE,
+        originPaneId,
         randomUUID(),
         currentChatId,
         // This session's own agent name (agentNameForPane over its pane) — the
         // SAME label the daemon stamps on inbound, so `tg replies` groups a
         // session's outbound and its inbound under one current-agent scope.
-        // Undefined when unresolvable → the record stays untagged.
+        // Undefined when unresolvable (also always the case for a non-tmux omp
+        // origin — currentPaneAgentName needs a real TMUX_PANE) → untagged.
         currentPaneAgentName() ?? undefined,
       )
       // 0o600: the log is a conversation transcript — owner-only, like the daemon socket.

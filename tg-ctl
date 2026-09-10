@@ -149,6 +149,7 @@ import {
   encodeAcpFrame,
   findLiveOmpAgents,
   liveOmpLabel,
+  liveOmpPaneId,
   matchLiveOmp,
   matchLiveOmpOrigin,
   ompReplyOriginMatches,
@@ -188,6 +189,15 @@ import {
   type AutoContinueSchedule,
   type ScheduleStoreData,
 } from "./features/tg-ctl/schedule-store"
+import {
+  AWARENESS_NUDGE_TEXT,
+  lastTgSentAtByKey,
+  markAwarenessNudgeSent,
+  parseAwarenessNudgeStore,
+  planAwarenessNudges,
+  serializeAwarenessNudgeStore,
+  type AwarenessNudgeStore,
+} from "./features/tg-ctl/tg-awareness-nudge"
 import { normalizeRichHtml, validateRichHtml } from "./features/render/rich"
 import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
 import { botIdFromToken, ctlPaths, daemonRunState, daemonStatusLine, ownsPidFile, pidStatus, planLegacyLastUserTargetMigration, readPidFile } from "./features/tg-ctl/lock"
@@ -249,7 +259,7 @@ import {
   withRoutesLock,
 } from "./features/tg-ctl/routes"
 import { parseLastUserTarget, serializeLastUserTarget, type LastUserTarget } from "./features/tg-ctl/last-user-target"
-import { appendRecordsToBlob, type HistoryRecord } from "./features/replies/history"
+import { appendRecordsToBlob, parseHistory, type HistoryRecord } from "./features/replies/history"
 import { inboundHistoryRecords } from "./features/replies/inbound"
 import { agentNameForPane } from "./features/tg-ctl/agent-name"
 import { isLikelySlashCommand, stepUpdates } from "./features/tg-ctl/updates"
@@ -8534,6 +8544,19 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       log(`persistSchedules failed: ${err}`)
     }
   }
+
+  // --- tg-awareness-nudge (tg-cli#363) — durable per-agent silence-nudge state ---
+  // Mirrors scheduleStore's own load/persist shape exactly (parse-on-load,
+  // atomic-write-on-mutation, best-effort — a corrupt/unwritable file degrades
+  // to "no nudges yet remembered", never breaks the poll loop).
+  let awarenessNudgeStore: AwarenessNudgeStore = parseAwarenessNudgeStore(readFileOrNull(ctx.paths.awarenessNudge))
+  const persistAwarenessNudge = (): void => {
+    try {
+      atomicWrite(ctx.paths.awarenessNudge, serializeAwarenessNudgeStore(awarenessNudgeStore))
+    } catch (err) {
+      log(`persistAwarenessNudge failed: ${err}`)
+    }
+  }
   const fireAutoContinue = async (s: AutoContinueSchedule): Promise<void> => {
     // A reset > ~24.8 days out is clamped to MAX_TIMER_MS, so the timer can wake
     // BEFORE the real reset — re-arm instead of injecting early.
@@ -9373,6 +9396,48 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         const noticed = noticeStaleQueuedDecisions(sweepNow)
         pruneAbandonedButtons(abandonedButtons, sweepNow, notifyAbandonedLongOutage)
         if (noticed || abandonedButtons.size !== before) persistQuestions(sweepNow)
+      }
+
+      // tg-cli#363: nudge a live omp ACP session that has gone quiet on tg for
+      // over an hour — Alex's repeated ask that agents actually use tg-cli.
+      // The tg skill's OWN triggers (finish a task, hit a blocker) only fire
+      // at a natural decision point; a long heads-down stretch never produces
+      // one, so passive discovery alone can never close this gap. Scoped to
+      // live omp agents (listLiveOmpAgents, same population/cache the idle-exit
+      // check above already uses) because promptOmpAcp is the only channel the
+      // daemon can proactively push INTO without the human having typed
+      // anything — a tmux-only pane has no equivalent out-of-band channel.
+      // Cheap when nothing is live (an empty liveAgents list plans no due keys
+      // and returns an empty store) and persisted only when the sweep actually
+      // changed something (a nudge fired, or a key's episode/liveness state
+      // moved) — same skip-persist-when-unchanged discipline as the
+      // abandonedButtons sweep just above, so a quiet bot with no live omp
+      // agent never pays a disk write per batch.
+      const liveOmpAgentsForNudge = listLiveOmpAgents()
+      if (liveOmpAgentsForNudge.length > 0 || Object.keys(awarenessNudgeStore).length > 0) {
+        const liveOmpAgentByNudgeKey = new Map(liveOmpAgentsForNudge.map((a) => [a.paneId ?? liveOmpPaneId(a.pid), a]))
+        const nudgeKeys = [...liveOmpAgentByNudgeKey.keys()]
+        const sessionIdByNudgeKey = new Map([...liveOmpAgentByNudgeKey].map(([key, a]) => [key, a.sessionId]))
+        const sentAtByKey = lastTgSentAtByKey(parseHistory(readFileOrNull(ctx.paths.history)))
+        const nudgePlan = planAwarenessNudges(nudgeKeys, sentAtByKey, awarenessNudgeStore, Date.now(), sessionIdByNudgeKey)
+        awarenessNudgeStore = nudgePlan.store
+        if (nudgePlan.keysChanged) persistAwarenessNudge()
+        // Only a send that actually SUCCEEDS commits the "nudged" marker
+        // (via markAwarenessNudgeSent, below) — a due key stays due next
+        // sweep on failure/drop instead of silently losing its one shot at
+        // reaching the exact busy/loaded agent this feature targets.
+        const sentKeys: string[] = []
+        for (const key of nudgePlan.due) {
+          const target = liveOmpAgentByNudgeKey.get(key)
+          if (!target) continue
+          const res = await promptOmpAcp(target, AWARENESS_NUDGE_TEXT)
+          log(res.ok ? `awareness-nudge sent to ${key}` : `awareness-nudge failed for ${key}: ${res.error}`)
+          if (res.ok) sentKeys.push(key)
+        }
+        if (sentKeys.length > 0) {
+          awarenessNudgeStore = markAwarenessNudgeSent(awarenessNudgeStore, sentKeys, Date.now())
+          persistAwarenessNudge()
+        }
       }
 
       // The idle long-poll is abortable by SIGTERM (beginGracefulShutdown) so a

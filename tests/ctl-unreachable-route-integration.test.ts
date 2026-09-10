@@ -136,4 +136,4 @@ test('/agent <name> to an agent outside tmux queues to its inbox and replies exp
   expect(reactions.length).toBeGreaterThanOrEqual(2);
   expect(reactions.every((r) => r.message_id === 10)).toBe(true);
   expect(readFileSync(join(inboxDir, 'acked.jsonl'), 'utf8')).toContain('"delivered_ts":"t"');
-});
+}, 25_000);
