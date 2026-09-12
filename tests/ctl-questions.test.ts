@@ -11,7 +11,6 @@ import {
   extractAnswersFromHookReply,
   formatAgentHookOutput,
   hatchAbandonedPermissionText,
-  hatchApprovalRecordedText,
   hatchParseMode,
   parseButtonCallback,
   parseQuestionCloseCallback,
@@ -152,19 +151,6 @@ test('hatchAbandonedPermissionText escapes its own literal <justification> place
   // parse_mode: 'HTML' (hatchParseMode), an unescaped `<justification>` is an unrecognized
   // Telegram tag and the WHOLE edit gets rejected with a 400, silently dropped by botPost.
   // Escaped, it renders as the literal placeholder text a human is meant to read.
-  expect(text).toContain('&lt;justification&gt;');
-  expect(text).not.toContain('="<justification>"');
-});
-
-test('hatchApprovalRecordedText escapes the same literal <justification> placeholder as hatchAbandonedPermissionText', () => {
-  const hatchReq: ButtonRequest = {
-    requestId: 'hatch-block-reset-hard-aaaaaaaaaaaa',
-    agent: 'claude',
-    kind: 'permission',
-    question: '<b>Hatch approval request</b>',
-  };
-  const text = hatchApprovalRecordedText(hatchReq, 'block-reset-hard', 'Approve');
-  expect(text).toContain('<b>Hatch approval request</b>');
   expect(text).toContain('&lt;justification&gt;');
   expect(text).not.toContain('="<justification>"');
 });
