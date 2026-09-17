@@ -10,6 +10,9 @@ import {
   collectQuestionAnswers,
   extractAnswersFromHookReply,
   formatAgentHookOutput,
+  hatchAbandonedPermissionText,
+  hatchApprovalRecordedText,
+  hatchParseMode,
   parseButtonCallback,
   parseQuestionCloseCallback,
   isHatchPermissionRequest,
@@ -91,6 +94,78 @@ test('isHatchPermissionRequest: permission whose requestId starts with hatch- on
     kind: 'permission',
     requestId: 'no-long-inline-process-hatch-abc',
   })).toBe(false);
+});
+
+test('buildButtonMessage renders a hatch permission verbatim as HTML with parse_mode set', () => {
+  const hatchReq: ButtonRequest = {
+    requestId: 'hatch-block-reset-hard-aaaaaaaaaaaa',
+    agent: 'claude',
+    kind: 'permission',
+    question: '<b>Hatch approval request</b>\n\n<b>Hook:</b> <code>block-reset-hard</code>\n<b>Justification:</b> testing',
+    title: 'Hatch: block-reset-hard',
+  };
+  const payload = buildButtonMessage(1000, hatchReq);
+  expect(payload.text).toBe(hatchReq.question);
+  expect(payload.parse_mode).toBe('HTML');
+  expect(payload.text).not.toContain('Permission request from claude');
+});
+
+test('buildButtonMessage leaves a non-hatch permission on the plain-text path (no parse_mode)', () => {
+  const payload = buildButtonMessage(1000, {
+    requestId: 'p_plain',
+    agent: 'claude',
+    kind: 'permission',
+    question: 'run rm -rf /tmp/x?',
+  });
+  expect(payload.parse_mode).toBeUndefined();
+  expect(payload.text).toContain('Permission request from claude');
+});
+
+test('hatchParseMode gates on isHatchPermissionRequest, same as buildButtonMessage', () => {
+  expect(hatchParseMode({
+    requestId: 'hatch-block-reset-hard-aaaaaaaaaaaa',
+    agent: 'claude',
+    kind: 'permission',
+    question: 'x',
+  })).toBe('HTML');
+  expect(hatchParseMode({
+    requestId: 'p_plain',
+    agent: 'claude',
+    kind: 'permission',
+    question: 'x',
+  })).toBeUndefined();
+});
+
+test('hatchAbandonedPermissionText escapes its own literal <justification> placeholder so parse_mode: HTML never rejects the edit', () => {
+  const hatchReq: ButtonRequest = {
+    requestId: 'hatch-block-reset-hard-aaaaaaaaaaaa',
+    agent: 'claude',
+    kind: 'permission',
+    question: '<b>Hatch approval request</b>',
+  };
+  const text = hatchAbandonedPermissionText(hatchReq, 'block-reset-hard');
+  // The ORIGINAL prompt (buildQuestionText's hatch early-return) rides through verbatim —
+  // it is agent-tools' own pre-escaped HTML, not this function's concern.
+  expect(text).toContain('<b>Hatch approval request</b>');
+  // The status suffix hand-authors a literal `="<justification>"` placeholder — sent under
+  // parse_mode: 'HTML' (hatchParseMode), an unescaped `<justification>` is an unrecognized
+  // Telegram tag and the WHOLE edit gets rejected with a 400, silently dropped by botPost.
+  // Escaped, it renders as the literal placeholder text a human is meant to read.
+  expect(text).toContain('&lt;justification&gt;');
+  expect(text).not.toContain('="<justification>"');
+});
+
+test('hatchApprovalRecordedText escapes the same literal <justification> placeholder as hatchAbandonedPermissionText', () => {
+  const hatchReq: ButtonRequest = {
+    requestId: 'hatch-block-reset-hard-aaaaaaaaaaaa',
+    agent: 'claude',
+    kind: 'permission',
+    question: '<b>Hatch approval request</b>',
+  };
+  const text = hatchApprovalRecordedText(hatchReq, 'block-reset-hard', 'Approve');
+  expect(text).toContain('<b>Hatch approval request</b>');
+  expect(text).toContain('&lt;justification&gt;');
+  expect(text).not.toContain('="<justification>"');
 });
 
 test('questionCapability is explicit: claude/codex/opencode/omp support buttons, pi/aider are limited', () => {

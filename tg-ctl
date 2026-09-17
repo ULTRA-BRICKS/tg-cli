@@ -216,6 +216,7 @@ import {
   hatchAbandonedLongOutageText,
   hatchAbandonedPermissionText,
   hatchApprovalRecordedText,
+  hatchParseMode,
   isHatchPermissionRequest,
   isHatchRequest,
   parseHatchHookId,
@@ -660,6 +661,15 @@ async function sendMessage(ctx: Ctx, text: string, extra: Record<string, unknown
   return typeof messageId === "number" ? messageId : null
 }
 
+// Shared by every initial-post call site (forwardAndPostQuestion, ompPermissionSink) so the
+// parse_mode/reply_markup shape can't drift between them — a divergent copy is exactly how a
+// hatch card's parse_mode threading silently stops matching between the two flows.
+async function sendButtonCard(ctx: Ctx, payload: ButtonMessagePayload): Promise<number | null> {
+  const extra: Record<string, unknown> = { reply_markup: payload.reply_markup }
+  if (payload.parse_mode) extra.parse_mode = payload.parse_mode
+  return sendMessage(ctx, payload.text, extra)
+}
+
 async function answerCallbackQuery(ctx: Ctx, callbackQueryId: string, text: string): Promise<void> {
   await botPost(ctx, "answerCallbackQuery", { callback_query_id: callbackQueryId, text })
 }
@@ -672,9 +682,11 @@ async function editMessageText(
   messageId: number,
   text: string,
   replyMarkup?: ButtonMessagePayload["reply_markup"],
+  parseMode?: ButtonMessagePayload["parse_mode"],
 ): Promise<void> {
   const body: Record<string, unknown> = { chat_id: ctx.chatId, message_id: messageId, text }
   if (replyMarkup) body.reply_markup = replyMarkup
+  if (parseMode) body.parse_mode = parseMode
   await botPost(ctx, "editMessageText", body)
 }
 
@@ -3272,7 +3284,7 @@ function retireAbandonedEntry(ctx: Ctx, rt: QuestionRuntime, entry: PendingButto
       // moment it's needed (review finding). Mirrors the question branch above,
       // which already passes `abandoned.reply_markup` for the same reason.
       const abandonedMarkup = buildButtonMessage(ctx.chatId, entry.req).reply_markup
-      if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandonedText, abandonedMarkup)
+      if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandonedText, abandonedMarkup, hatchParseMode(entry.req))
       else {
         entry.finalText = abandonedText
         entry.finalReplyMarkup = abandonedMarkup
@@ -3342,7 +3354,7 @@ async function forwardAndPostQuestion(
   const conn = armPendingSocketClose(ctx, rt, entry, pendingKey)
 
   const payload = buildButtonMessage(ctx.chatId, req)
-  const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
+  const messageId = await sendButtonCard(ctx, payload)
   if (messageId === null) {
     // botPost already logged the low-level send failure; tie it to THIS abandoned
     // forward so the drop is greppable. No card posted → nothing to late-deliver.
@@ -3391,7 +3403,7 @@ async function forwardAndPostQuestion(
   if (rt.pending.get(pendingKey) !== entry || entry.finalText) {
     const finalText = entry.finalText ?? EXPIRED_TERMINAL_TEXT
     if (finalText === EXPIRED_TERMINAL_TEXT) void clearMessageKeyboard(ctx, messageId)
-    void editMessageText(ctx, messageId, finalText, entry.finalReplyMarkup)
+    void editMessageText(ctx, messageId, finalText, entry.finalReplyMarkup, finalText === EXPIRED_TERMINAL_TEXT ? undefined : hatchParseMode(entry.req))
   }
 }
 
@@ -3506,7 +3518,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       rt.persist()
       if (found.entry.messageId !== null) {
         void clearMessageKeyboard(ctx, found.entry.messageId)
-        void editMessageText(ctx, found.entry.messageId, buildAnsweredQuestionText(found.entry.req, found.queuedDecision.label))
+        void editMessageText(ctx, found.entry.messageId, buildAnsweredQuestionText(found.entry.req, found.queuedDecision.label), undefined, hatchParseMode(found.entry.req))
       }
       log(`ask-forward hatch-queued-decision-delivered: hookId=${hookId} key=${found.key} label=${found.queuedDecision.label}`)
       return
@@ -3665,7 +3677,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
           rt.persist()
           if (retained.messageId !== null) {
             void clearMessageKeyboard(ctx, retained.messageId)
-            void editMessageText(ctx, retained.messageId, buildAnsweredQuestionText(req, qd.label))
+            void editMessageText(ctx, retained.messageId, buildAnsweredQuestionText(req, qd.label), undefined, hatchParseMode(req))
           }
           log(`ask-forward queued-decision-delivered: ${describeAskRequest(req)} key=${pendingKey} label=${qd.label}`)
           return
@@ -3714,7 +3726,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       // which botPost swallows).
       if (retained.messageId !== null) {
         const restored = buildButtonMessage(ctx.chatId, req)
-        void editMessageText(ctx, retained.messageId, restored.text, restored.reply_markup)
+        void editMessageText(ctx, retained.messageId, restored.text, restored.reply_markup, restored.parse_mode)
       }
       log(`ask-forward reattached: ${describeAskRequest(req)} key=${pendingKey} messageId=${retained.messageId ?? "-"}`)
       return
@@ -5278,7 +5290,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   ompPermissionSink = (req) => {
     void (async () => {
       const payload = buildButtonMessage(ctx.chatId, req)
-      const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
+      const messageId = await sendButtonCard(ctx, payload)
       const key = callbackRequestId(req)
       abandonedButtons.set(key, { req, messageId: messageId ?? null, at: Date.now() })
       persistQuestions()
@@ -5301,6 +5313,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         hookId !== null
           ? hatchAbandonedLongOutageText(entry.req, hookId, entry.queuedDecision?.label)
           : abandonedLongOutageText(entry.req, label, entry.queuedDecision?.label),
+        undefined,
+        hatchParseMode(entry.req),
       )
     }
     log(`ask-abandoned-long-outage: ${describeAskRequest(entry.req)} key=${key}`)
@@ -5372,6 +5386,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           entry.messageId,
           queuedDecisionStillWaitingText(entry.req, label, qd.label),
           buildButtonMessage(ctx.chatId, entry.req).reply_markup,
+          hatchParseMode(entry.req),
         )
       }
       log(`ask-permission-decision-queue-still-waiting-notice: ${describeAskRequest(entry.req)}`)
@@ -8776,7 +8791,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const cardId = retained.messageId ?? action.messageId
       if (cardId !== null) {
         void clearMessageKeyboard(ctx, cardId)
-        void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label))
+        void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label), undefined, hatchParseMode(retained.req))
       }
       log(`omp-acp: tap delivered via session/request_permission reply optionId=${optionId}`)
       return true
@@ -8977,7 +8992,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             const cardId = retained.messageId ?? action.messageId
             if (cardId !== null) {
               void clearMessageKeyboard(ctx, cardId)
-              void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label))
+              void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label), undefined, hatchParseMode(retained.req))
             }
             return true
           }
@@ -9024,6 +9039,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             ? hatchApprovalRecordedText(retained.req, hookId, answer.label)
             : queuedPermissionDecisionText(retained.req, label, answer.label),
           buildButtonMessage(ctx.chatId, retained.req).reply_markup,
+          hatchParseMode(retained.req),
         )
       }
       log(`ask-permission-decision-queued: ${describeAskRequest(retained.req)} key=${action.requestId} label=${answer.label}`)
@@ -9137,7 +9153,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // (ABANDONED_RETAIN_MS, 30 min) finds neither entry and shows a misleading
       // "expired" on a card that WAS answered.
       void clearMessageKeyboard(ctx, cardId)
-      void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label))
+      void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label), undefined, hatchParseMode(retained.req))
     }
     return true
   }
@@ -9350,7 +9366,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // making the duplicate-card report impossible to confirm from logs.
         log(`ask-answered: ${describeAskRequest(pending.req)} key=${action.requestId} label=${answer.label} messageId=${pending.messageId ?? "-"}`)
         void answerCallbackQuery(ctx, action.callbackQueryId, "✓ sent to the agent")
-        if (pending.messageId !== null) void editMessageText(ctx, pending.messageId, finalText)
+        if (pending.messageId !== null) void editMessageText(ctx, pending.messageId, finalText, undefined, hatchParseMode(pending.req))
         // The agent is unblocked → deliver anything queued behind this question.
         // Fire-and-forget, but guard the promise: an error here must never become
         // an unhandled rejection that takes down the daemon.

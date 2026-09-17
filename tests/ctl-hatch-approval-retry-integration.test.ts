@@ -106,7 +106,14 @@ interface MockTg {
   stop: (c?: boolean) => Promise<void> | void;
   push: (batch: unknown[]) => void;
   cards: () => unknown[];
+  cardParseModes: () => Array<string | undefined>;
   edits: () => string[];
+  // Telegram edits a message with NO formatting unless `parse_mode` rides the SAME edit
+  // call — the original post's parse_mode is not "sticky" across an edit. A hatch card's
+  // `buildQuestionText` output is raw HTML, so every status edit re-sending it (answered/
+  // abandoned/queued-decision/long-outage) must carry 'HTML' again or Telegram renders the
+  // tags literally (review finding on the parse_mode threading this fixture exercises).
+  editParseModes: () => Array<string | undefined>;
   answeredCbs: () => Array<{ callback_query_id: string; text: string }>;
   allowData: () => string | null;
 }
@@ -114,7 +121,9 @@ interface MockTg {
 function mockTelegram(): MockTg {
   const updateQueue: unknown[][] = [];
   const cards: unknown[] = [];
+  const cardParseModes: Array<string | undefined> = [];
   const edits: string[] = [];
+  const editParseModes: Array<string | undefined> = [];
   const answeredCbs: Array<{ callback_query_id: string; text: string }> = [];
   let lastKeyboard: Array<Array<{ callback_data: string }>> | null = null;
   let cardSeq = 0;
@@ -135,13 +144,16 @@ function mockTelegram(): MockTg {
         if (kb?.length) {
           cardSeq += 1;
           cards.push(body);
+          cardParseModes.push(typeof body.parse_mode === 'string' ? body.parse_mode : undefined);
           lastKeyboard = kb;
           return Response.json({ ok: true, result: { message_id: cardSeq } });
         }
         return Response.json({ ok: true, result: { message_id: 900 } });
       }
       if (url.pathname.endsWith('/editMessageText')) {
-        edits.push(String(((await req.json()) as Record<string, unknown>).text ?? ''));
+        const body = (await req.json()) as Record<string, unknown>;
+        edits.push(String(body.text ?? ''));
+        editParseModes.push(typeof body.parse_mode === 'string' ? body.parse_mode : undefined);
         return Response.json({ ok: true, result: true });
       }
       if (url.pathname.endsWith('/editMessageReplyMarkup')) return Response.json({ ok: true, result: true });
@@ -159,7 +171,9 @@ function mockTelegram(): MockTg {
     stop: (c) => server.stop(c),
     push: (b) => updateQueue.push(b),
     cards: () => cards,
+    cardParseModes: () => cardParseModes,
     edits: () => edits,
+    editParseModes: () => editParseModes,
     answeredCbs: () => answeredCbs,
     allowData: () => lastKeyboard?.[0]?.[0]?.callback_data ?? null, // row 0 = [Approve, Reject]
   };
@@ -251,6 +265,12 @@ test('HATCH RETRY (tg-cli#349): a tap after the requesting process exited is rec
   const toast = tg.answeredCbs().findLast((c) => c.text.includes('recorded'));
   expect(toast?.text).toContain('applied automatically the next time the same hatch command is retried');
   expect(await until(() => tg.edits().some((e) => e.includes('recorded') && e.includes('Approve')), 4000)).toBe(true);
+  // The recorded-decision edit is a SEPARATE editMessageText call from the initial abandon
+  // edit above -- it must carry its own parse_mode or the card flips back to literal tags
+  // the instant a human taps (review finding: this is a distinct call site from the
+  // HATCH ABANDONED test's coverage of the abandon-edit alone).
+  const recordedEditIndex = tg.edits().findIndex((e) => e.includes('recorded') && e.includes('Approve'));
+  expect(tg.editParseModes()[recordedEditIndex]).toBe('HTML');
 
   // The approval is DURABLY recorded — not silently dropped — with decision 'allow' for
   // the ORIGINAL requestId. This is the exact step that fails before the fix: the entry
@@ -272,6 +292,12 @@ test('HATCH RETRY (tg-cli#349): a tap after the requesting process exited is rec
   // No second card was ever posted — the retry is answered silently against the
   // existing card, not by asking the human again.
   expect(tg.cards()).toHaveLength(1);
+  // The retry-delivered edit (buildAnsweredQuestionText, a THIRD distinct editMessageText
+  // call beyond the abandon and recorded edits above) must also carry parse_mode, or the
+  // card renders literal tags the instant the retry lands.
+  const deliveredEditIndex = tg.edits().findIndex((e) => e.includes('Selected answer: Approve'));
+  expect(deliveredEditIndex).toBeGreaterThanOrEqual(0);
+  expect(tg.editParseModes()[deliveredEditIndex]).toBe('HTML');
   expect(daemonLog(cfgDir)).toContain('ask-forward hatch-queued-decision-delivered');
 
   daemon.kill('SIGTERM');
@@ -356,6 +382,14 @@ test('HATCH ABANDONED (no tap): the card names the concrete retry command instea
   expect(await until(() => tg.edits().some((e) => e.includes(HATCH_ENV_VAR)), 5000)).toBe(true);
   const cardText = tg.edits().find((e) => e.includes(HATCH_ENV_VAR))!;
   expect(cardText).toContain('retry');
+  // The original post carries parse_mode: 'HTML' (buildButtonMessage gates it on
+  // isHatchPermissionRequest) — and, critically, so must THIS abandon-edit: Telegram
+  // edits a message with no formatting unless parse_mode rides the SAME call, so if the
+  // abandon-edit's parse_mode were dropped the card would flip from a rendered HTML card
+  // to literal `<b>`/`<code>` tags the instant it abandons (review finding).
+  expect(tg.cardParseModes()[0]).toBe('HTML');
+  const abandonEditIndex = tg.edits().findIndex((e) => e.includes(HATCH_ENV_VAR));
+  expect(tg.editParseModes()[abandonEditIndex]).toBe('HTML');
   // Neither impossible promise a headless, one-shot hatch request can never keep: there
   // is no live hook to "tap again once it reconnects" for, and no terminal to "answer
   // directly in the terminal" in.
