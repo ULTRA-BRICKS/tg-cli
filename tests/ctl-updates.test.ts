@@ -717,6 +717,63 @@ test('non-owner `!cmd` gets NO raw passthrough — rejected before any action', 
   expect(r.newOffset).toBe(2);
 });
 
+test('owner `!rm -rf /` is BLOCKED — no raw passthrough, warning names the rule and mentions `!!`, threadId is null (flat chat)', () => {
+  const r = stepUpdates([upd(1, { text: '!rm -rf /' })], makeOpts());
+  expect(r.actions).toHaveLength(1);
+  expect(r.actions[0].kind).toBe('reply');
+  const action = r.actions[0] as { kind: 'reply'; text: string; threadId?: number | null };
+  expect(action.text).toContain('rm-rf');
+  expect(action.text).toContain('!!');
+  expect(action.threadId).toBeNull();
+});
+
+test('owner `!RM -rf /` (mixed case) is BLOCKED just like the lowercase form', () => {
+  const r = stepUpdates([upd(1, { text: '!RM -rf /' })], makeOpts());
+  expect(r.actions).toHaveLength(1);
+  expect(r.actions[0].kind).toBe('reply');
+  expect((r.actions[0] as { kind: 'reply'; text: string }).text).toContain('rm-rf');
+});
+
+test('owner `!!!rm -rf /` (triple bang) COLLAPSES to a single `!`, no stray `!` for shell history-expansion', () => {
+  const r = stepUpdates([upd(1, { text: '!!!rm -rf /' })], makeOpts());
+  expect(r.actions).toEqual([
+    { kind: 'inject-text', text: '!rm -rf /', messageId: 1 },
+    { kind: 'ack', messageId: 1 },
+  ]);
+});
+
+test('owner `!!rm -rf /` (doubled bang) confirms and runs it anyway, VERBATIM with one `!` peeled', () => {
+  const r = stepUpdates([upd(1, { text: '!!rm -rf /' })], makeOpts());
+  expect(r.actions).toEqual([
+    { kind: 'inject-text', text: '!rm -rf /', messageId: 1 },
+    { kind: 'ack', messageId: 1 },
+  ]);
+});
+
+test('owner replying with `!rm -rf /` is BLOCKED — reply, not a reply-route injection', () => {
+  const r = stepUpdates(
+    [upd(1, { text: '!rm -rf /', reply_to_message: { message_id: 55, chat: { id: CHAT_ID }, date: NOW, text: 'earlier' } })],
+    makeOpts(),
+  );
+  expect(r.actions).toHaveLength(1);
+  expect(r.actions[0].kind).toBe('reply');
+  expect((r.actions[0] as { kind: 'reply'; text: string }).text).toContain('rm-rf');
+});
+
+test('owner replying with `!!rm -rf /` (confirmed) reply-routes VERBATIM, one `!` peeled', () => {
+  const r = stepUpdates(
+    [upd(1, { text: '!!rm -rf /', reply_to_message: { message_id: 55, chat: { id: CHAT_ID }, date: NOW, text: 'earlier' } })],
+    makeOpts(),
+  );
+  expect(r.actions[0]).toEqual({
+    kind: 'reply-route',
+    replyToMessageId: 55,
+    injectText: '!rm -rf /',
+    from: 'Alex',
+    messageId: 1,
+  });
+});
+
 // --- plain text → wrapped inject (wrap fn injected via opts) ---
 
 test('plain text is wrapped with first_name', () => {

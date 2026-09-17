@@ -23,6 +23,7 @@ import { parseNewCommand, parseNewDirCallback, parseNewHarnessCallback, parseNew
 import { parseTasksCallback, parseTasksCommand } from './tasks-command';
 import { parseContinueCallback } from './limits';
 import { botCommandNames } from './bot-commands';
+import { shellPassthroughGate } from './shell-danger-gate';
 
 // Bot API getFile hard limit; larger files cannot be downloaded by bots.
 const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024;
@@ -428,6 +429,11 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         // would knock the `!` off column 0 and defeat the harness passthrough.
         const isVerbatimText = m.text.startsWith('/') || m.text.startsWith('!');
         const isBangReply = !!m.reply_to_message && m.text.startsWith('!');
+        // Gate a `!` shell-command reply the same as the flat/topic bang paths — a
+        // catastrophic shape must not reach the origin pane just because it arrived
+        // as a reply. Computed once here (not inside the ternary below) so both the
+        // warning short-circuit and the injectText line below read the same result.
+        const bangGate = isBangReply ? shellPassthroughGate(m.text) : null;
         // Bound once so every branch below narrows against the SAME reference —
         // a decoupled `m.reply_to_message!` non-null assertion (one expression
         // asserting non-null based on an entirely separate expression's truthy
@@ -441,7 +447,13 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         const postTimeoutRequestId = reply
           ? (opts.postTimeoutQuestionRequestIdForMessage?.(reply.message_id) ?? null)
           : null;
-        action = decisionRequestId && decisionToken && reply
+        // bangGate?.warning is checked FIRST: isBangReply implies isVerbatimText, so
+        // the decisionToken/postTimeoutRequestId branches below are already
+        // unreachable for a bang reply (both require `!isVerbatimText`) — this only
+        // intercepts the reply-route branch a blocked bang reply would otherwise take.
+        action = bangGate?.warning
+          ? { kind: 'reply', text: bangGate.warning }
+          : decisionRequestId && decisionToken && reply
           ? {
               kind: 'answer-question',
               callbackQueryId: '',
@@ -464,7 +476,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
                 replyToMessageId: reply.message_id,
                 // A `!` reply keeps its raw text (verbatim, `!` at column 0); a
                 // prose reply gets the quote anchor + wrap.
-                injectText: isBangReply ? m.text : buildReplyInject(m, name, opts),
+                injectText: isBangReply && bangGate ? bangGate.injectText : buildReplyInject(m, name, opts),
                 from: name,
                 messageId: m.message_id,
               }
@@ -550,8 +562,15 @@ function textAction(
   // the harness VERBATIM — no `[TG from …]` wrap — so it runs the rest as an
   // in-session shell command. The harness only honours a `!` at column 0, so the
   // text must be injected raw (no wrap, no reply quote-anchor). Owner-gated by
-  // `senderAllowed` upstream — a non-owner never reaches here.
-  if (text.startsWith('!')) return { kind: 'inject-text', text, messageId };
+  // `senderAllowed` upstream — a non-owner never reaches here. A catastrophic
+  // shape (`!rm -rf /`, `!git push --force`, …) is intercepted by
+  // shellPassthroughGate BEFORE injection — the sender must resend it with a
+  // doubled `!!` to confirm and run it anyway (tg-cli shell-danger-gate).
+  if (text.startsWith('!')) {
+    const shellGate = shellPassthroughGate(text);
+    if (shellGate.warning) return { kind: 'reply', text: shellGate.warning, threadId };
+    return { kind: 'inject-text', text: shellGate.injectText, messageId };
+  }
   if (text.startsWith('/')) {
     const verb = text.split(/\s+/, 1)[0];
     const cmd = verb.replace(/@\w+$/, ''); // tolerate /cmd@botname in groups
@@ -663,8 +682,13 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
     if (TOPIC_GLOBAL_CMDS.has(verb)) return [textAction(text, name, opts, m.message_id, m.reply_to_message?.message_id ?? null, threadId)];
     // A `!shell` passthrough is VERBATIM into the topic pane (harness `!` convention): no wrap and
     // no reply quote-anchor, so the `!` stays at column 0 — same rule as the flat path. Checked
-    // before the reply-anchor branch so a `!` reply is verbatim too.
-    if (text.startsWith('!')) return [{ kind: 'topic-route', threadId, injectText: text, from: name, messageId: m.message_id }];
+    // before the reply-anchor branch so a `!` reply is verbatim too. A catastrophic shape is
+    // intercepted by shellPassthroughGate and replied to IN THE TOPIC instead of injected.
+    if (text.startsWith('!')) {
+      const shellGate = shellPassthroughGate(text);
+      if (shellGate.warning) return [{ kind: 'reply', text: shellGate.warning, threadId }];
+      return [{ kind: 'topic-route', threadId, injectText: shellGate.injectText, from: name, messageId: m.message_id }];
+    }
     // §11 deferral 1: a prose reply carries the same ↩ «…» quote-anchor as flat-chat replies.
     // A /command reply still goes verbatim (the startsWith('/') guard above already passed it
     // through to the injectText path below).
@@ -680,8 +704,23 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
     // Carry the wrapped text so a SAME-BATCH re-spawn (which re-binds before this runs) can route
     // it to the now-live pane rather than dropping it (codex r9 #1). Never leaks to a flat agent.
     const deadText = m.text ?? '';
-    const deadVerbatim = deadText.startsWith('!') || isLikelySlashCommand(deadText);
-    const deadInject = deadText ? (deadVerbatim ? deadText : opts.wrap(name, deadText, m.message_id)) : '';
+    // A `!` here is the SAME verbatim-passthrough surface as the other three: if a
+    // SAME-BATCH re-spawn re-binds this topic before this action runs, handleTopicDead
+    // replays injectText VERBATIM into the freshly-live pane via handleTopicRoute — so an
+    // ungated dangerous command here would reach a real shell exactly like the bound-topic
+    // path does. Gate it identically; a blocked command becomes a wrapped warning instead
+    // of raw shell text (still carried through on same-batch re-spawn, but as prose, never
+    // executed).
+    const deadBangGate = deadText.startsWith('!') ? shellPassthroughGate(deadText) : null;
+    const deadInject = !deadText
+      ? ''
+      : deadBangGate?.warning
+        ? opts.wrap(name, deadBangGate.warning, m.message_id)
+        : deadBangGate
+          ? deadBangGate.injectText // safe or `!!`-confirmed bang (already peeled)
+          : isLikelySlashCommand(deadText)
+            ? deadText
+            : opts.wrap(name, deadText, m.message_id);
     return [{ kind: 'topic-dead', threadId, injectText: deadInject, messageId: m.message_id }];
   }
   // awaiting-path / awaiting-model: a text answer to the /new flow. A path message advances the

@@ -607,7 +607,16 @@ adapter layer; until then unknown `/cmd` passes through verbatim (below).
   wrapper/prefix would knock the `!` off column 0 and defeat the convention. Owner-gated by
   the same sender allowlist as every other inbound message (§9) — a non-owner never reaches
   the passthrough. A `!` reply is verbatim too (the quote-anchor is dropped). Multi-line `!`
-  bodies inject whole via bracketed paste.
+  bodies inject whole via bracketed paste. Before injection — on every verbatim-`!` surface,
+  including a closed topic's `topic-dead` recovery path (whose injectText can replay VERBATIM
+  into a freshly re-spawned pane on a same-batch re-spawn) — `shellPassthroughGate`
+  (`features/tg-ctl/shell-danger-gate.ts`) checks the command against a narrow named-shape
+  denylist (`rm -rf`, `sudo rm`, `git reset --hard`, force-push, a fork bomb, `curl | sh`, …).
+  A match is NOT injected — the sender gets a plain-text reply naming the matched rule and is
+  told to resend prefixed with a doubled `!!` to confirm and run it anyway; doubling the bang
+  peels one `!` and skips the denylist entirely. This is a content gate layered on top of the
+  identity gate above, not a replacement for it — same honest non-goal as
+  agent-hooks/workflow-danger-gate: a narrow denylist, not a sandbox.
 
 ## 14. Multi-harness support
 

@@ -242,6 +242,18 @@ test('topics ON: a `!shell` command in a BOUND topic injects VERBATIM (no wrap, 
   expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '!git status', from: 'Alex', messageId: 15 });
 });
 
+test('topics ON: `!rm -rf /` in a BOUND topic is BLOCKED — reply in the topic, not topic-route', () => {
+  const r = stepUpdates(
+    [upd(17, { text: '!rm -rf /', message_thread_id: 50, is_topic_message: true })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions).toHaveLength(2);
+  expect(r.actions[0].kind).toBe('reply');
+  expect((r.actions[0] as { kind: 'reply'; text: string; threadId?: number | null }).threadId).toBe(50);
+  expect((r.actions[0] as { kind: 'reply'; text: string }).text).toContain('rm-rf');
+  expect(r.actions[1]).toEqual({ kind: 'ack', messageId: 17 });
+});
+
 test('topics ON: a `!shell` REPLY in a BOUND topic is VERBATIM — no quote-anchor prepended', () => {
   const r = stepUpdates(
     [
@@ -255,6 +267,34 @@ test('topics ON: a `!shell` REPLY in a BOUND topic is VERBATIM — no quote-anch
     makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
   );
   expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '!ls', from: 'Alex', messageId: 16 });
+});
+
+test('topics ON: a dangerous `!rm -rf /` REPLY in a BOUND topic is BLOCKED — reply, not a verbatim topic-route', () => {
+  // Pins that the danger gate fires BEFORE the reply-anchor branch (updates.ts: the `!` check
+  // runs first regardless of reply_to_message) — a dangerous bang reply must not slip through
+  // via the reply-routing path.
+  const r = stepUpdates(
+    [
+      upd(20, {
+        text: '!rm -rf /',
+        message_thread_id: 50,
+        is_topic_message: true,
+        reply_to_message: { message_id: 91, chat: { id: CHAT_ID }, date: NOW, text: 'earlier' },
+      }),
+    ],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions[0].kind).toBe('reply');
+  expect((r.actions[0] as { kind: 'reply'; text: string; threadId?: number | null }).threadId).toBe(50);
+  expect((r.actions[0] as { kind: 'reply'; text: string }).text).toContain('rm-rf');
+});
+
+test('topics ON: `!!rm -rf /` (doubled bang) in a BOUND topic is confirmed and injected VERBATIM, one `!` peeled', () => {
+  const r = stepUpdates(
+    [upd(21, { text: '!!rm -rf /', message_thread_id: 50, is_topic_message: true })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '!rm -rf /', from: 'Alex', messageId: 21 });
 });
 
 test('topics ON: media (no text) in a BOUND topic is ACKED only — never leaks to a flat agent', () => {
@@ -277,6 +317,29 @@ test('topics ON: a message in a CLOSED topic → topic-dead (offer re-spawn) —
     { kind: 'topic-dead', threadId: 50, injectText: wrap('Alex', 'still here?', 13), messageId: 13 },
     { kind: 'ack', messageId: 13 },
   ]);
+});
+
+test('topics ON: `!rm -rf /` in a CLOSED topic is BLOCKED — topic-dead carries a warning, not raw shell (tg-cli shell-danger-gate)', () => {
+  // A same-batch re-spawn tap replays topic-dead's injectText VERBATIM into the freshly-live
+  // pane (handleTopicDead -> handleTopicRoute). A dangerous `!` here must not carry raw shell
+  // text through that path — it must be wrapped as a warning instead.
+  const r = stepUpdates(
+    [upd(18, { text: '!rm -rf /', message_thread_id: 50, is_topic_message: true })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' }),
+  );
+  expect(r.actions[0].kind).toBe('topic-dead');
+  const injectText = (r.actions[0] as { kind: 'topic-dead'; injectText: string }).injectText;
+  expect(injectText).not.toBe('!rm -rf /');
+  expect(injectText).toContain('rm-rf');
+  expect(r.actions[1]).toEqual({ kind: 'ack', messageId: 18 });
+});
+
+test('topics ON: `!!rm -rf /` (confirmed) in a CLOSED topic still carries the peeled command verbatim', () => {
+  const r = stepUpdates(
+    [upd(19, { text: '!!rm -rf /', message_thread_id: 50, is_topic_message: true })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' }),
+  );
+  expect(r.actions[0]).toEqual({ kind: 'topic-dead', threadId: 50, injectText: '!rm -rf /', messageId: 19 });
 });
 
 test('topics ON: a media-only message in a CLOSED topic → topic-dead with empty injectText', () => {
