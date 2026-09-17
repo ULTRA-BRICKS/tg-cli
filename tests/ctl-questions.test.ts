@@ -15,6 +15,7 @@ import {
   hatchParseMode,
   parseButtonCallback,
   parseQuestionCloseCallback,
+  parseDecisionReplyToken,
   isHatchPermissionRequest,
   questionCapability,
   queuedDecisionCanAutoDeliver,
@@ -410,6 +411,28 @@ test('parseQuestionCloseCallback accepts only close-card callbacks', () => {
   expect(parseQuestionCloseCallback('tgqc:q_123')).toEqual({ requestId: 'q_123' });
   expect(parseQuestionCloseCallback('tgq:q_123:o1')).toBe(null);
   expect(parseQuestionCloseCallback('tgqc:')).toBe(null);
+});
+
+test('parseDecisionReplyToken recognizes affirmative/negative tokens, case/whitespace-insensitive', () => {
+  expect(parseDecisionReplyToken('yes')).toBe('allow');
+  expect(parseDecisionReplyToken('YES')).toBe('allow');
+  expect(parseDecisionReplyToken('  ok  ')).toBe('allow');
+  expect(parseDecisionReplyToken('go')).toBe('allow');
+  expect(parseDecisionReplyToken('да')).toBe('allow');
+  expect(parseDecisionReplyToken('но')).toBe(null);
+  expect(parseDecisionReplyToken('no')).toBe('deny');
+  expect(parseDecisionReplyToken('stop')).toBe('deny');
+  expect(parseDecisionReplyToken('нет')).toBe('deny');
+  expect(parseDecisionReplyToken('maybe later')).toBe(null);
+  expect(parseDecisionReplyToken('')).toBe(null);
+});
+
+test('parseDecisionReplyToken: Object.prototype keys never resolve as a decision (prototype-pollution guard)', () => {
+  expect(parseDecisionReplyToken('constructor')).toBe(null);
+  expect(parseDecisionReplyToken('toString')).toBe(null);
+  expect(parseDecisionReplyToken('__proto__')).toBe(null);
+  expect(parseDecisionReplyToken('hasOwnProperty')).toBe(null);
+  expect(parseDecisionReplyToken('valueOf')).toBe(null);
 });
 
 test('resolveButtonCallback maps option callbacks to labels', () => {

@@ -3,6 +3,33 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.52.7
+
+**Feat (tg-cli#402): resolve permission cards via a plain-text reply.**
+
+- A plain-text REPLY to a PENDING or still-answerable-abandoned permission card (covers hatch
+  cards, but works for any permission-kind, non-multiQuestion card) resolves it exactly like
+  tapping Allow/Deny — no button tap required. Recognized tokens (case-insensitive, trimmed):
+  affirmative `t/y/yes/yep/yeah/ya/ok/okay/k/go/да/ок/го` → allow; negative
+  `n/no/nope/nah/stop/deny/нет` → deny (`parseDecisionReplyToken`,
+  `features/tg-ctl/questions.ts`).
+- Implemented by synthesizing the existing `'answer-question'` Action from the reply, with an
+  empty-string `callbackQueryId` sentinel — the SAME downstream code a real button tap hits
+  (`resolveButtonCallback`, the hook-socket delivery, the card edit, `flushDeferred`). No new
+  Action kind. `answerCallbackQuery` now no-ops on the empty sentinel (there is no real Telegram
+  callback query to acknowledge; the card's own edit is the visible feedback).
+- An unrecognized reply body, or a reply to a message that isn't a currently-decidable
+  permission card, falls straight through to the existing reply-route / post-timeout-question
+  handling unchanged — never hijacks an unrelated reply.
+- A failure branch that reports its outcome ONLY via the toast (expired / already-answered /
+  mismatched card, or an omp ACP reply failure) can't rely on the empty-sentinel no-op — that
+  would silently swallow the human's "yes" with no feedback at all. Those call sites now fall
+  back to a plain chat reply carrying the same text (`answerCallbackQueryOrNotify`); a success
+  branch that already edits the card is unaffected.
+- `DECISION_REPLY_TOKENS` is built on a null-prototype object so a reply body like
+  `"constructor"`/`"__proto__"`/`"toString"` can never resolve through `Object.prototype` to a
+  spurious truthy value.
+
 ## 1.52.6
 
 **Feat (tg-cli#402): render hatch approval cards as HTML.**

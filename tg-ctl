@@ -671,7 +671,36 @@ async function sendButtonCard(ctx: Ctx, payload: ButtonMessagePayload): Promise<
 }
 
 async function answerCallbackQuery(ctx: Ctx, callbackQueryId: string, text: string): Promise<void> {
+  // A text-reply-synthesized decision (see the 'answer-question' construction in
+  // features/tg-ctl/updates.ts) carries an empty callbackQueryId sentinel: there is no real
+  // Telegram callback query to acknowledge, so this is a correct no-op on a SUCCESS path — the
+  // card's own editMessageText already gives the human visible feedback. It is NOT correct on a
+  // pure-toast failure branch (expired / already-answered / mismatched) that posts no edit —
+  // those call sites MUST use answerCallbackQueryOrNotify below instead, or the sentinel would
+  // silently swallow the only feedback the human would otherwise get (review finding).
+  if (!callbackQueryId) return
   await botPost(ctx, "answerCallbackQuery", { callback_query_id: callbackQueryId, text })
+}
+
+// For a failure branch that reports its outcome ONLY via the toast (no accompanying card edit):
+// a real button tap's `action.callbackQueryId` is always real, so `answerCallbackQuery` reaches
+// the human either way. A text-reply-synthesized decision (empty-sentinel `action`, see
+// features/tg-ctl/updates.ts) has no callback query to toast — without this, the human's "yes"
+// would silently do nothing with zero feedback (review finding: a same-batch race where a button
+// tap resolves the card a moment before a text reply to it lands would otherwise vanish
+// unexplained). Falls back to a plain chat reply carrying the identical text. Success branches
+// that follow up with an editMessageText keep using plain `answerCallbackQuery` — the card edit
+// is already sufficient feedback there and a second message would be redundant noise.
+async function answerCallbackQueryOrNotify(
+  ctx: Ctx,
+  action: Extract<Action, { kind: "answer-question" }>,
+  text: string,
+): Promise<void> {
+  if (!action.callbackQueryId) {
+    await sendMessage(ctx, text)
+    return
+  }
+  await answerCallbackQuery(ctx, action.callbackQueryId, text)
 }
 
 // NOTE: Telegram's editMessageText REPLACES the whole inline keyboard — omitting
@@ -2810,6 +2839,21 @@ interface AbandonedButton {
   // the notice for an entry that already got one (would read as spam / a false
   // "still no connection" repeat right after a bounce).
   queuedDecision?: { value: string; label: string; decision: PermissionDecision; at: number; notifiedAt?: number }
+}
+
+// Shared by permissionRequestIdForMessage's two lookups (PendingButton and
+// AbandonedButton have compatible {req, messageId} shapes) — a single copy of
+// the "is this the one decidable permission card at this message_id" predicate
+// instead of two independently-written loops that could silently drift apart
+// if the definition of "decidable" ever changes (review finding).
+function findDecidablePermissionRequestId(
+  entries: Iterable<[string, { req: ButtonRequest; messageId: number | null }]>,
+  messageId: number,
+): string | null {
+  for (const [requestId, entry] of entries) {
+    if (entry.messageId === messageId && entry.req.kind === "permission" && !entry.req.multiQuestion) return requestId
+  }
+  return null
 }
 
 // A question that has already been ANSWERED, kept briefly so a re-forward of the
@@ -8784,7 +8828,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         answeredButtons.delete(action.requestId)
         abandonedButtons.set(action.requestId, { req: retained.req, messageId: retained.messageId, at: retained.at })
         persistQuestions()
-        await answerCallbackQuery(ctx, action.callbackQueryId, "could not reach omp ACP — tap again")
+        await answerCallbackQueryOrNotify(ctx, action, "could not reach omp ACP — tap again")
         return true
       }
       await answerCallbackQuery(ctx, action.callbackQueryId, "✓ sent to the agent")
@@ -8808,7 +8852,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       action.messageId !== null &&
       action.messageId !== retained.messageId
     ) {
-      await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+      await answerCallbackQueryOrNotify(ctx, action, "expired")
       return true
     }
     // Enforce the retention window at DELIVERY time, not only on persist/restore. On a
@@ -9302,7 +9346,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           // "answered" vs aged-out.
           const priorAnswer = answeredButtons.get(action.requestId)
           const stillAnswered = priorAnswer !== undefined && Date.now() - priorAnswer.at <= ANSWERED_REPLAY_MS
-          await answerCallbackQuery(ctx, action.callbackQueryId, stillAnswered ? "already answered" : "expired")
+          await answerCallbackQueryOrNotify(ctx, action, stillAnswered ? "already answered" : "expired")
           return true
         }
         // A tap must come from THIS prompt's Telegram message: a stale tap on
@@ -9314,12 +9358,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           action.messageId !== null &&
           action.messageId !== pending.messageId
         ) {
-          await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+          await answerCallbackQueryOrNotify(ctx, action, "expired")
           return true
         }
         const answer = resolveButtonCallback(pending.req, { requestId: action.requestId, value: action.value })
         if (answer.status !== "answered") {
-          await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+          await answerCallbackQueryOrNotify(ctx, action, "expired")
           return true
         }
         pendingButtons.delete(action.requestId)
@@ -9712,6 +9756,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           }
           return null
         },
+        permissionRequestIdForMessage: (messageId) =>
+          findDecidablePermissionRequestId(pendingButtons, messageId) ?? findDecidablePermissionRequestId(abandonedButtons, messageId),
       })
 
       // The batch is durably journaled BEFORE this point (see the atomicWrite above), so

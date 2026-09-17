@@ -495,6 +495,25 @@ export function buildAnsweredQuestionText(req: ButtonRequest, answer: string): s
   ].join('\n\n');
 }
 
+// Plain-text-reply-as-decision (tg-cli, human-requested live): a reply to a PENDING/abandoned
+// permission card whose body is one of these tokens resolves exactly like tapping Allow/Deny —
+// case-insensitive, trimmed. Anything else is NOT a decision reply (the caller must fall
+// through to normal reply handling, never hijack an unrelated reply).
+// Object.create(null) — a plain `{}` literal inherits Object.prototype, so a reply body of
+// "constructor"/"toString"/"__proto__" would resolve through the prototype chain to a truthy
+// non-string value instead of undefined, making parseDecisionReplyToken wrongly return a
+// decision for those inputs (review finding).
+const DECISION_REPLY_TOKENS: Record<string, 'allow' | 'deny'> = Object.assign(Object.create(null), {
+  t: 'allow', y: 'allow', yes: 'allow', yep: 'allow', yeah: 'allow', ya: 'allow',
+  ok: 'allow', okay: 'allow', k: 'allow', go: 'allow', да: 'allow', ок: 'allow', го: 'allow',
+  n: 'deny', no: 'deny', nope: 'deny', nah: 'deny', stop: 'deny', deny: 'deny', нет: 'deny',
+});
+
+export function parseDecisionReplyToken(text: string): 'allow' | 'deny' | null {
+  const norm = text.trim().toLowerCase();
+  return DECISION_REPLY_TOKENS[norm] ?? null;
+}
+
 export function parseButtonCallback(data: string | undefined): ParsedButtonCallback | null {
   if (!data) return null;
   const parts = data.split(':');

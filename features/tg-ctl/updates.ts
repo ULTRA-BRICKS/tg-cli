@@ -16,7 +16,7 @@
 // it is still a real instruction and must reach the agent.
 
 import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatus } from './types';
-import { parseButtonCallback, parseQuestionCloseCallback } from './questions';
+import { parseButtonCallback, parseQuestionCloseCallback, parseDecisionReplyToken } from './questions';
 import { isAgentCommand, parseAgentCallback, parseAgentCancelCallback, parseAgentCommand } from './agent-match';
 import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
 import { parseNewCommand, parseNewDirCallback, parseNewHarnessCallback, parseNewModelCallback, parseNewRetryCallback, parseNewPrivateTopicFallbackCallback } from './new-command';
@@ -58,6 +58,14 @@ export interface StepOpts {
   // The entrypoint owns the retained-question store, so the pure step only asks whether
   // the replied-to Telegram message_id is one of those cards.
   postTimeoutQuestionRequestIdForMessage?: (messageId: number) => string | null;
+  // Plain-text-reply-as-decision (human-requested): the entrypoint owns pendingButtons/
+  // abandonedButtons, so the pure step only asks "is the replied-to message_id a LIVE-or-
+  // retained PERMISSION-kind, non-multiQuestion card?" — the lookup itself does NOT check
+  // retention/expiry (a stale-but-still-retained abandoned entry can still match); that
+  // enforcement happens downstream at delivery time (lateDeliverAbandonedQuestion's
+  // isAbandonedExpired check), the same as a real button tap on the same entry.
+  // Returns its callbackRequestId (the same id `resolveButtonCallback` expects), else null.
+  permissionRequestIdForMessage?: (messageId: number) => string | null;
 }
 
 // Default quote-anchor time format: deterministic UTC `YYYY-MM-DD HH:MM`.
@@ -420,22 +428,40 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         // would knock the `!` off column 0 and defeat the harness passthrough.
         const isVerbatimText = m.text.startsWith('/') || m.text.startsWith('!');
         const isBangReply = !!m.reply_to_message && m.text.startsWith('!');
-        const postTimeoutRequestId = m.reply_to_message
-          ? (opts.postTimeoutQuestionRequestIdForMessage?.(m.reply_to_message.message_id) ?? null)
+        // Bound once so every branch below narrows against the SAME reference —
+        // a decoupled `m.reply_to_message!` non-null assertion (one expression
+        // asserting non-null based on an entirely separate expression's truthy
+        // check) is exactly the kind of coupling a future edit can silently
+        // desync into a runtime TypeError (review finding).
+        const reply = m.reply_to_message;
+        const decisionToken = !isVerbatimText ? parseDecisionReplyToken(m.text) : null;
+        const decisionRequestId = decisionToken && reply
+          ? (opts.permissionRequestIdForMessage?.(reply.message_id) ?? null)
           : null;
-        action = postTimeoutRequestId && !isVerbatimText
+        const postTimeoutRequestId = reply
+          ? (opts.postTimeoutQuestionRequestIdForMessage?.(reply.message_id) ?? null)
+          : null;
+        action = decisionRequestId && decisionToken && reply
           ? {
-              kind: 'post-timeout-question-reply',
-              requestId: postTimeoutRequestId,
-              questionMessageId: m.reply_to_message!.message_id,
-              text: m.text,
-              from: name,
-              messageId: m.message_id,
+              kind: 'answer-question',
+              callbackQueryId: '',
+              requestId: decisionRequestId,
+              value: decisionToken,
+              messageId: reply.message_id,
             }
-          : m.reply_to_message && (!isVerbatimText || isBangReply)
+          : postTimeoutRequestId && !isVerbatimText && reply
+            ? {
+                kind: 'post-timeout-question-reply',
+                requestId: postTimeoutRequestId,
+                questionMessageId: reply.message_id,
+                text: m.text,
+                from: name,
+                messageId: m.message_id,
+              }
+          : reply && (!isVerbatimText || isBangReply)
             ? {
                 kind: 'reply-route',
-                replyToMessageId: m.reply_to_message.message_id,
+                replyToMessageId: reply.message_id,
                 // A `!` reply keeps its raw text (verbatim, `!` at column 0); a
                 // prose reply gets the quote anchor + wrap.
                 injectText: isBangReply ? m.text : buildReplyInject(m, name, opts),
@@ -447,7 +473,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
                 name,
                 opts,
                 m.message_id,
-                m.reply_to_message?.message_id ?? null,
+                reply?.message_id ?? null,
                 opts.topicsEnabled && m.is_topic_message ? (m.message_thread_id ?? null) : null,
               );
       }
