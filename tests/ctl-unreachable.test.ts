@@ -175,6 +175,27 @@ test('findUnreachableAgents: an interactive claude with a tty and no tmux pane i
   ]);
 });
 
+test('findUnreachableAgents: a bun-source-invoked omp with a tty and no tmux pane classifies as omp (tg-cli#413 follow-up)', () => {
+  // Before the matchAgentCommand fix this classified as null (unrecognized), so
+  // this process was invisible to BOTH findUnreachableAgents and
+  // findLiveOmpAgents. tg-ctl's entrypoint filters agent !== 'omp' out of the
+  // unreachable list (omp coverage is exclusively findLiveOmpAgents's job), so
+  // this pins the classification half of the fix, not the final routing list.
+  const procs = [
+    proc(1, 0, '/sbin/launchd'),
+    proc(6000, 1, 'login'),
+    proc(6001, 6000, '-zsh'),
+    proc(
+      7300,
+      6001,
+      'bun --preload /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/omp.ts /Users/u/xp/oh-my-pi/packages/coding-agent/src/cli.ts',
+    ),
+  ];
+  const tty = new Map<number, string>([[6001, 'ttys004'], [7300, 'ttys004']]);
+  const out = findUnreachableAgents([], procs, tty);
+  expect(out.map((a) => [a.pid, a.agent])).toEqual([[7300, 'omp']]);
+});
+
 test('findUnreachableAgents: a wrapper + real binary pair folds into one agent; a nested session under another agent stays distinct; empty tty map → none', () => {
   const procs = [
     proc(1, 0, '/sbin/launchd'),
