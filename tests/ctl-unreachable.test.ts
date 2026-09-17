@@ -87,13 +87,18 @@ test('parseAgentNameFromCommand handles --name X, --name=X and a missing value',
   expect(parseAgentNameFromCommand('claude')).toBeNull();
 });
 
-test('isInteractiveAgentCommand excludes print/exec/daemon shapes', () => {
+test('isInteractiveAgentCommand excludes print/exec/daemon/mcp shapes', () => {
   expect(isInteractiveAgentCommand('claude --name x', 'claude')).toBe(true);
   expect(isInteractiveAgentCommand('/Users/u/.local/bin/claude --print --output-format text', 'claude')).toBe(false);
   expect(isInteractiveAgentCommand('claude -p "hi"', 'claude')).toBe(false);
   expect(isInteractiveAgentCommand('node /opt/homebrew/bin/codex exec -s read-only', 'codex')).toBe(false);
   expect(isInteractiveAgentCommand('claude daemon run --json-path x', 'claude')).toBe(false);
   expect(isInteractiveAgentCommand('claude bg-spare --bg-spare /tmp/x', 'claude')).toBe(false);
+  // claude mcp serve/list — a one-shot/server subcommand, never the interactive TUI,
+  // now load-bearing for headless-aware kinds since findUnreachableAgents no longer
+  // falls back to a tty requirement for claude (tg-cli#413 follow-up review finding).
+  expect(isInteractiveAgentCommand('claude mcp serve', 'claude')).toBe(false);
+  expect(isInteractiveAgentCommand('claude mcp list', 'claude')).toBe(false);
   expect(isInteractiveAgentCommand('opencode run "do it"', 'opencode')).toBe(false);
   expect(isInteractiveAgentCommand('opencode', 'opencode')).toBe(true);
 });
@@ -196,7 +201,7 @@ test('findUnreachableAgents: a bun-source-invoked omp with a tty and no tmux pan
   expect(out.map((a) => [a.pid, a.agent])).toEqual([[7300, 'omp']]);
 });
 
-test('findUnreachableAgents: a wrapper + real binary pair folds into one agent; a nested session under another agent stays distinct; empty tty map → none', () => {
+test('findUnreachableAgents: a wrapper + real binary pair folds into one agent; a nested session under another agent stays distinct', () => {
   const procs = [
     proc(1, 0, '/sbin/launchd'),
     proc(300, 1, 'node /Users/u/.claude/local/claude --name a'),
@@ -217,7 +222,60 @@ test('findUnreachableAgents: a wrapper + real binary pair folds into one agent; 
     [312, 'tgtest'],
   ]);
   expect(out[0].agent).toBe('claude');
+  // an empty tty map (fully headless, no controlling terminal anywhere) still finds the
+  // same agents — only the display tty degrades to null, never the whole agent (tg-cli#413
+  // follow-up: this used to assert `[]` here, pinning the bug).
+  const outNoTty = findUnreachableAgents([], procs, new Map());
+  expect(outNoTty.map((a) => [a.pid, a.name])).toEqual([
+    [300, 'a'],
+    [312, 'tgtest'],
+  ]);
+  expect(outNoTty.every((a) => a.tty === null)).toBe(true);
+});
+
+test('a fully headless claude session (no tty, no pane) is still discovered', () => {
+  const procs = [
+    proc(1, 0, '/sbin/launchd'),
+    proc(7103, 1, 'claude --name landing'), // parented directly under launchd, no tty at all
+  ];
+  const out = findUnreachableAgents([], procs, new Map());
+  expect(out).toEqual([
+    { pid: 7103, agent: 'claude', tty: null, command: 'claude --name landing', name: 'landing', cwd: null },
+  ]);
+});
+
+test('a fully headless codex/opencode session (no tty, no pane) is also discovered — headlessAware is not claude-only', () => {
+  const codexProcs = [proc(1, 0, '/sbin/launchd'), proc(8100, 1, 'codex')];
+  expect(findUnreachableAgents([], codexProcs, new Map())).toEqual([
+    { pid: 8100, agent: 'codex', tty: null, command: 'codex', name: null, cwd: null },
+  ]);
+  const opencodeProcs = [proc(1, 0, '/sbin/launchd'), proc(8200, 1, 'opencode')];
+  expect(findUnreachableAgents([], opencodeProcs, new Map())).toEqual([
+    { pid: 8200, agent: 'opencode', tty: null, command: 'opencode', name: null, cwd: null },
+  ]);
+});
+
+test('a headless `claude mcp serve` is never falsely listed as unreachable (unlike a real interactive session)', () => {
+  const procs = [
+    proc(1, 0, '/sbin/launchd'),
+    proc(7200, 1, 'claude mcp serve'), // one-shot server subcommand, no controlling tty
+  ];
   expect(findUnreachableAgents([], procs, new Map())).toEqual([]);
+});
+
+test('a headless pi/aider (no per-shape headless detection) is still dropped without a tty, unlike claude/codex/opencode', () => {
+  const procs = [
+    proc(1, 0, '/sbin/launchd'),
+    proc(9100, 1, 'pi --message "summarize"'), // no controlling terminal at all
+    proc(9200, 1, 'aider --yes'),
+  ];
+  expect(findUnreachableAgents([], procs, new Map())).toEqual([]);
+  // a raw, un-parsed sentinel value ('??'/'?'/'-') in the map must be treated exactly
+  // like a missing entry — the gate normalizes before checking, not just before display
+  // (a caller can hand findUnreachableAgents a raw map, same as the omp sibling's tests do).
+  expect(findUnreachableAgents([], procs, new Map([[9100, '??']]))).toEqual([]);
+  const withTty = new Map([[9100, 'ttys020']]);
+  expect(findUnreachableAgents([], procs, withTty).map((a) => [a.pid, a.agent])).toEqual([[9100, 'pi']]);
 });
 
 // --- labels, keys, matching, texts ---
@@ -272,4 +330,10 @@ test('status/reply texts name the reason, tty, cwd and name', () => {
   expect(listing).toContain('/agent <name> <text>');
   expect(queuedReplyText(ua())).toContain('landing is running outside tmux');
   expect(queuedReplyText(ua())).toContain('Stop-hook inbox');
+});
+
+test('describeUnreachable/queuedReplyText render "tty none" for a headless agent with no tty', () => {
+  const headless = ua({ tty: null });
+  expect(describeUnreachable(headless, 0)).toContain('tty none');
+  expect(queuedReplyText(headless)).toContain('landing is running outside tmux (tty none,');
 });

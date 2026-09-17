@@ -106,10 +106,13 @@ const shimDir = join(cfgDir, 'bin');
 const shimLog = join(cfgDir, 'tmux-calls.log');
 mkdirSync(shimDir);
 writeFileSync(join(shimDir, 'tmux'), `#!/bin/sh\necho "$@" >> '${shimLog}'\nexit 0\n`, { mode: 0o755 });
-// ps PATH shim: the legacy 3-column `pid ppid command` shape regardless of argv, so the
-// process-table scan for agents OUTSIDE tmux (tg-cli#306) sees NO tty map and lists
-// nothing — otherwise the guard text would enumerate whatever interactive claude/codex
-// sessions happen to run on the developer's machine, and (a) below would not be hermetic.
+// ps PATH shim: the legacy 3-column `pid ppid command` shape regardless of argv, with no
+// agent process on the fake table (only launchd) — the process-table scan for agents
+// OUTSIDE tmux (tg-cli#306) always runs now (tg-cli#413 follow-up removed the
+// empty-tty-map short-circuit) but still lists nothing here because there is nothing to
+// match, not because the scan was skipped — otherwise the guard text would enumerate
+// whatever interactive claude/codex sessions happen to run on the developer's machine,
+// and (a) below would not be hermetic.
 writeFileSync(join(shimDir, 'ps'), `#!/bin/sh\nprintf '    1     0 /sbin/launchd\\n'\nexit 0\n`, { mode: 0o755 });
 
 const reg = createDaemonRegistry();
