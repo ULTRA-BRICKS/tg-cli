@@ -365,3 +365,47 @@ test('HATCH ABANDONED (no tap): the card names the concrete retry command instea
   daemon.kill('SIGTERM');
   await daemon.exited;
 }, 20_000);
+
+// tg-cli#403 (multi-model security review finding): findQueuedHatchDecision used
+// to match a retry by hookId ALONE. Hook names (e.g. "test-hook",
+// "block-reset-hard") are short, conventional strings a rig/hook framework
+// encourages reusing verbatim ACROSS unrelated projects -- before this fix, a
+// decision approved ONCE for one project's cwd would auto-apply to any LATER,
+// unrelated project's same-named hatch hook too, for as long as the entry stayed
+// retained (critical mode's Infinity retention removes even the 12h bound that
+// previously limited the blast radius). Scoping the match to the SAME cwd closes
+// this while leaving the legitimate same-project retry (HATCH RETRY above)
+// unaffected.
+test('HATCH CROSS-PROJECT SCOPE (tg-cli#403 security fix): a queued decision for one project cwd does NOT auto-apply to a same-hookId retry from a DIFFERENT project cwd', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  const daemon = await startDaemon(cfgDir, tg.port);
+
+  // Original ask from project A (its cwd is cfgDir, per makeCfgDir's own
+  // registration). Process exits before any tap.
+  const ask1 = startAsk(cfgDir, tg.port, hatchRequest(HATCH_REQUEST_ID_1));
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+  ask1.kill(9);
+  await ask1.exited;
+
+  // The human approves it -- recorded, but for project A's cwd.
+  const allowData = tg.allowData()!;
+  tg.push([tap(allowData, 801, 1)]);
+  expect(await until(() => queuedDecisionOf(cfgDir, HATCH_REQUEST_ID_1)?.decision === 'allow', 5000)).toBe(true);
+
+  // A retry with the SAME hookId, but from a DIFFERENT project directory
+  // (simulating a same-named hatch hook firing in an unrelated repo). Hatch
+  // requests bypass the registration-set gate (tg-cli#333), so this still
+  // forwards and posts its OWN card rather than being silently dropped -- the
+  // assertion is that it must NOT be auto-answered from project A's decision.
+  const otherCwd = mkdtempSync(join(tmpdir(), 'tgctl-hatch-other-project-'));
+  const ask2 = startAsk(cfgDir, tg.port, { ...hatchRequest(HATCH_REQUEST_ID_2), cwd: otherCwd });
+  expect(await until(() => tg.cards().length === 2, 6000)).toBe(true);
+  expect(daemonLog(cfgDir)).not.toContain('hatch-queued-decision-delivered');
+  ask2.kill(9);
+  await ask2.exited;
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);

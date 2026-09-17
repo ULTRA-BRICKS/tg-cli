@@ -3,6 +3,15 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.53.0
+
+**Feature (tg-cli#403, agent-tools#754): critical/no-timeout hatch approval mode — quiet-hours-aware reminders, reminder-message replacement, and proactive live-session delivery of late decisions.**
+
+- `ButtonRequest` gains an opt-in `critical` flag. When a hatch/permission ask sets it, `tg-ctl ask`'s daemon round-trip no longer applies `ASK_TOTAL_TIMEOUT_MS`, and the daemon never arms its `UNSCOPED_ABANDON_MS` backstop for it either — the ask waits for a real decision no matter how long it takes, rather than reporting a timeout while the human is still deciding. Non-critical (default) hatch/permission behavior is byte-for-byte unchanged.
+- While a critical ask is pending, the human gets a periodic reminder ping (`TG_CTL_CRITICAL_REMINDER_INTERVAL_MS`, default 15 min), suppressed during quiet hours (`TG_CTL_QUIET_HOURS_START_HOUR`/`TG_CTL_QUIET_HOURS_END_HOUR`, default 23:00-08:00 local) and deferred to exactly one reminder right after quiet hours end. Each new reminder deletes (or, on delete failure, edits-away) the previous one — the original request card is never touched. New pure scheduler: `features/tg-ctl/hatch-critical-reminder.ts`.
+- The moment a critical decision lands — however late — it is pushed proactively into a matching LIVE omp session via `promptOmpAcp`, in addition to the existing durable-record + retry-command card text. Never attaches to (or spawns) a session `listLiveOmpAgents()` doesn't already report as live.
+- New `deleteMessage` Bot API helper.
+
 ## 1.52.5
 
 **Fix (tg-cli#322): fire-and-forget omp ACP delivery; journal getUpdates batches before offset advance.**
