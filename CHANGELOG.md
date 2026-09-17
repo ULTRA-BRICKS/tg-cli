@@ -3,6 +3,13 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.52.10
+
+**Fix (tg-ctl omp discovery, PR #405 follow-up): discover a headless omp session with no controlling tty and no tmux pane.**
+
+- `findLiveOmpAgents` (`features/tg-ctl/omp.ts`) additionally required a tty OR a tmux pane before treating an interactive omp process as a live agent ("drop daemons with neither"). This silently dropped a genuinely live omp session started detached/headless — no terminal at all, not in tmux. `listUnreachableAgents` cannot cover the gap either, since it explicitly excludes `agent === "omp"` (that coverage is `findLiveOmpAgents`'s job). The session fell through every candidate list straight to the bare legacy `NO_AGENT_REPLY` ("Claude Code not in tmux...") even though ACP delivery (`promptOmpAcp`/`ensureOmpAcp`) needs only the process's pid/cwd, never a tty or a pane.
+- Removed the tty-or-pane gate entirely: any process that already passes `isOmpLiveSessionCommand` (which already excludes workers, `omp acp` children, and `-p`/`--print` one-shots) is a genuine live session regardless of tty/pane presence.
+
 ## 1.52.9
 
 **Feature (tg-cli#403, agent-tools#754): critical/no-timeout hatch approval mode — quiet-hours-aware reminders, reminder-message replacement, and proactive live-session delivery of late decisions.**

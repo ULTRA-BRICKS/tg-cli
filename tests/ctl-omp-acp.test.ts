@@ -158,6 +158,26 @@ test('findLiveOmpAgents lists interactive omp both in and out of tmux; workers a
   expect(agents.find((a) => a.pid === 300)?.paneId).toBeNull();
 });
 
+test('findLiveOmpAgents includes a headless omp session with neither a tty nor a tmux pane (tg-cli#405 follow-up)', () => {
+  const panes: PaneInfo[] = [];
+  const procs = [
+    proc(1, 0, '/sbin/launchd'),
+    proc(700, 1, '/opt/homebrew/bin/omp'), // headless: no tty, no tmux pane
+  ];
+  const ttyByPid = new Map<number, string>([[700, '??']]);
+  const agents = findLiveOmpAgents(panes, procs, ttyByPid);
+  expect(agents).toHaveLength(1);
+  expect(agents[0]).toMatchObject({ pid: 700, paneId: null, tty: null });
+});
+
+test('findLiveOmpAgents includes a headless omp session entirely absent from the tty map', () => {
+  const panes: PaneInfo[] = [];
+  const procs = [proc(701, 1, '/opt/homebrew/bin/omp')];
+  const agents = findLiveOmpAgents(panes, procs, new Map());
+  expect(agents).toHaveLength(1);
+  expect(agents[0].paneId).toBeNull();
+});
+
 test('liveOmpLabel prefers omp session title over cwd basename', () => {
   const titled: LiveOmpAgent = {
     pid: 7,

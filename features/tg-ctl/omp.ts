@@ -175,9 +175,22 @@ function pidsUnderPanes(panes: PaneInfo[], procs: ProcInfo[]): Map<number, strin
 }
 
 /**
- * Interactive omp processes, whether or not they sit in a tmux pane.
- * A pane does not make them "tmux-injectable": preferOmpApiOverTmux is always
- * true for omp.
+ * Interactive omp processes, whether or not they sit in a tmux pane OR have a
+ * controlling tty at all. `isOmpLiveSessionCommand` already narrows `procs` to
+ * the genuine top-level interactive CLI (never a worker, `omp acp` child, or a
+ * `-p`/`--print` one-shot) — anything left IS a live conversational session, so
+ * `preferOmpApiOverTmux` is always true for omp and ACP delivery (promptOmpAcp /
+ * ensureOmpAcp) needs only the pid's cwd, never a tty or a pane.
+ *
+ * Past bug (tg-cli#405 follow-up): this used to additionally require a tty OR a
+ * pane ("drop daemons with neither") and silently dropped a genuinely live omp
+ * session that has neither — e.g. one launched detached/headless (no controlling
+ * terminal, not in tmux). Such a session is invisible to `listUnreachableAgents`
+ * too (that path explicitly excludes `agent === "omp"`, since omp coverage is
+ * this function's job), so it fell through every candidate list straight to the
+ * bare "Claude Code not in tmux" legacy reply — even though ACP delivery to it
+ * works exactly the same as any other omp session. Do not reintroduce a tty/pane
+ * requirement here.
  */
 export function findLiveOmpAgents(
   panes: PaneInfo[],
@@ -190,8 +203,6 @@ export function findLiveOmpAgents(
     if (!isOmpLiveSessionCommand(p.command)) continue;
     const tty = ttyByPid.get(p.pid) ?? null;
     const paneId = paneByPid.get(p.pid) ?? null;
-    // Need a tty OR a pane — drop daemons with neither.
-    if (!paneId && (!tty || tty === '?' || tty === '??')) continue;
     out.push({
       pid: p.pid,
       cwd: null,
