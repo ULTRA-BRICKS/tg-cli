@@ -24,6 +24,7 @@ agent_hooks:
   target: ~/.claude/hooks
   target_kind: claude-code
   all: true
+  worktree_only: true
 git_hooks:
   dispatcher:
     enabled: true
