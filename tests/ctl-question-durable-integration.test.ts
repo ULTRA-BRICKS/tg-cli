@@ -142,6 +142,10 @@ interface MockTg {
   keyboardClears: () => number;
   answeredCbs: () => Array<{ callback_query_id: string; text: string }>;
   optionData: (row: number) => string | null;
+  // Every sendMessage carrying NO inline keyboard — the plain-chat-reply fallback
+  // (answerCallbackQueryOrNotify) a toast-only failure branch uses for a
+  // text-reply-synthesized decision, which has no callback query to toast.
+  plainMessages: () => string[];
   // Hold every card-bearing sendMessage open for `ms` AFTER recording the card, so a
   // test can close the asking socket mid-send and exercise the messageId-null race.
   delaySend: (ms: number) => void;
@@ -152,6 +156,7 @@ function mockTelegram(): MockTg {
   const cards: unknown[] = [];
   const edits: string[] = [];
   const answeredCbs: Array<{ callback_query_id: string; text: string }> = [];
+  const plainMessages: string[] = [];
   let keyboardClears = 0;
   let lastKeyboard: Array<Array<{ callback_data: string }>> | null = null;
   let cardSeq = 0;
@@ -180,6 +185,7 @@ function mockTelegram(): MockTg {
           if (sendDelayMs) await Bun.sleep(sendDelayMs);
           return Response.json({ ok: true, result: { message_id: id } });
         }
+        plainMessages.push(String(body.text ?? ''));
         return Response.json({ ok: true, result: { message_id: 900 } });
       }
       if (url.pathname.endsWith('/editMessageText')) {
@@ -208,6 +214,7 @@ function mockTelegram(): MockTg {
     keyboardClears: () => keyboardClears,
     answeredCbs: () => answeredCbs,
     optionData: (row) => lastKeyboard?.[row]?.[0]?.callback_data ?? null,
+    plainMessages: () => plainMessages,
     delaySend: (ms) => {
       sendDelayMs = ms;
     },
@@ -1943,3 +1950,246 @@ test('PERM QUEUE RE-TAP RESETS NOTICE: after the still-waiting notice fires, a r
   daemon.kill('SIGTERM');
   await daemon.exited;
 }, 30_000);
+
+// ---------------------------------------------------------------------------
+// Plain-text-reply-as-decision (human-requested live feature): a plain-text
+// reply to a PENDING permission card resolves it exactly the same as tapping
+// a button — same 'answer-question' Action, same downstream code, with an
+// empty callbackQueryId sentinel that answerCallbackQuery silently no-ops on
+// (the card's own edit is the visible feedback; there is no real Telegram
+// callback query to acknowledge).
+// ---------------------------------------------------------------------------
+
+test('TEXT-REPLY DECISION: a plain-text reply to a LIVE permission card resolves it exactly like a button tap', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+
+  const daemon = await startDaemon(cfgDir, tg.port);
+  const ask = startAsk(cfgDir, tg.port, PERMISSION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+
+  // A plain-text reply to the card's message (id 1, per mockTelegram's fixed
+  // message_id) with an affirmative token — no button tap involved.
+  tg.push([
+    {
+      update_id: 900,
+      message: {
+        message_id: 901,
+        from: { id: 1, first_name: 'Alex' },
+        chat: { id: 1 },
+        date: Math.floor(Date.now() / 1000),
+        text: 'yes',
+        reply_to_message: {
+          message_id: 1,
+          chat: { id: 1 },
+          date: Math.floor(Date.now() / 1000) - 30,
+          text: 'Permission from claude\n\nAllow bash command: rm -rf /tmp/test?',
+        },
+      },
+    },
+  ]);
+
+  // The decision reaches the hook exactly like a real button tap would.
+  const out = await new Response(ask.stdout).text();
+  await ask.exited;
+  expect(JSON.parse(out)).toMatchObject({
+    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
+  });
+  // The card is edited to the SAME answered text a real tap produces.
+  expect(await until(() => tg.edits().some((e) => e.includes('Selected answer: Approve')), 4000)).toBe(true);
+  // No real Telegram callback query existed for this text reply — the empty
+  // callbackQueryId sentinel must never reach answerCallbackQuery's HTTP call.
+  expect(tg.answeredCbs().length).toBe(0);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 25_000);
+
+test('TEXT-REPLY DECISION: an unrelated plain-text reply to the same card does NOT resolve it', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+
+  const daemon = await startDaemon(cfgDir, tg.port);
+  const ask = startAsk(cfgDir, tg.port, PERMISSION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+
+  tg.push([
+    {
+      update_id: 902,
+      message: {
+        message_id: 903,
+        from: { id: 1, first_name: 'Alex' },
+        chat: { id: 1 },
+        date: Math.floor(Date.now() / 1000),
+        text: 'sounds good, thanks',
+        reply_to_message: {
+          message_id: 1,
+          chat: { id: 1 },
+          date: Math.floor(Date.now() / 1000) - 30,
+          text: 'Permission from claude\n\nAllow bash command: rm -rf /tmp/test?',
+        },
+      },
+    },
+  ]);
+
+  // No positive event to await here (the whole point is that nothing happens):
+  // a real daemon process racing a real HTTP mock has no fake-timer seam, so a
+  // bounded real wait is the deliberate exception (matches this file's own
+  // "prove nothing happened" tests, e.g. PERM QUEUE EXPIRE) — then confirm the
+  // card is STILL pending/unanswered: the hook has not received a decision,
+  // and no "Selected answer" edit was ever posted.
+  await Bun.sleep(800);
+  expect(ask.exitCode).toBeNull();
+  expect(tg.edits().some((e) => e.includes('Selected answer'))).toBe(false);
+
+  ask.kill(9);
+  await ask.exited;
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 20_000);
+
+test('TEXT-REPLY DECISION: a multiQuestion permission card is NOT resolved by a text reply (excluded by design)', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+
+  const daemon = await startDaemon(cfgDir, tg.port);
+  // A multi-question SET MEMBER's lone answer must never be resolvable via the
+  // text-reply shortcut (permissionRequestIdForMessage excludes multiQuestion) —
+  // the local dialog may be showing a DIFFERENT question of the set.
+  const ask = startAsk(cfgDir, tg.port, { ...PERMISSION, multiQuestion: true });
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+
+  tg.push([
+    {
+      update_id: 910,
+      message: {
+        message_id: 911,
+        from: { id: 1, first_name: 'Alex' },
+        chat: { id: 1 },
+        date: Math.floor(Date.now() / 1000),
+        text: 'yes',
+        reply_to_message: {
+          message_id: 1,
+          chat: { id: 1 },
+          date: Math.floor(Date.now() / 1000) - 30,
+          text: 'Permission from claude\n\nAllow bash command: rm -rf /tmp/test?',
+        },
+      },
+    },
+  ]);
+
+  // No positive event to await for "excluded, nothing resolved" — see the
+  // sibling negative test above for the same real-daemon-timing rationale.
+  await Bun.sleep(800);
+  expect(ask.exitCode).toBeNull();
+  expect(tg.edits().some((e) => e.includes('Selected answer'))).toBe(false);
+
+  ask.kill(9);
+  await ask.exited;
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 20_000);
+
+test('TEXT-REPLY DECISION: a question-kind card is NOT resolved by a text reply (permission-only scope)', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+
+  const daemon = await startDaemon(cfgDir, tg.port);
+  const ask = startAsk(cfgDir, tg.port, QUESTION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+
+  // "yes" is a recognized decision token, but the card is a QUESTION, not a
+  // PERMISSION — permissionRequestIdForMessage must never match it.
+  tg.push([
+    {
+      update_id: 912,
+      message: {
+        message_id: 913,
+        from: { id: 1, first_name: 'Alex' },
+        chat: { id: 1 },
+        date: Math.floor(Date.now() / 1000),
+        text: 'yes',
+        reply_to_message: {
+          message_id: 1,
+          chat: { id: 1 },
+          date: Math.floor(Date.now() / 1000) - 30,
+          text: 'Question from claude\n\nWhere should I deploy?',
+        },
+      },
+    },
+  ]);
+
+  // The pane has an OPEN question, so this reply is deferred (queued behind it,
+  // features/tg-ctl's defer-while-waiting model) rather than injected immediately
+  // — either way, the important property is that it never resolves the question
+  // card itself via the decision path.
+  await Bun.sleep(800);
+  expect(ask.exitCode).toBeNull();
+  expect(tg.edits().some((e) => e.includes('Selected answer'))).toBe(false);
+
+  ask.kill(9);
+  await ask.exited;
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 20_000);
+
+test('TEXT-REPLY DECISION: a same-batch race (button tap resolves the card a moment before a text reply lands) notifies via plain chat reply, not silence', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+
+  const daemon = await startDaemon(cfgDir, tg.port);
+  const ask = startAsk(cfgDir, tg.port, PERMISSION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+
+  // Both updates land in the SAME poll batch: a button tap AND a text-reply
+  // decision for the SAME card. stepUpdates computes both actions against the
+  // pre-apply state (pending still present for both), but callback-derived
+  // actions dispatch before message-derived ones sharing the same requestId key
+  // — so the tap resolves the card first, and the text-reply's answer-question
+  // action then finds it already gone. The empty-sentinel no-op in
+  // answerCallbackQuery would otherwise swallow this outcome entirely; the
+  // fallback (answerCallbackQueryOrNotify) must send a plain chat reply instead.
+  tg.push([
+    tap('tgq:p_durable:allow', 920, 1),
+    {
+      update_id: 921,
+      message: {
+        message_id: 922,
+        from: { id: 1, first_name: 'Alex' },
+        chat: { id: 1 },
+        date: Math.floor(Date.now() / 1000),
+        text: 'yes',
+        reply_to_message: {
+          message_id: 1,
+          chat: { id: 1 },
+          date: Math.floor(Date.now() / 1000) - 30,
+          text: 'Permission from claude\n\nAllow bash command: rm -rf /tmp/test?',
+        },
+      },
+    },
+  ]);
+
+  const out = await new Response(ask.stdout).text();
+  await ask.exited;
+  expect(JSON.parse(out)).toMatchObject({
+    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
+  });
+  expect(await until(() => tg.edits().some((e) => e.includes('Selected answer: Approve')), 4000)).toBe(true);
+  // The real tap gets its normal "✓ sent to the agent" toast; the losing
+  // text-reply has no callback query to toast, so it must get a plain chat
+  // message instead of vanishing silently. A PERMISSION's answer is never
+  // cached in answeredButtons (question-only replay cache — see the
+  // "case answer-question" comment on why: silently replaying a prior
+  // allow/deny would be a behavioral/security change), so the loser sees
+  // "expired", not "already answered".
+  expect(await until(() => tg.answeredCbs().some((c) => c.text === '✓ sent to the agent'), 4000)).toBe(true);
+  expect(await until(() => tg.plainMessages().includes('expired'), 4000)).toBe(true);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 25_000);

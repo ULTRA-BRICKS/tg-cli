@@ -3,7 +3,7 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
-## 1.53.0
+## 1.52.9
 
 **Feature (tg-cli#403, agent-tools#754): critical/no-timeout hatch approval mode — quiet-hours-aware reminders, reminder-message replacement, and proactive live-session delivery of late decisions.**
 
@@ -11,6 +11,80 @@ semantic versioning.
 - While a critical ask is pending, the human gets a periodic reminder ping (`TG_CTL_CRITICAL_REMINDER_INTERVAL_MS`, default 15 min), suppressed during quiet hours (`TG_CTL_QUIET_HOURS_START_HOUR`/`TG_CTL_QUIET_HOURS_END_HOUR`, default 23:00-08:00 local) and deferred to exactly one reminder right after quiet hours end. Each new reminder deletes (or, on delete failure, edits-away) the previous one — the original request card is never touched. New pure scheduler: `features/tg-ctl/hatch-critical-reminder.ts`.
 - The moment a critical decision lands — however late — it is pushed proactively into a matching LIVE omp session via `promptOmpAcp`, in addition to the existing durable-record + retry-command card text. Never attaches to (or spawns) a session `listLiveOmpAgents()` doesn't already report as live.
 - New `deleteMessage` Bot API helper.
+
+## 1.52.8
+
+**Feat (tg-cli#402): resolve permission cards via a plain-text reply.**
+
+- A plain-text REPLY to a PENDING or still-answerable-abandoned permission card (covers hatch
+  cards, but works for any permission-kind, non-multiQuestion card) resolves it exactly like
+  tapping Allow/Deny — no button tap required. Recognized tokens (case-insensitive, trimmed):
+  affirmative `t/y/yes/yep/yeah/ya/ok/okay/k/go/да/ок/го` → allow; negative
+  `n/no/nope/nah/stop/deny/нет` → deny (`parseDecisionReplyToken`,
+  `features/tg-ctl/questions.ts`).
+- Implemented by synthesizing the existing `'answer-question'` Action from the reply, with an
+  empty-string `callbackQueryId` sentinel — the SAME downstream code a real button tap hits
+  (`resolveButtonCallback`, the hook-socket delivery, the card edit, `flushDeferred`). No new
+  Action kind. `answerCallbackQuery` now no-ops on the empty sentinel (there is no real Telegram
+  callback query to acknowledge; the card's own edit is the visible feedback).
+- An unrecognized reply body, or a reply to a message that isn't a currently-decidable
+  permission card, falls straight through to the existing reply-route / post-timeout-question
+  handling unchanged — never hijacks an unrelated reply.
+- A failure branch that reports its outcome ONLY via the toast (expired / already-answered /
+  mismatched card, or an omp ACP reply failure) can't rely on the empty-sentinel no-op — that
+  would silently swallow the human's "yes" with no feedback at all. Those call sites now fall
+  back to a plain chat reply carrying the same text (`answerCallbackQueryOrNotify`); a success
+  branch that already edits the card is unaffected.
+- `DECISION_REPLY_TOKENS` is built on a null-prototype object so a reply body like
+  `"constructor"`/`"__proto__"`/`"toString"` can never resolve through `Object.prototype` to a
+  spurious truthy value.
+
+## 1.52.7
+
+**Feat (tg-cli#402): render hatch approval cards as HTML.**
+
+- `buildButtonMessage()` skips the generic heading/source/title wrapper for a hatch-permission
+  request (`isHatchPermissionRequest`) and renders its `question` field verbatim with
+  `parse_mode: 'HTML'` — the companion `agent-tools` change emits a structured HTML card
+  (title/agent/branch/path/hook/justification up top, the rest collapsed in a
+  `<blockquote expandable>`) instead of a plain-text wall.
+- `parse_mode` threads through every Telegram API call site that can post or edit a hatch
+  card's text across its whole lifecycle: the initial `forwardAndPostQuestion`/
+  `ompPermissionSink` sends, the hook-reconnect `editMessageText` card restore, and every
+  status edit that concatenates the raw HTML body onto a plain-text suffix (abandoned,
+  long-outage, queued-decision recorded/delivered, a live tap) — a headless hatch request's
+  process exits almost immediately, so the abandon-edit is the NORMAL path, not an edge case,
+  and omitting `parse_mode` there would garble a freshly-rendered card back to literal
+  `<b>`/`<code>` tags within seconds of posting (review finding).
+- Each status builder's plain-text suffix is HTML-escaped (`hatchSafeStatus`) before riding
+  along with the raw HTML body under the same `parse_mode: 'HTML'` — two of them embed a
+  literal `="<justification>"` placeholder that would otherwise break Telegram's entity parser
+  and silently drop the edit.
+- Every other request kind (including plan approval) is unaffected — `parse_mode` stays unset,
+  the existing "Permission request from …" wrapper stays byte-identical.
+- **Deployment order:** must ship AFTER the sibling `agent-tools` PR. Shipping this first would
+  have Telegram reject hatch cards outright (400) on unescaped `&`/`<`/`>` in the old plain-text
+  `_question()` output.
+
+## 1.52.6
+
+**Fix (tg-cli omp delivery reliability): restore wedged-ACP-client eviction under fire-and-forget delivery, and fix a silent lsof timeout in live-session discovery.**
+
+- `jsonlPathsOfPid`/`cwdOfPid` now pass `-n` to `lsof` (skip reverse-DNS hostname lookups). Without
+  it, a real omp process's open API sockets made `lsof -p <pid> -Fn` take ~30s on this network —
+  15x past the hardcoded 2s `LSOF_TIMEOUT_MS` — so the daemon's live-session discovery silently
+  failed almost every time, and `promptOmpAcp` delivered into a disconnected ephemeral `session/new`
+  instead of the live `session/load`'d one. Measured: 30.117s → 0.048s for the identical call.
+- 1.52.4/1.52.5's fire-and-forget `promptOmpAcp` (tg-cli#322/#357) deleted the wedged-client
+  eviction path 1.49.2/1.51.1 shipped (tg-cli#353), with no replacement — `ACP_PROMPT_TIMEOUT_MS`
+  became unused dead code, and its two regression tests were deleted outright. A cached ACP client
+  whose pipe stops responding was reused forever; every later prompt into it silently vanished
+  while `promptOmpAcp` kept reporting `{ok:true}`. Restored the SAME 1.51.1-reviewed eviction
+  predicate (no traffic since the prompt was written, no permission reply still owed), scheduled
+  via `setTimeout` so it stays off the fire-and-forget critical path — no new `await` added.
+- New regression test `tests/ctl-omp-acp-prompt-evict.test.ts` (recreates the deleted
+  `ctl-omp-acp-prompt-evict.test.ts`, adapted to assert the new deferred eviction log line instead
+  of the old awaited-call failure log line).
 
 ## 1.52.5
 

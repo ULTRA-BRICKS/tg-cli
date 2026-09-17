@@ -216,6 +216,7 @@ import {
   hatchAbandonedLongOutageText,
   hatchAbandonedPermissionText,
   hatchApprovalRecordedText,
+  hatchParseMode,
   hatchProactiveDecisionText,
   isHatchPermissionRequest,
   isHatchRequest,
@@ -666,8 +667,46 @@ async function sendMessage(ctx: Ctx, text: string, extra: Record<string, unknown
   return typeof messageId === "number" ? messageId : null
 }
 
+// Shared by every initial-post call site (forwardAndPostQuestion, ompPermissionSink) so the
+// parse_mode/reply_markup shape can't drift between them — a divergent copy is exactly how a
+// hatch card's parse_mode threading silently stops matching between the two flows.
+async function sendButtonCard(ctx: Ctx, payload: ButtonMessagePayload): Promise<number | null> {
+  const extra: Record<string, unknown> = { reply_markup: payload.reply_markup }
+  if (payload.parse_mode) extra.parse_mode = payload.parse_mode
+  return sendMessage(ctx, payload.text, extra)
+}
+
 async function answerCallbackQuery(ctx: Ctx, callbackQueryId: string, text: string): Promise<void> {
+  // A text-reply-synthesized decision (see the 'answer-question' construction in
+  // features/tg-ctl/updates.ts) carries an empty callbackQueryId sentinel: there is no real
+  // Telegram callback query to acknowledge, so this is a correct no-op on a SUCCESS path — the
+  // card's own editMessageText already gives the human visible feedback. It is NOT correct on a
+  // pure-toast failure branch (expired / already-answered / mismatched) that posts no edit —
+  // those call sites MUST use answerCallbackQueryOrNotify below instead, or the sentinel would
+  // silently swallow the only feedback the human would otherwise get (review finding).
+  if (!callbackQueryId) return
   await botPost(ctx, "answerCallbackQuery", { callback_query_id: callbackQueryId, text })
+}
+
+// For a failure branch that reports its outcome ONLY via the toast (no accompanying card edit):
+// a real button tap's `action.callbackQueryId` is always real, so `answerCallbackQuery` reaches
+// the human either way. A text-reply-synthesized decision (empty-sentinel `action`, see
+// features/tg-ctl/updates.ts) has no callback query to toast — without this, the human's "yes"
+// would silently do nothing with zero feedback (review finding: a same-batch race where a button
+// tap resolves the card a moment before a text reply to it lands would otherwise vanish
+// unexplained). Falls back to a plain chat reply carrying the identical text. Success branches
+// that follow up with an editMessageText keep using plain `answerCallbackQuery` — the card edit
+// is already sufficient feedback there and a second message would be redundant noise.
+async function answerCallbackQueryOrNotify(
+  ctx: Ctx,
+  action: Extract<Action, { kind: "answer-question" }>,
+  text: string,
+): Promise<void> {
+  if (!action.callbackQueryId) {
+    await sendMessage(ctx, text)
+    return
+  }
+  await answerCallbackQuery(ctx, action.callbackQueryId, text)
 }
 
 // NOTE: Telegram's editMessageText REPLACES the whole inline keyboard — omitting
@@ -678,9 +717,11 @@ async function editMessageText(
   messageId: number,
   text: string,
   replyMarkup?: ButtonMessagePayload["reply_markup"],
+  parseMode?: ButtonMessagePayload["parse_mode"],
 ): Promise<void> {
   const body: Record<string, unknown> = { chat_id: ctx.chatId, message_id: messageId, text }
   if (replyMarkup) body.reply_markup = replyMarkup
+  if (parseMode) body.parse_mode = parseMode
   await botPost(ctx, "editMessageText", body)
 }
 
@@ -1021,7 +1062,7 @@ function cwdOfPid(pid: number): string | null {
     // no procfs (macOS) or the process is gone — fall through to lsof
   }
   try {
-    const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
+    const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(pid), "-d", "cwd", "-Fn", "-n"], {
       stdout: "pipe",
       stderr: "pipe",
       env: SUBPROC_ENV,
@@ -1063,7 +1104,7 @@ function listUnreachableAgents(): UnreachableAgent[] {
 // `lsof -Fn` n-paths for a pid — used to find omp's primary session jsonl.
 function jsonlPathsOfPid(pid: number): string[] {
   try {
-    const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(pid), "-Fn"], {
+    const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(pid), "-Fn", "-n"], {
       stdout: "pipe",
       stderr: "pipe",
       env: SUBPROC_ENV,
@@ -1253,6 +1294,7 @@ async function promptOmpAcp(target: OmpAcpTarget | string, text: string): Promis
   const cwd = agent.cwd || "/"
   try {
     const client = await ensureOmpAcp(agent)
+    const promptSentAt = Date.now()
     // Fire-and-forget (tg-cli#322, task-cli#138): the prior design awaited
     // acpCall(...120_000) here, blocking Telegram delivery on the agent's real
     // reply for up to two minutes — the root cause a rejected prior fix then
@@ -1264,6 +1306,54 @@ async function promptOmpAcp(target: OmpAcpTarget | string, text: string): Promis
     // drops it, same as any other unmatched ACP notification — nothing is
     // awaiting it, so nothing hangs.
     writeAcp(client, buildAcpSessionPrompt(client.nextId++, client.sessionId, text))
+    // Regression (tg-cli#353 relapse, 2026-09-17): going fire-and-forget dropped
+    // the ONLY signal that ever evicted a wedged ACP client (tg-cli#353/#352,
+    // shipped 1.49.2/1.51.1) -- the old code awaited acpCall and evicted+killed
+    // on its own timeout. With no await, a cached client whose pipe is
+    // genuinely dead (the exact tg-cli#353 shape: a target session already
+    // owned by another live process) is reused FOREVER: every future prompt
+    // into that key writes into a dead pipe, promptOmpAcp still returns
+    // {ok:true} (a stdin write never itself errors), and nothing ever reaches
+    // the human. Run the SAME eviction predicate 1.51.1 shipped (two
+    // independent review passes), just scheduled off the critical path so it
+    // cannot block delivery: no ACP traffic at all since this prompt was
+    // written (lastActivityAt is the proxy pumpAcpClient already maintains)
+    // AND no session/request_permission reply is still owed on this client
+    // (never evict out from under a human slowly answering a live Telegram
+    // permission — the documented 12h ABANDONED_PERMISSION_RETAIN_MS
+    // guarantee).
+    setTimeout(() => {
+      try {
+        if (client.pendingPermissions > 0) return
+        // Strict > (not >=): lastActivityAt is also touched by this same
+        // client's own session/load response, which resolves just before
+        // promptSentAt is captured -- a >= comparison can tie at millisecond
+        // resolution and wrongly treat that pre-prompt activity as "traffic
+        // since the prompt", masking a genuinely wedged session/prompt.
+        if (client.lastActivityAt > promptSentAt) return
+        const key = ompAcpKey(agent)
+        const stillCached = ompAcpClients.get(key) === client
+        if (stillCached) ompAcpClients.delete(key)
+        client.proc.kill()
+        // Only log a real eviction: if a newer client already replaced this
+        // one under the same key (e.g. a fresh ensureOmpAcp ran before this
+        // timer fired), killing the orphaned old proc is just cleanup, not an
+        // eviction from the live map -- a duplicate/misleading log line here
+        // would undermine the incident-triage trust this change exists for.
+        if (stillCached) {
+          log(
+            `omp-acp: evicted wedged client cwd=${cwd} session=${agent.sessionId ?? "-"} ` +
+              `(no ACP traffic ${ACP_PROMPT_TIMEOUT_MS}ms after prompt)`,
+          )
+        }
+      } catch (err) {
+        // Never let the deferred timer itself throw -- an uncaught exception
+        // here runs outside promptOmpAcp's own try/catch (a fresh event-loop
+        // turn) and would crash the daemon, defeating the whole fire-and-
+        // forget point of this function.
+        log(`omp-acp: eviction check failed cwd=${cwd} session=${agent.sessionId ?? "-"}: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }, ACP_PROMPT_TIMEOUT_MS)
     return { ok: true }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err)
@@ -2851,6 +2941,21 @@ interface AbandonedButton {
   criticalState?: DaemonCriticalState
 }
 
+// Shared by permissionRequestIdForMessage's two lookups (PendingButton and
+// AbandonedButton have compatible {req, messageId} shapes) — a single copy of
+// the "is this the one decidable permission card at this message_id" predicate
+// instead of two independently-written loops that could silently drift apart
+// if the definition of "decidable" ever changes (review finding).
+function findDecidablePermissionRequestId(
+  entries: Iterable<[string, { req: ButtonRequest; messageId: number | null }]>,
+  messageId: number,
+): string | null {
+  for (const [requestId, entry] of entries) {
+    if (entry.messageId === messageId && entry.req.kind === "permission" && !entry.req.multiQuestion) return requestId
+  }
+  return null
+}
+
 // A question that has already been ANSWERED, kept briefly so a re-forward of the
 // SAME requestId (a stable hash of session + question text) replays the stored
 // answer instead of posting a fresh card. The in-flight dedup (`activeButtonKeys`)
@@ -3367,7 +3472,7 @@ function retireAbandonedEntry(ctx: Ctx, rt: QuestionRuntime, entry: PendingButto
       // moment it's needed (review finding). Mirrors the question branch above,
       // which already passes `abandoned.reply_markup` for the same reason.
       const abandonedMarkup = buildButtonMessage(ctx.chatId, entry.req).reply_markup
-      if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandonedText, abandonedMarkup)
+      if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandonedText, abandonedMarkup, hatchParseMode(entry.req))
       else {
         entry.finalText = abandonedText
         entry.finalReplyMarkup = abandonedMarkup
@@ -3453,7 +3558,7 @@ async function forwardAndPostQuestion(
   const conn = armPendingSocketClose(ctx, rt, entry, pendingKey)
 
   const payload = buildButtonMessage(ctx.chatId, req)
-  const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
+  const messageId = await sendButtonCard(ctx, payload)
   if (messageId === null) {
     // botPost already logged the low-level send failure; tie it to THIS abandoned
     // forward so the drop is greppable. No card posted → nothing to late-deliver.
@@ -3502,7 +3607,7 @@ async function forwardAndPostQuestion(
   if (rt.pending.get(pendingKey) !== entry || entry.finalText) {
     const finalText = entry.finalText ?? EXPIRED_TERMINAL_TEXT
     if (finalText === EXPIRED_TERMINAL_TEXT) void clearMessageKeyboard(ctx, messageId)
-    void editMessageText(ctx, messageId, finalText, entry.finalReplyMarkup)
+    void editMessageText(ctx, messageId, finalText, entry.finalReplyMarkup, finalText === EXPIRED_TERMINAL_TEXT ? undefined : hatchParseMode(entry.req))
   }
 }
 
@@ -3617,7 +3722,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       rt.persist()
       if (found.entry.messageId !== null) {
         void clearMessageKeyboard(ctx, found.entry.messageId)
-        void editMessageText(ctx, found.entry.messageId, buildAnsweredQuestionText(found.entry.req, found.queuedDecision.label))
+        void editMessageText(ctx, found.entry.messageId, buildAnsweredQuestionText(found.entry.req, found.queuedDecision.label), undefined, hatchParseMode(found.entry.req))
       }
       log(`ask-forward hatch-queued-decision-delivered: hookId=${hookId} key=${found.key} label=${found.queuedDecision.label}`)
       return
@@ -3776,7 +3881,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
           rt.persist()
           if (retained.messageId !== null) {
             void clearMessageKeyboard(ctx, retained.messageId)
-            void editMessageText(ctx, retained.messageId, buildAnsweredQuestionText(req, qd.label))
+            void editMessageText(ctx, retained.messageId, buildAnsweredQuestionText(req, qd.label), undefined, hatchParseMode(req))
           }
           log(`ask-forward queued-decision-delivered: ${describeAskRequest(req)} key=${pendingKey} label=${qd.label}`)
           return
@@ -3841,7 +3946,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       // which botPost swallows).
       if (retained.messageId !== null) {
         const restored = buildButtonMessage(ctx.chatId, req)
-        void editMessageText(ctx, retained.messageId, restored.text, restored.reply_markup)
+        void editMessageText(ctx, retained.messageId, restored.text, restored.reply_markup, restored.parse_mode)
       }
       log(`ask-forward reattached: ${describeAskRequest(req)} key=${pendingKey} messageId=${retained.messageId ?? "-"}`)
       return
@@ -5438,7 +5543,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   ompPermissionSink = (req) => {
     void (async () => {
       const payload = buildButtonMessage(ctx.chatId, req)
-      const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
+      const messageId = await sendButtonCard(ctx, payload)
       const key = callbackRequestId(req)
       abandonedButtons.set(key, { req, messageId: messageId ?? null, at: Date.now() })
       persistQuestions()
@@ -5461,6 +5566,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         hookId !== null
           ? hatchAbandonedLongOutageText(entry.req, hookId, entry.queuedDecision?.label)
           : abandonedLongOutageText(entry.req, label, entry.queuedDecision?.label),
+        undefined,
+        hatchParseMode(entry.req),
       )
     }
     log(`ask-abandoned-long-outage: ${describeAskRequest(entry.req)} key=${key}`)
@@ -5532,6 +5639,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           entry.messageId,
           queuedDecisionStillWaitingText(entry.req, label, qd.label),
           buildButtonMessage(ctx.chatId, entry.req).reply_markup,
+          hatchParseMode(entry.req),
         )
       }
       log(`ask-permission-decision-queue-still-waiting-notice: ${describeAskRequest(entry.req)}`)
@@ -8957,14 +9065,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         answeredButtons.delete(action.requestId)
         abandonedButtons.set(action.requestId, { req: retained.req, messageId: retained.messageId, at: retained.at })
         persistQuestions()
-        await answerCallbackQuery(ctx, action.callbackQueryId, "could not reach omp ACP — tap again")
+        await answerCallbackQueryOrNotify(ctx, action, "could not reach omp ACP — tap again")
         return true
       }
       await answerCallbackQuery(ctx, action.callbackQueryId, "✓ sent to the agent")
       const cardId = retained.messageId ?? action.messageId
       if (cardId !== null) {
         void clearMessageKeyboard(ctx, cardId)
-        void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label))
+        void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label), undefined, hatchParseMode(retained.req))
       }
       log(`omp-acp: tap delivered via session/request_permission reply optionId=${optionId}`)
       return true
@@ -8981,7 +9089,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       action.messageId !== null &&
       action.messageId !== retained.messageId
     ) {
-      await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+      await answerCallbackQueryOrNotify(ctx, action, "expired")
       return true
     }
     // Enforce the retention window at DELIVERY time, not only on persist/restore. On a
@@ -9165,7 +9273,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             const cardId = retained.messageId ?? action.messageId
             if (cardId !== null) {
               void clearMessageKeyboard(ctx, cardId)
-              void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label))
+              void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label), undefined, hatchParseMode(retained.req))
             }
             return true
           }
@@ -9212,6 +9320,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             ? hatchApprovalRecordedText(retained.req, hookId, answer.label)
             : queuedPermissionDecisionText(retained.req, label, answer.label),
           buildButtonMessage(ctx.chatId, retained.req).reply_markup,
+          hatchParseMode(retained.req),
         )
       }
       // tg-cli#403 acceptance criterion (d): a CRITICAL hatch decision is
@@ -9351,7 +9460,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // (ABANDONED_RETAIN_MS, 30 min) finds neither entry and shows a misleading
       // "expired" on a card that WAS answered.
       void clearMessageKeyboard(ctx, cardId)
-      void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label))
+      void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label), undefined, hatchParseMode(retained.req))
     }
     return true
   }
@@ -9500,7 +9609,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           // "answered" vs aged-out.
           const priorAnswer = answeredButtons.get(action.requestId)
           const stillAnswered = priorAnswer !== undefined && Date.now() - priorAnswer.at <= ANSWERED_REPLAY_MS
-          await answerCallbackQuery(ctx, action.callbackQueryId, stillAnswered ? "already answered" : "expired")
+          await answerCallbackQueryOrNotify(ctx, action, stillAnswered ? "already answered" : "expired")
           return true
         }
         // A tap must come from THIS prompt's Telegram message: a stale tap on
@@ -9512,12 +9621,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           action.messageId !== null &&
           action.messageId !== pending.messageId
         ) {
-          await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+          await answerCallbackQueryOrNotify(ctx, action, "expired")
           return true
         }
         const answer = resolveButtonCallback(pending.req, { requestId: action.requestId, value: action.value })
         if (answer.status !== "answered") {
-          await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+          await answerCallbackQueryOrNotify(ctx, action, "expired")
           return true
         }
         pendingButtons.delete(action.requestId)
@@ -9564,7 +9673,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // making the duplicate-card report impossible to confirm from logs.
         log(`ask-answered: ${describeAskRequest(pending.req)} key=${action.requestId} label=${answer.label} messageId=${pending.messageId ?? "-"}`)
         void answerCallbackQuery(ctx, action.callbackQueryId, "✓ sent to the agent")
-        if (pending.messageId !== null) void editMessageText(ctx, pending.messageId, finalText)
+        if (pending.messageId !== null) void editMessageText(ctx, pending.messageId, finalText, undefined, hatchParseMode(pending.req))
         // The agent is unblocked → deliver anything queued behind this question.
         // Fire-and-forget, but guard the promise: an error here must never become
         // an unhandled rejection that takes down the daemon.
@@ -10010,6 +10119,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           }
           return null
         },
+        permissionRequestIdForMessage: (messageId) =>
+          findDecidablePermissionRequestId(pendingButtons, messageId) ?? findDecidablePermissionRequestId(abandonedButtons, messageId),
       })
 
       // The batch is durably journaled BEFORE this point (see the atomicWrite above), so

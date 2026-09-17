@@ -4,6 +4,7 @@
 // answerCallbackQuery, hook sockets, and native adapter I/O.
 
 import type { AgentKind, Registration } from './types';
+import { escapeHtml } from '../render/html';
 
 export type ButtonRequestKind = 'question' | 'permission';
 export type QuestionCapability = 'buttons' | 'unsupported';
@@ -114,6 +115,11 @@ export interface ButtonRequest {
 export interface ButtonMessagePayload {
   chat_id: number;
   text: string;
+  // Set only for a hatch-permission card (isHatchPermissionRequest): its `question` is
+  // pre-built HTML by agent-tools' `_question` (title/agent/branch/path/hook/justification up
+  // top, everything else collapsed in a <blockquote expandable>). Every other kind stays plain
+  // text, this field unset, exactly as before.
+  parse_mode?: 'HTML';
   reply_markup: {
     inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
   };
@@ -232,6 +238,36 @@ export function isHatchPermissionRequest(
   return req.kind === 'permission' && req.requestId.startsWith('hatch-');
 }
 
+// Single source of truth for "does this request's rendered text carry the hatch's raw HTML
+// body (buildQuestionText's early return below) and therefore need parse_mode threaded to the
+// actual Bot API call" -- every sendMessage/editMessageText call site for a request that MIGHT
+// be hatch-shaped (the whole lifecycle: initial post, reconnect-restore, abandon, long-outage,
+// queued-decision delivery, a live tap) MUST route through this rather than re-deriving
+// isHatchPermissionRequest(req) ? 'HTML' : undefined inline at each of the ~8 call sites, so a
+// future kind gaining its own HTML body only has to change this one place (tg-cli review
+// finding: the first pass threaded parse_mode through only the initial post + one reconnect
+// site and left the abandon/long-outage/queued-decision/live-tap edits plain, which would have
+// garbled every hatch card back to literal `<b>`/`<code>` tags within seconds of posting, since
+// a headless hatch request's process exits almost immediately and the abandon-timer path is the
+// NORMAL case, not an edge case).
+export function hatchParseMode(req: ButtonRequest): 'HTML' | undefined {
+  return isHatchPermissionRequest(req) ? 'HTML' : undefined;
+}
+
+// The status/suffix line every text builder below appends to the ORIGINAL prompt
+// (buildQuestionText(req)) is hand-authored plain text (window labels, env var names, fixed
+// Approve/Reject decision labels) -- safe as literal text, but two of them also embed a
+// literal `="<justification>"` placeholder. For a hatch permission the ORIGINAL prompt is raw
+// HTML (agent-tools already escaped ITS OWN interpolated values) and the whole message rides
+// under parse_mode: 'HTML' (hatchParseMode) -- so the plain suffix must be escaped too, or
+// Telegram's entity parser rejects the unrecognized `<justification>` tag and the edit is
+// silently dropped (botPost swallows the 400), leaving the human staring at a stale card. A
+// non-hatch permission/question sends with no parse_mode at all, so escaping here would corrupt
+// it by inserting literal `&lt;`/`&amp;` -- hence the isHatchPermissionRequest gate.
+function hatchSafeStatus(req: ButtonRequest, status: string): string {
+  return isHatchPermissionRequest(req) ? escapeHtml(status) : status;
+}
+
 // Exhaustive over AgentKind on purpose: adding a new kind forces a deliberate
 // capability decision here (the compiler flags a missing case) instead of a
 // silent default — omp is ACP buttons (session/request_permission), not the
@@ -262,6 +298,7 @@ export function buildButtonMessage(chatId: number, req: ButtonRequest): ButtonMe
   return {
     chat_id: chatId,
     text: buildQuestionText(req),
+    parse_mode: hatchParseMode(req),
     reply_markup: {
       inline_keyboard: buildInlineKeyboard(req),
     },
@@ -305,7 +342,7 @@ export function abandonedPermissionText(req: ButtonRequest, label: string): stri
   const status = queuedDecisionCanAutoDeliver(req)
     ? `hook disconnected for ${label} — if it reconnects, this card restores automatically. A tap now is queued and delivered the moment that happens; you can also answer directly in the terminal.`
     : `hook disconnected for ${label} — if it reconnects, this card restores automatically. A tap now is queued, but this daemon can't prove a later reconnect is the SAME request, so it won't auto-deliver; you'll need to tap again once it reconnects, or answer directly in the terminal.`;
-  return [buildQuestionText(req), status].join('\n\n');
+  return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
 }
 
 // Hatch counterpart to abandonedPermissionText: a RIG_HATCH_REQUEST_<hookId>
@@ -321,7 +358,7 @@ export function abandonedPermissionText(req: ButtonRequest, label: string): stri
 // than asking again.
 export function hatchAbandonedPermissionText(req: ButtonRequest, hookId: string): string {
   const status = `hatch request disconnected — the requesting command already gave up waiting, so there is no live process left to answer. A tap now IS recorded: retry the exact same command with the same ${hatchEnvVarName(hookId)}="<justification>" env var and it will be applied automatically with no new Telegram prompt. Only retry if the original need is still current.`;
-  return [buildQuestionText(req), status].join('\n\n');
+  return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
 }
 
 // A Telegram tap landed while a permission's hook was disconnected (see
@@ -371,7 +408,7 @@ export function queuedPermissionDecisionText(req: ButtonRequest, label: string, 
   const status = queuedDecisionCanAutoDeliver(req)
     ? `queued "${decisionLabel}" for ${label} — delivered automatically once the hook reconnects. Tap again to change it, or answer in the terminal now.`
     : `queued "${decisionLabel}" for ${label} — this daemon can't prove a later reconnect is the SAME request, so it won't auto-deliver; you'll need to tap again (or answer in the terminal) once it reconnects.`;
-  return [buildQuestionText(req), status].join('\n\n');
+  return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
 }
 
 // Hatch counterpart to queuedPermissionDecisionText: a tap DID land for a
@@ -382,7 +419,7 @@ export function queuedPermissionDecisionText(req: ButtonRequest, label: string, 
 // requestId, same hookId) is answered instantly instead of asking again.
 export function hatchApprovalRecordedText(req: ButtonRequest, hookId: string, decisionLabel: string): string {
   const status = `recorded "${decisionLabel}" for hatch request ${hookId} — the requesting command already gave up waiting, so it could not be delivered. Retry the exact same command with the same ${hatchEnvVarName(hookId)}="<justification>" env var and it will be applied automatically with no new Telegram prompt. Only retry if the original need is still current.`;
-  return [buildQuestionText(req), status].join('\n\n');
+  return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
 }
 
 // tg-cli#403: PROACTIVE counterpart to hatchApprovalRecordedText — pushed into a
@@ -427,7 +464,7 @@ export function abandonedLongOutageText(req: ButtonRequest, label: string, queue
   const status = queuedDecisionLabel
     ? `still no connection for ${label} after a long wait — your queued "${queuedDecisionLabel}" was never delivered and this card is giving up on it; answer directly in the terminal.`
     : `still no connection for ${label} after a long wait — this was never delivered over Telegram; answer directly in the terminal.`;
-  return [buildQuestionText(req), status].join('\n\n');
+  return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
 }
 
 // Hatch counterpart to abandonedLongOutageText: mirrors its two-branch shape
@@ -439,7 +476,7 @@ export function hatchAbandonedLongOutageText(req: ButtonRequest, hookId: string,
   const status = queuedDecisionLabel
     ? `hatch request ${hookId}: no retry arrived after a long wait — your recorded "${queuedDecisionLabel}" was never applied and this card is giving up on it. A fresh retry will prompt again from scratch.`
     : `hatch request ${hookId}: no retry arrived after a long wait — this was never delivered. A fresh retry will prompt again from scratch.`;
-  return [buildQuestionText(req), status].join('\n\n');
+  return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
 }
 
 // A QUEUED permission decision has been waiting past QUEUED_DECISION_NOTICE_MS
@@ -471,14 +508,33 @@ export function queuedDecisionStillWaitingText(req: ButtonRequest, label: string
   const status = queuedDecisionCanAutoDeliver(req)
     ? `still waiting to reconnect for ${label} — your queued "${decisionLabel}" has NOT been discarded and will still be delivered automatically if it reconnects. If the connection stays down much longer you'll get a separate notice. Tap again to change it, or answer in the terminal now.`
     : `still waiting to reconnect for ${label} — your queued "${decisionLabel}" has NOT been discarded, but this daemon can't prove a later reconnect is the SAME request, so it won't auto-deliver; you'll need to tap again once it reconnects. If the connection stays down much longer you'll get a separate notice. You can also answer in the terminal now.`;
-  return [buildQuestionText(req), status].join('\n\n');
+  return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
 }
 
 export function buildAnsweredQuestionText(req: ButtonRequest, answer: string): string {
   return [
     buildQuestionText(req),
-    `Selected answer: ${answer}`,
+    hatchSafeStatus(req, `Selected answer: ${answer}`),
   ].join('\n\n');
+}
+
+// Plain-text-reply-as-decision (tg-cli, human-requested live): a reply to a PENDING/abandoned
+// permission card whose body is one of these tokens resolves exactly like tapping Allow/Deny —
+// case-insensitive, trimmed. Anything else is NOT a decision reply (the caller must fall
+// through to normal reply handling, never hijack an unrelated reply).
+// Object.create(null) — a plain `{}` literal inherits Object.prototype, so a reply body of
+// "constructor"/"toString"/"__proto__" would resolve through the prototype chain to a truthy
+// non-string value instead of undefined, making parseDecisionReplyToken wrongly return a
+// decision for those inputs (review finding).
+const DECISION_REPLY_TOKENS: Record<string, 'allow' | 'deny'> = Object.assign(Object.create(null), {
+  t: 'allow', y: 'allow', yes: 'allow', yep: 'allow', yeah: 'allow', ya: 'allow',
+  ok: 'allow', okay: 'allow', k: 'allow', go: 'allow', да: 'allow', ок: 'allow', го: 'allow',
+  n: 'deny', no: 'deny', nope: 'deny', nah: 'deny', stop: 'deny', deny: 'deny', нет: 'deny',
+});
+
+export function parseDecisionReplyToken(text: string): 'allow' | 'deny' | null {
+  const norm = text.trim().toLowerCase();
+  return DECISION_REPLY_TOKENS[norm] ?? null;
 }
 
 export function parseButtonCallback(data: string | undefined): ParsedButtonCallback | null {
@@ -703,6 +759,15 @@ function buildInlineKeyboard(req: ButtonRequest): ButtonMessagePayload['reply_ma
 }
 
 function buildQuestionText(req: ButtonRequest, opts: { includeOptions?: boolean } = {}): string {
+  // A hatch-permission's `question` (agenttools_hatch_escalation's `_question`) already IS the
+  // whole card -- title, requesting agent/session, path/branch, hook + justification up top, a
+  // collapsed <blockquote expandable> for the rest. Wrapping it in the generic heading/source/
+  // title concatenation below would bury that structure back under boilerplate this format was
+  // built specifically to avoid. Relies on agent-tools' contract that `question` is always
+  // non-empty pre-built HTML -- Telegram rejects an empty sendMessage/editMessageText text,
+  // same silently-swallowed-400 failure mode this whole change guards against elsewhere.
+  if (isHatchPermissionRequest(req)) return req.question;
+
   const heading = req.kind === 'permission'
     ? `Permission request from ${req.agent}`
     : `Question from ${req.agent}`;
