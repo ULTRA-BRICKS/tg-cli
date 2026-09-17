@@ -16,6 +16,7 @@
 // duplicate card.
 
 import type { PermissionDecision } from './questions';
+import type { DaemonCriticalState } from './hatch-critical-reminder';
 
 // One retained question: a LIVE pending OR a socket-closed (abandoned) one — both
 // are equivalent on disk, a SCOPED question whose chosen answer can still reach its
@@ -41,6 +42,17 @@ export interface RetainedQuestionRecord {
   // this queued tap — undefined until it does. Persisted so a restart between
   // the notice and the eventual reconnect doesn't re-fire it.
   queuedDecision?: { value: string; label: string; decision: PermissionDecision; at: number; notifiedAt?: number };
+  // tg-cli#403: scheduling state for the critical-mode reminder cadence
+  // (features/tg-ctl/hatch-critical-reminder.ts's planCriticalReminder/
+  // markCriticalReminderSent) — only ever populated when `req.critical ===
+  // true`. `lastReminderMessageId` is the daemon's own bookkeeping (which
+  // Telegram message to delete/edit-away when the NEXT reminder posts, tg-cli#403
+  // acceptance criterion (c)) — kept OUTSIDE the pure scheduler module's own
+  // state shape because it's a Telegram artifact id, not a scheduling decision.
+  // Shares its shape with hatch-critical-reminder.ts's exported DaemonCriticalState
+  // (imported, not re-declared — review finding: two independently-maintained
+  // copies of the same shape would silently drift the moment either is edited).
+  criticalState?: DaemonCriticalState;
 }
 
 export interface RetainedAnswerRecord {
@@ -141,10 +153,57 @@ function parseQuestions(value: unknown, now: number, maxAgeMs: number): Retained
     const messageId = typeof rec.messageId === 'number' ? rec.messageId : rec.messageId === null ? null : undefined;
     if (messageId === undefined) continue; // a number|null is required; anything else is corrupt
     const queuedDecision = parseQueuedDecision(rec.queuedDecision, now);
-    out.push({ req: rec.req as Record<string, unknown>, messageId, at: rec.at, ...(queuedDecision ? { queuedDecision } : {}) });
+    const criticalState = parseCriticalState(rec.criticalState, now);
+    out.push({
+      req: rec.req as Record<string, unknown>,
+      messageId,
+      at: rec.at,
+      ...(queuedDecision ? { queuedDecision } : {}),
+      ...(criticalState ? { criticalState } : {}),
+    });
   }
   // Newest first, capped: on overflow keep the freshest (most likely still tappable).
   return capByRecency(out);
+}
+
+// A malformed criticalState must never corrupt the whole retained-question record
+// (the req/messageId/at/queuedDecision are still worth restoring) — drop just the
+// scheduling state, same fail-soft posture as parseQueuedDecision. Every field is
+// individually optional (a fresh critical entry has none of them yet), so this
+// degrades field-by-field rather than all-or-nothing: a corrupt `lastReminderAt`
+// alongside a valid `lastReminderMessageId` still restores the message id (worth
+// keeping — it's what the next reminder needs to delete/replace) while simply
+// resetting the reminder clock (worst case: one reminder fires sooner than the
+// full interval after a restore, never a lost reminder).
+function parseCriticalState(value: unknown, now: number): RetainedQuestionRecord['criticalState'] {
+  if (!value || typeof value !== 'object') return undefined;
+  const rec = value as Record<string, unknown>;
+  const lastReminderAt =
+    typeof rec.lastReminderAt === 'number' && Number.isFinite(rec.lastReminderAt) && rec.lastReminderAt <= now
+      ? rec.lastReminderAt
+      : undefined;
+  const lastReminderMessageId =
+    typeof rec.lastReminderMessageId === 'number'
+      ? rec.lastReminderMessageId
+      : rec.lastReminderMessageId === null
+        ? null
+        : undefined;
+  // A future-dated deferral is nonsensical (same reasoning as parseQueuedDecision's
+  // `at > now` rejection) but, unlike that field, dropping it is harmless: the next
+  // sweep's planCriticalReminder just re-derives a fresh deferral if it's still
+  // quiet hours, or fires normally if not.
+  const quietHoursDeferredUntil =
+    typeof rec.quietHoursDeferredUntil === 'number' && Number.isFinite(rec.quietHoursDeferredUntil) && rec.quietHoursDeferredUntil > now
+      ? rec.quietHoursDeferredUntil
+      : undefined;
+  if (lastReminderAt === undefined && lastReminderMessageId === undefined && quietHoursDeferredUntil === undefined) {
+    return undefined;
+  }
+  return {
+    ...(lastReminderAt !== undefined ? { lastReminderAt } : {}),
+    ...(lastReminderMessageId !== undefined ? { lastReminderMessageId } : {}),
+    ...(quietHoursDeferredUntil !== undefined ? { quietHoursDeferredUntil } : {}),
+  };
 }
 
 // A malformed queuedDecision must never corrupt the whole retained-question record

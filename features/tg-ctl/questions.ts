@@ -100,6 +100,16 @@ export interface ButtonRequest {
   //     request that omits it, or a record persisted to disk before this field
   //     existed (pre-upgrade transient).
   promptTurnId?: string;
+  // tg-cli#403 / agent-tools#754: opt-in "critical" hatch/permission mode. When
+  // true, the daemon removes ASK_TOTAL_TIMEOUT_MS's bound for this ask (waits
+  // indefinitely for a human decision instead of reporting a timeout) and runs
+  // the quiet-hours-aware reminder cadence (features/tg-ctl/hatch-critical-reminder.ts)
+  // while it stays undecided. Alex's explicit, verbatim ask (tg-cli#403 ticket
+  // body) is the sanctioned exception to tg-cli#360/#380's "no new timers" rule
+  // for the reminder cadence this enables — cite this field's origin, don't
+  // re-litigate it. Default/absent === false: every existing (non-critical)
+  // call site is byte-for-byte unaffected.
+  critical?: boolean;
 }
 
 export interface ButtonMessagePayload {
@@ -410,6 +420,19 @@ export function queuedPermissionDecisionText(req: ButtonRequest, label: string, 
 export function hatchApprovalRecordedText(req: ButtonRequest, hookId: string, decisionLabel: string): string {
   const status = `recorded "${decisionLabel}" for hatch request ${hookId} — the requesting command already gave up waiting, so it could not be delivered. Retry the exact same command with the same ${hatchEnvVarName(hookId)}="<justification>" env var and it will be applied automatically with no new Telegram prompt. Only retry if the original need is still current.`;
   return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
+}
+
+// tg-cli#403: PROACTIVE counterpart to hatchApprovalRecordedText — pushed into a
+// still-LIVE agent session (promptOmpAcp) the moment a CRITICAL hatch decision
+// lands, rather than only ever being discoverable by re-reading the Telegram
+// card. Mirrors hatchApprovalRecordedText's exact retry-command phrasing (same
+// hatchEnvVarName call) so the two surfaces never disagree on how to retry —
+// deliberately concise (no buildQuestionText prefix): this lands as an
+// unsolicited chat message inside a live coding session, not a Telegram card,
+// so repeating the full original question text would be noise the agent didn't
+// ask for and already has in its own Telegram history.
+export function hatchProactiveDecisionText(hookId: string, decisionLabel: string): string {
+  return `hatch decision arrived: "${decisionLabel}" for hatch request ${hookId} (this took a while — the original requesting command already gave up waiting). Retry the exact same command with the same ${hatchEnvVarName(hookId)}="<justification>" env var and it will be applied automatically with no new Telegram prompt. Only retry if the original need is still current.`;
 }
 
 // Same socket-close event, but for a multi-question SET MEMBER: a lone late answer

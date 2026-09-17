@@ -1,0 +1,339 @@
+// tg-cli#403 acceptance criterion (d): the moment a CRITICAL hatch decision
+// lands for a request whose underlying process has already exited (the exact
+// original incident — a tap landing after the requesting command gave up
+// waiting), it is pushed PROACTIVELY into a still-LIVE agent session via
+// promptOmpAcp, not merely left discoverable on the Telegram card. Reuses
+// ctl-omp-acp-integration.test.ts's fake-omp-binary + Bun.serve mock Telegram
+// technique (a real ACP JSON-RPC child process, not a mock function) so the
+// assertion is on the actual wire protocol frame, not an internal call spy.
+//
+// The single most important safety property under test here (both tests
+// below): promptOmpAcp/ensureOmpAcp is NEVER called for a cwd with no LIVE
+// match — see tg-awareness-nudge.ts's own "Population" doc comment on why
+// (ensureOmpAcp's attach path can itself SPAWN a session).
+import { afterEach, expect, test } from 'bun:test';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import type { Subprocess } from 'bun';
+import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
+
+const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
+const LIVE_CWD = '/Users/u/work/review-cli';
+const SESSION_ID = '01a07d8e-c12c-7433-903d-e98726bfda37';
+
+const reg = createDaemonRegistry();
+const servers: Array<{ stop: (c?: boolean) => Promise<void> | void }> = [];
+
+afterEach(async () => {
+  await reapDaemons(reg);
+  for (const s of servers.splice(0)) await s.stop(true);
+});
+
+// Same fake `ps`/`lsof`/`omp` triplet as ctl-omp-acp-integration.test.ts: pid
+// 7103 is a live omp process whose cwd (via lsof) is LIVE_CWD and whose
+// session jsonl (also via lsof) carries SESSION_ID.
+function writeFakeBins(cfgDir: string, sessionFile: string, acpLog: string): string {
+  const binDir = join(cfgDir, 'bin');
+  mkdirSync(binDir);
+  writeFileSync(join(binDir, 'tmux'), `#!/bin/sh\nexit 0\n`, { mode: 0o755 });
+  writeFileSync(
+    join(binDir, 'ps'),
+    `#!/bin/sh
+case "$*" in
+  *tty*)
+    printf '    1 ??\\n'
+    printf ' 7103 ttys004\\n'
+    ;;
+  *)
+    printf '    1     0 /sbin/launchd\\n'
+    printf ' 7103     1 /opt/homebrew/bin/omp\\n'
+    ;;
+esac
+exit 0
+`,
+    { mode: 0o755 },
+  );
+  writeFileSync(
+    join(binDir, 'lsof'),
+    `#!/bin/sh
+printf 'p7103\\n'
+printf 'fcwd\\n'
+printf 'n${LIVE_CWD}\\n'
+printf 'n${sessionFile}\\n'
+exit 0
+`,
+    { mode: 0o755 },
+  );
+  writeFileSync(
+    join(binDir, 'omp'),
+    `#!/usr/bin/env bun
+const fs = require("fs");
+const logPath = process.env.OMP_ACP_LOG;
+if (!process.argv.includes("acp")) process.exit(0);
+function encode(msg) { return JSON.stringify(msg) + "\\n"; }
+let buf = "";
+process.stdin.on("data", (chunk) => {
+  buf += chunk.toString("utf8");
+  while (true) {
+    const nl = buf.indexOf("\\n");
+    if (nl < 0) break;
+    const json = buf.slice(0, nl).trim();
+    buf = buf.slice(nl + 1);
+    if (!json.startsWith("{")) continue;
+    let msg;
+    try { msg = JSON.parse(json); } catch { continue; }
+    if (logPath) fs.appendFileSync(logPath, json + "\\n");
+    if (msg.method === "initialize") {
+      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentInfo: { name: "oh-my-pi" } } }));
+    } else if (msg.method === "session/load") {
+      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { sessionId: msg.params.sessionId } }));
+    } else if (msg.method === "session/new") {
+      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "01fake-acp-session" } }));
+    } else if (msg.method === "session/prompt") {
+      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } }));
+    }
+  }
+});
+setInterval(() => {}, 1 << 30);
+`,
+    { mode: 0o755 },
+  );
+  return binDir;
+}
+
+function makeCfgDir(): { cfgDir: string; binDir: string; acpLog: string; sessionFile: string } {
+  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-hatch-proactive-'));
+  writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
+  writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
+  // registration is irrelevant here — hatch bypasses the registration gate — but
+  // harmless to include for parity with the other hatch fixtures.
+  writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ cwd: cfgDir }));
+  const sessionDir = join(cfgDir, 'sessions');
+  mkdirSync(sessionDir);
+  const sessionFile = join(sessionDir, `2026-09-07T20-28-22-700Z_${SESSION_ID}.jsonl`);
+  writeFileSync(
+    sessionFile,
+    [
+      '{"type":"title","v":1,"title":"ReviewFix","source":"auto"}',
+      `{"type":"session","version":3,"id":"${SESSION_ID}","cwd":"${LIVE_CWD}","title":"ReviewFix"}`,
+      '',
+    ].join('\n'),
+  );
+  const acpLog = join(cfgDir, 'acp.log');
+  writeFileSync(acpLog, '');
+  const binDir = writeFakeBins(cfgDir, sessionFile, acpLog);
+  return { cfgDir, binDir, acpLog, sessionFile };
+}
+
+async function startDaemon(cfgDir: string, binDir: string, acpLog: string, apiPort: number): Promise<Subprocess> {
+  const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
+  const daemon = await spawnDaemon(reg, {
+    tgCtlPath: TG_CTL,
+    cfgDir,
+    env: {
+      // The fake `omp` binary is `#!/usr/bin/env bun` — env needs bun's real
+      // install dir on PATH to resolve it, hence appending process.env.PATH
+      // (not just /usr/bin:/bin) — mirrors ctl-omp-acp-integration.test.ts.
+      PATH: `${binDir}:${process.env.PATH ?? ''}`,
+      HOME: cfgDir,
+      TG_CTL_CONFIG_DIR: cfgDir,
+      TG_API_BASE: `http://127.0.0.1:${apiPort}`,
+      OMP_ACP_LOG: acpLog,
+      TMUX: '',
+    },
+    logFd,
+  });
+  closeSync(logFd);
+  return daemon;
+}
+
+function startAsk(cfgDir: string, binDir: string, apiPort: number, request: Record<string, unknown>): Subprocess {
+  const env: Record<string, string> = {
+    PATH: `${binDir}:/usr/bin:/bin`,
+    HOME: cfgDir,
+    TG_CTL_CONFIG_DIR: cfgDir,
+    TG_API_BASE: `http://127.0.0.1:${apiPort}`,
+  };
+  const ask = trackProc(reg, Bun.spawn([process.execPath, TG_CTL, 'ask'], { env, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' }));
+  ask.stdin.write(JSON.stringify(request) + '\n');
+  ask.stdin.end();
+  return ask;
+}
+
+interface MockTg {
+  port: number;
+  stop: (c?: boolean) => Promise<void> | void;
+  push: (batch: unknown[]) => void;
+  cards: () => unknown[];
+  edits: () => string[];
+  allowData: () => string | null;
+}
+
+function mockTelegram(): MockTg {
+  const updateQueue: unknown[][] = [];
+  const cards: unknown[] = [];
+  const edits: string[] = [];
+  let lastKeyboard: Array<Array<{ callback_data: string }>> | null = null;
+  let cardSeq = 0;
+
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/getUpdates')) {
+        const batch = updateQueue.shift();
+        if (batch) return Response.json({ ok: true, result: batch });
+        await Bun.sleep(50);
+        return Response.json({ ok: true, result: [] });
+      }
+      if (url.pathname.endsWith('/sendMessage')) {
+        const body = (await req.json()) as Record<string, unknown>;
+        const kb = (body.reply_markup as { inline_keyboard?: Array<Array<{ callback_data: string }>> } | undefined)?.inline_keyboard;
+        if (kb?.length) {
+          cardSeq += 1;
+          cards.push(body);
+          lastKeyboard = kb;
+          return Response.json({ ok: true, result: { message_id: cardSeq } });
+        }
+        return Response.json({ ok: true, result: { message_id: 900 } });
+      }
+      if (url.pathname.endsWith('/editMessageText')) {
+        edits.push(String(((await req.json()) as Record<string, unknown>).text ?? ''));
+        return Response.json({ ok: true, result: true });
+      }
+      if (url.pathname.endsWith('/editMessageReplyMarkup')) return Response.json({ ok: true, result: true });
+      if (url.pathname.endsWith('/deleteMessage')) return Response.json({ ok: true, result: true });
+      if (url.pathname.endsWith('/answerCallbackQuery')) return Response.json({ ok: true, result: true });
+      if (url.pathname.endsWith('/setMessageReaction')) return Response.json({ ok: true, result: true });
+      return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+    },
+  });
+
+  return {
+    port: server.port,
+    stop: (c) => server.stop(c),
+    push: (b) => updateQueue.push(b),
+    cards: () => cards,
+    edits: () => edits,
+    allowData: () => lastKeyboard?.[0]?.[0]?.callback_data ?? null,
+  };
+}
+
+function tap(callbackData: string, updateId: number, messageId = 1): unknown {
+  return {
+    update_id: updateId,
+    callback_query: {
+      id: `cb${updateId}`,
+      from: { id: 1, first_name: 'Alex' },
+      message: { message_id: messageId, chat: { id: 1 }, date: Math.floor(Date.now() / 1000) },
+      data: callbackData,
+    },
+  };
+}
+
+async function until(cond: () => boolean, ms: number): Promise<boolean> {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    if (cond()) return true;
+    await Bun.sleep(40);
+  }
+  return cond();
+}
+
+function daemonLog(cfgDir: string): string {
+  const p = join(cfgDir, 'daemon.log');
+  return existsSync(p) ? readFileSync(p, 'utf8') : '';
+}
+
+test('a late CRITICAL hatch decision reaches a LIVE omp session via a real ACP session/prompt call', async () => {
+  const { cfgDir, binDir, acpLog } = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  const daemon = await startDaemon(cfgDir, binDir, acpLog, tg.port);
+
+  const hookId = 'proactive-hook';
+  const ask = startAsk(cfgDir, binDir, tg.port, {
+    requestId: `hatch-${hookId}-dddddddddddd`,
+    agent: 'claude',
+    kind: 'permission',
+    question: `Allow rig hatch escalation: ${hookId}?`,
+    permissionEvent: 'PermissionRequest',
+    critical: true,
+    cwd: LIVE_CWD,
+  });
+
+  expect(await until(() => tg.cards().length === 1, 6000)).toBe(true);
+
+  // The requesting process exits (its own external kill/reboot — critical mode
+  // means the DAEMON never forces this, but the process itself can still die)
+  // BEFORE any tap lands, moving the entry into abandonedButtons.
+  ask.kill(9);
+  await ask.exited;
+  const envVar = `RIG_HATCH_REQUEST_${hookId.toUpperCase().replace(/-/g, '_')}`;
+  expect(await until(() => tg.edits().some((e) => e.includes(envVar)), 5000)).toBe(true);
+
+  // A human taps Approve well after the process is gone.
+  const allowData = tg.allowData()!;
+  tg.push([tap(allowData, 501, 1)]);
+
+  expect(await until(() => existsSync(acpLog) && readFileSync(acpLog, 'utf8').includes('"method":"session/prompt"'), 15_000)).toBe(true);
+  const acp = readFileSync(acpLog, 'utf8');
+  expect(acp).toContain('"method":"initialize"');
+  expect(acp).toContain('"method":"session/load"');
+  expect(acp).toContain(SESSION_ID);
+  // Never session/new for a MATCHED live session — attaching to the existing one.
+  expect(acp).not.toContain('"method":"session/new"');
+  expect(acp).toContain(hookId);
+  expect(acp).toContain('Approve');
+
+  expect(await until(() => daemonLog(cfgDir).includes('hatch-critical-proactive-delivered'), 5000)).toBe(true);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 25_000);
+
+test('a late CRITICAL hatch decision for a cwd with NO live session never calls promptOmpAcp/spawns anything — durable record only', async () => {
+  const { cfgDir, binDir, acpLog } = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  const daemon = await startDaemon(cfgDir, binDir, acpLog, tg.port);
+
+  const hookId = 'no-live-hook';
+  const ask = startAsk(cfgDir, binDir, tg.port, {
+    requestId: `hatch-${hookId}-eeeeeeeeeeee`,
+    agent: 'claude',
+    kind: 'permission',
+    question: `Allow rig hatch escalation: ${hookId}?`,
+    permissionEvent: 'PermissionRequest',
+    critical: true,
+    // Deliberately NOT the live omp's cwd — no session anywhere matches this.
+    cwd: '/Users/u/work/some-unrelated-project',
+  });
+
+  expect(await until(() => tg.cards().length === 1, 6000)).toBe(true);
+  ask.kill(9);
+  await ask.exited;
+  const envVar = `RIG_HATCH_REQUEST_${hookId.toUpperCase().replace(/-/g, '_')}`;
+  expect(await until(() => tg.edits().some((e) => e.includes(envVar)), 5000)).toBe(true);
+
+  const allowData = tg.allowData()!;
+  tg.push([tap(allowData, 502, 1)]);
+
+  // The decision still lands normally (card updated with "recorded" text) — this
+  // is only about the PROACTIVE push channel being correctly refused.
+  expect(await until(() => tg.edits().some((e) => e.includes('recorded') && e.includes('Approve')), 5000)).toBe(true);
+  expect(await until(() => daemonLog(cfgDir).includes('hatch-critical-proactive-skip'), 3000)).toBe(true);
+
+  // Genuine real-clock wait (not a fake-timer stand-in): proving an ABSENCE — no
+  // wrongly-fired ACP call — across a real OS subprocess/daemon boundary that
+  // an in-process fake-timer harness cannot advance. Already confirmed the
+  // daemon reached and logged its skip decision above; this only guards
+  // against a delayed/fire-and-forget call landing slightly later.
+  await Bun.sleep(500);
+  const acp = existsSync(acpLog) ? readFileSync(acpLog, 'utf8') : '';
+  expect(acp).not.toContain(hookId);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 25_000);

@@ -217,6 +217,7 @@ import {
   hatchAbandonedPermissionText,
   hatchApprovalRecordedText,
   hatchParseMode,
+  hatchProactiveDecisionText,
   isHatchPermissionRequest,
   isHatchRequest,
   parseHatchHookId,
@@ -237,6 +238,11 @@ import {
   serializeQuestionStore,
   type QuestionStoreData,
 } from "./features/tg-ctl/question-store"
+import {
+  markCriticalReminderSent,
+  planCriticalReminder,
+  type DaemonCriticalState,
+} from "./features/tg-ctl/hatch-critical-reminder"
 import {
   parseRegistrations,
   pruneRegistrations,
@@ -725,6 +731,18 @@ async function editMessageText(
 // message, a transient API error), never throwing into the poll loop.
 async function clearMessageKeyboard(ctx: Ctx, messageId: number): Promise<void> {
   await botPost(ctx, "editMessageReplyMarkup", { chat_id: ctx.chatId, message_id: messageId })
+}
+
+// Delete a previously-sent message outright (tg-cli#403: reminder-message
+// replacement — a new critical-mode reminder deletes the PREVIOUS reminder
+// rather than letting them pile up in the chat). Returns whether Telegram
+// actually deleted it; the caller falls back to editMessageText with a short
+// placeholder when it didn't (message too old for Bot API delete, already
+// gone, etc.) — deleteMessage itself never throws (botPostResult swallows
+// transport/HTTP-level failures the same as every other botPost* helper).
+async function deleteMessage(ctx: Ctx, messageId: number): Promise<boolean> {
+  const result = await botPostResult(ctx, "deleteMessage", { chat_id: ctx.chatId, message_id: messageId })
+  return result.ok
 }
 
 // Set a reaction on a message (tg-cli#114 lifecycle: 👀 working → 😴 stalled →
@@ -1358,6 +1376,26 @@ async function replyOmpAcpPermission(req: ButtonRequest, optionId: string): Prom
 function liveOmpForPane(paneId: string, agentPid?: number): LiveOmpAgent | null {
   const agents = listLiveOmpAgents()
   return agents.find((a) => a.paneId === paneId || (agentPid !== undefined && a.pid === agentPid)) ?? null
+}
+
+// tg-cli#403: which LIVE omp session (if any) a critical hatch/permission
+// decision should be proactively pushed into. paneId is checked first (more
+// precise — an exact tmux pane match) and cwd second (the fallback for an omp
+// session running outside tmux, where paneId is best-effort/absent), mirroring
+// the cwd/paneId matching the request already carries structurally (see
+// ButtonRequest.cwd/paneId). Returns null — never a spawn/attach fallback —
+// when nothing in listLiveOmpAgents() actually matches; the caller must never
+// promptOmpAcp a session this returns null for (see the call site's own doc
+// comment on why: ensureOmpAcp's attach path can itself spawn a session).
+function liveOmpAgentForHatchRequest(req: ButtonRequest): LiveOmpAgent | null {
+  const agents = listLiveOmpAgents()
+  if (req.paneId) {
+    const byPane = agents.find((a) => a.paneId === req.paneId)
+    if (byPane) return byPane
+  }
+  if (!req.cwd) return null
+  const wantCwd = resolve(req.cwd)
+  return agents.find((a) => a.cwd !== null && resolve(a.cwd) === wantCwd) ?? null
 }
 
 function noAgentReplyNow(): string {
@@ -2852,6 +2890,14 @@ interface PendingButton {
   timer?: ReturnType<typeof setTimeout>
   finalText?: string
   finalReplyMarkup?: ButtonMessagePayload["reply_markup"]
+  // tg-cli#403: critical-mode reminder scheduling state (undefined unless
+  // req.critical === true). Lives here rather than a parallel store because a
+  // critical entry spends most of its life in EXACTLY this map — its
+  // underlying process/socket is still connected, simply awaiting a decision
+  // (see forwardAndPostQuestion's skip of the raw UNSCOPED_ABANDON_MS timer
+  // for a critical request). Carried over into AbandonedButton.criticalState
+  // if it later transitions there (retainAbandonedQuestion).
+  criticalState?: DaemonCriticalState
 }
 
 // A SCOPED question whose hook socket has CLOSED — the agent's 120s hook budget
@@ -2888,6 +2934,11 @@ interface AbandonedButton {
   // the notice for an entry that already got one (would read as spam / a false
   // "still no connection" repeat right after a bounce).
   queuedDecision?: { value: string; label: string; decision: PermissionDecision; at: number; notifiedAt?: number }
+  // tg-cli#403: see PendingButton.criticalState's doc comment — the same
+  // field, carried over by retainAbandonedQuestion when a critical entry's
+  // socket closes before a decision lands, and restored from disk (see
+  // question-store.ts's matching RetainedQuestionRecord.criticalState).
+  criticalState?: DaemonCriticalState
 }
 
 // Shared by permissionRequestIdForMessage's two lookups (PendingButton and
@@ -2986,11 +3037,21 @@ const ABANDONED_PERMISSION_RETAIN_MS = (() => {
 // tested directly here instead, deterministically, with no timing race).
 // Scalar args, not an entry object (review finding: avoids a throwaway
 // wrapper allocation at every restore-loop call site).
-export function retainMsFor(kind: ButtonRequest["kind"]): number {
+// `critical` (tg-cli#403, optional — every pre-existing call/test passes only
+// `kind`, unaffected): a critical request's decision must remain deliverable no
+// matter how long the human takes, the entire reason critical mode exists —
+// bypasses the kind-based window ENTIRELY (Infinity, never a real setTimeout
+// delay — this is only ever compared via subtraction, like every other use of
+// this function) rather than merely lengthening it. Without this, a critical
+// hatch request whose process disconnected would still silently expire (and
+// discard a genuinely late human tap) once ABANDONED_PERMISSION_RETAIN_MS
+// (12h) elapsed, directly contradicting "wait indefinitely" (review finding).
+export function retainMsFor(kind: ButtonRequest["kind"], critical?: boolean): number {
+  if (critical === true) return Infinity
   return kind === "permission" ? ABANDONED_PERMISSION_RETAIN_MS : ABANDONED_RETAIN_MS
 }
-export function isAbandonedExpired(kind: ButtonRequest["kind"], at: number, now: number): boolean {
-  return now - at > retainMsFor(kind)
+export function isAbandonedExpired(kind: ButtonRequest["kind"], at: number, now: number, critical?: boolean): boolean {
+  return now - at > retainMsFor(kind, critical)
 }
 
 // PURE decision for what a hook reconnect should do about a retained entry's
@@ -3018,7 +3079,7 @@ export function decideQueuedPermissionReconnect(
   now: number,
 ): QueuedPermissionReconnectOutcome {
   if (!retained.queuedDecision) return { kind: "no-queued-decision" }
-  if (isAbandonedExpired(retained.req.kind, retained.at, now)) return { kind: "expired" }
+  if (isAbandonedExpired(retained.req.kind, retained.at, now, retained.req.critical)) return { kind: "expired" }
   if (!queuedDecisionCanAutoDeliver(retained.req)) return { kind: "no-turn-proof" }
   if (retained.req.promptTurnId !== req.promptTurnId) return { kind: "turn-mismatch" }
   if (!permissionPayloadMatches(retained.req, req)) return { kind: "payload-mismatch" }
@@ -3031,15 +3092,33 @@ export function decideQueuedPermissionReconnect(
 // reconnect-of-the-SAME-process case) this scans by hookId because a hatch
 // retry is always a genuinely NEW requestId/process, never a reconnect of the
 // old one.
+//
+// `cwd` (tg-cli#403 security review finding): hookId alone is NOT a safe
+// match key on its own — hook names (e.g. "block-reset-hard",
+// "block-devserver-primary") are short, conventional strings a rig/hook
+// framework encourages reusing verbatim ACROSS unrelated projects. Before
+// critical mode, a stale cross-project match was bounded by
+// ABANDONED_PERMISSION_RETAIN_MS (12h) — a real but narrow window. Critical
+// mode's Infinity retention (retainMsFor above) removes that bound entirely
+// for a critical entry, which would otherwise let a decision approved ONCE,
+// in ONE project, auto-apply FOREVER to any later, unrelated project that
+// happens to fire a same-named hatch hook. Scoping the match to the SAME cwd
+// (the project directory a hatch ask always carries — see
+// normalizeHookPayload's `cwd: … ?? env.cwd`, which is always a real
+// `process.cwd()` string) closes that cross-project blast radius while
+// leaving every legitimate same-project retry (the ONLY case this mechanism
+// exists for) unaffected.
 function findQueuedHatchDecision(
   abandoned: Map<string, AbandonedButton>,
   hookId: string,
+  cwd: string | undefined,
   now: number,
 ): { key: string; entry: AbandonedButton; queuedDecision: NonNullable<AbandonedButton["queuedDecision"]> } | null {
   for (const [key, entry] of abandoned) {
     if (!entry.queuedDecision) continue
     if (parseHatchHookId(entry.req.requestId) !== hookId) continue
-    if (isAbandonedExpired(entry.req.kind, entry.at, now)) continue
+    if (entry.req.cwd !== cwd) continue
+    if (isAbandonedExpired(entry.req.kind, entry.at, now, entry.req.critical)) continue
     return { key, entry, queuedDecision: entry.queuedDecision }
   }
   return null
@@ -3088,7 +3167,7 @@ function pruneAbandonedButtons(
   onExpire?: (key: string, entry: AbandonedButton) => void,
 ): void {
   for (const [key, entry] of abandoned) {
-    if (isAbandonedExpired(entry.req.kind, entry.at, now)) {
+    if (isAbandonedExpired(entry.req.kind, entry.at, now, entry.req.critical)) {
       onExpire?.(key, entry)
       abandoned.delete(key)
     }
@@ -3165,6 +3244,13 @@ function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     // it here would silently
     // degrade every restored/reconnected request to the untrusted case.
     promptTurnId: typeof rec.promptTurnId === "string" ? rec.promptTurnId : undefined,
+    // tg-cli#403 / agent-tools#754: MUST survive BOTH the socket boundary and
+    // the disk restore — it's what gates askDaemon's Infinity deadline,
+    // forwardAndPostQuestion's UNSCOPED_ABANDON_MS skip, and the daemon's
+    // reminder sweep. This is the SERVER-side (daemon socket) parse; the
+    // CLIENT-side counterpart lives in hook-normalize.ts's
+    // normalizeHookPayload "already normalized" branch.
+    critical: rec.critical === true ? true : undefined,
   }
 }
 
@@ -3317,7 +3403,16 @@ function retainAbandonedQuestion(rt: QuestionRuntime, entry: PendingButton, pend
   } else if (req.kind === "question" && !req.options?.length) {
     return false
   }
-  rt.abandoned.set(pendingKey, { req, messageId: entry.messageId, at: Date.now() })
+  rt.abandoned.set(pendingKey, {
+    req,
+    messageId: entry.messageId,
+    at: Date.now(),
+    // tg-cli#403: the reminder scheduler's clock must survive this transition —
+    // otherwise a socket-close mid-episode would silently reset it and either
+    // delay or (worse, if criticalState carried a quietHoursDeferredUntil)
+    // double-fire the deferred reminder.
+    ...(entry.criticalState ? { criticalState: entry.criticalState } : {}),
+  })
   return true
 }
 
@@ -3427,10 +3522,26 @@ async function forwardAndPostQuestion(
 ): Promise<void> {
   rt.activeKeys.add(pendingKey)
   const entry: PendingButton = { req, socket, messageId: null, at: Date.now() }
+  // tg-cli#403: a CRITICAL request's clock for the FIRST reminder starts at
+  // the card's post time, not at the first sweep tick that happens to
+  // observe it — otherwise a reminder could fire (near-)immediately after
+  // the card is posted, since planCriticalReminder treats an undefined
+  // lastReminderAt as "infinitely overdue".
+  if (req.critical === true) entry.criticalState = { lastReminderAt: entry.at }
   // An UNSCOPED question defers EVERY pane (fail-closed), so it MUST self-clear on a
   // timer or it wedges all routing. A SCOPED question waits forever (no timer): only
   // its socket close releases it (see armPendingSocketClose).
-  if (!req.paneId) {
+  //
+  // tg-cli#403: a CRITICAL unscoped (paneless — the headless hatch case) request
+  // is the ONE exception: this timer is exactly what would otherwise force-close
+  // its live socket after UNSCOPED_ABANDON_MS (110s default) with a bare "null"
+  // reply, defeating "wait indefinitely" for the very use case critical mode
+  // exists for (a headless RIG_HATCH_REQUEST_* ask). No timer is armed at all —
+  // the entry stays in `pending`, live socket open, until either a real answer
+  // arrives (the ordinary tap path, unaffected) or the socket itself closes
+  // (the underlying process actually exits/gets killed — armPendingSocketClose's
+  // 'close' handler still retires it exactly as for any other request).
+  if (!req.paneId && req.critical !== true) {
     entry.timer = setTimeout(() => {
       if (rt.pending.get(pendingKey) !== entry) return
       rt.pending.delete(pendingKey)
@@ -3596,7 +3707,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
   // decide twice for what is, from their side, the exact same request.
   const hookId = parseHatchHookId(req.requestId)
   if (hookId !== null) {
-    const found = findQueuedHatchDecision(rt.abandoned, hookId, Date.now())
+    const found = findQueuedHatchDecision(rt.abandoned, hookId, req.cwd, Date.now())
     if (found) {
       rt.abandoned.delete(found.key)
       const answer: ButtonAnswer = {
@@ -3795,7 +3906,23 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
           break // ordinary reconnect, nothing queued — nothing to log
       }
       rt.activeKeys.add(pendingKey)
-      const entry: PendingButton = { req, socket, messageId: retained.messageId, at: Date.now() }
+      const entry: PendingButton = {
+        req,
+        socket,
+        messageId: retained.messageId,
+        at: Date.now(),
+        // tg-cli#403 review finding: a reconnecting SCOPED critical request (a hatch
+        // ask that happened to carry a real paneId — best-effort from TMUX_PANE —
+        // is the one case reconnectable at all) must carry its reminder-scheduling
+        // clock over from the abandoned entry it's reattaching to. Without this, the
+        // fresh PendingButton starts with `criticalState: undefined`, which
+        // planCriticalReminder treats as "infinitely overdue" — the very next sweep
+        // would fire a reminder immediately, and since `lastReminderMessageId` is also
+        // lost, the previous reminder (if any) would never get deleted/replaced,
+        // violating acceptance criterion (c) on every daemon bounce or transient
+        // socket drop for a scoped critical request.
+        ...(retained.criticalState ? { criticalState: retained.criticalState } : {}),
+      }
       rt.pending.set(pendingKey, entry)
       armPendingSocketClose(ctx, rt, entry, pendingKey)
       // tg-cli#317 review finding: a reconnect landing HERE (the daemon reattaching
@@ -3898,8 +4025,17 @@ function parseAskStream(raw: string, how: "end" | "dropped" | "timeout"): AskAtt
 }
 
 // Overall hook budget. Kept UNDER the 120s the harness gives the hook process so the
-// reconnect loop returns a real answer (or null) before the harness kills it.
-const ASK_TOTAL_TIMEOUT_MS = 115_000
+// reconnect loop returns a real answer (or null) before the harness kills it. Skipped
+// entirely for a CRITICAL ask (tg-cli#403) — see askDaemon's deadline computation.
+// Env-overridable ONLY for tests to prove the non-critical/critical contrast without a
+// real 115s wait (mirrors UNSCOPED_ABANDON_MS's own clamp: setTimeout silently clamps
+// any delay > 2^31-1 ms to ~1ms, so an oversized override is clamped rather than
+// flipping into an immediate false timeout); production never sets it.
+const ASK_TOTAL_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.TG_CTL_ASK_TOTAL_TIMEOUT_MS)
+  const TIMEOUT_MAX = 2_147_483_647
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, TIMEOUT_MAX) : 115_000
+})()
 // Backoff between reconnect attempts. Also lets a LIVE daemon's socket-close handler
 // run (moving the entry to `abandoned`) BEFORE the resend lands, so the resend
 // re-attaches instead of racing the in-flight dedup.
@@ -3909,6 +4045,7 @@ function oneAskAttempt(ctx: Ctx, requestLine: string, timeoutMs: number): Promis
   return new Promise<AskAttempt>((resolve) => {
     let done = false
     let raw = ""
+    let timer: ReturnType<typeof setTimeout> | undefined
     const finish = (how: "end" | "dropped" | "timeout"): void => {
       if (done) return
       done = true
@@ -3916,10 +4053,23 @@ function oneAskAttempt(ctx: Ctx, requestLine: string, timeoutMs: number): Promis
       resolve(parseAskStream(raw, how))
     }
     const socket = createConnection(ctx.paths.socket)
-    const timer = setTimeout(() => {
-      socket.destroy()
-      finish("timeout")
-    }, timeoutMs)
+    // tg-cli#403 CRITICAL LANDMINE: `timeoutMs` is `Infinity` for a critical ask
+    // (askDaemon's deadline is Infinity, and Date.now() subtracted from Infinity
+    // is still Infinity). Node/Bun's setTimeout silently CLAMPS any delay beyond
+    // 2^31-1 ms (32-bit signed overflow) to ~1ms and fires almost immediately —
+    // passing Infinity straight to setTimeout would flip "wait forever" into "time
+    // out instantly", the EXACT OPPOSITE of critical mode's intent. Skip scheduling
+    // the timer entirely when the delay isn't finite; the promise then resolves
+    // purely from the socket's own data/end/error/close events, with no deadline
+    // to race against at all — the "skip scheduling" fix this ticket explicitly
+    // prescribes over clamping, since clamping still needs SOME real bound to
+    // clamp TO, which a genuinely unbounded critical wait doesn't have.
+    timer = Number.isFinite(timeoutMs)
+      ? setTimeout(() => {
+          socket.destroy()
+          finish("timeout")
+        }, timeoutMs)
+      : undefined
     socket.setEncoding("utf8")
     socket.on("connect", () => socket.write(requestLine + "\n"))
     socket.on("data", (chunk) => {
@@ -4078,7 +4228,17 @@ async function askDaemon(ctx: Ctx): Promise<void> {
   }
   // ONE deadline shared by the whole call (all cards of a multi-question), kept
   // under the harness's 120s hook budget so we always answer before it kills us.
-  const deadline = Date.now() + ASK_TOTAL_TIMEOUT_MS
+  //
+  // tg-cli#403: a CRITICAL request (never true for a multi-question set in
+  // practice — critical is a hatch/permission-only opt-in) removes this bound
+  // entirely. `Infinity` is a safe DEADLINE sentinel (never passed directly to
+  // setTimeout): `Date.now() < Infinity` is always true, and `Infinity - x` stays
+  // `Infinity` through every downstream subtraction (requestHookAnswerWithReconnect's
+  // `remaining`, askDaemonOnce's `remaining`) — every one of THOSE call sites turns
+  // its own "remaining" into an actual setTimeout delay only inside oneAskAttempt,
+  // which explicitly skips scheduling when the delay isn't finite (see its own doc
+  // comment on the 32-bit setTimeout overflow clamp this guards against).
+  const deadline = reqs.some((r) => r.critical === true) ? Infinity : Date.now() + ASK_TOTAL_TIMEOUT_MS
 
   if (reqs.length === 1) {
     const req = reqs[0]
@@ -5460,7 +5620,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // sweep. `>=` (not pruneAbandonedButtons's own strict `>`), deliberately
       // ASYMMETRIC with the shared `now`: this must skip everything the prune is
       // about to take (the double-edit hazard, never allowed), even though that
-      // means the exact boundary tick (`now - entry.at === retainMsFor(entry.req.kind)`)
+      // means the exact boundary tick (`now - entry.at === retainMsFor(entry.req.kind, entry.req.critical)`)
       // gets neither notice nor prune this ONE sweep (prune's `>` doesn't take it
       // yet either) — resolved trivially on the very next sweep. A stale "neither
       // fired for one tick" beats a card showing two contradictory edits.
@@ -5469,7 +5629,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // gate) — this branch is defense-in-depth against that convention ever
       // drifting, matching every OTHER retention-window check in this file
       // (review finding: this was the one site left unconditional).
-      if (now - entry.at >= retainMsFor(entry.req.kind)) continue
+      if (now - entry.at >= retainMsFor(entry.req.kind, entry.req.critical)) continue
       qd.notifiedAt = now
       changed = true
       const label = resolveWindowAgentLabel(entry.req.windowName, entry.req.cwd)
@@ -5539,7 +5699,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           // can't be late-delivered (no pane) and must not resurrect to re-wedge.
           ...[...pendingButtons.values()]
             .filter((e) => e.req.paneId && (e.req.kind === "permission" || e.req.options?.length))
-            .map((e) => ({ req: e.req as unknown as Record<string, unknown>, messageId: e.messageId, at: e.at })),
+            .map((e) => ({
+              req: e.req as unknown as Record<string, unknown>,
+              messageId: e.messageId,
+              at: e.at,
+              // tg-cli#403: a scoped (paneId-set) critical entry's reminder clock
+              // must survive a restart too — otherwise every daemon bounce would
+              // silently reset the human's reminder cadence.
+              ...(e.criticalState ? { criticalState: e.criticalState } : {}),
+            })),
           ...[...abandonedButtons.values()].map((e) => ({
             req: e.req as unknown as Record<string, unknown>,
             messageId: e.messageId,
@@ -5549,6 +5717,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             // "delivered automatically once the hook reconnects" for a decision
             // that a restart just silently threw away.
             ...(e.queuedDecision ? { queuedDecision: e.queuedDecision } : {}),
+            // tg-cli#403: see the pendingButtons mapper above — same field, same reason.
+            ...(e.criticalState ? { criticalState: e.criticalState } : {}),
           })),
         ],
         answered: [...answeredButtons].map(([key, e]) => ({
@@ -5596,7 +5766,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (!req) continue
       if (!req.paneId && !(req.kind === "permission" && isHatchRequest(req))) continue
       if (req.kind === "question" && !req.options?.length) continue
-      if (isAbandonedExpired(req.kind, rec.at, nowRestore)) {
+      if (isAbandonedExpired(req.kind, rec.at, nowRestore, req.critical)) {
         // Carry the queuedDecision through (same rule as the live-abandonedButtons
         // restore below): a tap that was never delivered before the daemon went
         // down for the whole retention window must still be NAMED in the give-up
@@ -5611,7 +5781,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // a stray one on a non-permission record (corrupt/foreign write) is dropped rather
       // than silently auto-answering a question it was never meant for.
       const queuedDecision = req.kind === "permission" ? rec.queuedDecision : undefined
-      abandonedButtons.set(callbackRequestId(req), { req, messageId: rec.messageId, at: rec.at, queuedDecision })
+      // tg-cli#403: only meaningful when the restored req is itself critical — a
+      // stray criticalState on a non-critical record (corrupt/foreign write) is
+      // dropped rather than silently scheduling reminders nobody asked for.
+      const criticalState = req.critical === true ? rec.criticalState : undefined
+      abandonedButtons.set(callbackRequestId(req), { req, messageId: rec.messageId, at: rec.at, queuedDecision, criticalState })
     }
     const restored = raw
     for (const a of restored.answered) {
@@ -5749,7 +5923,21 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // can't prove an unscoped question is a DIFFERENT pane than the inject target, so don't paste.
       // This can NEVER wedge routing: every entry self-clears in ≤110s (the abandon timer above),
       // unlike a stale queue (which is intentionally NOT treated as a defer).
-      if (!pb.req.paneId) return true
+      //
+      // tg-cli#403 EXCEPTION: a CRITICAL unscoped request (the common headless hatch
+      // case) deliberately does NOT self-clear in ≤110s anymore — forwardAndPostQuestion
+      // skips the UNSCOPED_ABANDON_MS backstop for it entirely, by design, so it can wait
+      // indefinitely for a human decision. Without this carve-out, that same "fail closed,
+      // never wedges because it always self-clears fast" reasoning above would silently
+      // become FALSE the moment a critical hatch request is pending: it would defer EVERY
+      // agent's inbound Telegram traffic — not just the (nonexistent) pane it's asking
+      // from — for as long as the human hasn't tapped, which could be hours (multi-model
+      // review finding on this exact feature). A critical unscoped entry was never asking
+      // from any real pane in the first place (see parseHatchHookId's doc comment,
+      // questions.ts — hatch is structurally headless), so there is no live prompt here
+      // for an inbound message to actually collide with; excluding it restores the
+      // original bounded-wedge invariant for everything else, unchanged.
+      if (!pb.req.paneId && pb.req.critical !== true) return true
       if (pb.req.paneId === paneId) return true
     }
     return false
@@ -8914,7 +9102,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // uses ABANDONED_PERMISSION_RETAIN_MS here, matching pruneAbandonedButtons's own
     // per-kind window (tg-cli#182): otherwise a tap could be rejected as "expired" here
     // for an entry pruneAbandonedButtons has NOT actually deleted yet.
-    if (isAbandonedExpired(retained.req.kind, retained.at, Date.now())) {
+    if (isAbandonedExpired(retained.req.kind, retained.at, Date.now(), retained.req.critical)) {
       abandonedButtons.delete(action.requestId)
       persistQuestions()
       const staleCardId = retained.messageId ?? action.messageId
@@ -9134,6 +9322,32 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           buildButtonMessage(ctx.chatId, retained.req).reply_markup,
           hatchParseMode(retained.req),
         )
+      }
+      // tg-cli#403 acceptance criterion (d): a CRITICAL hatch decision is
+      // pushed PROACTIVELY into a still-live agent session the instant it
+      // lands here — this exact call site is the original incident (a human
+      // tap landing after the requesting process had already given up
+      // waiting). Best-effort, fire-and-forget: it must never block or fail
+      // the card-edit above, which is the correctness-critical part a human
+      // actually sees. Only ever targets a session listLiveOmpAgents()
+      // ALREADY reports as live — see tg-awareness-nudge.ts's own
+      // "Population" doc comment for why: promptOmpAcp's ensureOmpAcp can
+      // itself SPAWN a session, and calling it for a cwd with no live match
+      // would attach to (or start) a session that was never actually still
+      // running, exactly the hazard that doc comment exists to prevent.
+      if (hookId !== null && retained.req.critical === true) {
+        const liveTarget = liveOmpAgentForHatchRequest(retained.req)
+        if (liveTarget) {
+          void promptOmpAcp(liveTarget, hatchProactiveDecisionText(hookId, answer.label)).then((res) => {
+            log(
+              res.ok
+                ? `hatch-critical-proactive-delivered: hookId=${hookId} cwd=${liveTarget.cwd ?? "-"}`
+                : `hatch-critical-proactive-failed: hookId=${hookId} err=${res.error}`,
+            )
+          })
+        } else {
+          log(`hatch-critical-proactive-skip: hookId=${hookId} reason=no-live-session cwd=${retained.req.cwd ?? "-"} pane=${retained.req.paneId ?? "-"}`)
+        }
       }
       log(`ask-permission-decision-queued: ${describeAskRequest(retained.req)} key=${action.requestId} label=${answer.label}`)
       // The ephemeral toast must make the SAME promise as the card text — both
@@ -9670,6 +9884,106 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         const noticed = noticeStaleQueuedDecisions(sweepNow)
         pruneAbandonedButtons(abandonedButtons, sweepNow, notifyAbandonedLongOutage)
         if (noticed || abandonedButtons.size !== before) persistQuestions(sweepNow)
+      }
+
+      // tg-cli#403: critical-mode reminder cadence. A critical request never
+      // times out — askDaemon skips ASK_TOTAL_TIMEOUT_MS for it and
+      // forwardAndPostQuestion never arms the raw UNSCOPED_ABANDON_MS backstop
+      // for it either — so without this sweep a decision it's waiting on could
+      // sit silently forgotten in Telegram indefinitely. This is the sanctioned
+      // exception to tg-cli#360/#380's "no new timers" rule (Alex's own
+      // verbatim ask in the tg-cli#403 ticket body). A critical entry can be
+      // waiting in EITHER map depending on whether its underlying process/
+      // socket is still connected (pendingButtons — the common case: the
+      // process is alive and simply hasn't gotten a decision yet) or has
+      // already disconnected without one (abandonedButtons, retained the same
+      // way tg-cli#349 retains any hatch/permission) — both are swept
+      // identically since a human reminder doesn't care which map it's in.
+      if (pendingButtons.size > 0 || abandonedButtons.size > 0) {
+        const sweepNow = Date.now()
+        let criticalChanged = false
+        const sweepOneCritical = async (
+          key: string,
+          req: ButtonRequest,
+          messageId: number | null,
+          priorState: DaemonCriticalState | undefined,
+          setState: (s: DaemonCriticalState) => void,
+          stillPresent: () => boolean,
+        ): Promise<void> => {
+          if (req.critical !== true) return
+          const state: DaemonCriticalState = priorState ?? {}
+          const plan = planCriticalReminder(state, sweepNow)
+          if (!plan.due) {
+            // Persist a newly-computed quiet-hours deferral so a restart mid-quiet-hours
+            // doesn't silently reset it and risk a second "morning" reminder.
+            if (plan.nextState.quietHoursDeferredUntil !== state.quietHoursDeferredUntil) {
+              setState({ ...state, quietHoursDeferredUntil: plan.nextState.quietHoursDeferredUntil })
+              criticalChanged = true
+            }
+            return
+          }
+          const hookId = parseHatchHookId(req.requestId)
+          const label = resolveWindowAgentLabel(req.windowName, req.cwd)
+          const pointer = messageId !== null ? " (see the original card above)" : ""
+          const text =
+            hookId !== null
+              ? `⏳ still waiting on your decision for hatch request ${hookId}${pointer}`
+              : `⏳ still waiting on your decision — ${label}${pointer}`
+          const sentId = await sendMessage(ctx, text)
+          if (sentId === null) {
+            // Send failed — never mark sent (see markCriticalReminderSent's own doc
+            // comment): this reminder stays due and is retried next sweep instead of
+            // silently skipping a whole interval for a ping the human never saw.
+            log(`hatch-critical-reminder-send-failed: key=${key} hookId=${hookId ?? "-"}`)
+            return
+          }
+          // Review finding (round 1): the entry's underlying socket can close mid-`await`
+          // above — retainAbandonedQuestion then migrates it from pendingButtons into a
+          // NEW AbandonedButton object in abandonedButtons, carrying a COPY of the
+          // pre-send `criticalState`. `entry`/`setState` in THIS closure still point at
+          // the now-orphaned pending slot; committing here would be invisible to the
+          // freshly-migrated slot, which independently re-plans against its own stale
+          // state and would send a SECOND reminder in the very same sweep tick (and
+          // delete the wrong prior message, since its own `priorMessageId` is stale
+          // too). Bail without committing so the next sweep retries cleanly against
+          // whichever map now actually holds the entry — this reminder's Telegram
+          // message is a harmless one-off orphan in that narrow window, never a
+          // duplicate.
+          if (!stillPresent()) {
+            log(`hatch-critical-reminder-stale-entry: key=${key} hookId=${hookId ?? "-"} messageId=${sentId} — entry moved to a different map mid-send; not committing (will retry next sweep)`)
+            return
+          }
+          const priorMessageId = state.lastReminderMessageId ?? null
+          if (priorMessageId !== null) {
+            // Replace, never accumulate (acceptance criterion (c)): delete the
+            // PREVIOUS reminder, falling back to an edit-to-placeholder if Telegram
+            // refuses the delete (message too old, already gone, …). The ORIGINAL
+            // request card is never touched here — only prior reminder pings.
+            const deleted = await deleteMessage(ctx, priorMessageId)
+            if (!deleted) void editMessageText(ctx, priorMessageId, "⏰ reminder superseded by a newer one")
+          }
+          setState(markCriticalReminderSent(sweepNow, sentId))
+          criticalChanged = true
+          log(`hatch-critical-reminder-sent: key=${key} hookId=${hookId ?? "-"} messageId=${sentId}`)
+        }
+        for (const [key, entry] of pendingButtons) {
+          await sweepOneCritical(key, entry.req, entry.messageId, entry.criticalState, (s) => {
+            entry.criticalState = s
+          }, () => pendingButtons.get(key) === entry)
+        }
+        for (const [key, entry] of abandonedButtons) {
+          // Review finding (round 1): once a tap has landed (queuedDecision set), the
+          // human's decision is already made and recorded — the card was edited to
+          // "recorded …" at tap time. Continuing to ping "still waiting on your
+          // decision" forever after the decision was already given would directly
+          // contradict the card, and nothing ever clears a critical entry's Infinity
+          // retention window to stop it on its own.
+          if (entry.queuedDecision) continue
+          await sweepOneCritical(key, entry.req, entry.messageId, entry.criticalState, (s) => {
+            entry.criticalState = s
+          }, () => abandonedButtons.get(key) === entry)
+        }
+        if (criticalChanged) persistQuestions(sweepNow)
       }
 
       // tg-cli#363: nudge a live omp ACP session that has gone quiet on tg for

@@ -1247,6 +1247,68 @@ test('NO-WEDGE guard: an UNSCOPED question never answered still self-clears at t
   await daemon.exited;
 }, 40_000);
 
+// tg-cli#403 (multi-model review finding): a CRITICAL unscoped hatch request
+// deliberately NEVER self-clears — forwardAndPostQuestion skips the
+// UNSCOPED_ABANDON_MS backstop for it entirely, by design, so it can wait
+// indefinitely for a human decision. Without a carve-out in
+// paneHasPendingQuestion, the "an unscoped entry defers ALL panes, but that's
+// safe because it always self-clears within ≤110s" invariant the NO-WEDGE
+// guard test above pins would silently become FALSE the moment a critical
+// hatch request is pending: it would defer every agent's inbound Telegram
+// traffic for as long as the human hasn't tapped, potentially hours. This
+// test proves the carve-out holds: routing stays live WHILE the critical
+// request is still open (never self-cleared, never answered).
+test('NO-WEDGE guard, CRITICAL exception (tg-cli#403): an UNSCOPED CRITICAL hatch request never self-clears, but it must NOT wedge routing to other inbound the way a non-critical unscoped question does', async () => {
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const edits: string[] = [];
+  const plainMessages: string[] = [];
+  const server = recordingServer(updateQueue, reactions, edits, plainMessages);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const ask = startAsk(
+    cfgDir,
+    server.port,
+    {
+      requestId: 'hatch-wedge-guard-aaaaaaaaaaaa',
+      agent: 'claude',
+      kind: 'permission',
+      question: 'Allow rig hatch escalation: wedge-guard?',
+      permissionEvent: 'PermissionRequest',
+      critical: true,
+    },
+    { unscoped: true },
+  );
+  trackProc(reg, ask);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
+    expect(server.cb()).not.toBe('');
+  }
+
+  // Inbound to the (only) agent pane arrives while the critical hatch request is
+  // still open. Unlike the ordinary unscoped case (which defers until it
+  // self-clears), it must reach the pane PROMPTLY — never deferred behind a
+  // request with no bound at all.
+  updateQueue.push([
+    { update_id: 80, message: { message_id: 81, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'do not wedge me' } },
+  ]);
+  await waitForInjected(cfgDir, 'do not wedge me', 8000);
+
+  // The hatch request is STILL pending the whole time — proof this isn't merely
+  // "it happened to expire first" (the exact regression the NO-WEDGE guard test
+  // above pins for the non-critical case). No expiry text, process still alive.
+  expect(edits).not.toContain('expired — answer in terminal');
+  expect(ask.killed).toBe(false);
+
+  ask.kill(9);
+  await ask.exited;
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 20_000);
+
 // The dangerous failure mode of the #58 sweep: an unscoped question's expiry must
 // NOT flush/drop a backlog that belongs to a DIFFERENT, still-live question on
 // the same pane. The deferred queue is keyed by PANE, not question, so a naive

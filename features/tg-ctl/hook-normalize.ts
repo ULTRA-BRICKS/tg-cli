@@ -166,6 +166,13 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       windowName: typeof p.windowName === 'string' ? p.windowName : env.windowName,
       subagent: typeof p.subagent === 'string' ? p.subagent : env.subagent,
       promptTurnId: typeof p.promptTurnId === 'string' ? p.promptTurnId : undefined,
+      // tg-cli#403 / agent-tools#754: the caller's opt-in "wait indefinitely,
+      // remind periodically" mode. This is the branch a hand-built hatch
+      // ButtonRequest (agent-tools' request_hatch_approval, piped into
+      // `tg-ctl ask` from a Python script, never a live harness hook) actually
+      // goes through — it must survive here or `critical:true` would silently
+      // never reach the daemon at all.
+      critical: p.critical === true ? true : undefined,
     };
   }
 
