@@ -1035,10 +1035,14 @@ function listAgentCandidates(): AgentCandidate[] {
 
 // --- agents OUTSIDE tmux (tg-cli#306) ---
 //
-// A second, cheap ps read (`pid tty` only) tells which processes have a controlling
-// terminal; the pure `findUnreachableAgents` then picks the interactive agent processes
-// that sit in NO tmux pane's process tree. Their cwd comes from lsof (one call per such
-// agent — a handful at most). Every failure degrades to "none seen", never a crash.
+// A second, cheap ps read (`pid tty` only) is DISPLAY-ONLY for claude/codex/opencode
+// (tg-cli#413 follow-up removed the gate there — see the "Past bug (tg-cli#413
+// follow-up)" note above `findUnreachableAgents`); for pi/aider/omp/unknown (no
+// per-shape headless detection) it is still load-bearing: `findUnreachableAgents`
+// requires a real tty map entry for those kinds before listing one as unreachable.
+// Their cwd comes from lsof (one call per such agent — a handful at most). A `ps`
+// failure here degrades to an empty map, never a crash — that only suppresses
+// pi/aider/omp/unknown (still tty-gated); claude/codex/opencode are listed either way.
 function readPidTtyMap(): Map<number, string> {
   try {
     const ps = Bun.spawnSync(["ps", "-axo", "pid=,tty="], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
@@ -1090,13 +1094,10 @@ function listUnreachableAgents(): UnreachableAgent[] {
   const now = Date.now()
   if (unreachableCache && now - unreachableCache.at < UNREACHABLE_SCAN_TTL_MS) return unreachableCache.agents
   const ttyByPid = readPidTtyMap()
-  let agents: UnreachableAgent[] = []
-  if (ttyByPid.size > 0) {
-    const { panes, procs } = snapshot()
-    agents = findUnreachableAgents(panes, procs, ttyByPid)
-      .filter((a) => a.agent !== "omp")
-      .map((a) => ({ ...a, cwd: cwdOfPid(a.pid) }))
-  }
+  const { panes, procs } = snapshot()
+  const agents = findUnreachableAgents(panes, procs, ttyByPid)
+    .filter((a) => a.agent !== "omp")
+    .map((a) => ({ ...a, cwd: cwdOfPid(a.pid) }))
   unreachableCache = { at: now, agents }
   return agents
 }
