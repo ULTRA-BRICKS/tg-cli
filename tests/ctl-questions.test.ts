@@ -10,8 +10,12 @@ import {
   collectQuestionAnswers,
   extractAnswersFromHookReply,
   formatAgentHookOutput,
+  hatchAbandonedPermissionText,
+  hatchApprovalRecordedText,
+  hatchParseMode,
   parseButtonCallback,
   parseQuestionCloseCallback,
+  parseDecisionReplyToken,
   isHatchPermissionRequest,
   questionCapability,
   queuedDecisionCanAutoDeliver,
@@ -91,6 +95,78 @@ test('isHatchPermissionRequest: permission whose requestId starts with hatch- on
     kind: 'permission',
     requestId: 'no-long-inline-process-hatch-abc',
   })).toBe(false);
+});
+
+test('buildButtonMessage renders a hatch permission verbatim as HTML with parse_mode set', () => {
+  const hatchReq: ButtonRequest = {
+    requestId: 'hatch-block-reset-hard-aaaaaaaaaaaa',
+    agent: 'claude',
+    kind: 'permission',
+    question: '<b>Hatch approval request</b>\n\n<b>Hook:</b> <code>block-reset-hard</code>\n<b>Justification:</b> testing',
+    title: 'Hatch: block-reset-hard',
+  };
+  const payload = buildButtonMessage(1000, hatchReq);
+  expect(payload.text).toBe(hatchReq.question);
+  expect(payload.parse_mode).toBe('HTML');
+  expect(payload.text).not.toContain('Permission request from claude');
+});
+
+test('buildButtonMessage leaves a non-hatch permission on the plain-text path (no parse_mode)', () => {
+  const payload = buildButtonMessage(1000, {
+    requestId: 'p_plain',
+    agent: 'claude',
+    kind: 'permission',
+    question: 'run rm -rf /tmp/x?',
+  });
+  expect(payload.parse_mode).toBeUndefined();
+  expect(payload.text).toContain('Permission request from claude');
+});
+
+test('hatchParseMode gates on isHatchPermissionRequest, same as buildButtonMessage', () => {
+  expect(hatchParseMode({
+    requestId: 'hatch-block-reset-hard-aaaaaaaaaaaa',
+    agent: 'claude',
+    kind: 'permission',
+    question: 'x',
+  })).toBe('HTML');
+  expect(hatchParseMode({
+    requestId: 'p_plain',
+    agent: 'claude',
+    kind: 'permission',
+    question: 'x',
+  })).toBeUndefined();
+});
+
+test('hatchAbandonedPermissionText escapes its own literal <justification> placeholder so parse_mode: HTML never rejects the edit', () => {
+  const hatchReq: ButtonRequest = {
+    requestId: 'hatch-block-reset-hard-aaaaaaaaaaaa',
+    agent: 'claude',
+    kind: 'permission',
+    question: '<b>Hatch approval request</b>',
+  };
+  const text = hatchAbandonedPermissionText(hatchReq, 'block-reset-hard');
+  // The ORIGINAL prompt (buildQuestionText's hatch early-return) rides through verbatim —
+  // it is agent-tools' own pre-escaped HTML, not this function's concern.
+  expect(text).toContain('<b>Hatch approval request</b>');
+  // The status suffix hand-authors a literal `="<justification>"` placeholder — sent under
+  // parse_mode: 'HTML' (hatchParseMode), an unescaped `<justification>` is an unrecognized
+  // Telegram tag and the WHOLE edit gets rejected with a 400, silently dropped by botPost.
+  // Escaped, it renders as the literal placeholder text a human is meant to read.
+  expect(text).toContain('&lt;justification&gt;');
+  expect(text).not.toContain('="<justification>"');
+});
+
+test('hatchApprovalRecordedText escapes the same literal <justification> placeholder as hatchAbandonedPermissionText', () => {
+  const hatchReq: ButtonRequest = {
+    requestId: 'hatch-block-reset-hard-aaaaaaaaaaaa',
+    agent: 'claude',
+    kind: 'permission',
+    question: '<b>Hatch approval request</b>',
+  };
+  const text = hatchApprovalRecordedText(hatchReq, 'block-reset-hard', 'Approve');
+  expect(text).toContain('<b>Hatch approval request</b>');
+  expect(text).toContain('&lt;justification&gt;');
+  expect(text).not.toContain('="<justification>"');
 });
 
 test('questionCapability is explicit: claude/codex/opencode/omp support buttons, pi/aider are limited', () => {
@@ -335,6 +411,28 @@ test('parseQuestionCloseCallback accepts only close-card callbacks', () => {
   expect(parseQuestionCloseCallback('tgqc:q_123')).toEqual({ requestId: 'q_123' });
   expect(parseQuestionCloseCallback('tgq:q_123:o1')).toBe(null);
   expect(parseQuestionCloseCallback('tgqc:')).toBe(null);
+});
+
+test('parseDecisionReplyToken recognizes affirmative/negative tokens, case/whitespace-insensitive', () => {
+  expect(parseDecisionReplyToken('yes')).toBe('allow');
+  expect(parseDecisionReplyToken('YES')).toBe('allow');
+  expect(parseDecisionReplyToken('  ok  ')).toBe('allow');
+  expect(parseDecisionReplyToken('go')).toBe('allow');
+  expect(parseDecisionReplyToken('да')).toBe('allow');
+  expect(parseDecisionReplyToken('но')).toBe(null);
+  expect(parseDecisionReplyToken('no')).toBe('deny');
+  expect(parseDecisionReplyToken('stop')).toBe('deny');
+  expect(parseDecisionReplyToken('нет')).toBe('deny');
+  expect(parseDecisionReplyToken('maybe later')).toBe(null);
+  expect(parseDecisionReplyToken('')).toBe(null);
+});
+
+test('parseDecisionReplyToken: Object.prototype keys never resolve as a decision (prototype-pollution guard)', () => {
+  expect(parseDecisionReplyToken('constructor')).toBe(null);
+  expect(parseDecisionReplyToken('toString')).toBe(null);
+  expect(parseDecisionReplyToken('__proto__')).toBe(null);
+  expect(parseDecisionReplyToken('hasOwnProperty')).toBe(null);
+  expect(parseDecisionReplyToken('valueOf')).toBe(null);
 });
 
 test('resolveButtonCallback maps option callbacks to labels', () => {

@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { stepUpdates, type StepOpts } from '../features/tg-ctl/updates';
+import { stepUpdates, buildReplyInject, type StepOpts } from '../features/tg-ctl/updates';
 import { DEFAULT_CONTROL, type ControlConfig, type TgMessage, type TgUpdate } from '../features/tg-ctl/types';
 
 const CHAT_ID = 1000;
@@ -269,6 +269,147 @@ test('text reply to a post-timeout question card is routed as the deferred answe
     },
     { kind: 'ack', messageId: 99 },
   ]);
+});
+
+// --- plain-text-reply-as-decision for permission cards ---
+
+test('an affirmative text reply to a decidable permission card resolves as allow', () => {
+  const r = stepUpdates(
+    [
+      upd(101, {
+        text: 'yes',
+        reply_to_message: {
+          message_id: 60,
+          chat: { id: CHAT_ID },
+          date: NOW - 30,
+          text: 'Permission from claude\n\nRun `git push --force`?',
+        },
+      }),
+    ],
+    makeOpts({ permissionRequestIdForMessage: (messageId) => (messageId === 60 ? 'perm_1' : null) }),
+  );
+  expect(r.actions).toEqual([
+    { kind: 'answer-question', callbackQueryId: '', requestId: 'perm_1', value: 'allow', messageId: 60 },
+    { kind: 'ack', messageId: 101 },
+  ]);
+});
+
+test('a negative text reply to a decidable permission card resolves as deny', () => {
+  const r = stepUpdates(
+    [
+      upd(102, {
+        text: 'no',
+        reply_to_message: {
+          message_id: 60,
+          chat: { id: CHAT_ID },
+          date: NOW - 30,
+          text: 'Permission from claude\n\nRun `git push --force`?',
+        },
+      }),
+    ],
+    makeOpts({ permissionRequestIdForMessage: (messageId) => (messageId === 60 ? 'perm_1' : null) }),
+  );
+  expect(r.actions).toEqual([
+    { kind: 'answer-question', callbackQueryId: '', requestId: 'perm_1', value: 'deny', messageId: 60 },
+    { kind: 'ack', messageId: 102 },
+  ]);
+});
+
+test('an unrecognized reply body to a decidable permission card falls through unconsumed', () => {
+  const r = stepUpdates(
+    [
+      upd(103, {
+        text: 'maybe later',
+        reply_to_message: {
+          message_id: 60,
+          chat: { id: CHAT_ID },
+          date: NOW - 30,
+          text: 'Permission from claude\n\nRun `git push --force`?',
+        },
+      }),
+    ],
+    makeOpts({ permissionRequestIdForMessage: (messageId) => (messageId === 60 ? 'perm_1' : null) }),
+  );
+  expect(r.actions.some((a) => a.kind === 'answer-question')).toBe(false);
+  expect(r.actions[0]).toEqual({
+    kind: 'reply-route',
+    replyToMessageId: 60,
+    injectText: buildReplyInject(upd(103, {
+      text: 'maybe later',
+      reply_to_message: {
+        message_id: 60,
+        chat: { id: CHAT_ID },
+        date: NOW - 30,
+        text: 'Permission from claude\n\nRun `git push --force`?',
+      },
+    }).message!, 'Alex', makeOpts()),
+    from: 'Alex',
+    messageId: 103,
+  });
+});
+
+test('a decision reply token is case-insensitive and tolerates surrounding whitespace', () => {
+  const opts = makeOpts({ permissionRequestIdForMessage: (messageId) => (messageId === 60 ? 'perm_1' : null) });
+  const reply = { message_id: 60, chat: { id: CHAT_ID }, date: NOW - 30, text: 'Permission from claude\n\nProceed?' };
+  const rUpper = stepUpdates([upd(104, { text: 'YES', reply_to_message: reply })], opts);
+  expect(rUpper.actions[0]).toEqual({
+    kind: 'answer-question',
+    callbackQueryId: '',
+    requestId: 'perm_1',
+    value: 'allow',
+    messageId: 60,
+  });
+  const rPadded = stepUpdates([upd(105, { text: '  Ok  ', reply_to_message: reply })], opts);
+  expect(rPadded.actions[0]).toEqual({
+    kind: 'answer-question',
+    callbackQueryId: '',
+    requestId: 'perm_1',
+    value: 'allow',
+    messageId: 60,
+  });
+});
+
+test('cyrillic decision tokens resolve allow/deny', () => {
+  const opts = makeOpts({ permissionRequestIdForMessage: (messageId) => (messageId === 60 ? 'perm_1' : null) });
+  const reply = { message_id: 60, chat: { id: CHAT_ID }, date: NOW - 30, text: 'Permission from claude\n\nProceed?' };
+  for (const [token, value] of [
+    ['да', 'allow'],
+    ['ок', 'allow'],
+    ['го', 'allow'],
+    ['нет', 'deny'],
+  ] as const) {
+    const r = stepUpdates([upd(106, { text: token, reply_to_message: reply })], opts);
+    expect(r.actions[0]).toEqual({
+      kind: 'answer-question',
+      callbackQueryId: '',
+      requestId: 'perm_1',
+      value,
+      messageId: 60,
+    });
+  }
+});
+
+test('a valid decision token to a non-decidable message_id falls through normally', () => {
+  const r = stepUpdates(
+    [
+      upd(107, {
+        text: 'yes',
+        reply_to_message: { message_id: 61, chat: { id: CHAT_ID }, date: NOW - 30, text: 'unrelated message' },
+      }),
+    ],
+    makeOpts({ permissionRequestIdForMessage: () => null }),
+  );
+  expect(r.actions.some((a) => a.kind === 'answer-question')).toBe(false);
+  expect(r.actions[0]).toEqual({
+    kind: 'reply-route',
+    replyToMessageId: 61,
+    injectText: buildReplyInject(upd(107, {
+      text: 'yes',
+      reply_to_message: { message_id: 61, chat: { id: CHAT_ID }, date: NOW - 30, text: 'unrelated message' },
+    }).message!, 'Alex', makeOpts()),
+    from: 'Alex',
+    messageId: 107,
+  });
 });
 
 // --- sender allowlist (spec §9: from.id, not chat id) ---

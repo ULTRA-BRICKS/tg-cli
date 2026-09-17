@@ -3,6 +3,60 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.52.8
+
+**Feat (tg-cli#402): resolve permission cards via a plain-text reply.**
+
+- A plain-text REPLY to a PENDING or still-answerable-abandoned permission card (covers hatch
+  cards, but works for any permission-kind, non-multiQuestion card) resolves it exactly like
+  tapping Allow/Deny — no button tap required. Recognized tokens (case-insensitive, trimmed):
+  affirmative `t/y/yes/yep/yeah/ya/ok/okay/k/go/да/ок/го` → allow; negative
+  `n/no/nope/nah/stop/deny/нет` → deny (`parseDecisionReplyToken`,
+  `features/tg-ctl/questions.ts`).
+- Implemented by synthesizing the existing `'answer-question'` Action from the reply, with an
+  empty-string `callbackQueryId` sentinel — the SAME downstream code a real button tap hits
+  (`resolveButtonCallback`, the hook-socket delivery, the card edit, `flushDeferred`). No new
+  Action kind. `answerCallbackQuery` now no-ops on the empty sentinel (there is no real Telegram
+  callback query to acknowledge; the card's own edit is the visible feedback).
+- An unrecognized reply body, or a reply to a message that isn't a currently-decidable
+  permission card, falls straight through to the existing reply-route / post-timeout-question
+  handling unchanged — never hijacks an unrelated reply.
+- A failure branch that reports its outcome ONLY via the toast (expired / already-answered /
+  mismatched card, or an omp ACP reply failure) can't rely on the empty-sentinel no-op — that
+  would silently swallow the human's "yes" with no feedback at all. Those call sites now fall
+  back to a plain chat reply carrying the same text (`answerCallbackQueryOrNotify`); a success
+  branch that already edits the card is unaffected.
+- `DECISION_REPLY_TOKENS` is built on a null-prototype object so a reply body like
+  `"constructor"`/`"__proto__"`/`"toString"` can never resolve through `Object.prototype` to a
+  spurious truthy value.
+
+## 1.52.7
+
+**Feat (tg-cli#402): render hatch approval cards as HTML.**
+
+- `buildButtonMessage()` skips the generic heading/source/title wrapper for a hatch-permission
+  request (`isHatchPermissionRequest`) and renders its `question` field verbatim with
+  `parse_mode: 'HTML'` — the companion `agent-tools` change emits a structured HTML card
+  (title/agent/branch/path/hook/justification up top, the rest collapsed in a
+  `<blockquote expandable>`) instead of a plain-text wall.
+- `parse_mode` threads through every Telegram API call site that can post or edit a hatch
+  card's text across its whole lifecycle: the initial `forwardAndPostQuestion`/
+  `ompPermissionSink` sends, the hook-reconnect `editMessageText` card restore, and every
+  status edit that concatenates the raw HTML body onto a plain-text suffix (abandoned,
+  long-outage, queued-decision recorded/delivered, a live tap) — a headless hatch request's
+  process exits almost immediately, so the abandon-edit is the NORMAL path, not an edge case,
+  and omitting `parse_mode` there would garble a freshly-rendered card back to literal
+  `<b>`/`<code>` tags within seconds of posting (review finding).
+- Each status builder's plain-text suffix is HTML-escaped (`hatchSafeStatus`) before riding
+  along with the raw HTML body under the same `parse_mode: 'HTML'` — two of them embed a
+  literal `="<justification>"` placeholder that would otherwise break Telegram's entity parser
+  and silently drop the edit.
+- Every other request kind (including plan approval) is unaffected — `parse_mode` stays unset,
+  the existing "Permission request from …" wrapper stays byte-identical.
+- **Deployment order:** must ship AFTER the sibling `agent-tools` PR. Shipping this first would
+  have Telegram reject hatch cards outright (400) on unescaped `&`/`<`/`>` in the old plain-text
+  `_question()` output.
+
 ## 1.52.6
 
 **Fix (tg-cli omp delivery reliability): restore wedged-ACP-client eviction under fire-and-forget delivery, and fix a silent lsof timeout in live-session discovery.**
