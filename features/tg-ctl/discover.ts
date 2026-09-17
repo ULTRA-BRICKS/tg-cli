@@ -72,12 +72,55 @@ function basename(path: string): string {
   return idx === -1 ? path : path.slice(idx + 1);
 }
 
+function isOmpFilenameStem(t: string | undefined): boolean {
+  if (!t) return false;
+  const stem = basename(t);
+  const dot = stem.lastIndexOf('.');
+  return (dot > 0 ? stem.slice(0, dot) : stem) === 'omp';
+}
+
+// omp run FROM SOURCE via its own JS runtime — argv0 'bun', not 'omp' — as
+// `bun --preload <...>/scripts/omp.ts <...>/src/cli.ts` (the real dev-checkout
+// launcher) or `bun <path>/bin/omp acp ...` (a dev/test PATH shim, no flags at
+// all). Only bun's LEADING run of `--preload`/`--preload=<value>` flags (the
+// flag region before the script positional) is scanned for an omp-stemmed
+// value, plus `tokens[1]` itself for the flagless shim shape — never a wider
+// scan of the whole command line, which produces false positives on unrelated
+// bun invocations merely containing an `omp`-stemmed token elsewhere in argv
+// (see CHANGELOG 1.52.11). Scanning the whole leading `--preload` run, not
+// just the first flag, tolerates any ordering of chained preloads (e.g. a
+// timing/instrumentation preload alongside omp's own) without reopening that
+// false-positive surface: the scan still stops at the first token that isn't
+// itself a `--preload` flag, which any false-positive command hits immediately
+// (its `tokens[1]` is a subcommand/script, not `--preload`). Known limitation
+// (accepted, not fixable at this layer): `ps` flattens argv to a single
+// string, so a checkout path containing a space splits across multiple tokens
+// and this match silently misses — same limitation every whitespace-split
+// check in this file already has.
+function isBunOmpLaunch(tokens: string[]): boolean {
+  if (isOmpFilenameStem(tokens[1])) return true;
+  let i = 1;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (t === '--preload') {
+      if (isOmpFilenameStem(tokens[i + 1])) return true;
+      i += 2;
+    } else if (t.startsWith('--preload=')) {
+      if (isOmpFilenameStem(t.slice('--preload='.length))) return true;
+      i += 1;
+    } else {
+      break;
+    }
+  }
+  return false;
+}
+
 // Match a single process command line to an agent. Shells (-zsh, bash, …) and
 // everything else fall through to null — they are traversed, never matched.
 export function matchAgentCommand(command: string): AgentKind | null {
   const trimmed = command.trim();
-  const argv0 = trimmed.split(/\s+/, 1)[0] ?? '';
-  const base = basename(argv0);
+  const tokens = trimmed.split(/\s+/);
+  const base = basename(tokens[0] ?? '');
   // claude also matches via a wrapper argv0 (e.g. `node …/.claude/local/claude --resume`).
   if (
     base === 'claude' ||
@@ -98,10 +141,13 @@ export function matchAgentCommand(command: string): AgentKind | null {
   // a merely-containing binary ('ompi-info') never matches. Worker helpers
   // (`__omp_worker_daemon_broker`, `__omp_worker_js_eval_process`) share the
   // same argv0 — they are not the user session (243 still matches the TUI).
+  // This is shape 1 of 2: `isBunOmpLaunch` below recognizes omp run FROM
+  // SOURCE via bun, where argv0 is 'bun', not 'omp'.
+  const isOmpWorker = /\b__omp_worker_/.test(trimmed);
   if (base === 'omp') {
-    if (/\b__omp_worker_/.test(trimmed)) return null;
-    return 'omp';
+    return isOmpWorker ? null : 'omp';
   }
+  if (base === 'bun' && !isOmpWorker && isBunOmpLaunch(tokens)) return 'omp';
   return null;
 }
 

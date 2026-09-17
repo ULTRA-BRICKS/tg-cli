@@ -266,6 +266,22 @@ test('finds omp through an intermediate shell (omp → bash -lc → tg)', () => 
   expect(findAgentInAncestry(procs, 760)).toEqual({ agent: 'omp', pid: 750 });
 });
 
+test('finds omp run from source via bun --preload through an intermediate shell (tg-cli#413 follow-up)', () => {
+  // Outbound branding for a bun-source-invoked omp session: `tg` running as a
+  // subprocess of the session must still resolve the omp ancestor, not just
+  // the compiled-binary shape.
+  const procs = [
+    proc(
+      750,
+      1,
+      'bun --preload /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/omp.ts /Users/u/xp/oh-my-pi/packages/coding-agent/src/cli.ts',
+    ),
+    proc(760, 750, 'bash -lc tg "status"'),
+    proc(770, 760, 'tg status'),
+  ];
+  expect(findAgentInAncestry(procs, 760)).toEqual({ agent: 'omp', pid: 750 });
+});
+
 test('a background ollama daemon is NOT in the ancestry, so it never matches', () => {
   // The whole point of the fix: ollama runs as a sibling daemon, not an
   // ancestor of tg, so ancestry returns null and the caller must NOT pick it.

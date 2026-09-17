@@ -67,6 +67,95 @@ test('matchAgentCommand does not treat omp worker helpers as the user session', 
   expect(matchAgentCommand('/opt/homebrew/bin/omp __omp_worker_js_eval_process')).toBeNull();
 });
 
+test('matchAgentCommand recognizes omp run from source via bun --preload (tg-cli#413 follow-up)', () => {
+  expect(
+    matchAgentCommand(
+      'bun --preload /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/omp.ts /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/../src/cli.ts',
+    ),
+  ).toBe('omp');
+});
+
+test('matchAgentCommand recognizes bun --preload=value (equals form, verified bun accepts it)', () => {
+  expect(
+    matchAgentCommand(
+      'bun --preload=/Users/u/xp/oh-my-pi/packages/coding-agent/scripts/omp.ts /Users/u/xp/oh-my-pi/packages/coding-agent/src/cli.ts',
+    ),
+  ).toBe('omp');
+});
+
+test('matchAgentCommand recognizes a bun-invoked omp PATH shim (test fixture shape)', () => {
+  expect(
+    matchAgentCommand(
+      'bun /var/folders/xyz/T/tgctl-omp-anchor-Abc123/bin/omp acp --allow-home --cwd=/Users/u/work/review-cli',
+    ),
+  ).toBe('omp');
+});
+
+test('matchAgentCommand still excludes omp worker helpers when launched via bun', () => {
+  // Fixtures must actually reach isBunOmpLaunch's true branch first (real
+  // preload/shim shape) so the assertion exercises the !isOmpWorker guard
+  // itself, not just "this doesn't look like an omp launch at all".
+  expect(
+    matchAgentCommand(
+      'bun --preload /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/omp.ts /Users/u/xp/oh-my-pi/packages/coding-agent/src/cli.ts __omp_worker_daemon_broker',
+    ),
+  ).toBeNull();
+  expect(
+    matchAgentCommand(
+      'bun /var/folders/xyz/T/tgctl-omp-anchor-Abc123/bin/omp __omp_worker_js_eval_process',
+    ),
+  ).toBeNull();
+});
+
+test('matchAgentCommand does not misclassify an unrelated bun script', () => {
+  expect(matchAgentCommand('bun /Users/u/some/project/scripts/build.ts')).toBeNull();
+});
+
+test('matchAgentCommand does not misclassify a bun command with a bare "omp" argument elsewhere in argv', () => {
+  // Only --preload's value or bun's direct script argument (tokens[1]) count — a
+  // bare 'omp' token anywhere else in argv must never trigger a false positive
+  // (caught in review: an early draft scanned every whitespace token).
+  expect(matchAgentCommand('bun run scripts/deploy.ts --target omp')).toBeNull();
+  expect(matchAgentCommand('bun test --grep omp')).toBeNull();
+  expect(matchAgentCommand('bun x omp --help')).toBeNull();
+});
+
+test('matchAgentCommand does not misclassify a LATER --preload flag pointing at an unrelated omp-named file (review round 2)', () => {
+  // bun's own --preload flag works on subcommands too (e.g. `bun test --preload
+  // <file>`) — at a position OTHER than tokens[1]. Only a --preload immediately
+  // at tokens[1] (the real omp launcher's exact shape) counts; a --preload
+  // appearing later, pointing at an unrelated file that happens to be named
+  // omp.ts, must never trigger a false positive.
+  expect(matchAgentCommand('bun test --preload ./test/omp.ts')).toBeNull();
+  expect(matchAgentCommand('bun run deploy.ts --preload omp.ts')).toBeNull();
+});
+
+test('matchAgentCommand recognizes the PI_TIMING chained double --preload (omp.ts stays at tokens[2])', () => {
+  // scripts/omp in the oh-my-pi repo, under PI_TIMING, emits
+  // `run_bun --preload "$preload" --preload "$timing_preload" "$cli" "$@"` —
+  // omp's own --preload is always FIRST, so omp.ts stays at tokens[2] and the
+  // timing preload at tokens[4] is never (and need not be) inspected.
+  expect(
+    matchAgentCommand(
+      'bun --preload /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/omp.ts --preload /Users/u/xp/oh-my-pi/utils/src/module-timer.ts /Users/u/xp/oh-my-pi/packages/coding-agent/src/cli.ts',
+    ),
+  ).toBe('omp');
+});
+
+test('matchAgentCommand still finds the omp preload even if a chained --preload precedes it', () => {
+  // Robustness beyond the currently-observed launcher order: the whole LEADING
+  // run of --preload flags is scanned (never past the first non-preload
+  // token), so a hypothetical future reordering of chained preloads still
+  // resolves — without reopening the later-position false-positive class
+  // (bun test --preload ./test/omp.ts stays null: tokens[1] is 'test', not
+  // '--preload', so the scan never starts).
+  expect(
+    matchAgentCommand(
+      'bun --preload /Users/u/xp/oh-my-pi/utils/src/module-timer.ts --preload /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/omp.ts /Users/u/xp/oh-my-pi/packages/coding-agent/src/cli.ts',
+    ),
+  ).toBe('omp');
+});
+
 test('finds omp in a pane whose pane_current_command is a version string, not omp', () => {
   // Claude Code panes report a version as pane_current_command; omp TUI may too.
   // Discovery walks the process tree, not the pane command string.
@@ -85,6 +174,40 @@ test('isOmpLiveSessionCommand keeps the interactive TUI and drops acp/print/work
   expect(isOmpLiveSessionCommand('omp -p "hi"')).toBe(false);
   expect(isOmpLiveSessionCommand('omp --print hi')).toBe(false);
   expect(isOmpLiveSessionCommand('omp __omp_worker_daemon_broker')).toBe(false);
+});
+
+test('isOmpLiveSessionCommand drops bun-invoked acp/print/workers too (tg-cli#413 follow-up)', () => {
+  // The daemon spawns its own ACP child as exactly one of these bun shapes on a
+  // machine where omp runs from source or via a PATH shim. Now that
+  // matchAgentCommand classifies them as 'omp', this exclusion is the ONLY thing
+  // stopping findLiveOmpAgents from listing the daemon's own ACP child as a live
+  // agent and routing inbound Telegram messages into it.
+  expect(
+    isOmpLiveSessionCommand(
+      'bun --preload /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/omp.ts /Users/u/xp/oh-my-pi/packages/coding-agent/src/cli.ts acp --no-session',
+    ),
+  ).toBe(false);
+  expect(
+    isOmpLiveSessionCommand(
+      'bun /var/folders/xyz/T/tgctl-omp-anchor-Abc123/bin/omp acp --allow-home --cwd=/Users/u/work/review-cli',
+    ),
+  ).toBe(false);
+  expect(
+    isOmpLiveSessionCommand(
+      'bun --preload /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/omp.ts /Users/u/xp/oh-my-pi/packages/coding-agent/src/cli.ts -p --auto-approve',
+    ),
+  ).toBe(false);
+  expect(
+    isOmpLiveSessionCommand(
+      'bun --preload /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/omp.ts /Users/u/xp/oh-my-pi/packages/coding-agent/src/cli.ts __omp_worker_daemon_broker',
+    ),
+  ).toBe(false);
+  // The interactive bun-source shape itself DOES count as a live session.
+  expect(
+    isOmpLiveSessionCommand(
+      'bun --preload /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/omp.ts /Users/u/xp/oh-my-pi/packages/coding-agent/src/cli.ts',
+    ),
+  ).toBe(true);
 });
 
 test('isPrimaryOmpSessionFile matches the session jsonl, never a nested subagent transcript', () => {
@@ -176,6 +299,21 @@ test('findLiveOmpAgents includes a headless omp session entirely absent from the
   const agents = findLiveOmpAgents(panes, procs, new Map());
   expect(agents).toHaveLength(1);
   expect(agents[0].paneId).toBeNull();
+});
+
+test('findLiveOmpAgents discovers omp run from source via bun --preload, no tty, no tmux pane (tg-cli#413 follow-up)', () => {
+  const panes: PaneInfo[] = [];
+  const procs = [
+    proc(1, 0, '/sbin/launchd'),
+    proc(
+      73711,
+      1,
+      'bun --preload /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/omp.ts /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/../src/cli.ts',
+    ),
+  ];
+  const agents = findLiveOmpAgents(panes, procs, new Map());
+  expect(agents).toHaveLength(1);
+  expect(agents[0]).toMatchObject({ pid: 73711, paneId: null, tty: null });
 });
 
 test('liveOmpLabel prefers omp session title over cwd basename', () => {
