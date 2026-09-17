@@ -34,13 +34,19 @@ import { matchAgentCommand } from './discover';
 export interface UnreachableAgent {
   pid: number;
   agent: AgentKind;
-  tty: string;
+  tty: string | null;
   command: string;
   name: string | null; // the `--name` value as typed (unsanitized), null when absent
   cwd: string | null; // resolved by the caller (lsof); null when unresolvable
 }
 
-// `ps -axo pid=,tty=` → pid → tty. A tty of `??` (macOS) / `?` (Linux) means NO
+// "No controlling terminal" sentinels `ps` prints for the tty column: `?` (Linux),
+// `??` (macOS), `-` (some BSDs). Shared by `parsePidTtyList` (drops these rows outright)
+// and `normalizeTty` (collapses them to a display `null`) so the two can't silently
+// diverge on what counts as "no tty".
+const NO_TTY_SENTINELS = new Set(['?', '??', '-']);
+
+// `ps -axo pid=,tty=` → pid → tty. A sentinel tty (see `NO_TTY_SENTINELS`) means NO
 // controlling terminal (a daemon, a `-p` run under a tool, a launchd child) and is
 // dropped. Lines with extra tokens are skipped — this keeps the parser inert against
 // the legacy 3-column fake `ps` scripts the integration suite ships (they ignore
@@ -51,10 +57,20 @@ export function parsePidTtyList(out: string): Map<number, string> {
     const m = line.match(/^\s*(\d+)\s+(\S+)\s*$/);
     if (!m) continue;
     const tty = m[2];
-    if (tty === '??' || tty === '?' || tty === '-') continue;
+    if (NO_TTY_SENTINELS.has(tty)) continue;
     ttyByPid.set(Number(m[1]), tty);
   }
   return ttyByPid;
+}
+
+// Normalize a raw `ttyByPid` value into a display/gating value: no map entry, or any
+// `NO_TTY_SENTINELS` value, collapses to null. Shared by `findUnreachableAgents` here and
+// `findLiveOmpAgents` in `omp.ts` so the sentinel list can't silently diverge between the
+// two discovery paths — and so a caller that hands either function a RAW, un-parsed map
+// (as `ctl-omp-acp.test.ts` already does for `findLiveOmpAgents`) gets the same sentinel
+// treatment `parsePidTtyList` would have applied, both for display AND for gating.
+export function normalizeTty(tty: string | undefined): string | null {
+  return tty && !NO_TTY_SENTINELS.has(tty) ? tty : null;
 }
 
 // `lsof -a -p <pid> -d cwd -Fn` prints field lines: `p<pid>`, `fcwd`, `n<path>`.
@@ -120,14 +136,27 @@ interface CommandShape {
   headlessOptions: Set<string>; // an option that makes the run a one-shot / helper
   headlessSubcommands: Set<string>; // the FIRST positional word with the same meaning
   valueOptions: Set<string>; // options that ALWAYS take a value — the value is skipped
+  // True when this harness's headless/one-shot shapes are enumerated above, so
+  // `isInteractiveAgentCommand` alone can tell a genuinely interactive session apart
+  // from a cron/launchd one-shot. False (ALWAYS_INTERACTIVE_SHAPE) means tg-ctl has NO
+  // per-shape headless detection for this kind — a controlling tty remains the only
+  // signal `findUnreachableAgents` has, so it is still required there (tg-cli#413
+  // follow-up: removing the tty requirement is only safe for a headless-aware shape).
+  headlessAware: boolean;
 }
 // tg-ctl's own launcher flags, understood by every harness row (claude-rotate passes
 // `--name <label>` to whichever binary it starts): applied on top of each shape so a
 // label like `daemon`/`exec`/`run` is never read as a subcommand.
 const LAUNCHER_VALUE_OPTIONS = new Set(['--name']);
 const CLAUDE_SHAPE: CommandShape = {
+  headlessAware: true,
   headlessOptions: new Set(['--print', '-p', '--bg', '--background']),
-  headlessSubcommands: new Set(['daemon', 'bg-pty-host', 'bg-spare']),
+  // `mcp` mirrors codex/opencode's own row below — `claude mcp serve`/`claude mcp list`
+  // are one-shot/server subcommands, never the interactive TUI (tg-cli#413 follow-up
+  // review: this table is now load-bearing for headless-aware kinds, not just a tty
+  // tie-breaker, so a missing row here is a false-positive unreachable listing, not
+  // merely a missed tty-present one).
+  headlessSubcommands: new Set(['daemon', 'bg-pty-host', 'bg-spare', 'mcp']),
   // `-r/--resume [id]` and `-w/--worktree [name]` take an OPTIONAL value (verified in
   // `claude --help`), so they are deliberately NOT here: a value-less `-w` followed by a
   // real subcommand must still reach that subcommand. Their optional value is a plain
@@ -139,18 +168,23 @@ const CLAUDE_SHAPE: CommandShape = {
   ]),
 };
 const CODEX_SHAPE: CommandShape = {
+  headlessAware: true,
   headlessOptions: new Set<string>(),
   headlessSubcommands: new Set(['exec', 'e', 'login', 'logout', 'mcp', 'app-server', 'apply', 'completion', 'debug', 'sandbox', 'features']),
   valueOptions: new Set(['-c', '--config', '-m', '--model', '-p', '--profile', '-s', '--sandbox', '-a', '--ask-for-approval', '-C', '--cd', '--add-dir', '-i', '--image']),
 };
 const OPENCODE_SHAPE: CommandShape = {
+  headlessAware: true,
   headlessOptions: new Set<string>(),
   headlessSubcommands: new Set(['run', 'serve', 'web', 'acp', 'auth', 'agent', 'upgrade', 'export', 'import', 'github', 'models', 'stats', 'mcp']),
   valueOptions: new Set(['-m', '--model', '--agent', '-s', '--session', '--port', '--hostname', '--prompt']),
 };
 // Harnesses tg-ctl knows only by name (no headless mode it can tell apart): every
-// invocation with a tty counts as interactive.
+// invocation with a tty counts as interactive. Not headless-aware — `findUnreachableAgents`
+// keeps requiring a real tty map entry for these kinds (pi/aider/omp/unknown), since a tty
+// is the only signal that separates a live session from a one-shot cron/launchd invocation.
 const ALWAYS_INTERACTIVE_SHAPE: CommandShape = {
+  headlessAware: false,
   headlessOptions: new Set<string>(),
   headlessSubcommands: new Set<string>(),
   valueOptions: new Set<string>(),
@@ -225,13 +259,26 @@ function pidsUnderPanes(panes: PaneInfo[], procs: ProcInfo[]): Set<number> {
   return covered;
 }
 
-// Interactive agent processes (a controlling tty, no `--print`/helper shape) that sit
-// in NO tmux pane's process tree. A proc whose IMMEDIATE PARENT is itself a matched
-// agent (a `node …/claude` launcher wrapping the real binary) is folded into that
-// parent, so a wrapper + binary pair yields one agent, not two. Only the direct parent
-// counts: a session started from another agent's shell tool (a nested `claude` a few
-// hops below a `claude`) is a DISTINCT agent and must stay listed — verified live: the
-// first cut folded on any ancestor and hid exactly the test session (tg-cli#306).
+// Interactive agent processes that sit in NO tmux pane's process tree. A proc whose
+// IMMEDIATE PARENT is itself a matched agent (a `node …/claude` launcher wrapping the
+// real binary) is folded into that parent, so a wrapper + binary pair yields one agent,
+// not two. Only the direct parent counts: a session started from another agent's shell
+// tool (a nested `claude` a few hops below a `claude`) is a DISTINCT agent and must stay
+// listed — verified live: the first cut folded on any ancestor and hid exactly the test
+// session (tg-cli#306).
+//
+// Past bug (tg-cli#413 follow-up): for claude/codex/opencode this used to additionally
+// require a `ttyByPid` entry ("drop anything with no controlling terminal"), which
+// silently dropped a genuinely live, fully headless session (launched detached, no tty
+// at all — e.g. under launchd/a daemon supervisor) even though delivery here never needs
+// a tty: the whole mechanism is the Stop-hook inbox (pid/cwd/name only).
+// `isInteractiveAgentCommand` already independently excludes headless CLI *shapes*
+// (`--print`, `daemon`, `exec`, …) for those three harnesses, so the tty requirement
+// added nothing but a silent drop THERE. A tty is still required for pi/aider/omp/unknown
+// (`ALWAYS_INTERACTIVE_SHAPE`, `headlessAware: false`): tg-ctl has no per-shape headless
+// detection for them, so a real tty remains the only signal that separates a live session
+// from a one-shot cron/launchd invocation. `ttyByPid` is otherwise consulted only to fill
+// the optional display field, mirroring the sibling `findLiveOmpAgents` in `omp.ts`.
 // `cwd` is left null — the caller resolves it (lsof) because it is I/O.
 export function findUnreachableAgents(
   panes: PaneInfo[],
@@ -243,10 +290,11 @@ export function findUnreachableAgents(
   for (const p of procs) byPid.set(p.pid, p);
   const matched = new Map<number, AgentKind>();
   for (const p of procs) {
-    const tty = ttyByPid.get(p.pid);
-    if (!tty || covered.has(p.pid)) continue;
+    if (covered.has(p.pid)) continue;
     const agent = matchAgentCommand(p.command);
     if (!agent || !isInteractiveAgentCommand(p.command, agent)) continue;
+    const needsTty = !shapeFor(agent).headlessAware;
+    if (needsTty && normalizeTty(ttyByPid.get(p.pid)) === null) continue;
     matched.set(p.pid, agent);
   }
   const out: UnreachableAgent[] = [];
@@ -256,7 +304,7 @@ export function findUnreachableAgents(
     out.push({
       pid,
       agent,
-      tty: ttyByPid.get(pid)!,
+      tty: normalizeTty(ttyByPid.get(pid)),
       command: proc.command,
       name: parseAgentNameFromCommand(proc.command),
       cwd: null,
@@ -314,7 +362,7 @@ export function matchUnreachable(selector: string, agents: UnreachableAgent[]): 
 // One status line per unreachable agent (used by `tg-ctl status` and /status).
 export function describeUnreachable(a: UnreachableAgent, pendingCount: number): string {
   const label = unreachableLabel(a);
-  const parts = [`tty ${a.tty}`, `cwd ${a.cwd ?? '?'}`, `name ${a.name ?? '-'}`, `pid ${a.pid}`];
+  const parts = [`tty ${a.tty ?? 'none'}`, `cwd ${a.cwd ?? '?'}`, `name ${a.name ?? '-'}`, `pid ${a.pid}`];
   const pending = pendingCount > 0 ? `, ${pendingCount} queued` : '';
   return `${label} · ${a.agent} — unreachable: not in tmux (${parts.join(', ')})${pending}`;
 }
@@ -339,7 +387,7 @@ export function noAgentReplyText(legacy: string, agents: UnreachableAgent[]): st
 // The reply after a message was queued to an unreachable agent's inbox.
 export function queuedReplyText(a: UnreachableAgent): string {
   return (
-    `${unreachableLabel(a)} is running outside tmux (tty ${a.tty}, cwd ${a.cwd ?? '?'}) — queued to its ` +
+    `${unreachableLabel(a)} is running outside tmux (tty ${a.tty ?? 'none'}, cwd ${a.cwd ?? '?'}) — queued to its ` +
     'Stop-hook inbox; delivered when the agent next ends a turn (an idle agent receives it only at its ' +
     'next turn). You get a 👌 reaction on this message once it is delivered.'
   );

@@ -34,7 +34,7 @@ import { matchAgentCommand } from './discover';
 import type { AgentKind, PaneInfo, ProcInfo } from './types';
 import type { ButtonOption, ButtonRequest } from './questions';
 import { uniqueProjectSelectorHits, type AgentCandidate } from './agent-match';
-import { parseAgentNameFromCommand } from './unreachable';
+import { normalizeTty, parseAgentNameFromCommand } from './unreachable';
 
 export interface LiveOmpAgent {
   pid: number;
@@ -201,7 +201,6 @@ export function findLiveOmpAgents(
   const out: LiveOmpAgent[] = [];
   for (const p of procs) {
     if (!isOmpLiveSessionCommand(p.command)) continue;
-    const tty = ttyByPid.get(p.pid) ?? null;
     const paneId = paneByPid.get(p.pid) ?? null;
     out.push({
       pid: p.pid,
@@ -210,7 +209,7 @@ export function findLiveOmpAgents(
       sessionId: null,
       title: null,
       paneId,
-      tty: tty && tty !== '?' && tty !== '??' ? tty : null,
+      tty: normalizeTty(ttyByPid.get(p.pid)),
       name: parseAgentNameFromCommand(p.command),
     });
   }

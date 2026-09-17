@@ -3,6 +3,15 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.52.11
+
+**Fix (tg-ctl unreachable-agent discovery, PR #413 follow-up): discover a fully headless claude/codex/opencode session with no controlling tty and no tmux pane.**
+
+- `findUnreachableAgents` (`features/tg-ctl/unreachable.ts`) required a tty map entry before treating an interactive claude/codex/opencode process as unreachable-but-visible ("drop anything with no controlling terminal"). This silently dropped a genuinely live, fully headless session (launched detached, no tty at all — e.g. under launchd/a daemon supervisor) even though delivery here never needs a tty: the whole mechanism is the Stop-hook inbox (pid/cwd/name only). `isInteractiveAgentCommand` already independently excludes headless CLI *shapes* (`--print`, `daemon`, `exec`, …) per harness, so the tty requirement added nothing but a silent drop — the same bug class PR #413 fixed for `findLiveOmpAgents`, never touched by that PR.
+- `listUnreachableAgents` (root `tg-ctl`) compounded the gap with `if (ttyByPid.size > 0) { ...scan... }` — skipping the ENTIRE unreachable-agent scan whenever the host has zero usable tty entries at all, exactly the live bug scenario. Removed the guard; it now unconditionally scans, matching the sibling `listLiveOmpAgents`.
+- `UnreachableAgent.tty` is now `string | null` (matching `LiveOmpAgent.tty`); `ttyByPid` is consulted only to fill this optional display field, never to gate inclusion, for the three harnesses with a per-shape headless table (claude/codex/opencode). `pi`/`aider`/`omp`/`unknown` have no such table (`ALWAYS_INTERACTIVE_SHAPE`), so a real tty remains the only signal that separates a live session from a one-shot cron/launchd invocation for them — unchanged. `describeUnreachable`/`queuedReplyText` render `tty none` for a null tty. New shared `normalizeTty` helper (used by both `unreachable.ts` and `omp.ts`) replaces a duplicated tty-sentinel ternary.
+- `CLAUDE_SHAPE.headlessSubcommands` gained `mcp` (mirroring the existing `codex`/`opencode` rows): with the tty backstop gone, this per-harness table is now the ONLY thing separating a real interactive claude session from a one-shot `claude mcp serve`/`claude mcp list` — review caught it missing `mcp`, which would have made a detached `claude mcp serve` show up as a phantom unreachable agent.
+
 ## 1.52.10
 
 **Fix (tg-ctl omp discovery, PR #405 follow-up): discover a headless omp session with no controlling tty and no tmux pane.**
