@@ -9585,7 +9585,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   const executeAction = async (action: Action, precedingOk: boolean): Promise<boolean> => {
     switch (action.kind) {
       case "reply":
-        await sendMessage(ctx, action.text)
+        await sendMessage(ctx, action.text, replyContext(action.threadId))
         return true
       case "answer-callback":
         await answerCallbackQuery(ctx, action.callbackQueryId, action.text)

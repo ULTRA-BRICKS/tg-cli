@@ -204,7 +204,7 @@ export type Action =
   // `!shell` reply it is the RAW `!…` text with no wrap/anchor (codex #192) so `!`
   // stays at column 0 for the harness passthrough while still routing to origin.
   | { kind: 'reply-route'; replyToMessageId: number; injectText: string; from: string; messageId: number }
-  | { kind: 'reply'; text: string } // sendMessage back to the chat
+  | { kind: 'reply'; text: string; threadId?: number | null } // sendMessage back to the chat (threadId: reply inside a bound topic)
   | { kind: 'answer-callback'; callbackQueryId: string; text: string }
   // messageId is the Telegram message the tapped button belongs to (null when
   // Telegram omits it); the daemon rejects taps whose message does not match

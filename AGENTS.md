@@ -177,7 +177,12 @@ tests can pass fakes.
   pane). Default ON; opt out per machine with `control.git_state_banner: false` — an agent that
   always works on a feature branch sees the banner on every delivery to that pane, which is
   expected noise from the check's design (it detects "pane busy", not "message off-topic"), not a
-  bug. Shared shapes in `types.ts`.
+  bug. `shell-danger-gate.ts` gates the `!<shell command>` Telegram passthrough (four
+  verbatim-injection surfaces: `textAction`, `topicActionFor`'s bound-topic and closed-topic
+  branches, and the flat entrypoint's `!`-reply path) against a narrow named-shape denylist
+  (`rm -rf`, `sudo rm`, force-push, a fork bomb, `curl | sh`, …) layered on top of the existing
+  identity-only sender-allowlist gate — a match is replied to instead of injected, with a `!!`
+  doubled-bang override to confirm and run anyway. Shared shapes in `types.ts`.
 - `features/replies/` — the `tg replies` subcommand (message recall). All PURE except `cli.ts`,
   which is effectful-via-DI like `features/hooks/cli.ts` (the I/O — history read, `$TMUX_PANE`
   detection, stdout — is injected as `RepliesCliDeps`, so the orchestration is unit-tested without
