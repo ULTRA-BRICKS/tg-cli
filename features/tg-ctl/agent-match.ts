@@ -217,6 +217,43 @@ export function matchWindows(selector: string, candidates: AgentCandidate[]): Ma
   return { matches, confident: matches.length === 1 };
 }
 
+// --- gone-agent (dead subagent) fallback ---
+
+// Live incident (2026-09-18): a `/agent <name>` selector that matches NO live agent
+// ANYWHERE tg-ctl can see (tmux window, live omp process, or an out-of-tmux process)
+// used to just report "no agent matching" and drop the message. The CTO's reaction,
+// verbatim: "О хороший кейс. Если субагента нету больше надо в агента отправлять" (if
+// the subagent no longer exists, it needs to be routed to [its parent] agent).
+//
+// tg-ctl has NO session-tree / parent-pid bookkeeping for a subagent that already
+// exited — by the time its name stops resolving, the process (and every trace of who
+// spawned it) is gone from `ps`/tmux alike, so there is no "parent" to look up. The
+// only safe available proxy is the CTO's own last-user-target anchor (tg-cli#78, see
+// `resolveLastUserTargetCandidate` in tg-ctl) — the session he was last CONFIRMED
+// talking to, a DELIBERATE prior choice of his, not a guess. In the ordinary workflow
+// that IS the session that dispatched the now-finished subagent, or at minimum the one
+// he'd want it relayed to. The caller passes that already-resolved (pane-id-reuse
+// checked) candidate straight to `goneAgentFallbackReplyText` below when it is
+// non-null; a null anchor keeps the caller's explicit "no agent matching" error.
+//
+// Deliberately NEVER also falls back to "the only agent currently live": that exact
+// heuristic caused a real production misroute (the `/agent ext` → lone `rig` pane
+// incident, still guarded by ctl-agent-nomatch-integration.test.ts and
+// ctl-agent-selector-nomatch-integration.test.ts) where a plain typo/no-match selector
+// silently absorbed into whatever one unrelated agent happened to be running. tg-ctl
+// cannot tell "this name is a gone subagent" apart from "this is a typo" — so the bar
+// for a fallback must be a signal the CTO actually chose, never a candidate count.
+
+// The reply for a delivery rescued by the last-user-target anchor above — NEVER a
+// silent reroute: names the selector that missed and where it actually landed instead.
+// `deferred` mirrors tg-ctl's `routedReply` idiom: the anchor pane had an open
+// forwarded question, so the message was QUEUED, not injected yet — say so rather
+// than claiming "delivered" for something still pending.
+export function goneAgentFallbackReplyText(selector: string, label: string, deferred?: boolean): string {
+  const outcome = deferred ? 'queued for' : 'delivered to';
+  return `agent '${selector}' is gone — ${outcome} '${label}' instead (your last active session)`;
+}
+
 // --- grouping for selection buttons ---
 
 export interface SessionGroup {

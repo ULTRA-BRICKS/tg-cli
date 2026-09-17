@@ -23,6 +23,7 @@ import {
   isBareWindowName,
   isAgentCommand,
   matchWindows,
+  goneAgentFallbackReplyText,
   resolveWindowAgentLabel,
   suggestSelector,
   type AgentCandidate,
@@ -6604,6 +6605,28 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return i >= 0 ? distinctLabels(fleet)[i] : `${target.windowName} · ${target.agent}`
   }
 
+  // Resolve + log the gone-agent anchor fallback target shared by handleAgentRoute (text)
+  // and routePrewrappedAgentMessage (media) — see agent-match.ts's "gone-agent (dead
+  // subagent) fallback" comment for the full rationale. `allowed` is the caller's
+  // topic-scope gate (the text route passes `action.threadId == null`; the media route
+  // always passes `true` — a topic message never carries media through this handler at
+  // all, `topicActionFor` acks it before the flat photo/document dispatch ever runs, so
+  // no such guard is needed there). Returns null when there is no live anchor to try (or
+  // the caller disallowed it); the caller then keeps its explicit "no agent matching" error.
+  const resolveGoneAgentAnchor = (
+    logPrefix: string,
+    selector: string,
+    candidates: AgentCandidate[],
+    allowed: boolean,
+  ): { anchor: AgentCandidate; label: string } | null => {
+    if (!allowed) return null
+    const anchor = resolveLastUserTargetCandidate(ctx, candidates)
+    if (!anchor) return null
+    const label = labelFor(anchor, candidates)
+    log(`${logPrefix}: selector="${selector}" → gone → anchor fallback ${anchor.paneId}/${anchor.windowName}`)
+    return { anchor, label }
+  }
+
   const armSelectedAgentRoute = (target: AgentCandidate, label: string, messageId: number | null, threadId: number | null): string => {
     const previous = cancelSelectedAgentRoute()
     if (previous && previous.messageId !== null && previous.messageId !== messageId) {
@@ -6864,6 +6887,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
       const queued = await tryQueueUnreachable(route.selector, "tg", route.rest, prewrappedText, sourceMessageId)
       if (queued !== null) return queued
+      const found = resolveGoneAgentAnchor("media-agent-route", route.selector, candidates, true)
+      if (found) {
+        const { anchor, label } = found
+        const ok = await injectPrewrappedToPane(anchor.paneId, prewrappedText, sourceMessageId, anchor.panePath ?? "/")
+        if (ok) {
+          recordLastUserTarget(anchor.paneId, anchor.panePath)
+          await sendMessage(ctx, goneAgentFallbackReplyText(route.selector, label))
+        }
+        return ok
+      }
       const names = candidates.map((c) => c.windowName).join(", ")
       log(`media-agent-route: selector="${route.selector}" → NO match among [${names}] — reporting error`)
       await sendMessage(ctx, `no agent matching '${route.selector}' (running: ${names}) — try /agent to pick`)
@@ -7000,6 +7033,25 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, action.rest, action.messageId)
         const queued = await tryQueueUnreachable(action.selector, action.from, action.rest, wrapped, action.messageId, out)
         if (queued !== null) return queued
+        // The named target is not live ANYWHERE tg-ctl can see — see agent-match.ts's
+        // "gone-agent (dead subagent) fallback" comment for the full rationale. FLAT
+        // chat only: a bound topic already carries its own stronger routing signal (the
+        // topic's bound pane), so this flat last-user-target anchor — which may point at
+        // a DIFFERENT project's pane entirely — must not override it, matching this
+        // function's existing "topic-originated /agent keeps the plain hint" precedent
+        // above.
+        const found = resolveGoneAgentAnchor("agent-route", action.selector, candidates, action.threadId == null)
+        if (found) {
+          const { anchor, label } = found
+          const res = await injectToPane(anchor.paneId, action.from, action.rest, action.messageId, true)
+          if (!res.ok) {
+            await sendMessage(ctx, res.error ?? "inject failed", out)
+            return false
+          }
+          recordLastUserTarget(anchor.paneId, anchor.panePath)
+          await sendMessage(ctx, goneAgentFallbackReplyText(action.selector, label, res.deferred), out)
+          return true
+        }
       }
       const names = candidates.map((c) => c.windowName).join(", ")
       log(`agent-route: selector="${action.selector}" → NO match among [${names}] — reporting error`)

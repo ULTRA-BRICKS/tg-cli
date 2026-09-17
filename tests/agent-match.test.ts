@@ -10,6 +10,7 @@ import {
   distinctLabels,
   dedupeCandidates,
   suggestSelector,
+  goneAgentFallbackReplyText,
   type AgentCandidate,
 } from '../features/tg-ctl/agent-match';
 
@@ -529,4 +530,23 @@ test('labels: two bare-window panes with the same cwd basename stay distinct (pa
   expect(new Set(labels).size).toBe(2);
   expect(labels[0]).toContain('%1');
   expect(labels[1]).toContain('%2');
+});
+
+// --- goneAgentFallbackReplyText ---
+// Live incident (tg-cli, 2026-09-18): "если субагента нету больше надо в агента
+// отправлять" — a `/agent <name>` selector that misses EVERYWHERE must, when the
+// CTO's own last-user-target anchor still resolves to a live agent, deliver there
+// (never the "only agent running" heuristic — that caused a real production misroute,
+// see ctl-agent-nomatch-integration.test.ts / ctl-agent-selector-nomatch-integration.test.ts).
+
+test('goneAgentFallbackReplyText names the selector and the anchor it landed on', () => {
+  expect(goneAgentFallbackReplyText('ghost', 'main · claude')).toBe(
+    "agent 'ghost' is gone — delivered to 'main · claude' instead (your last active session)",
+  );
+});
+
+test('goneAgentFallbackReplyText says "queued for" instead of "delivered to" when the anchor deferred', () => {
+  expect(goneAgentFallbackReplyText('ghost', 'main · claude', true)).toBe(
+    "agent 'ghost' is gone — queued for 'main · claude' instead (your last active session)",
+  );
 });
