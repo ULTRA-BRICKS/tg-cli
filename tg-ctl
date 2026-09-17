@@ -1003,7 +1003,7 @@ function cwdOfPid(pid: number): string | null {
     // no procfs (macOS) or the process is gone — fall through to lsof
   }
   try {
-    const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
+    const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(pid), "-d", "cwd", "-Fn", "-n"], {
       stdout: "pipe",
       stderr: "pipe",
       env: SUBPROC_ENV,
@@ -1045,7 +1045,7 @@ function listUnreachableAgents(): UnreachableAgent[] {
 // `lsof -Fn` n-paths for a pid — used to find omp's primary session jsonl.
 function jsonlPathsOfPid(pid: number): string[] {
   try {
-    const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(pid), "-Fn"], {
+    const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(pid), "-Fn", "-n"], {
       stdout: "pipe",
       stderr: "pipe",
       env: SUBPROC_ENV,
@@ -1235,6 +1235,7 @@ async function promptOmpAcp(target: OmpAcpTarget | string, text: string): Promis
   const cwd = agent.cwd || "/"
   try {
     const client = await ensureOmpAcp(agent)
+    const promptSentAt = Date.now()
     // Fire-and-forget (tg-cli#322, task-cli#138): the prior design awaited
     // acpCall(...120_000) here, blocking Telegram delivery on the agent's real
     // reply for up to two minutes — the root cause a rejected prior fix then
@@ -1246,6 +1247,54 @@ async function promptOmpAcp(target: OmpAcpTarget | string, text: string): Promis
     // drops it, same as any other unmatched ACP notification — nothing is
     // awaiting it, so nothing hangs.
     writeAcp(client, buildAcpSessionPrompt(client.nextId++, client.sessionId, text))
+    // Regression (tg-cli#353 relapse, 2026-09-17): going fire-and-forget dropped
+    // the ONLY signal that ever evicted a wedged ACP client (tg-cli#353/#352,
+    // shipped 1.49.2/1.51.1) -- the old code awaited acpCall and evicted+killed
+    // on its own timeout. With no await, a cached client whose pipe is
+    // genuinely dead (the exact tg-cli#353 shape: a target session already
+    // owned by another live process) is reused FOREVER: every future prompt
+    // into that key writes into a dead pipe, promptOmpAcp still returns
+    // {ok:true} (a stdin write never itself errors), and nothing ever reaches
+    // the human. Run the SAME eviction predicate 1.51.1 shipped (two
+    // independent review passes), just scheduled off the critical path so it
+    // cannot block delivery: no ACP traffic at all since this prompt was
+    // written (lastActivityAt is the proxy pumpAcpClient already maintains)
+    // AND no session/request_permission reply is still owed on this client
+    // (never evict out from under a human slowly answering a live Telegram
+    // permission — the documented 12h ABANDONED_PERMISSION_RETAIN_MS
+    // guarantee).
+    setTimeout(() => {
+      try {
+        if (client.pendingPermissions > 0) return
+        // Strict > (not >=): lastActivityAt is also touched by this same
+        // client's own session/load response, which resolves just before
+        // promptSentAt is captured -- a >= comparison can tie at millisecond
+        // resolution and wrongly treat that pre-prompt activity as "traffic
+        // since the prompt", masking a genuinely wedged session/prompt.
+        if (client.lastActivityAt > promptSentAt) return
+        const key = ompAcpKey(agent)
+        const stillCached = ompAcpClients.get(key) === client
+        if (stillCached) ompAcpClients.delete(key)
+        client.proc.kill()
+        // Only log a real eviction: if a newer client already replaced this
+        // one under the same key (e.g. a fresh ensureOmpAcp ran before this
+        // timer fired), killing the orphaned old proc is just cleanup, not an
+        // eviction from the live map -- a duplicate/misleading log line here
+        // would undermine the incident-triage trust this change exists for.
+        if (stillCached) {
+          log(
+            `omp-acp: evicted wedged client cwd=${cwd} session=${agent.sessionId ?? "-"} ` +
+              `(no ACP traffic ${ACP_PROMPT_TIMEOUT_MS}ms after prompt)`,
+          )
+        }
+      } catch (err) {
+        // Never let the deferred timer itself throw -- an uncaught exception
+        // here runs outside promptOmpAcp's own try/catch (a fresh event-loop
+        // turn) and would crash the daemon, defeating the whole fire-and-
+        // forget point of this function.
+        log(`omp-acp: eviction check failed cwd=${cwd} session=${agent.sessionId ?? "-"}: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }, ACP_PROMPT_TIMEOUT_MS)
     return { ok: true }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err)
