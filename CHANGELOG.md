@@ -3,7 +3,7 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
-## 1.52.7
+## 1.52.8
 
 **Feat (tg-cli#402): resolve permission cards via a plain-text reply.**
 
@@ -30,7 +30,7 @@ semantic versioning.
   `"constructor"`/`"__proto__"`/`"toString"` can never resolve through `Object.prototype` to a
   spurious truthy value.
 
-## 1.52.6
+## 1.52.7
 
 **Feat (tg-cli#402): render hatch approval cards as HTML.**
 
@@ -56,6 +56,26 @@ semantic versioning.
 - **Deployment order:** must ship AFTER the sibling `agent-tools` PR. Shipping this first would
   have Telegram reject hatch cards outright (400) on unescaped `&`/`<`/`>` in the old plain-text
   `_question()` output.
+
+## 1.52.6
+
+**Fix (tg-cli omp delivery reliability): restore wedged-ACP-client eviction under fire-and-forget delivery, and fix a silent lsof timeout in live-session discovery.**
+
+- `jsonlPathsOfPid`/`cwdOfPid` now pass `-n` to `lsof` (skip reverse-DNS hostname lookups). Without
+  it, a real omp process's open API sockets made `lsof -p <pid> -Fn` take ~30s on this network —
+  15x past the hardcoded 2s `LSOF_TIMEOUT_MS` — so the daemon's live-session discovery silently
+  failed almost every time, and `promptOmpAcp` delivered into a disconnected ephemeral `session/new`
+  instead of the live `session/load`'d one. Measured: 30.117s → 0.048s for the identical call.
+- 1.52.4/1.52.5's fire-and-forget `promptOmpAcp` (tg-cli#322/#357) deleted the wedged-client
+  eviction path 1.49.2/1.51.1 shipped (tg-cli#353), with no replacement — `ACP_PROMPT_TIMEOUT_MS`
+  became unused dead code, and its two regression tests were deleted outright. A cached ACP client
+  whose pipe stops responding was reused forever; every later prompt into it silently vanished
+  while `promptOmpAcp` kept reporting `{ok:true}`. Restored the SAME 1.51.1-reviewed eviction
+  predicate (no traffic since the prompt was written, no permission reply still owed), scheduled
+  via `setTimeout` so it stays off the fire-and-forget critical path — no new `await` added.
+- New regression test `tests/ctl-omp-acp-prompt-evict.test.ts` (recreates the deleted
+  `ctl-omp-acp-prompt-evict.test.ts`, adapted to assert the new deferred eviction log line instead
+  of the old awaited-call failure log line).
 
 ## 1.52.5
 
