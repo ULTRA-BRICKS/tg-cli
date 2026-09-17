@@ -560,6 +560,35 @@ test('PHOTO caption /agent with no matching selector reports the miss and never 
   expect(reactionEmojis(tg.reactions, 44)).not.toContain('👀');
 }, 15_000);
 
+test('PHOTO caption /agent with a GONE selector falls back to the last-user-target anchor, never a silent drop', async () => {
+  const h = makeHarness([
+    { paneId: PANE_HYPER, cwd: '' },
+    { paneId: PANE_TOOLS, cwd: '' },
+  ]);
+  // The CTO's own last confirmed target: agent-tools (%2) — the closest available
+  // proxy tg-ctl has for "whoever was addressing the now-gone 'ghost'" (see
+  // agent-match.ts's "gone-agent (dead subagent) fallback" comment).
+  writeFileSync(
+    join(h.cfgDir, 'tg-ctl.123.last-user-target.json'),
+    JSON.stringify({ paneId: PANE_TOOLS, cwd: h.dirTools, ts: Math.floor(Date.now() / 1000) }),
+  );
+  const tg = startFakeTg();
+  h.setMode('both');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushPhoto(716, 45, '/agent ghost please pick this up');
+
+  await waitFor(() => injectedLines(h.injectLog).length > 0);
+  await waitFor(() => tg.sends.some((s) => s.text.includes("agent 'ghost' is gone")));
+  await Bun.sleep(200);
+
+  const lines = injectedLines(h.injectLog);
+  expect(lines.some((l) => l.startsWith(`${PANE_TOOLS}\t`))).toBe(true);
+  expect(lines.some((l) => l.startsWith(`${PANE_HYPER}\t`))).toBe(false);
+  const reply = tg.sends.find((s) => s.text.includes('ghost'))!;
+  expect(reply.text).toContain('your last active session');
+}, 15_000);
+
 test('NO-REPLY bind: last-message agent GONE → never guesses into the gone pane (no fabricated button)', async () => {
   // The last message came from hyperide (%0), but %0 is now GONE (mode "tools" → only
   // agent-tools %2 is live). The anchor bind must NOT inject into the gone %0 nor
