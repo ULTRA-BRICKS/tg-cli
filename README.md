@@ -399,6 +399,41 @@ JSON object per line, trimmed to the last ~5000 messages). The `tg-ctl` daemon
 records inbound messages; `tg` records its own outbound. Both writers are
 best-effort and never block a send or an inject.
 
+### Structured result reports (`tg report`, v1.53.0)
+
+`tg report` formats a structured result report — ticket/PR link(s), user impact,
+a "what changed" summary, evidence, and required verification proof — as a
+Telegram Rich Message and sends it with `--tag report` (🟢 REPORT badge). It
+bridges the `/result-report` convention (which only produced a chat-visible
+report + an HTML file, never a Telegram push) to a real send: it re-enters
+the same pipeline every other `tg` send uses (dictionary gate, autolink,
+`--dry-run`, …).
+
+```
+tg report --title <text> (--ticket <id-or-url> | --pr <num-or-url>) \
+          --impact <text> --verify-cmd <cmd> --verify-result <result> \
+          [--evidence <text>]... [--summary <text>]... \
+          [--reply-to <id>] [--subagent <name>] [--topic <id>] [--dry-run]
+```
+
+`--title`, at least one of `--ticket`/`--pr`, `--impact`, `--verify-cmd`, and
+`--verify-result` are required — a report with no verification proof is
+refused before anything is sent. `--evidence`/`--summary`/`--ticket`/`--pr`
+are repeatable.
+
+```
+tg report --title "Fix the crash on empty input" --ticket HYP-123 \
+  --impact "users no longer see a crash when submitting an empty form" \
+  --verify-cmd "bun test tests/form.test.ts" --verify-result "12 pass, 0 fail" \
+  --summary "added a guard for the empty-string case" \
+  --evidence "reproduced pre-fix, confirmed fixed post-fix"
+
+tg report --dry-run --title "..." --pr owner/repo#456 --impact "..." \
+  --verify-cmd "..." --verify-result "..."   # validate without sending
+```
+
+See `tg help report` for the full flag reference.
+
 ---
 
 ## Agent branding
