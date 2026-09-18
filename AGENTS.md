@@ -445,3 +445,13 @@ monospace `tg --table` (`<pre>`) stays as the plain fallback grid.
 **Manual smoke sends** — the `bun test` suite never sends anything real. During development,
 sending a few real messages to the configured chat as proof IS accepted practice in this repo
 (the chat owner reads them). Keep them few and informative.
+
+**Never verify against the native Telegram Desktop app** — checking that a send/reply/hatch
+flow actually works means reading the message through a client, but that client MUST be
+qa-cli's headless Telegram Web driver (`qa telegram login`/`status`, `qa_cli/telegram.py` +
+`qa_cli/browser.py`, `TELEGRAM_WEB_URL`), never the user's real, live Telegram Desktop app
+(no `open -a Telegram`, AppleScript/`osascript … activate`, `NSWorkspace`, or computer-use
+automation of its window). tg-cli#420 (Telegram Desktop repeatedly auto-opening/stealing
+focus) was caused by an agent test session doing exactly this; see the agent-tools skill
+`no-native-telegram-desktop-automation` and the permanent guard
+`tests/no-telegram-desktop-launch.test.ts`.
