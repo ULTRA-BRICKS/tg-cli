@@ -79,6 +79,7 @@ import { gateText } from "./features/hooks/run-text-hooks"
 import { runHooksCli } from "./features/hooks/cli"
 import { transmit } from "./features/auto-attach/transmitter"
 import { parseArgs, escalationGateEnforced, type Format } from "./features/cli/args"
+import { buildReportSend, isReportError, isReportHelp, REPORT_USAGE } from "./features/cli/report"
 import { validateEscalationFormat, escalationFormatMessage } from "./features/cli/escalation-format"
 import { decodeTextEscapes } from "./features/cli/text-escapes"
 import {
@@ -144,6 +145,8 @@ export const USAGE = `Usage:
   tg --topic 7 "status"         # post INTO forum topic 7 (else TG_TOPIC)
   printf 'task\\tstatus\\nship\\tdone' | tg --table   # aligned <pre> table
   tg voice setup                # configure inbound voice→text (local Whisper STT)
+  tg report --title <t> --ticket <id> --impact <t> --verify-cmd <c> --verify-result <r>
+                                 # structured result report → Telegram (tg help report)
   tg --ls-emoji-helpers
 
 The global options (--format, --tag, --title, --subagent, --reply-to, --topic, the feature
@@ -479,13 +482,17 @@ if (import.meta.main) {
       console.log(colorizeHelp(formatHelp(), shouldColorize()))
       process.exit(0)
     }
+    if (topic === "report") {
+      console.log(colorizeHelp(REPORT_USAGE, shouldColorize()))
+      process.exit(0)
+    }
     if (topic === undefined) {
       console.log(colorizeHelp(USAGE, shouldColorize()))
       process.exit(0)
     }
     // A `tg help <unknown>` names a topic that does not exist — say so (3-part:
     // WHAT/WHY/HOW) on stderr and exit non-zero, rather than silently sending it.
-    console.error(`Error: unknown help topic '${topic}'. Available topics: format. See \`tg help\`.`)
+    console.error(`Error: unknown help topic '${topic}'. Available topics: format, report. See \`tg help\`.`)
     process.exit(1)
   }
 
@@ -556,6 +563,33 @@ if (import.meta.main) {
       errlog: (m) => console.error(m),
     })
     if (code !== null) process.exit(code)
+  }
+
+  // `tg report --title … (--ticket … | --pr …) --impact … --verify-cmd … --verify-result …`
+  // — formats a structured result report and re-enters the normal send pipeline
+  // with --tag report --format html (features/cli/report.ts owns the pure
+  // parsing/formatting; this block owns I/O + argv splicing, same shape as the
+  // `user`/`replies` subcommands above). Exact leading-token match; second token
+  // must be "-h" or a real "--flag" (or absent) — so `tg report failure` as
+  // prose still sends, and so does prose starting with a single dash like
+  // `tg report -50% latency regression` (buildReportSend itself only ever
+  // accepts "-h"/"--help" or a "--"-prefixed flag, so the guard mirrors that
+  // exactly instead of engaging on any leading "-").
+  if (
+    rawArgs[0] === "report" &&
+    (rawArgs.length === 1 || rawArgs[1] === "-h" || rawArgs[1].startsWith("--"))
+  ) {
+    const result = buildReportSend(rawArgs.slice(1))
+    if (isReportHelp(result)) {
+      console.log(colorizeHelp(result.help, shouldColorize()))
+      process.exit(0)
+    }
+    if (isReportError(result)) {
+      console.error(result.error)
+      process.exit(1)
+    }
+    process.argv.splice(2, process.argv.length - 2, ...result.argv)
+    rawArgs.splice(0, rawArgs.length, ...result.argv)
   }
 
   // Resolve feature flags FIRST: pull --feature/--no-feature out of argv, load

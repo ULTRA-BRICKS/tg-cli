@@ -3,6 +3,37 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.53.0
+
+**Feature (tg report): structured result-report subcommand, bridging `/result-report` to Telegram.**
+
+- The `/result-report` slash-command convention (a Claude Code command backed by rig-cli's
+  `rig report`) has been repeatedly expected to also push to Telegram, but it only ever produced
+  a chat-visible report + an HTML file — nothing wired it to `tg`. `tg --tag report` was the
+  existing "push a report to Telegram" primitive, but free-form: nothing enforced that a report
+  actually carried a ticket/PR link, the user impact, and verification proof.
+- New `tg report --title <text> (--ticket <id-or-url> | --pr <num-or-url>) --impact <text>
+  --verify-cmd <cmd> --verify-result <result> [--evidence <text>]... [--summary <text>]...`
+  (`features/cli/report.ts`, pure formatter). All five required fields (title, at least one of
+  ticket/PR, impact, verify-cmd, verify-result) are enforced before anything sends; a missing
+  field lists every gap at once rather than failing on the first. `--evidence`/`--summary`/
+  `--ticket`/`--pr` are repeatable. `--reply-to`/`--subagent`/`--topic`/`--dry-run` pass through
+  unchanged. `tg help report` / `tg report --help` / bare `tg report` all print the usage.
+- The formatted body is Rich-Message HTML (`<h2>`/`<h3>`/`<p>`/`<ul>`/`<pre>`, all user text
+  HTML-escaped) and re-enters the SAME send pipeline every other `tg` subcommand uses via
+  `--tag report --format html` — the dictionary gate, autolink-tasks/autolink-prs, `--dry-run`,
+  and every other guard apply exactly as they do to a hand-written `--tag report` send. A
+  ticket/PR value that already looks like a ticket code or `owner/repo#N` is left as plain text
+  for the existing autolink features to resolve; an http(s) URL is wrapped in a real `<a href>`.
+- `--title` is never re-emitted as the global `--title` flag (only into the body's `<h2>`):
+  routing it through the global flag hard-refused the most natural report headline shape
+  (`--title "HYP-123: fix the crash"`, since `--title` values are checked for embedded ticket
+  codes) and duplicated the headline on both the branded header and the body. Dropping it also
+  means the header stays just the `[window] 🟢 REPORT` badge, matching every other tag-only send.
+- A bare-number `--pr` value (e.g. `--pr 456`, one of the two forms `REPORT_USAGE` documents) is
+  normalized to `#456` before rendering, so autolink-prs (which only recognizes the `#N` shape)
+  can resolve it — previously it rendered as inert, unlinked text.
+
 ## 1.52.14
 
 **Feature (tg-cli#398): late-approval grant protocol for expired hatch asks.**

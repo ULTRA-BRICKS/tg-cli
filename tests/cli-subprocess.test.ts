@@ -254,3 +254,113 @@ test('--table does NOT bypass the gate: a bare-table decision is validated on th
   expect(proc.exitCode).toBe(1);
   expect(err).toContain('Blocked:');
 });
+
+// --- `tg report` subcommand dispatch (features/cli/report.ts wiring) ---
+
+test('tg help report prints the report usage and exits 0 (no creds needed)', () => {
+  const proc = run(['help', 'report']);
+  const out = proc.stdout.toString();
+  expect(proc.exitCode).toBe(0);
+  expect(out).toContain('tg report --title <text>');
+  expect(out).toContain('--verify-cmd <cmd>');
+});
+
+test('`tg help <unknown>` now lists report alongside format in the topic list', () => {
+  const proc = run(['help', 'bogus']);
+  const err = proc.stderr.toString();
+  expect(proc.exitCode).not.toBe(0);
+  expect(err).toContain('Available topics: format, report');
+});
+
+test('bare `tg report` and `tg report --help` both print usage and exit 0', () => {
+  for (const args of [['report'], ['report', '--help'], ['report', '-h']]) {
+    const proc = run(args);
+    expect(proc.exitCode).toBe(0);
+    expect(proc.stdout.toString()).toContain('tg report --title <text>');
+  }
+});
+
+test('`tg report --title x` (missing required fields) errors before the credential gate', () => {
+  const proc = run(['report', '--title', 'x']);
+  const err = proc.stderr.toString();
+  expect(proc.exitCode).toBe(1);
+  expect(err).toContain('Result report is missing required fields');
+  expect(err).toContain('ticket or PR link');
+  expect(err).not.toContain('TG_BOT_TOKEN');
+});
+
+test('a well-formed `tg report ...` reaches the normal send pipeline (fails only on missing creds)', () => {
+  const proc = run([
+    'report', '--title', 'Fix the thing', '--ticket', 'HYP-1',
+    '--impact', 'x', '--verify-cmd', 'x', '--verify-result', 'x',
+  ]);
+  const err = proc.stderr.toString();
+  expect(proc.exitCode).not.toBe(0);
+  // It got past the report parser and INTO the normal send pipeline — the
+  // only failure left in this creds-less test env is the credential gate.
+  expect(err).toContain('TG_BOT_TOKEN');
+  expect(err).not.toContain('Result report is missing required fields');
+}, 90000);
+
+test('`tg report <prose>` (second token is not "-h"/"--flag") is NOT captured by the subcommand — sends as a literal message', () => {
+  // The dispatch guard requires the second token to be "-h" or a real
+  // "--flag" (or absent) to engage the report parser; "failure" is neither,
+  // so this must fall through to an ordinary send exactly like any other
+  // prose starting with the word "report" — proven by reaching the
+  // credential gate, not the report-parser's missing-fields error.
+  const proc = run(['report', 'failure', 'investigation', 'notes']);
+  const err = proc.stderr.toString();
+  expect(proc.exitCode).not.toBe(0);
+  expect(err).toContain('TG_BOT_TOKEN');
+  expect(err).not.toContain('Result report is missing required fields');
+}, 90000);
+
+test('`tg report -50% ...` (a single-dash, non-flag second token) is NOT captured by the report subcommand', () => {
+  // Regression: the dispatch guard used to engage on ANY leading "-", which
+  // included non-flag prose like "-50%" — buildReportSend would then reject
+  // it as "unexpected argument — tg report takes only flags". The guard now
+  // requires "-h" or a real "--" flag, so this falls through to the ORDINARY
+  // global argv parser instead — which itself treats any unrecognized
+  // "-"-prefixed token as an attempted flag (the same as a bare `tg -50% …`
+  // with no "report" involved at all — an existing, unrelated tg behavior).
+  // The proof this is no longer the report subcommand's own rejection is the
+  // wording: "unknown flag", never "tg report takes only flags".
+  const proc = run(['report', '-50%', 'latency', 'regression']);
+  const err = proc.stderr.toString();
+  expect(proc.exitCode).not.toBe(0);
+  expect(err).toContain('unknown flag: -50%');
+  expect(err).not.toContain('tg report takes only flags');
+});
+
+test('a title containing a ticket code does not hard-fail the send (tg report never re-emits --title globally)', () => {
+  // Regression: routing the report title through the global --title flag used
+  // to hit args.ts's "refusing --title with an embedded ticket reference"
+  // guard for the most natural headline shape ("HYP-123: fix the crash").
+  const proc = run([
+    'report', '--title', 'HYP-123: fix the crash', '--ticket', 'HYP-123',
+    '--impact', 'x', '--verify-cmd', 'x', '--verify-result', 'x',
+  ]);
+  const err = proc.stderr.toString();
+  expect(proc.exitCode).not.toBe(0);
+  expect(err).not.toContain('Refusing: --title contains a ticket reference');
+  // Still reaches the ordinary send pipeline (creds gate is the only failure).
+  expect(err).toContain('TG_BOT_TOKEN');
+}, 90000);
+
+test('`tg report --dry-run ...` renders the full body through the actual send pipeline (rich routing, prefix, guards) with no network call', () => {
+  const proc = run([
+    'report', '--dry-run', '--title', 'Smoke test', '--ticket', 'HYP-1',
+    '--pr', 'alex-mextner/tg-cli#123',
+    '--impact', 'proves the pipeline end to end',
+    '--verify-cmd', 'bun test tests/cli-subprocess.test.ts',
+    '--verify-result', 'all green',
+    '--summary', 'added the dry-run e2e test',
+  ]);
+  const out = proc.stdout.toString();
+  expect(proc.exitCode).toBe(0);
+  expect(out).toContain('No network call was made and nothing was sent');
+  expect(out).toContain('<h2>Smoke test</h2>');
+  expect(out).toContain('<b>Ticket:</b> HYP-1');
+  expect(out).toContain('<a href="https://github.com/alex-mextner/tg-cli/pull/123">alex-mextner/tg-cli#123</a>');
+  expect(out).toContain('<pre>bun test tests/cli-subprocess.test.ts</pre>');
+}, 90000);
