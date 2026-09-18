@@ -13,6 +13,7 @@ import {
   goneAgentFallbackReplyText,
   type AgentCandidate,
 } from '../features/tg-ctl/agent-match';
+import { hasUnpairedSurrogate } from '../features/tg-ctl/text-util';
 
 const cand = (
   paneId: string,
@@ -300,6 +301,22 @@ test('buttons: one per candidate, callback round-trips to the right pane', () =>
   // duplicate the buttons: no `▸ <session>` group header, no per-agent label lines.
   expect(msg.text).toContain('deploy the thing');
   expect(msg.text).not.toContain('▸');
+});
+
+// tg#17245 (live incident): the route-picker prompt truncates the message
+// preview to 80 UTF-16 code units. A naive cut can land between the two
+// halves of a surrogate pair (an emoji), producing an orphaned lone
+// surrogate that Telegram's sendMessage rejects wholesale with a 400 "strings
+// must be encoded in UTF-8" — the whole picker fails to post ("couldn't post
+// the reply picker"). The cut must back up to keep the pair whole.
+test('buttons: a message preview that would split an emoji surrogate pair at the 80-char cut is not orphaned', () => {
+  // 78 filler chars + 😀 (\uD83D\uDE00) puts the high surrogate exactly at
+  // index 78 — a naive `.slice(0, 79)` keeps it and drops its low-surrogate
+  // partner.
+  const preview = `${'x'.repeat(78)}\ud83d\ude00${'y'.repeat(20)}`;
+  const msg = buildAgentSelectMessage(42, fleet, 'tok1', preview);
+  expect(msg.text).toBe(`Route to which agent?\n\u201c${'x'.repeat(78)}\u2026\u201d`);
+  expect(hasUnpairedSurrogate(msg.text)).toBe(false);
 });
 
 // --- buttons-only: the text body never duplicates the buttons (#63) ---
