@@ -3,6 +3,21 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.52.14
+
+**Feature (tg-cli#398): late-approval grant protocol for expired hatch asks.**
+
+- Expired hatch asks stay addressable for a 24h grace window (restart-safe 0600 store).
+- A late Approve mints a single-use grant (`hgr-<12hex>`, bound to hook_id + operation fingerprint + cwd + the daemon-observed route), confirms on the card, and routes the consume instructions to the origin (omp ACP / Stop-hook inbox) — never through a permission menu or pane, fixing the production no-menu delivery skip.
+- New client forms consume a grant: `ask --verify-grant <id> --hook <id>` (token, route-agnostic) and `--verify-grant --pull` (route-bound, no blank-route fallback), replying the standard hookSpecificOutput allow/deny JSON with requestId/approvalId at top level, exit 0 always.
+- Per-request timeoutMs honored up to a 15-min cap (absent keeps the 115s/110s defaults); additive payload fields (hookId/timeoutMs/origin/operation) normalized tolerantly at both ends.
+- Replaces the over-broad silent queuedDecision mechanism for hatch requests: a plain retry without a grant now re-asks with a fresh card.
+
+**Fix (tg-cli#398 follow-up): rebase merge left a dead block referencing an undeclared `hookId`, crashing every non-hatch permission's late tap.**
+
+- The grant protocol diverts hatch late-taps to `routeGrantNotice` before reaching the older scoped-permission reconnect-queue UI, but a leftover critical-proactive-push block (superseded by `routeGrantNotice`) still referenced `hookId`, which no declaration in scope provided. Any non-hatch permission tap that fell through to the queued-decision path threw `ReferenceError: hookId is not defined`, silently dropping its toast and card update. Removed the dead block; `liveOmpAgentForHatchRequest`/`hatchProactiveDecisionText` (now unused) removed with it.
+- `handleHatchLateTap`'s deny and grant-approved card edits were missing `hatchParseMode(req)`, so a hatch card's final edit rendered its embedded HTML as literal tag soup instead of formatted text. Both call sites now thread `parse_mode: 'HTML'` like every other hatch-shaped edit in the file.
+
 ## 1.52.13
 
 **Fix (tg-ctl reply/agent picker, live incident tg#17245): a truncated quote/preview that split an emoji mid-character made `sendMessage` fail outright with `400 Bad Request: strings must be encoded in UTF-8`, so the CTO saw "couldn't post the reply picker" instead of a picker.**
@@ -12,7 +27,6 @@ semantic versioning.
 - Multi-model review (Opus/Codex/GLM/Sonnet) caught two more live call sites in the SAME bug class that the first pass missed: `clampPlan`'s 3000-char cut, which feeds the ExitPlanMode plan-approval card, and `summarizeInput`'s 100-char cut, which feeds the permission-prompt question (`features/tg-ctl/hook-normalize.ts`) — both now route through the same helpers. Review also flagged that hand-copying `s.slice(0, max - 1)}…` into each of the first four files re-created exactly the duplication the fix was meant to close; `truncateWithEllipsis` now owns that shape in one place so a new truncation site can't reopen this class by hand.
 - Regression tests (`tests/text-util.test.ts`, plus one per call site including the two hook-normalize sites) construct an emoji landing exactly on each cut boundary and assert the output never contains an unpaired surrogate (shared `hasUnpairedSurrogate` detector, also in `text-util.ts`); each fails on the pre-fix `.slice(0, n)` and passes after.
 - `safeSliceEnd` backs up over a WHOLE run of consecutive high surrogates, not just one (review finding): `JSON.parse` doesn't validate that `\uXXXX` escapes pair up, so a hook payload's `tool_input.plan`/`.command` could in principle carry two-or-more consecutive high surrogates, and a single-step backup would land on the second one — itself still unpaired.
-
 ## 1.52.12
 
 **Feature (tg-ctl `/agent` routing, live report 2026-09-18): fall back to the CTO's last-user-target anchor when a named `/agent <selector>` is gone, instead of dropping the message.**
@@ -126,7 +140,6 @@ semantic versioning.
 - New regression test `tests/ctl-omp-acp-prompt-evict.test.ts` (recreates the deleted
   `ctl-omp-acp-prompt-evict.test.ts`, adapted to assert the new deferred eviction log line instead
   of the old awaited-call failure log line).
-
 ## 1.52.5
 
 **Fix (tg-cli#322): fire-and-forget omp ACP delivery; journal getUpdates batches before offset advance.**

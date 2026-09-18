@@ -7,6 +7,15 @@
 // technique (a real ACP JSON-RPC child process, not a mock function) so the
 // assertion is on the actual wire protocol frame, not an internal call spy.
 //
+// Hatch requests divert to the grant path (routeGrantNotice, tg-ctl) before
+// reaching the older scoped-permission reconnect-queue UI, so the proactive
+// push for hatch is routeGrantNotice's origin.agent === 'omp' branch, and the
+// daemon logs `hatch-grant-notice-delivered`/`-failed` (not `hatch-critical-
+// proactive-*` — nothing emits those anymore). The request payload carries
+// `origin: { agent: 'omp' }` so routeGrantNotice's cwd-basename match finds
+// the fixture's live session, matching what a real hatch escalation from
+// inside a live omp session sends.
+//
 // The single most important safety property under test here (both tests
 // below): promptOmpAcp/ensureOmpAcp is NEVER called for a cwd with no LIVE
 // match — see tg-awareness-nudge.ts's own "Population" doc comment on why
@@ -167,6 +176,7 @@ interface MockTg {
   push: (batch: unknown[]) => void;
   cards: () => unknown[];
   edits: () => string[];
+  editParseModes: () => Array<string | undefined>;
   allowData: () => string | null;
 }
 
@@ -174,6 +184,7 @@ function mockTelegram(): MockTg {
   const updateQueue: unknown[][] = [];
   const cards: unknown[] = [];
   const edits: string[] = [];
+  const editParseModes: Array<string | undefined> = [];
   let lastKeyboard: Array<Array<{ callback_data: string }>> | null = null;
   let cardSeq = 0;
 
@@ -199,7 +210,9 @@ function mockTelegram(): MockTg {
         return Response.json({ ok: true, result: { message_id: 900 } });
       }
       if (url.pathname.endsWith('/editMessageText')) {
-        edits.push(String(((await req.json()) as Record<string, unknown>).text ?? ''));
+        const body = (await req.json()) as Record<string, unknown>;
+        edits.push(String(body.text ?? ''));
+        editParseModes.push(typeof body.parse_mode === 'string' ? body.parse_mode : undefined);
         return Response.json({ ok: true, result: true });
       }
       if (url.pathname.endsWith('/editMessageReplyMarkup')) return Response.json({ ok: true, result: true });
@@ -216,6 +229,7 @@ function mockTelegram(): MockTg {
     push: (b) => updateQueue.push(b),
     cards: () => cards,
     edits: () => edits,
+    editParseModes: () => editParseModes,
     allowData: () => lastKeyboard?.[0]?.[0]?.callback_data ?? null,
   };
 }
@@ -246,6 +260,45 @@ function daemonLog(cfgDir: string): string {
   return existsSync(p) ? readFileSync(p, 'utf8') : '';
 }
 
+test('a late Deny on a disconnected hatch card carries parse_mode HTML', async () => {
+  const { cfgDir, binDir, acpLog } = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  const daemon = await startDaemon(cfgDir, binDir, acpLog, tg.port);
+
+  const hookId = 'deny-hook';
+  const requestId = `hatch-${hookId}-ffffffffffff`;
+  const ask = startAsk(cfgDir, binDir, tg.port, {
+    requestId,
+    agent: 'claude',
+    kind: 'permission',
+    question: `Allow rig hatch escalation: ${hookId}?`,
+    permissionEvent: 'PermissionRequest',
+    critical: true,
+    cwd: LIVE_CWD,
+    hookId,
+    operation: { kind: 'bash', fingerprint: 'sha256:fp-deny-1', cwd: LIVE_CWD },
+  });
+
+  expect(await until(() => tg.cards().length === 1, 6000)).toBe(true);
+  ask.kill(9);
+  await ask.exited;
+  expect(await until(() => tg.edits().some((e) => e.includes('disconnected')), 5000)).toBe(true);
+
+  // Deny is the SECOND button in a permission's [Approve, Reject] row —
+  // buildButtonMessage renders it as `tgq:<requestId>:deny`.
+  tg.push([tap(`tgq:${requestId}:deny`, 601, 1)]);
+  expect(await until(() => tg.edits().some((e) => e.includes('Selected answer: Reject')), 5000)).toBe(true);
+  const denyIndex = tg.edits().findIndex((e) => e.includes('Selected answer: Reject'));
+  // The deny edit embeds the same original hatch HTML (buildAnsweredQuestionText
+  // → buildQuestionText) as the approve edit — must carry the same parse_mode
+  // fix, or Telegram renders it as literal tag soup.
+  expect(tg.editParseModes()[denyIndex]).toBe('HTML');
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 25_000);
+
 test('a late CRITICAL hatch decision reaches a LIVE omp session via a real ACP session/prompt call', async () => {
   const { cfgDir, binDir, acpLog } = makeCfgDir();
   const tg = mockTelegram();
@@ -261,6 +314,11 @@ test('a late CRITICAL hatch decision reaches a LIVE omp session via a real ACP s
     permissionEvent: 'PermissionRequest',
     critical: true,
     cwd: LIVE_CWD,
+    origin: { agent: 'omp' },
+    // Grant protocol v1.1 (tg-cli#398) fields — a current agent-tools lib
+    // always sends these; isGrantableRequest fail-closes without them.
+    hookId,
+    operation: { kind: 'bash', fingerprint: 'sha256:fp-proactive-1', cwd: LIVE_CWD },
   });
 
   expect(await until(() => tg.cards().length === 1, 6000)).toBe(true);
@@ -270,8 +328,9 @@ test('a late CRITICAL hatch decision reaches a LIVE omp session via a real ACP s
   // BEFORE any tap lands, moving the entry into abandonedButtons.
   ask.kill(9);
   await ask.exited;
-  const envVar = `RIG_HATCH_REQUEST_${hookId.toUpperCase().replace(/-/g, '_')}`;
-  expect(await until(() => tg.edits().some((e) => e.includes(envVar)), 5000)).toBe(true);
+  // Grant protocol v1.1 (tg-cli#398) replaced the env-var retry hint with a
+  // generic "disconnected ... 24h grace" status — wait on that instead.
+  expect(await until(() => tg.edits().some((e) => e.includes('disconnected')), 5000)).toBe(true);
 
   // A human taps Approve well after the process is gone.
   const allowData = tg.allowData()!;
@@ -285,9 +344,13 @@ test('a late CRITICAL hatch decision reaches a LIVE omp session via a real ACP s
   // Never session/new for a MATCHED live session — attaching to the existing one.
   expect(acp).not.toContain('"method":"session/new"');
   expect(acp).toContain(hookId);
-  expect(acp).toContain('Approve');
+  // The grant-notice text (hatchGrantNoticeText) says "APPROVED belatedly"
+  // and carries the approval id — the new proactive-push payload, replacing
+  // the older hatchProactiveDecisionText's literal button-label echo.
+  expect(acp).toContain('APPROVED belatedly');
+  expect(acp).toContain('Approval ID');
 
-  expect(await until(() => daemonLog(cfgDir).includes('hatch-critical-proactive-delivered'), 5000)).toBe(true);
+  expect(await until(() => daemonLog(cfgDir).includes('hatch-grant-notice-delivered'), 5000)).toBe(true);
 
   daemon.kill('SIGTERM');
   await daemon.exited;
@@ -309,21 +372,34 @@ test('a late CRITICAL hatch decision for a cwd with NO live session never calls 
     critical: true,
     // Deliberately NOT the live omp's cwd — no session anywhere matches this.
     cwd: '/Users/u/work/some-unrelated-project',
+    origin: { agent: 'omp' },
+    // Grant protocol v1.1 (tg-cli#398) fields — a current agent-tools lib
+    // always sends these; isGrantableRequest fail-closes without them.
+    hookId,
+    operation: { kind: 'bash', fingerprint: 'sha256:fp-no-live-1', cwd: '/Users/u/work/some-unrelated-project' },
   });
 
   expect(await until(() => tg.cards().length === 1, 6000)).toBe(true);
   ask.kill(9);
   await ask.exited;
-  const envVar = `RIG_HATCH_REQUEST_${hookId.toUpperCase().replace(/-/g, '_')}`;
-  expect(await until(() => tg.edits().some((e) => e.includes(envVar)), 5000)).toBe(true);
+  // Grant protocol v1.1 (tg-cli#398) replaced the env-var retry hint with a
+  // generic "disconnected ... 24h grace" status — wait on that instead.
+  expect(await until(() => tg.edits().some((e) => e.includes('disconnected')), 5000)).toBe(true);
 
   const allowData = tg.allowData()!;
   tg.push([tap(allowData, 502, 1)]);
 
-  // The decision still lands normally (card updated with "recorded" text) — this
-  // is only about the PROACTIVE push channel being correctly refused.
-  expect(await until(() => tg.edits().some((e) => e.includes('recorded') && e.includes('Approve')), 5000)).toBe(true);
-  expect(await until(() => daemonLog(cfgDir).includes('hatch-critical-proactive-skip'), 3000)).toBe(true);
+  // The decision still lands normally (card updated with the grant-protocol
+  // "approved belatedly" text) — this is only about the PROACTIVE push
+  // channel being correctly refused. queueToInbox succeeds even with no live
+  // session, so routeGrantNotice reports delivered.
+  expect(await until(() => tg.edits().some((e) => e.includes('approved belatedly') && e.includes('grant')), 5000)).toBe(true);
+  // The card embeds the original request's HTML (`<b>Hatch approval
+  // request</b>` etc.) — the final edit MUST carry parse_mode: 'HTML' or
+  // Telegram renders that markup as literal tag soup.
+  const approvedIndex = tg.edits().findIndex((e) => e.includes('approved belatedly') && e.includes('grant'));
+  expect(tg.editParseModes()[approvedIndex]).toBe('HTML');
+  expect(await until(() => daemonLog(cfgDir).includes('hatch-grant-notice-delivered'), 3000)).toBe(true);
 
   // Genuine real-clock wait (not a fake-timer stand-in): proving an ABSENCE — no
   // wrongly-fired ACP call — across a real OS subprocess/daemon boundary that

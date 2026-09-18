@@ -463,6 +463,7 @@ export interface CtlPaths {
   history: string; // append-only JSONL message log for `tg replies` recall
   topics: string; // threadId→agent binding map for forum-topics mode (always allocated)
   questions: string; // durable forwarded-question state (pending/abandoned + answered-replay)
+  grants: string; // late-approval grant + grace store (tg-cli#398; 0600, daemon is the ONLY authority)
   schedules: string; // durable auto-continue schedules (re-armed on restart, #113)
   overloadRetries: string; // retry-attempt state for transient overload auto-continue
   usageWarnings: string; // recent proactive usage warnings, for duplicate suppression (#132)
