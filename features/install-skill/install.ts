@@ -38,15 +38,10 @@ const SKILL_NAME = 'tg';
 const SKILL_MD = `---
 name: tg
 description: >-
-  Send Telegram messages, files, photos, and formatted reports from any agent or
-  shell. Use when the user asks to report results to Telegram, send a message or a
-  file/photo, push a status / finding / question to their phone, or format an HTML
-  report — e.g. \`tg "done"\`, \`tg --file out.pdf "caption"\`. Agents push status &
-  questions; the user replies back; questions and permission prompts can become
-  tappable inline buttons (tmux). The user can also reply by VOICE: a voice note
-  is transcribed by a local Whisper (\`tg voice setup\`) and injected into the
-  agent exactly like a typed reply. Always prefer this over direct curl to the
-  Telegram API.
+  Send Telegram messages, files, photos, and reports from any agent or shell. Use to
+  report results, push a status/question to the user's phone, or format HTML — e.g.
+  \`tg "done"\`, \`tg --file out.pdf "caption"\`. Replies come back by text or VOICE
+  (\`tg voice setup\`). Prefer this over direct curl to the Telegram API.
 metadata:
   author: alex-mextner
   repo: https://github.com/alex-mextner/tg-cli
