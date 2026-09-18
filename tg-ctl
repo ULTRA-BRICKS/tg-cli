@@ -1189,16 +1189,47 @@ type OmpAcpClient = {
   // guarantee) -- promptOmpAcp must never evict+kill the client that prompt
   // depends on just because session/prompt itself also timed out.
   pendingPermissions: number
+  // Non-null id of a `session/prompt` this client has written but not yet had
+  // acknowledged (matched by response id) or timed out. ACP `session/prompt`
+  // is one turn at a time per session -- the tg-cli#353 wedge is exactly what
+  // happens when a second, un-acknowledged prompt races into the same pipe
+  // while the session is still owned by the first. A new prompt arriving
+  // while this is set queues in promptQueue instead of writing a second frame.
+  promptInFlightId: number | null
+  promptQueue: string[]
 }
 
 const ompAcpClients = new Map<string, OmpAcpClient>()
+
+// Coalesces concurrent ensureOmpAcp calls for the SAME key onto one spawn
+// (review finding, 2026-09-18): two Telegram replies to the same not-yet-
+// cached session landing in one dispatch batch (agent-route/inject actions
+// have no per-session resource key, so same-target messages in one batch
+// run concurrently) previously each saw an empty ompAcpClients, each spawned
+// its own `omp acp`, and both called session/load on the SAME underlying
+// session -- the exact double-ownership wedge this whole file exists to
+// prevent, reached through concurrent first-contact instead of a raced
+// write. The eviction-redelivery path (evict -> delete key -> respawn)
+// reopens the identical window on every wedge cycle, not just first
+// contact.
+const ompAcpEnsuring = new Map<string, Promise<OmpAcpClient>>()
 
 // Overridable only for tests (regression cover for the wedged-client evict
 // path in promptOmpAcp) -- production always gets the 120s default.
 const ACP_PROMPT_TIMEOUT_MS = Number(process.env.TG_CTL_ACP_PROMPT_TIMEOUT_MS) || 120_000
 
 function writeAcp(client: OmpAcpClient, msg: object): void {
-  client.proc.stdin.write(encodeAcpFrame(msg))
+  // A write against an already-dead pipe (EPIPE / write-after-close) must
+  // never throw out of a resolve/reject callback invoked synchronously from
+  // pumpAcpClient's read loop (writePrompt's advance/evict paths) -- an
+  // uncaught throw there is outside any caller's try/catch and would crash
+  // the daemon. The watchdog below still discovers the resulting silence
+  // and evicts/redelivers, same as any other genuinely dead client.
+  try {
+    client.proc.stdin.write(encodeAcpFrame(msg))
+  } catch (err) {
+    log(`omp-acp: write failed cwd=${client.cwd} session=${client.sessionId || "-"}: ${err instanceof Error ? err.message : String(err)}`)
+  }
 }
 
 function pumpAcpClient(client: OmpAcpClient, onPermission: (req: ButtonRequest) => void): void {
@@ -1216,7 +1247,21 @@ function pumpAcpClient(client: OmpAcpClient, onPermission: (req: ButtonRequest) 
         if (!raw || typeof raw !== "object") continue
         client.lastActivityAt = Date.now()
         const rec = raw as { id?: number; method?: string; result?: unknown; error?: { message?: string } }
-        if (typeof rec.id === "number" && client.pending.has(rec.id)) {
+        // `rec.method === undefined` is REQUIRED, not just `id` matching: an
+        // inbound ACP REQUEST (e.g. session/request_permission) carries its
+        // OWN id from the agent's own independent id counter, which can
+        // numerically collide with `client.nextId`-assigned ids for OUR
+        // outbound requests (both are small sequential integers starting
+        // near 1-3 per turn). Matching on id alone would treat a permission
+        // REQUEST as the RESPONSE to an outstanding session/prompt: the
+        // permission never reaches acpPermissionToButtonRequest below (the
+        // human never sees the card) and the prompt's `advance()` fires
+        // prematurely, flushing the next queued text into a session that is
+        // actually still blocked on that unanswered permission decision --
+        // reproducing the exact double-frame wedge this whole file exists to
+        // prevent, through the id-collision back door (review finding,
+        // 2026-09-18). A genuine JSON-RPC response never carries `method`.
+        if (typeof rec.id === "number" && rec.method === undefined && client.pending.has(rec.id)) {
           const wait = client.pending.get(rec.id)!
           client.pending.delete(rec.id)
           if (rec.error) wait.reject(new Error(rec.error.message ?? "ACP error"))
@@ -1269,10 +1314,25 @@ function ompAcpKey(agent: OmpAcpTarget): string {
 }
 
 async function ensureOmpAcp(agent: OmpAcpTarget): Promise<OmpAcpClient> {
-  const cwd = agent.cwd || "/"
   const key = ompAcpKey(agent)
   const existing = ompAcpClients.get(key)
   if (existing && existing.proc.exitCode === null) return existing
+
+  const inFlight = ompAcpEnsuring.get(key)
+  if (inFlight) return inFlight
+
+  const attempt = ensureOmpAcpSpawn(agent, key).finally(() => {
+    // Only clear if we're still the in-flight attempt for this key -- a
+    // later caller may already have started a NEW attempt (e.g. this one
+    // failed and a fresh reply retried) whose own entry must not be wiped.
+    if (ompAcpEnsuring.get(key) === attempt) ompAcpEnsuring.delete(key)
+  })
+  ompAcpEnsuring.set(key, attempt)
+  return attempt
+}
+
+async function ensureOmpAcpSpawn(agent: OmpAcpTarget, key: string): Promise<OmpAcpClient> {
+  const cwd = agent.cwd || "/"
   const loadSession = Boolean(agent.sessionId)
   const proc = Bun.spawn(["omp", ...ompAcpSpawnArgv({ cwd, loadSession })], {
     stdin: "pipe",
@@ -1289,6 +1349,8 @@ async function ensureOmpAcp(agent: OmpAcpTarget): Promise<OmpAcpClient> {
     pending: new Map(),
     lastActivityAt: Date.now(),
     pendingPermissions: 0,
+    promptInFlightId: null,
+    promptQueue: [],
   }
   pumpAcpClient(client, (req) => {
     ompPermissionSink?.(req)
@@ -1323,58 +1385,173 @@ async function promptOmpAcp(target: OmpAcpTarget | string, text: string): Promis
   const cwd = agent.cwd || "/"
   try {
     const client = await ensureOmpAcp(agent)
-    const promptSentAt = Date.now()
-    // Fire-and-forget (tg-cli#322, task-cli#138): the prior design awaited
-    // acpCall(...120_000) here, blocking Telegram delivery on the agent's real
-    // reply for up to two minutes — the root cause a rejected prior fix then
-    // papered over with a shutdown drain timer instead of removing the wait.
-    // The actual ask was just "get the message to the agent", not "wait for and
-    // surface the reply", so we write the NDJSON frame and return immediately.
-    // Whenever the real session/prompt response eventually arrives,
-    // pumpAcpClient's read loop finds no matching pending call for its id and
-    // drops it, same as any other unmatched ACP notification — nothing is
-    // awaiting it, so nothing hangs.
-    writeAcp(client, buildAcpSessionPrompt(client.nextId++, client.sessionId, text))
-    // Regression (tg-cli#353 relapse, 2026-09-17): going fire-and-forget dropped
-    // the ONLY signal that ever evicted a wedged ACP client (tg-cli#353/#352,
-    // shipped 1.49.2/1.51.1) -- the old code awaited acpCall and evicted+killed
-    // on its own timeout. With no await, a cached client whose pipe is
-    // genuinely dead (the exact tg-cli#353 shape: a target session already
-    // owned by another live process) is reused FOREVER: every future prompt
-    // into that key writes into a dead pipe, promptOmpAcp still returns
-    // {ok:true} (a stdin write never itself errors), and nothing ever reaches
-    // the human. Run the SAME eviction predicate 1.51.1 shipped (two
-    // independent review passes), just scheduled off the critical path so it
-    // cannot block delivery: no ACP traffic at all since this prompt was
-    // written (lastActivityAt is the proxy pumpAcpClient already maintains)
-    // AND no session/request_permission reply is still owed on this client
-    // (never evict out from under a human slowly answering a live Telegram
-    // permission — the documented 12h ABANDONED_PERMISSION_RETAIN_MS
-    // guarantee).
-    setTimeout(() => {
+    queuePrompt(client, agent, text)
+    return { ok: true }
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err)
+    log(`omp-acp: prompt delivery failed cwd=${cwd} session=${agent.sessionId ?? "-"}: ${error}`)
+    return { ok: false, error }
+  }
+}
+
+// Writes `text` as this client's next `session/prompt` if none is currently
+// outstanding; otherwise appends it to the client's queue. ACP session/prompt
+// is one turn at a time per session -- the tg-cli#353 wedge (a session already
+// owned by another live process) is exactly what a SECOND, un-acknowledged
+// prompt racing into the same pipe produces. Queued texts are flushed in
+// order as each prior prompt resolves (a matched response) or times out (the
+// eviction watchdog below). Never blocks: always returns immediately,
+// preserving the tg-cli#322 fire-and-forget contract.
+function queuePrompt(client: OmpAcpClient, agent: OmpAcpTarget, text: string): void {
+  if (client.promptInFlightId !== null) {
+    client.promptQueue.push(text)
+    // Incident-triage visibility (and a deterministic signal integration
+    // tests can poll for instead of a blind sleep): a queued prompt is
+    // otherwise invisible until it's eventually written or dropped.
+    log(
+      `omp-acp: session/prompt queued cwd=${agent.cwd || "/"} session=${agent.sessionId ?? client.sessionId ?? "-"} ` +
+        `(in flight, ${client.promptQueue.length} queued)`,
+    )
+    return
+  }
+  writePrompt(client, agent, text)
+}
+
+function writePrompt(client: OmpAcpClient, agent: OmpAcpTarget, text: string): void {
+  const cwd = agent.cwd || "/"
+  const id = client.nextId++
+  client.promptInFlightId = id
+
+  let timer: ReturnType<typeof setTimeout> | null = null
+
+  // Releases the queue for THIS prompt's id only -- a stale advance/evict
+  // from an already-superseded id (the other of the two already moved on to
+  // a fresh client for a later prompt) is a no-op, since promptInFlightId no
+  // longer matches.
+  const advance = (): void => {
+    if (client.promptInFlightId !== id) return
+    if (timer) clearTimeout(timer)
+    client.promptInFlightId = null
+    const next = client.promptQueue.shift()
+    if (next !== undefined) queuePrompt(client, agent, next)
+  }
+
+  // Kills the client and redelivers `text` -- the prompt that was in flight
+  // when the session turned out to be broken, previously silently dropped --
+  // plus everything queued behind it, through a fresh client for this key.
+  // Called ONLY by the watchdog's genuinely-dead-pipe branch below (a real
+  // ACP error response is handled separately, by `reject` below, WITHOUT
+  // eviction -- see its comment for why). Reusing the SAME dead pipe for the
+  // next queued text would just repeat the identical failure.
+  //
+  // Known accepted tradeoff (review finding, 2026-09-18, not fixed here):
+  // redelivering the in-flight text turns a false-positive eviction (the
+  // session was genuinely still working, just silent -- e.g. one long
+  // tool call with no intermediate `session/update` chatter for a full
+  // ACP_PROMPT_TIMEOUT_MS) into a DUPLICATE execution of that turn once the
+  // original eventually finishes, instead of the pre-fix silent loss. Silent
+  // loss is the exact production incident this change targets; a true fix
+  // for false-positive duplication needs an ACP-level heartbeat/cancel
+  // signal, out of scope here.
+  const evict = (reason: string): void => {
+    if (client.promptInFlightId !== id) return
+    if (timer) clearTimeout(timer)
+    client.pending.delete(id)
+    const key = ompAcpKey(agent)
+    const stillCached = ompAcpClients.get(key) === client
+    if (stillCached) ompAcpClients.delete(key)
+    const proc = client.proc
+    proc.kill("SIGKILL")
+    // Only log a real eviction: if a newer client already replaced this one
+    // under the same key, killing the orphaned old proc is just cleanup, not
+    // an eviction from the live map -- a duplicate/misleading log line here
+    // would undermine the incident-triage trust this change exists for.
+    if (stillCached) {
+      log(`omp-acp: evicted wedged client cwd=${cwd} session=${agent.sessionId ?? "-"} (${reason})`)
+    }
+    // SEQUENTIALLY awaited, not a fire-and-forget loop: promptOmpAcp only
+    // awaits ensureOmpAcp (session spawn/load), not the prompt's own reply,
+    // so awaiting it here still returns promptly -- but it guarantees the
+    // first redelivered text's ensureOmpAcp call finishes (and registers the
+    // fresh client in ompAcpClients) BEFORE the next queued text's
+    // promptOmpAcp call reads the map. A concurrent (un-awaited) loop would
+    // race N ensureOmpAcp calls against an empty cache and spawn N separate
+    // `omp acp` processes for one wedged key instead of one.
+    const redeliver = [text, ...client.promptQueue.splice(0)]
+    client.promptInFlightId = null
+    void (async () => {
       try {
-        if (client.pendingPermissions > 0) return
-        // Strict > (not >=): lastActivityAt is also touched by this same
-        // client's own session/load response, which resolves just before
-        // promptSentAt is captured -- a >= comparison can tie at millisecond
-        // resolution and wrongly treat that pre-prompt activity as "traffic
-        // since the prompt", masking a genuinely wedged session/prompt.
-        if (client.lastActivityAt > promptSentAt) return
-        const key = ompAcpKey(agent)
-        const stillCached = ompAcpClients.get(key) === client
-        if (stillCached) ompAcpClients.delete(key)
-        client.proc.kill()
-        // Only log a real eviction: if a newer client already replaced this
-        // one under the same key (e.g. a fresh ensureOmpAcp ran before this
-        // timer fired), killing the orphaned old proc is just cleanup, not an
-        // eviction from the live map -- a duplicate/misleading log line here
-        // would undermine the incident-triage trust this change exists for.
-        if (stillCached) {
-          log(
-            `omp-acp: evicted wedged client cwd=${cwd} session=${agent.sessionId ?? "-"} ` +
-              `(no ACP traffic ${ACP_PROMPT_TIMEOUT_MS}ms after prompt)`,
-          )
+        // Wait for the killed process to actually exit before spawning its
+        // replacement (matches spawnGuarded's SIGKILL+await-exited
+        // convention elsewhere in this file) -- a still-alive wedged owner
+        // racing a fresh session/load on the same session would recreate the
+        // exact double-ownership wedge eviction exists to resolve (review
+        // finding, 2026-09-18).
+        await proc.exited
+        for (const redeliverText of redeliver) {
+          await promptOmpAcp(agent, redeliverText)
         }
+      } catch (err) {
+        // Never let redelivery itself throw -- it runs outside promptOmpAcp's
+        // own try/catch (a fresh event-loop turn) and would crash the daemon.
+        log(`omp-acp: redelivery failed cwd=${cwd} session=${agent.sessionId ?? "-"}: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    })()
+  }
+
+  client.pending.set(id, {
+    resolve: () => advance(),
+    reject: (err) => {
+      // Previously silently discarded -- an explicit ACP error response (e.g.
+      // a transient per-turn failure) named the exact failure with zero log
+      // line. Log it and advance the queue normally (NOT evict): the client
+      // just proved its pipe is alive by replying at all, only this one
+      // prompt failed. Treating every error reply as a dead pipe was tried
+      // and reverted (review finding, 2026-09-18) -- for a PERSISTENT
+      // per-session error (e.g. "session already owned by another live
+      // process") it produced an unbounded, zero-backoff evict/respawn loop
+      // with no retry cap, since each fresh client's session/prompt would
+      // fail identically and immediately re-evict. A genuinely dead pipe is
+      // still caught by the watchdog below (paced at ACP_PROMPT_TIMEOUT_MS,
+      // not immediate).
+      log(`omp-acp: session/prompt error cwd=${cwd} session=${agent.sessionId ?? "-"}: ${err.message}`)
+      advance()
+    },
+  })
+  writeAcp(client, buildAcpSessionPrompt(id, client.sessionId, text))
+
+  // Regression (tg-cli#353 relapse, 2026-09-17): the prior design awaited
+  // acpCall(...120_000) here, blocking Telegram delivery on the agent's real
+  // reply for up to two minutes -- the root cause a rejected prior fix then
+  // papered over with a shutdown drain timer instead of removing the wait.
+  // This timer is a WATCHDOG, not a wait: promptOmpAcp already returned. It
+  // exists purely to evict a client whose pipe is genuinely dead (tg-cli#353:
+  // a target session already owned by another live process) so the NEXT
+  // prompt gets a fresh child instead of reusing a wedge forever.
+  //
+  // `checkpoint` is a SLIDING watchdog boundary, not the original prompt-sent
+  // time: a still-alive session (streaming session/update notifications, or a
+  // human mid-decision on a permission) must never advance the queue while
+  // turn 1 is still outstanding -- that would write a SECOND session/prompt
+  // frame into the same live pipe, exactly the relapse this change exists to
+  // prevent, just delayed past the timeout. Re-arming against a fresh
+  // checkpoint (not the original) keeps waiting for the real response (via
+  // `advance` above) or genuine silence to drive the queue, instead of ever
+  // force-advancing a session that is provably still working.
+  const scheduleWatchdog = (checkpoint: number): void => {
+    timer = setTimeout(() => {
+      try {
+        if (client.promptInFlightId !== id) return
+        // Strict > (not >=): lastActivityAt can tie with `checkpoint` at
+        // millisecond resolution (e.g. a session/load response resolving
+        // right as the initial checkpoint is captured) -- a >= comparison
+        // would wrongly treat that as "traffic since the checkpoint" and
+        // mask a genuinely wedged session/prompt.
+        if (client.pendingPermissions > 0 || client.lastActivityAt > checkpoint) {
+          scheduleWatchdog(Date.now())
+          return
+        }
+        evict(`no ACP traffic ${ACP_PROMPT_TIMEOUT_MS}ms after prompt`)
       } catch (err) {
         // Never let the deferred timer itself throw -- an uncaught exception
         // here runs outside promptOmpAcp's own try/catch (a fresh event-loop
@@ -1383,12 +1560,8 @@ async function promptOmpAcp(target: OmpAcpTarget | string, text: string): Promis
         log(`omp-acp: eviction check failed cwd=${cwd} session=${agent.sessionId ?? "-"}: ${err instanceof Error ? err.message : String(err)}`)
       }
     }, ACP_PROMPT_TIMEOUT_MS)
-    return { ok: true }
-  } catch (err) {
-    const error = err instanceof Error ? err.message : String(err)
-    log(`omp-acp: prompt delivery failed cwd=${cwd} session=${agent.sessionId ?? "-"}: ${error}`)
-    return { ok: false, error }
   }
+  scheduleWatchdog(Date.now())
 }
 
 async function replyOmpAcpPermission(req: ButtonRequest, optionId: string): Promise<{ ok: true } | { ok: false; error: string }> {

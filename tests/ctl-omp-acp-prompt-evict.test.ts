@@ -17,8 +17,16 @@ import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon
 // that key wrote into the dead pipe, promptOmpAcp kept returning {ok:true}
 // (a stdin write never itself errors), and nothing ever reached the human.
 // This proves the eviction is restored, off the fire-and-forget critical
-// path: a second reply after the first one wedges still spawns a SECOND
-// `omp acp` process instead of reusing the dead one.
+// path: a wedged client is never reused forever -- each redelivery attempt
+// gets a genuinely fresh `omp acp` process, never the dead one.
+//
+// tg-cli#353-adjacent serialization fix (2026-09-18, see
+// ctl-omp-acp-prompt-serialize.test.ts): eviction now ALSO redelivers the
+// in-flight text itself (previously only queued texts behind it were
+// redelivered, silently dropping the very message that discovered the
+// wedge). So a permanently-wedged session now self-retries via a fresh
+// client every ACP_PROMPT_TIMEOUT_MS, forever -- this test tracks that as
+// repeated evictions/spawns rather than a single one-shot eviction.
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -176,10 +184,16 @@ test('a session/prompt that never replies is evicted (off the fire-and-forget pa
   // fake-advance against (the daemon is a separate OS process on the platform
   // clock), so this polls its log file the same way the sibling ACP
   // integration tests do.
+  //
+  // Eviction now ALSO redelivers the in-flight text itself (not just
+  // anything queued behind it), through a fresh client -- so a single
+  // eviction of message 1 immediately produces a SECOND spawn (the
+  // automatic retry), not just the eviction log line. Wait for both.
   const t0 = Date.now();
   while (Date.now() - t0 < 10_000) {
     const daemonLog = existsSync(join(cfgDir, 'daemon.log')) ? readFileSync(join(cfgDir, 'daemon.log'), 'utf8') : '';
-    if (daemonLog.includes('omp-acp: evicted wedged client')) break;
+    const spawns = readFileSync(spawnLog, 'utf8').trim().split('\n').filter(Boolean);
+    if (daemonLog.includes('omp-acp: evicted wedged client') && spawns.length >= 2) break;
     await Bun.sleep(50);
   }
 
@@ -187,23 +201,37 @@ test('a session/prompt that never replies is evicted (off the fire-and-forget pa
   expect(daemonLogAfterFirst).toContain('omp-acp: evicted wedged client');
 
   const spawnsAfterFirst = readFileSync(spawnLog, 'utf8').trim().split('\n').filter(Boolean);
-  expect(spawnsAfterFirst.length).toBe(1);
+  // >= not === : eviction now self-retries every TG_CTL_ACP_PROMPT_TIMEOUT_MS
+  // (300ms here), so a test-process scheduling delay past the break point
+  // could observe a 3rd spawn already under way -- an exact count would
+  // flake under load, consistent with the >= 3 assertion used later.
+  expect(spawnsAfterFirst.length).toBeGreaterThanOrEqual(2);
+  expect(new Set(spawnsAfterFirst).size).toBe(spawnsAfterFirst.length);
 
   updates.push({
     update_id: 101,
     message: { message_id: 11, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: 2, text: '/agent WedgedSession second attempt' },
   });
 
-  // A second reply after the first one wedged must spawn a NEW omp acp child
-  // instead of reusing the dead one (the regression: it never did, forever).
+  // The second human reply arrives while the auto-redelivered first attempt
+  // (spawn #2) is itself still wedged and in flight, so it queues behind it
+  // (serialization) rather than spawning immediately. Spawn #2 wedges too
+  // (the fake omp never answers session/prompt) and its own eviction
+  // redelivers BOTH the still-unacknowledged first text and the queued
+  // second one onto a fresh spawn #3 -- proving neither message is ever
+  // silently dropped across repeated wedge/evict cycles, and no wedged
+  // client is ever reused.
   const t1 = Date.now();
   while (Date.now() - t1 < 10_000) {
     const spawns = readFileSync(spawnLog, 'utf8').trim().split('\n').filter(Boolean);
-    if (spawns.length >= 2) break;
+    if (spawns.length >= 3) break;
     await Bun.sleep(50);
   }
 
   const spawnsAfterSecond = readFileSync(spawnLog, 'utf8').trim().split('\n').filter(Boolean);
-  expect(spawnsAfterSecond.length).toBe(2);
-  expect(new Set(spawnsAfterSecond).size).toBe(2);
+  expect(spawnsAfterSecond.length).toBeGreaterThanOrEqual(3);
+  expect(new Set(spawnsAfterSecond).size).toBe(spawnsAfterSecond.length);
+
+  const evictionCount = (readFileSync(join(cfgDir, 'daemon.log'), 'utf8').match(/omp-acp: evicted wedged client/g) ?? []).length;
+  expect(evictionCount).toBeGreaterThanOrEqual(2);
 }, 25_000);
