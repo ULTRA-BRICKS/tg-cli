@@ -12,6 +12,7 @@
 // is NEVER fabricated (a fabricated "passing" CI would be worse than a blank).
 
 import { escapeHtml } from '../render/html';
+import { truncateWithEllipsis } from './text-util';
 
 // task-cli's canonical states. `/tasks <status>` filters on one of these; a range
 // of natural aliases normalizes onto them so `/tasks wip` or `/tasks review` work.
@@ -334,7 +335,7 @@ export function buildTasksReplyMarkup(view: TaskViewFilter, page: number, totalP
 
 function taskRow(t: TaskItem, pr: PrRef | null): string {
   const id = t.url ? `<a href="${escapeHtml(t.url)}">${escapeHtml(t.id)}</a>` : escapeHtml(t.id);
-  const title = escapeHtml(`${statusEmojiForTask(t, pr)} ${truncate(t.title, 58)}`);
+  const title = escapeHtml(`${statusEmojiForTask(t, pr)} ${truncateWithEllipsis(t.title, 58)}`);
   const state = escapeHtml(t.state || '—');
   const due = t.due ? escapeHtml(t.due) : '—';
   const prCell = pr ? `<a href="${escapeHtml(pr.url)}">#${pr.number}</a>` : '—';
@@ -442,10 +443,6 @@ export function isTaskViewFilter(view: unknown): view is TaskViewFilter {
 function clampPage(page: number, totalPages: number): number {
   if (!Number.isFinite(page)) return 0;
   return Math.min(Math.max(0, Math.floor(page)), Math.max(0, totalPages - 1));
-}
-
-function truncate(s: string, max: number): string {
-  return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
 }
 
 function escapeRegExp(s: string): string {

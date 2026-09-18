@@ -56,7 +56,11 @@ function insideTag(text: string, pos: number): boolean {
 }
 
 // Pull a surrogate-pair / tag-boundary back so we never cut mid-multibyte or
-// mid-tag. Returns an adjusted cut index in [start+1, hardCut].
+// mid-tag. Returns an adjusted cut index in [start+1, hardCut]. Same invariant as
+// `features/tg-ctl/text-util.ts`'s `safeSliceEnd` (also guards a Telegram-bound cut
+// against orphaning a UTF-16 surrogate half), independently evolved here for this
+// splitter's own tag-boundary concern — see that module's header for the shared
+// "why" (tg#17245: an orphaned surrogate 400s the whole Bot API send).
 function safeCut(text: string, start: number, hardCut: number): number {
   let cut = hardCut;
   // Don't sit on the low half of a surrogate pair.

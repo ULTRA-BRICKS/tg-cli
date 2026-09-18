@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import { buildReplyInject, stepUpdates, type StepOpts } from '../features/tg-ctl/updates';
 import { DEFAULT_CONTROL, type TgMessage, type TgUpdate } from '../features/tg-ctl/types';
+import { hasUnpairedSurrogate } from '../features/tg-ctl/text-util';
 
 const CHAT_ID = 1000;
 const NOW = 1_750_000_000;
@@ -53,6 +54,25 @@ test('long original is truncated to the head + ellipsis', () => {
   const out = buildReplyInject(reply('y', long, undefined), 'Alex', opts);
   const anchor = out.split('\n')[0];
   expect(anchor).toBe(`↩ tg#42 «[2026-06-12 14:30] ${'x'.repeat(60)}…»`);
+});
+
+// tg#17245 (live incident): the quoted head is cut at a fixed UTF-16 code-unit
+// count. A naive slice can land between the two halves of a surrogate pair (an
+// emoji), producing an orphaned lone surrogate. JSON.stringify escapes that as
+// `\uD83D` (still valid JSON on the wire), but Telegram's Bot API rejects the
+// decoded string server-side with a flat 400 "strings must be encoded in
+// UTF-8" — the whole sendMessage call fails. The cut must back up to keep the
+// pair whole (dropped together), never split.
+test('a quote head that would split an emoji surrogate pair drops the pair whole, not orphaned', () => {
+  // 😀 (\uD83D\uDE00) sits exactly on the QUOTE_HEAD_MAX=60 cut boundary: chars
+  // 0-58 fill positions 0..58, so the high surrogate lands at index 59 — a
+  // naive `.slice(0, 60)` would keep it and drop its low-surrogate partner.
+  const long = `${'x'.repeat(59)}\ud83d\ude00${'y'.repeat(10)}`;
+  const out = buildReplyInject(reply('y', long, undefined), 'Alex', opts);
+  const anchor = out.split('\n')[0];
+  expect(anchor).toBe(`↩ tg#42 «[2026-06-12 14:30] ${'x'.repeat(59)}…»`);
+  // No lone surrogate anywhere in the anchor — the property Telegram enforces.
+  expect(hasUnpairedSurrogate(anchor)).toBe(false);
 });
 
 test('multiline original/quote is collapsed to one anchor line', () => {

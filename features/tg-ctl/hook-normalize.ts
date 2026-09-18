@@ -19,6 +19,7 @@
 
 import type { AgentKind } from './types';
 import type { ButtonOption, ButtonRequest, ButtonRequestKind, DecisionLabels } from './questions';
+import { safeSliceEnd, truncateWithEllipsis } from './text-util';
 
 export interface HookEnv {
   agent: AgentKind; // from the --agent flag the installer wrote (default claude)
@@ -315,7 +316,7 @@ function normalizeAskUserQuestions(p: Record<string, unknown>, env: HookEnv): Bu
 // read the full plan in the pane; the button is for the proceed/keep decision.
 const PLAN_MAX = 3000;
 function clampPlan(plan: string): string {
-  return plan.length > PLAN_MAX ? `${plan.slice(0, PLAN_MAX)}\n… (plan truncated — see the pane)` : plan;
+  return plan.length > PLAN_MAX ? `${plan.slice(0, safeSliceEnd(plan, PLAN_MAX))}\n… (plan truncated — see the pane)` : plan;
 }
 
 // Which Claude Code hook event delivered this permission — the reply shape
@@ -333,6 +334,5 @@ function permissionEventOf(p: Record<string, unknown>): 'PreToolUse' | 'Permissi
 function summarizeInput(tool: string, input: Record<string, unknown>): string {
   const pick = (k: string): string | null => (typeof input[k] === 'string' ? (input[k] as string) : null);
   const raw = pick('command') ?? pick('file_path') ?? pick('path') ?? pick('url') ?? '';
-  const one = raw.replace(/\s+/g, ' ').trim();
-  return one.length > 100 ? `${one.slice(0, 99)}…` : one;
+  return truncateWithEllipsis(raw.replace(/\s+/g, ' ').trim(), 100);
 }

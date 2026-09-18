@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
 import { normalizeHookPayload, normalizeHookRequests, type HookEnv } from '../features/tg-ctl/hook-normalize';
+import { hasUnpairedSurrogate } from '../features/tg-ctl/text-util';
 
 const env: HookEnv = {
   agent: 'claude',
@@ -360,6 +361,32 @@ test('ExitPlanMode: SAME prompt_id but a DIFFERENT invocationNonce still gets a 
   const first = normalizeHookPayload(payload, { ...env, invocationNonce: 'nonce-1' });
   const second = normalizeHookPayload(payload, { ...env, invocationNonce: 'nonce-2' });
   expect(first!.requestId).not.toBe(second!.requestId);
+});
+
+// tg-cli#424 review finding F1: clampPlan's PLAN_MAX=3000 cut is the exact
+// same live-incident bug class (tg#17245) — an agent plan whose truncation
+// boundary lands mid-emoji orphans a lone surrogate, and Telegram's
+// sendMessage for the ExitPlanMode plan-approval card 400s wholesale.
+test('ExitPlanMode: a plan that would split an emoji surrogate pair at the 3000-char cut is not orphaned', () => {
+  // 2999 filler chars + 😀 (\uD83D\uDE00) puts the high surrogate exactly at
+  // index 2999 — a naive `.slice(0, 3000)` keeps it and drops its
+  // low-surrogate partner.
+  const plan = `${'x'.repeat(2999)}\ud83d\ude00${'y'.repeat(50)}`;
+  const req = normalizeHookPayload({ session_id: 'sid', hook_event_name: 'PreToolUse', tool_name: 'ExitPlanMode', tool_input: { plan } }, env);
+  expect(req!.question).toBe(`Proceed with this plan?\n\n${'x'.repeat(2999)}\n… (plan truncated — see the pane)`);
+  expect(hasUnpairedSurrogate(req!.question)).toBe(false);
+});
+
+// tg-cli#424 review finding F2: summarizeInput's 100-char cut feeds the
+// permission-prompt question — same bug class, same live failure mode.
+test('PermissionRequest: a command summary that would split an emoji surrogate pair at the 100-char cut is not orphaned', () => {
+  // 98 filler chars + 😀 (\uD83D\uDE00) puts the high surrogate exactly at
+  // index 98 — a naive `.slice(0, 99)` keeps it and drops its low-surrogate
+  // partner.
+  const command = `${'x'.repeat(98)}\ud83d\ude00${'y'.repeat(20)}`;
+  const req = normalizeHookPayload({ session_id: 'sid', hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command } }, env);
+  expect(req!.question).toBe(`Allow Bash? ${'x'.repeat(98)}…`);
+  expect(hasUnpairedSurrogate(req!.question)).toBe(false);
 });
 
 test('a payload with no prompt_id/turn_id (older harness) still normalizes — env.invocationNonce alone still scopes it correctly', () => {

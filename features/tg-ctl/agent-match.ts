@@ -7,6 +7,7 @@
 // turn plain data into routing decisions and button payloads.
 
 import type { AgentKind } from './types';
+import { truncateWithEllipsis } from './text-util';
 
 export interface AgentCandidate {
   paneId: string; // "%N"
@@ -559,6 +560,5 @@ export function parseAgentCancelCallback(data: string | undefined): { token: str
 }
 
 function truncate(s: string, max: number): string {
-  const t = s.replace(/\s+/g, ' ').trim();
-  return t.length <= max ? t : `${t.slice(0, max - 1)}…`;
+  return truncateWithEllipsis(s.replace(/\s+/g, ' ').trim(), max);
 }
