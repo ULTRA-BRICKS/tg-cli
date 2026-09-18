@@ -3,6 +3,73 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.53.1
+
+**Fix (tg-ctl): serialize ACP `session/prompt` delivery per session (tg-cli#353 relapse).**
+
+- Confirmed production bug: a Telegram reply routed to the correct live `omp` ACP agent
+  session never reached it, with zero error surfaced, whenever that session was busy
+  (mid-turn) when the reply arrived. Root cause: `promptOmpAcp` wrote `session/prompt` ACP
+  JSON-RPC frames fire-and-forget with no per-client serialization — if a human replied a
+  second time before the agent's first turn completed, `tg-ctl` wrote a SECOND
+  `session/prompt` frame into the same ACP session pipe while the first was still
+  outstanding. ACP `session/prompt` is one-turn-at-a-time per session — the same shape as
+  the already-documented, already-relapsed tg-cli#353 "session already owned by another
+  live process" wedge bug.
+- `OmpAcpClient` now tracks `promptInFlightId` (the id of an outstanding, unacknowledged
+  `session/prompt`) and `promptQueue` (texts waiting behind it). `promptOmpAcp` writes
+  immediately when no prompt is in flight; otherwise it queues. The prompt's own JSON-RPC
+  response id is now registered in `client.pending` (previously discarded entirely), so a
+  real response resolves the in-flight slot and flushes the next queued text.
+- The watchdog that guards against a genuinely dead pipe uses a SLIDING checkpoint: a
+  session that is still provably alive (streaming `session/update` notifications past the
+  timeout, or a human mid-decision on a permission) re-arms and keeps waiting instead of
+  ever advancing the queue — an earlier draft of this fix advanced on "still alive" too,
+  which raced a second frame into a still-busy pipe at the watchdog boundary instead of
+  immediately, reproducing the identical wedge just delayed. Only a real response or
+  genuine silence releases the queue slot.
+- On genuine eviction (a watchdog-detected dead pipe), the client is killed and BOTH the
+  in-flight text and everything queued behind it are redelivered through a fresh client,
+  sequentially, so one wedge never spawns more than one replacement process. Previously
+  only queued texts were redelivered, silently dropping the very message that discovered
+  the wedge. (Known accepted tradeoff, not fixed here: a false-positive eviction — the
+  session was genuinely still working with no ACP traffic for a full watchdog window — now
+  redelivers as a duplicate turn instead of silently losing the message; a full fix needs
+  an ACP-level heartbeat, out of scope.)
+- An explicit ACP JSON-RPC error reply to `session/prompt` (previously silently discarded
+  with zero log line) is now logged and the queue advances normally — deliberately NOT
+  treated as eviction: an earlier draft did evict-and-immediately-redeliver on every error,
+  which produced an unbounded, zero-backoff respawn loop for any session with a persistent
+  per-prompt error (reverted after review, 2026-09-18).
+- Fixed a critical id-namespace collision this fix's own new `client.pending` registration
+  exposed: an inbound ACP `session/request_permission` REQUEST carries the agent's own,
+  independently-counted id, which can numerically collide with `client.nextId`-assigned ids
+  for OUR outbound `session/prompt`/`initialize`/`session/load` calls. The pending-response
+  matcher now requires `rec.method === undefined` (a genuine JSON-RPC response never carries
+  `method`) before matching on id alone — previously a colliding permission request could be
+  mistaken for the prompt's own response, skipping the permission card entirely and flushing
+  the next queued text into a session still actually blocked on that unanswered decision.
+- Fixed a concurrent-spawn race: two Telegram replies to the same not-yet-cached session
+  landing in one dispatch batch (same-target messages with no per-session resource key can
+  run concurrently) previously each saw an empty client cache and spawned their own
+  `omp acp`, both `session/load`-ing the identical underlying session — the double-ownership
+  wedge this whole file exists to prevent, reached through concurrent first contact instead
+  of a raced write. `ensureOmpAcp` now coalesces concurrent callers for the same key onto one
+  in-flight spawn attempt.
+- Eviction now `kill("SIGKILL")`s the wedged process and awaits its actual exit (matching
+  this file's existing `spawnGuarded` convention) before spawning its replacement — the
+  previous unawaited `SIGTERM` could let the fresh client's `session/load` race a still-alive
+  wedged owner, reproducing the exact double-ownership wedge eviction exists to resolve.
+- `writeAcp` no longer lets a write against an already-dead pipe (EPIPE / write-after-close)
+  escape uncaught from a resolve/reject callback invoked synchronously off the ACP read
+  loop, which could otherwise crash the daemon.
+- New regression coverage: `tests/ctl-omp-acp-prompt-serialize.test.ts` (the core
+  serialization fix), `tests/ctl-omp-acp-prompt-serialize-watchdog-busy.test.ts` (the
+  watchdog must never advance a genuinely busy session), `tests/ctl-omp-acp-prompt-serialize-id-collision.test.ts`
+  (the permission/prompt id-collision fix), and `tests/ctl-omp-acp-prompt-serialize-error-reply.test.ts`
+  (a persistent ACP error must drain the queue without evict-and-respawn) — each verified to
+  fail against its specific pre-fix behavior and pass against the fix.
+
 ## 1.53.0
 
 **Feature (tg report): structured result-report subcommand, bridging `/result-report` to Telegram.**
