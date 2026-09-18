@@ -475,17 +475,6 @@ export function hatchGrantApprovedText(req: ButtonRequest, approvalId: string, d
   return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
 }
 
-// tg-cli#403: PROACTIVE counterpart to hatchGrantApprovedText — pushed into a
-// still-LIVE agent session (promptOmpAcp) the moment a CRITICAL hatch decision
-// lands, rather than only ever being discoverable by re-reading the Telegram
-// card. Deliberately concise (no buildQuestionText prefix): this lands as an
-// unsolicited chat message inside a live coding session, not a Telegram card,
-// so repeating the full original question text would be noise the agent didn't
-// ask for and already has in its own Telegram history.
-export function hatchProactiveDecisionText(hookId: string, decisionLabel: string): string {
-  return `hatch decision arrived: "${decisionLabel}" for hatch request ${hookId} (this took a while — the original requesting command already gave up waiting). Retry the exact same command with the same ${hatchEnvVarName(hookId)}="<justification>" env var and it will be applied automatically with no new Telegram prompt. Only retry if the original need is still current.`;
-}
-
 // Same socket-close event, but for a multi-question SET MEMBER: a lone late answer
 // must NOT be delivered (the local dialog may be showing a DIFFERENT question of
 // the set, see ButtonRequest.multiQuestion) and, unlike a permission, there is no

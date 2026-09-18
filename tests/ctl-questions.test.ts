@@ -11,6 +11,7 @@ import {
   extractAnswersFromHookReply,
   formatAgentHookOutput,
   hatchAbandonedPermissionText,
+  hatchGrantApprovedText,
   hatchParseMode,
   parseButtonCallback,
   parseQuestionCloseCallback,
@@ -136,7 +137,7 @@ test('hatchParseMode gates on isHatchPermissionRequest, same as buildButtonMessa
   })).toBeUndefined();
 });
 
-test('hatchAbandonedPermissionText escapes its own literal <justification> placeholder so parse_mode: HTML never rejects the edit', () => {
+test('hatchAbandonedPermissionText: the original HTML prompt rides through verbatim, and the new grant-window status carries no unescaped placeholder', () => {
   const hatchReq: ButtonRequest = {
     requestId: 'hatch-block-reset-hard-aaaaaaaaaaaa',
     agent: 'claude',
@@ -147,12 +148,30 @@ test('hatchAbandonedPermissionText escapes its own literal <justification> place
   // The ORIGINAL prompt (buildQuestionText's hatch early-return) rides through verbatim —
   // it is agent-tools' own pre-escaped HTML, not this function's concern.
   expect(text).toContain('<b>Hatch approval request</b>');
-  // The status suffix hand-authors a literal `="<justification>"` placeholder — sent under
-  // parse_mode: 'HTML' (hatchParseMode), an unescaped `<justification>` is an unrecognized
-  // Telegram tag and the WHOLE edit gets rejected with a 400, silently dropped by botPost.
-  // Escaped, it renders as the literal placeholder text a human is meant to read.
-  expect(text).toContain('&lt;justification&gt;');
-  expect(text).not.toContain('="<justification>"');
+  // Grant protocol v1.1 (tg-cli#398): the abandoned card no longer promises an
+  // automatic env-var replay — it advertises the 24h grace window a late Approve
+  // tap mints a grant from. No unescaped placeholder rides along either.
+  expect(text).toContain('24h');
+  expect(text).toContain('one-time grant');
+  expect(text).not.toContain('<justification');
+});
+
+test('hatchGrantApprovedText escapes its literal <HOOK> placeholder (undelivered branch) so parse_mode: HTML never rejects the edit', () => {
+  const hatchReq: ButtonRequest = {
+    requestId: 'hatch-block-reset-hard-aaaaaaaaaaaa',
+    agent: 'claude',
+    kind: 'permission',
+    question: '<b>Hatch approval request</b>',
+  };
+  const text = hatchGrantApprovedText(hatchReq, 'hgr-abc123def456', false);
+  // The ORIGINAL prompt still rides through verbatim.
+  expect(text).toContain('<b>Hatch approval request</b>');
+  // The undelivered-notice status hand-authors a literal `RIG_HATCH_REQUEST_<HOOK>=…`
+  // placeholder — sent under parse_mode: 'HTML' (hatchParseMode), an unescaped `<HOOK>`
+  // is an unrecognized Telegram tag and the WHOLE edit gets rejected with a 400,
+  // silently dropped by botPost. Escaped, it renders as the literal placeholder text.
+  expect(text).toContain('&lt;HOOK&gt;');
+  expect(text).not.toContain('RIG_HATCH_REQUEST_<HOOK>');
 });
 
 test('questionCapability is explicit: claude/codex/opencode/omp support buttons, pi/aider are limited', () => {

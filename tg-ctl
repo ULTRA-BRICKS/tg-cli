@@ -220,7 +220,6 @@ import {
   hatchAbandonedPermissionText,
   hatchGrantApprovedText,
   hatchParseMode,
-  hatchProactiveDecisionText,
   isHatchPermissionRequest,
   isHatchRequest,
   parseHatchHookId,
@@ -1406,26 +1405,6 @@ async function replyOmpAcpPermission(req: ButtonRequest, optionId: string): Prom
 function liveOmpForPane(paneId: string, agentPid?: number): LiveOmpAgent | null {
   const agents = listLiveOmpAgents()
   return agents.find((a) => a.paneId === paneId || (agentPid !== undefined && a.pid === agentPid)) ?? null
-}
-
-// tg-cli#403: which LIVE omp session (if any) a critical hatch/permission
-// decision should be proactively pushed into. paneId is checked first (more
-// precise — an exact tmux pane match) and cwd second (the fallback for an omp
-// session running outside tmux, where paneId is best-effort/absent), mirroring
-// the cwd/paneId matching the request already carries structurally (see
-// ButtonRequest.cwd/paneId). Returns null — never a spawn/attach fallback —
-// when nothing in listLiveOmpAgents() actually matches; the caller must never
-// promptOmpAcp a session this returns null for (see the call site's own doc
-// comment on why: ensureOmpAcp's attach path can itself spawn a session).
-function liveOmpAgentForHatchRequest(req: ButtonRequest): LiveOmpAgent | null {
-  const agents = listLiveOmpAgents()
-  if (req.paneId) {
-    const byPane = agents.find((a) => a.paneId === req.paneId)
-    if (byPane) return byPane
-  }
-  if (!req.cwd) return null
-  const wantCwd = resolve(req.cwd)
-  return agents.find((a) => a.cwd !== null && resolve(a.cwd) === wantCwd) ?? null
 }
 
 function noAgentReplyNow(): string {
@@ -9521,7 +9500,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (answer.decision === "deny") {
       if (cardId !== null) {
         void clearMessageKeyboard(ctx, cardId)
-        void editMessageText(ctx, cardId, buildAnsweredQuestionText(req, answer.label))
+        void editMessageText(ctx, cardId, buildAnsweredQuestionText(req, answer.label), undefined, hatchParseMode(req))
       }
       log(`hatch-late-deny: ${describeAskRequest(req)} key=${action.requestId} — expired ask, nothing to deliver`)
       await answerCallbackQuery(ctx, action.callbackQueryId, "denied — the request had already expired; the agent must re-request")
@@ -9601,7 +9580,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const delivered = await routeGrantNotice(ctx, req, notice)
     if (cardId !== null) {
       void clearMessageKeyboard(ctx, cardId)
-      void editMessageText(ctx, cardId, hatchGrantApprovedText(req, grant.approval_id, delivered))
+      void editMessageText(ctx, cardId, hatchGrantApprovedText(req, grant.approval_id, delivered), undefined, hatchParseMode(req))
     }
     log(`hatch-grant-notice-${delivered ? "delivered" : "failed"}: approvalId=${grant.approval_id} route=${grant.route ?? "-"} key=${action.requestId}`)
     await answerCallbackQuery(
@@ -9925,32 +9904,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           hatchParseMode(retained.req),
         )
       }
-      // tg-cli#403 acceptance criterion (d): a CRITICAL hatch decision is
-      // pushed PROACTIVELY into a still-live agent session the instant it
-      // lands here — this exact call site is the original incident (a human
-      // tap landing after the requesting process had already given up
-      // waiting). Best-effort, fire-and-forget: it must never block or fail
-      // the card-edit above, which is the correctness-critical part a human
-      // actually sees. Only ever targets a session listLiveOmpAgents()
-      // ALREADY reports as live — see tg-awareness-nudge.ts's own
-      // "Population" doc comment for why: promptOmpAcp's ensureOmpAcp can
-      // itself SPAWN a session, and calling it for a cwd with no live match
-      // would attach to (or start) a session that was never actually still
-      // running, exactly the hazard that doc comment exists to prevent.
-      if (hookId !== null && retained.req.critical === true) {
-        const liveTarget = liveOmpAgentForHatchRequest(retained.req)
-        if (liveTarget) {
-          void promptOmpAcp(liveTarget, hatchProactiveDecisionText(hookId, answer.label)).then((res) => {
-            log(
-              res.ok
-                ? `hatch-critical-proactive-delivered: hookId=${hookId} cwd=${liveTarget.cwd ?? "-"}`
-                : `hatch-critical-proactive-failed: hookId=${hookId} err=${res.error}`,
-            )
-          })
-        } else {
-          log(`hatch-critical-proactive-skip: hookId=${hookId} reason=no-live-session cwd=${retained.req.cwd ?? "-"} pane=${retained.req.paneId ?? "-"}`)
-        }
-      }
+      // Hatch's proactive push lives entirely in routeGrantNotice (this
+      // file), exercised via handleHatchLateTap.
       log(`ask-permission-decision-queued: ${describeAskRequest(retained.req)} key=${action.requestId} label=${answer.label}`)
       // The ephemeral toast must make the SAME promise as the card text — both
       // branch on the SAME shared predicate (queuedDecisionCanAutoDeliver)
