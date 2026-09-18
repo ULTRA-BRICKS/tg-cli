@@ -24,6 +24,7 @@ import { parseTasksCallback, parseTasksCommand } from './tasks-command';
 import { parseContinueCallback } from './limits';
 import { botCommandNames } from './bot-commands';
 import { shellPassthroughGate } from './shell-danger-gate';
+import { safeSliceEnd } from './text-util';
 
 // Bot API getFile hard limit; larger files cannot be downloaded by bots.
 const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024;
@@ -95,7 +96,12 @@ export function buildReplyAnchor(m: TgMessage, opts: StepOpts): string {
   const original = (rtm?.text ?? rtm?.caption ?? '').replace(/\s+/g, ' ').trim();
   const selected = m.quote?.text?.replace(/\s+/g, ' ').trim();
   const body = selected || original;
-  const head = body.length > QUOTE_HEAD_MAX ? `${body.slice(0, QUOTE_HEAD_MAX)}…` : `${body}…`;
+  // Deliberately NOT `truncateWithEllipsis`: the anchor ends in `…` UNCONDITIONALLY (even
+  // an untruncated body gets one, per the module comment above) and cuts at the full
+  // QUOTE_HEAD_MAX rather than reserving a unit for the ellipsis — a different contract
+  // from the reserve-one-unit shape `truncateWithEllipsis` gives everyone else. Still
+  // routed through `safeSliceEnd` so the cut itself never splits a surrogate pair.
+  const head = body.length > QUOTE_HEAD_MAX ? `${body.slice(0, safeSliceEnd(body, QUOTE_HEAD_MAX))}…` : `${body}…`;
   const when = rtm ? (opts.fmtTime ?? fmtQuoteTimeUtc)(rtm.date) : '';
   const origId = rtm ? `tg#${rtm.message_id} ` : '';
   return `↩ ${origId}«[${when}] ${head}»`;

@@ -10,8 +10,10 @@ import {
   distinctLabels,
   dedupeCandidates,
   suggestSelector,
+  goneAgentFallbackReplyText,
   type AgentCandidate,
 } from '../features/tg-ctl/agent-match';
+import { hasUnpairedSurrogate } from '../features/tg-ctl/text-util';
 
 const cand = (
   paneId: string,
@@ -301,6 +303,22 @@ test('buttons: one per candidate, callback round-trips to the right pane', () =>
   expect(msg.text).not.toContain('▸');
 });
 
+// tg#17245 (live incident): the route-picker prompt truncates the message
+// preview to 80 UTF-16 code units. A naive cut can land between the two
+// halves of a surrogate pair (an emoji), producing an orphaned lone
+// surrogate that Telegram's sendMessage rejects wholesale with a 400 "strings
+// must be encoded in UTF-8" — the whole picker fails to post ("couldn't post
+// the reply picker"). The cut must back up to keep the pair whole.
+test('buttons: a message preview that would split an emoji surrogate pair at the 80-char cut is not orphaned', () => {
+  // 78 filler chars + 😀 (\uD83D\uDE00) puts the high surrogate exactly at
+  // index 78 — a naive `.slice(0, 79)` keeps it and drops its low-surrogate
+  // partner.
+  const preview = `${'x'.repeat(78)}\ud83d\ude00${'y'.repeat(20)}`;
+  const msg = buildAgentSelectMessage(42, fleet, 'tok1', preview);
+  expect(msg.text).toBe(`Route to which agent?\n\u201c${'x'.repeat(78)}\u2026\u201d`);
+  expect(hasUnpairedSurrogate(msg.text)).toBe(false);
+});
+
 // --- buttons-only: the text body never duplicates the buttons (#63) ---
 
 // The CTO complaint: the picker rendered a `▸ <window>` group header AND a
@@ -529,4 +547,23 @@ test('labels: two bare-window panes with the same cwd basename stay distinct (pa
   expect(new Set(labels).size).toBe(2);
   expect(labels[0]).toContain('%1');
   expect(labels[1]).toContain('%2');
+});
+
+// --- goneAgentFallbackReplyText ---
+// Live incident (tg-cli, 2026-09-18): "если субагента нету больше надо в агента
+// отправлять" — a `/agent <name>` selector that misses EVERYWHERE must, when the
+// CTO's own last-user-target anchor still resolves to a live agent, deliver there
+// (never the "only agent running" heuristic — that caused a real production misroute,
+// see ctl-agent-nomatch-integration.test.ts / ctl-agent-selector-nomatch-integration.test.ts).
+
+test('goneAgentFallbackReplyText names the selector and the anchor it landed on', () => {
+  expect(goneAgentFallbackReplyText('ghost', 'main · claude')).toBe(
+    "agent 'ghost' is gone — delivered to 'main · claude' instead (your last active session)",
+  );
+});
+
+test('goneAgentFallbackReplyText says "queued for" instead of "delivered to" when the anchor deferred', () => {
+  expect(goneAgentFallbackReplyText('ghost', 'main · claude', true)).toBe(
+    "agent 'ghost' is gone — queued for 'main · claude' instead (your last active session)",
+  );
 });

@@ -17,6 +17,7 @@ import {
   type PrRef,
   type TaskItem,
 } from '../features/tg-ctl/tasks-command';
+import { hasUnpairedSurrogate } from '../features/tg-ctl/text-util';
 
 test('normalizeTaskStatus: canonical + aliases + non-status', () => {
   expect(normalizeTaskStatus('todo')).toBe('todo');
@@ -156,6 +157,23 @@ test('composeTasksTable: header + one row per task; missing data is an em dash, 
   expect(html.match(/—/g)!.length).toBeGreaterThanOrEqual(2);
   // #5 has a due date and no PR
   expect(html).toContain('2026-07-10');
+});
+
+// tg#17245-class bug: a task title is cut at a fixed 58 UTF-16 code-unit
+// count before being HTML-escaped into the table. A naive slice can land
+// between the two halves of a surrogate pair (an emoji), orphaning a lone
+// surrogate that Telegram's sendMessage rejects wholesale with a 400
+// "strings must be encoded in UTF-8". The cut must back up to keep the pair
+// whole.
+test('composeTasksTable: a title that would split an emoji surrogate pair at the 58-char cut is not orphaned', () => {
+  // 56 filler chars + 😀 (\uD83D\uDE00) puts the high surrogate exactly at
+  // index 56 — a naive `.slice(0, 57)` keeps it and drops its low-surrogate
+  // partner.
+  const longTitle = `${'x'.repeat(56)}\ud83d\ude00${'y'.repeat(10)}`;
+  const withEmoji: TaskItem[] = [{ id: '#1', title: longTitle, state: 'todo', url: 'https://x/1', due: '' }];
+  const html = composeTasksTable(withEmoji, new Map(), { agent: null, status: null });
+  expect(html).toContain(`${'x'.repeat(56)}\u2026`);
+  expect(hasUnpairedSurrogate(html)).toBe(false);
 });
 
 test('rollupReviewState: draft dominates, then the gh reviewDecision enum, else null', () => {

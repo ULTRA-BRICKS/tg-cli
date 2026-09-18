@@ -19,6 +19,7 @@
 
 import type { AgentKind } from './types';
 import type { ButtonOption, ButtonRequest, ButtonRequestKind, DecisionLabels } from './questions';
+import { safeSliceEnd, truncateWithEllipsis } from './text-util';
 
 export interface HookEnv {
   agent: AgentKind; // from the --agent flag the installer wrote (default claude)
@@ -92,6 +93,30 @@ function readOptions(raw: unknown): ButtonOption[] | null {
     out.push(description ? { label, description } : { label });
   }
   return out.length ? out : null;
+}
+
+// Tolerant readers for the grant protocol v1.1 additive subfields (tg-cli#398):
+// a present-but-malformed subfield is DROPPED (the field degrades to its
+// remaining valid parts, or undefined), never a rejection — an old daemon must
+// keep accepting a new lib's payload.
+function readAskOrigin(raw: unknown): ButtonRequest['origin'] {
+  const rec = asRecord(raw);
+  if (!rec) return undefined;
+  const out: NonNullable<ButtonRequest['origin']> = {};
+  if (typeof rec.agent === 'string' && rec.agent) out.agent = rec.agent;
+  if (typeof rec.sessionId === 'string' && rec.sessionId) out.sessionId = rec.sessionId;
+  if (typeof rec.subagent === 'string' && rec.subagent) out.subagent = rec.subagent;
+  return Object.keys(out).length ? out : undefined;
+}
+function readAskOperation(raw: unknown): ButtonRequest['operation'] {
+  const rec = asRecord(raw);
+  if (!rec) return undefined;
+  const out: NonNullable<ButtonRequest['operation']> = {};
+  if (typeof rec.kind === 'string' && rec.kind) out.kind = rec.kind;
+  if (typeof rec.fingerprint === 'string' && rec.fingerprint) out.fingerprint = rec.fingerprint;
+  if (typeof rec.cwd === 'string' && rec.cwd) out.cwd = rec.cwd;
+  if (typeof rec.repoRoot === 'string' && rec.repoRoot) out.repoRoot = rec.repoRoot;
+  return Object.keys(out).length ? out : undefined;
 }
 
 // Build a ButtonRequest from an already-known field set, folding in the env.
@@ -173,6 +198,16 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       // goes through — it must survive here or `critical:true` would silently
       // never reach the daemon at all.
       critical: p.critical === true ? true : undefined,
+      // Grant protocol v1.1 additive fields (tg-cli#398): carry them through
+      // tolerantly — the agent-tools lib ships independently of this daemon,
+      // so an old lib simply omits them (undefined) and malformed subfields
+      // are dropped, never a rejection. `operation` is OPAQUE here (the lib
+      // computes the fingerprint; the daemon only compares it, grants.ts).
+      hookId: typeof p.hookId === 'string' && p.hookId ? p.hookId : undefined,
+      timeoutMs:
+        typeof p.timeoutMs === 'number' && Number.isFinite(p.timeoutMs) && p.timeoutMs > 0 ? p.timeoutMs : undefined,
+      origin: readAskOrigin(p.origin),
+      operation: readAskOperation(p.operation),
     };
   }
 
@@ -315,7 +350,7 @@ function normalizeAskUserQuestions(p: Record<string, unknown>, env: HookEnv): Bu
 // read the full plan in the pane; the button is for the proceed/keep decision.
 const PLAN_MAX = 3000;
 function clampPlan(plan: string): string {
-  return plan.length > PLAN_MAX ? `${plan.slice(0, PLAN_MAX)}\n… (plan truncated — see the pane)` : plan;
+  return plan.length > PLAN_MAX ? `${plan.slice(0, safeSliceEnd(plan, PLAN_MAX))}\n… (plan truncated — see the pane)` : plan;
 }
 
 // Which Claude Code hook event delivered this permission — the reply shape
@@ -333,6 +368,5 @@ function permissionEventOf(p: Record<string, unknown>): 'PreToolUse' | 'Permissi
 function summarizeInput(tool: string, input: Record<string, unknown>): string {
   const pick = (k: string): string | null => (typeof input[k] === 'string' ? (input[k] as string) : null);
   const raw = pick('command') ?? pick('file_path') ?? pick('path') ?? pick('url') ?? '';
-  const one = raw.replace(/\s+/g, ' ').trim();
-  return one.length > 100 ? `${one.slice(0, 99)}…` : one;
+  return truncateWithEllipsis(raw.replace(/\s+/g, ' ').trim(), 100);
 }

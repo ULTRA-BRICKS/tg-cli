@@ -34,6 +34,40 @@ semantic versioning.
   normalized to `#456` before rendering, so autolink-prs (which only recognizes the `#N` shape)
   can resolve it — previously it rendered as inert, unlinked text.
 
+## 1.52.14
+
+**Feature (tg-cli#398): late-approval grant protocol for expired hatch asks.**
+
+- Expired hatch asks stay addressable for a 24h grace window (restart-safe 0600 store).
+- A late Approve mints a single-use grant (`hgr-<12hex>`, bound to hook_id + operation fingerprint + cwd + the daemon-observed route), confirms on the card, and routes the consume instructions to the origin (omp ACP / Stop-hook inbox) — never through a permission menu or pane, fixing the production no-menu delivery skip.
+- New client forms consume a grant: `ask --verify-grant <id> --hook <id>` (token, route-agnostic) and `--verify-grant --pull` (route-bound, no blank-route fallback), replying the standard hookSpecificOutput allow/deny JSON with requestId/approvalId at top level, exit 0 always.
+- Per-request timeoutMs honored up to a 15-min cap (absent keeps the 115s/110s defaults); additive payload fields (hookId/timeoutMs/origin/operation) normalized tolerantly at both ends.
+- Replaces the over-broad silent queuedDecision mechanism for hatch requests: a plain retry without a grant now re-asks with a fresh card.
+
+**Fix (tg-cli#398 follow-up): rebase merge left a dead block referencing an undeclared `hookId`, crashing every non-hatch permission's late tap.**
+
+- The grant protocol diverts hatch late-taps to `routeGrantNotice` before reaching the older scoped-permission reconnect-queue UI, but a leftover critical-proactive-push block (superseded by `routeGrantNotice`) still referenced `hookId`, which no declaration in scope provided. Any non-hatch permission tap that fell through to the queued-decision path threw `ReferenceError: hookId is not defined`, silently dropping its toast and card update. Removed the dead block; `liveOmpAgentForHatchRequest`/`hatchProactiveDecisionText` (now unused) removed with it.
+- `handleHatchLateTap`'s deny and grant-approved card edits were missing `hatchParseMode(req)`, so a hatch card's final edit rendered its embedded HTML as literal tag soup instead of formatted text. Both call sites now thread `parse_mode: 'HTML'` like every other hatch-shaped edit in the file.
+
+## 1.52.13
+
+**Fix (tg-ctl reply/agent picker, live incident tg#17245): a truncated quote/preview that split an emoji mid-character made `sendMessage` fail outright with `400 Bad Request: strings must be encoded in UTF-8`, so the CTO saw "couldn't post the reply picker" instead of a picker.**
+
+- Root cause, confirmed via `~/.config/tg-cli/launchd.tg-ctl.err.log`: a reply to a message whose origin pane was no longer visible (`reply-route: replyTo=17245 → origin omp:93571 NOT visible in snapshot → picker (2 candidates)`) built the picker text from `buildReplyAnchor`'s 60-char quote head and `buildAgentSelectMessage`'s 80-char message preview — both truncate with a raw `s.slice(0, n)` on UTF-16 code-unit count. When the cut lands between the two halves of a surrogate pair (any astral character, most commonly an emoji), it orphans a lone surrogate; `JSON.stringify` escapes that as a literal `\uD83D` (still valid ASCII on the wire), but Telegram's Bot API decodes the JSON string server-side and rejects the resulting invalid Unicode with a flat 400 that fails the WHOLE request — `sendMessage failed: 400 {"description":"Bad Request: strings must be encoded in UTF-8"}`, immediately followed by the picker's own `couldn't post the reply picker` fallback.
+- New `safeSliceEnd` (`features/tg-ctl/text-util.ts`) backs a truncation cut up by one UTF-16 code unit when it would otherwise land on a lone high surrogate, so a split pair is always dropped together rather than orphaned; `truncateWithEllipsis(s, max)` wraps it as the shared cut-then-ellipsis shape used everywhere a preview/detail/cell is truncated. Wired into `buildReplyAnchor`'s quote head (`updates.ts`, via `safeSliceEnd` directly — it has a different, always-appends-`…` contract), `buildAgentSelectMessage`'s prompt preview (`agent-match.ts`), the harness-failure notification's detail line (`limits.ts`), and the `/tasks` table's title cell (`tasks-command.ts`).
+- Multi-model review (Opus/Codex/GLM/Sonnet) caught two more live call sites in the SAME bug class that the first pass missed: `clampPlan`'s 3000-char cut, which feeds the ExitPlanMode plan-approval card, and `summarizeInput`'s 100-char cut, which feeds the permission-prompt question (`features/tg-ctl/hook-normalize.ts`) — both now route through the same helpers. Review also flagged that hand-copying `s.slice(0, max - 1)}…` into each of the first four files re-created exactly the duplication the fix was meant to close; `truncateWithEllipsis` now owns that shape in one place so a new truncation site can't reopen this class by hand.
+- Regression tests (`tests/text-util.test.ts`, plus one per call site including the two hook-normalize sites) construct an emoji landing exactly on each cut boundary and assert the output never contains an unpaired surrogate (shared `hasUnpairedSurrogate` detector, also in `text-util.ts`); each fails on the pre-fix `.slice(0, n)` and passes after.
+- `safeSliceEnd` backs up over a WHOLE run of consecutive high surrogates, not just one (review finding): `JSON.parse` doesn't validate that `\uXXXX` escapes pair up, so a hook payload's `tool_input.plan`/`.command` could in principle carry two-or-more consecutive high surrogates, and a single-step backup would land on the second one — itself still unpaired.
+## 1.52.12
+
+**Feature (tg-ctl `/agent` routing, live report 2026-09-18): fall back to the CTO's last-user-target anchor when a named `/agent <selector>` is gone, instead of dropping the message.**
+
+- A `/agent <name> <text>` (or media-caption equivalent) whose selector matched NO live agent ANYWHERE tg-ctl can see (tmux window, live omp process, out-of-tmux process) used to just reply "no agent matching" and drop the message. Live CTO reaction, verbatim: "О хороший кейс. Если субагента нету больше надо в агента отправлять" (if the subagent no longer exists, it needs to be routed to [its parent] agent).
+- tg-ctl has no session-tree / parent-pid bookkeeping for a subagent that already exited — by the time its name stops resolving, the process (and every trace of who spawned it) is gone from `ps`/tmux alike, so there is genuinely no "parent" to look up. `handleAgentRoute` and `routePrewrappedAgentMessage` (root `tg-ctl`) now fall back to the CTO's own last-user-target anchor (tg-cli#78) — the session he was last CONFIRMED talking to — when it still resolves to a live candidate, and reply explicitly: `agent '<name>' is gone — delivered to '<label>' instead (your last active session)` (or `queued for` when the anchor pane has an open forwarded question, mirroring the existing `routedReply` idiom). New pure `goneAgentFallbackReplyText` (`features/tg-ctl/agent-match.ts`).
+- Deliberately does NOT also fall back to "the only agent currently live": that exact heuristic previously caused a real production misroute (the `/agent ext` → lone `rig` pane incident, guarded by `ctl-agent-nomatch-integration.test.ts` / `ctl-agent-selector-nomatch-integration.test.ts`) where a plain typo/no-match selector silently absorbed into whatever one unrelated agent happened to be running. tg-ctl cannot tell "this name is a gone subagent" apart from "this is a typo", so the fallback bar is a signal the CTO actually chose (the anchor), never a candidate count. No anchor at all (or several live candidates with no anchor hit) keeps the existing explicit "no agent matching" error.
+- The text-route fallback is FLAT-chat only (`action.threadId == null`): a `/agent <gone>` typed inside a BOUND topic keeps the plain "no agent matching" error rather than reaching for the flat anchor, which may point at a completely different project's pane than the one the topic is bound to (multi-model review finding — this mirrors the function's existing "topic-originated `/agent <name>` keeps the plain hint" precedent for the select-only arm).
+- The media route's photo/document `/agent <gone>` fallback (`routePrewrappedAgentMessage`) never carries topic context at all — a bound-topic message is acked by `topicActionFor` before the flat photo/document dispatch ever runs (verified: no threadId is even plumbed into this handler), so it needs no equivalent guard. Both routes now share one small `resolveGoneAgentAnchor` helper (resolve anchor, label, log) to keep the two call sites from drifting; the media route also now refreshes the tg-cli#78 anchor (`recordLastUserTarget`) on a successful fallback delivery, matching the text route (multi-model review findings).
+
 ## 1.52.11
 
 **Fix (tg-ctl omp discovery, tg-cli#413 follow-up): recognize omp run from source (`bun --preload`) as a live agent.**
@@ -137,7 +171,6 @@ semantic versioning.
 - New regression test `tests/ctl-omp-acp-prompt-evict.test.ts` (recreates the deleted
   `ctl-omp-acp-prompt-evict.test.ts`, adapted to assert the new deferred eviction log line instead
   of the old awaited-call failure log line).
-
 ## 1.52.5
 
 **Fix (tg-cli#322): fire-and-forget omp ACP delivery; journal getUpdates batches before offset advance.**

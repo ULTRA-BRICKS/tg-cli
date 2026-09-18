@@ -19,6 +19,7 @@
 //     never a printf-style "%s"/"%0" placeholder that can render literally.
 
 import { escapeHtml } from '../render/html';
+import { truncateWithEllipsis } from './text-util';
 
 // setTimeout clamps a delay > 2^31-1 ms to ~1ms (fires immediately) — the same
 // trap the daemon already documents for its other timers. Clamp so a reset far
@@ -580,8 +581,7 @@ export function extractFailure(
 }
 
 function truncateDetail(s: string): string {
-  const MAX = 240;
-  return s.length <= MAX ? s : `${s.slice(0, MAX - 1)}…`;
+  return truncateWithEllipsis(s, 240);
 }
 
 // Build the operator notification, or null to SUPPRESS it. Suppressed when the

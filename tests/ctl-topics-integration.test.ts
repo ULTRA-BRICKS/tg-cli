@@ -478,3 +478,35 @@ test('topics ON: forum_topic_closed on a tracked topic persists status=closed (l
   daemon.kill('SIGTERM');
   await daemon.exited;
 }, 30_000);
+
+test('topics ON: `/agent <gone>` inside a BOUND topic does NOT fall back to the flat last-user-target anchor', async () => {
+  // The flat 1:1 anchor points at %1 (an earlier flat conversation), but the CTO
+  // is typing inside topic 50, bound to %2 — a DIFFERENT project's pane. The flat
+  // anchor must never override the topic's own (stronger, deliberately chosen)
+  // routing signal; see tg-ctl's handleAgentRoute gone-agent fallback comment.
+  const cfgDir = makeCfgDir({
+    topics: true,
+    seedTopics: [{ threadId: 50, name: 'api', status: 'bound', paneId: TOPIC_PANE, ts: 1 }],
+  });
+  writeFileSync(
+    join(cfgDir, 'tg-ctl.123.last-user-target.json'),
+    JSON.stringify({ paneId: FLAT_PANE, cwd: cfgDir, ts: Math.floor(Date.now() / 1000) }),
+  );
+  const updateQueue: unknown[][] = [];
+  const { server, sends } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([topicMsg(18, 50, '/agent ghost do this', nowSec)]);
+
+  await waitFor(() => sends.some((s) => String(s.text ?? '').includes("no agent matching 'ghost'")));
+  // Never injected into the flat anchor pane (%1) — the topic guard held.
+  expect(injected(cfgDir).some((l) => l.pane === FLAT_PANE)).toBe(false);
+  expect(injected(cfgDir)).toEqual([]);
+  const errorReplies = sends.filter((s) => String(s.text ?? '').includes("no agent matching 'ghost'"));
+  expect(errorReplies.every((s) => s.message_thread_id === 50)).toBe(true);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);

@@ -20,6 +20,7 @@ import {
   type HarnessFailureEvent,
   type UsageLimitEvent,
 } from '../features/tg-ctl/limits';
+import { hasUnpairedSurrogate } from '../features/tg-ctl/text-util';
 
 // A fixed local reference so wall-clock resolution is deterministic regardless of
 // when the suite runs. 2026-07-02 12:00 local.
@@ -406,6 +407,21 @@ test('extractFailure: an API error with no reset → api-error, null resetAt', (
   expect(f.kind).toBe('api-error');
   expect(f.resetAt).toBeNull();
   expect(f.detail).toContain('overloaded');
+});
+
+// tg#17245-class bug: the detail line is cut at a fixed 240 UTF-16 code-unit
+// count. A naive slice can land between the two halves of a surrogate pair
+// (an emoji), orphaning a lone surrogate that Telegram's sendMessage rejects
+// wholesale with a 400 "strings must be encoded in UTF-8". The cut must back
+// up to keep the pair whole.
+test('extractFailure: a detail line that would split an emoji surrogate pair at the 240-char cut is not orphaned', () => {
+  // 238 filler chars + 😀 (\uD83D\uDE00) puts the high surrogate exactly at
+  // index 238 — a naive `.slice(0, 239)` keeps it and drops its low-surrogate
+  // partner.
+  const long = `${'x'.repeat(238)}\ud83d\ude00${'y'.repeat(30)}`;
+  const f = extractFailure('overloaded', long, NOW);
+  expect(f.detail).toBe(`${'x'.repeat(238)}\u2026`);
+  expect(hasUnpairedSurrogate(f.detail)).toBe(false);
 });
 
 test('formatClock / formatDelta', () => {
