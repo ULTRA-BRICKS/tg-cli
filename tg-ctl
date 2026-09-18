@@ -7322,12 +7322,36 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           await sendMessage(ctx, noAgentReplyNow())
           return false
         }
-        // Even a single visible candidate is NOT trusted here: the recognized
-        // origin is unconfirmed, so post the picker rather than auto-inject. The
-        // origin pane isn't visible — it may be a snapshot flake OR genuinely gone;
-        // either way the human picks. Name the agent they meant so a real kill
-        // reads as "that agent is gone" rather than a silent re-ask (CTO ask, #72).
-        log(`reply-route: replyTo=${action.replyToMessageId} → origin ${recognized.paneId} NOT visible in snapshot → picker (${candidates.length} candidates)`)
+        // DEAD-SENDER FALLBACK: the origin was a disposable/one-shot sender —
+        // a subagent process (or a synthetic omp:<pid> from a headless script,
+        // tg-cli#363) dispatched by a live orchestrator, sent once, and exited —
+        // so its pane/pid will NEVER become visible again. routes.json still
+        // names it, but forcing the human to pick every time loses the reply's
+        // content behind a card when the right target is obvious: the live
+        // agent that owns the SAME project directory (recognized.cwd) is that
+        // sender's parent/active session, and the natural place for a reply
+        // meant for its now-gone child. Scoping the auto-route to an EXACT cwd
+        // match keeps this narrower than "trust any single visible candidate"
+        // (the bug this guard replaced, tg-cli#53): a flaky/partial snapshot
+        // that merely drops the origin pane cannot spuriously produce a
+        // DIFFERENT pane sharing the exact recorded cwd, so it cannot resurrect
+        // that regression. Several same-project candidates are still genuinely
+        // ambiguous (which one is "the parent"?) and fall through to the picker.
+        const sameProjectCandidates = recognized.cwd
+          ? candidates.filter((c) => routeMatchesPane({ recognizedCwd: recognized.cwd, panePath: c.panePath }))
+          : []
+        if (sameProjectCandidates.length === 1) {
+          const parent = sameProjectCandidates[0]
+          log(`reply-route: replyTo=${action.replyToMessageId} → origin ${recognized.paneId} gone, routing to live parent ${parent.paneId} (same project ${recognized.cwd}) msg="${msgPreview}"`)
+          const delivered = await injectVerbatim(parent.paneId)
+          if (delivered && parent.panePath) recordLastUserTarget(parent.paneId, parent.panePath)
+          return delivered
+        }
+        // No single live parent for this project (none, or more than one) —
+        // the recognized origin is unconfirmed and ambiguous, so post the
+        // picker rather than guess. Name the agent they meant so a genuinely
+        // terminated one reads as "that agent is gone" rather than a silent re-ask (CTO ask, #72).
+        log(`reply-route: replyTo=${action.replyToMessageId} → origin ${recognized.paneId} NOT visible in snapshot → picker (${candidates.length} candidates, ${sameProjectCandidates.length} same-project)`)
         return postReplyPicker(candidates, goneNotice())
       }
       // origin pane visible but not a same-project agent → genuinely reused/gone;
