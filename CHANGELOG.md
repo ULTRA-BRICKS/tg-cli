@@ -351,7 +351,7 @@ discovery alone can't close the gap. This adds the ACTIVE side.
 The 1.49.2 wedged-client eviction fix (tg-cli#353, shipped below) evicted + killed the cached ACP
 client on **any** `session/prompt` timeout. Two independent review passes on
 PR #352 (Opus-omp and Sonnet-omp, posted at
-https://github.com/alex-mextner/tg-cli/pull/352#issuecomment-5610743766)
+https://git.hyperide.ai/ultrabricks/tg-cli/pull/352#issuecomment-5610743766)
 found this was too broad: `session/prompt` only resolves at *turn
 completion* per ACP semantics, so (a) a healthy turn still legitimately
 running past the timeout got killed mid-turn, and (b) worse, a

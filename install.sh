@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # install.sh — install the `tg` CLI (Bun/TypeScript)
 # Works both from a local clone (./install.sh) and piped from curl:
-#   curl -fsSL https://raw.githubusercontent.com/alex-mextner/tg-cli/main/install.sh | bash
+#   curl -fsSL https://git.hyperide.ai/ultrabricks/tg-cli/raw/branch/main/install.sh | bash
 set -euo pipefail
 
 # ── identity ──────────────────────────────────────────────────────────────────
 TOOL="tg"
 REPO="tg-cli"
-GITHUB_USER="alex-mextner"
+GIT_OWNER="ultrabricks"
 ENTRY="tg"          # path inside repo root (not bin/)
 CLONE_BASE="${XDG_DATA_HOME:-$HOME/.local/share}"
 
@@ -30,7 +30,7 @@ else
   fi
   mkdir -p "$CLONE_BASE"
   CLONE_DIR="$CLONE_BASE/$REPO"
-  EXPECT_URL="https://github.com/$GITHUB_USER/$REPO.git"
+  EXPECT_URL="https://git.hyperide.ai/$GIT_OWNER/$REPO.git"
   if [[ -d "$CLONE_DIR/.git" ]]; then
     actual_url="$(git -C "$CLONE_DIR" remote get-url origin 2>/dev/null || echo "")"
     if [[ "$actual_url" != "$EXPECT_URL" ]]; then

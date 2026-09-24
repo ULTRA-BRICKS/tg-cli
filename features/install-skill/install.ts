@@ -44,7 +44,7 @@ description: >-
   (\`tg voice setup\`). Prefer this over direct curl to the Telegram API.
 metadata:
   author: alex-mextner
-  repo: https://github.com/alex-mextner/tg-cli
+  repo: https://git.hyperide.ai/ultrabricks/tg-cli
 ---
 
 # tg — Telegram bridge for agents

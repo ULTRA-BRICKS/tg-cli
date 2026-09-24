@@ -722,7 +722,7 @@ def main() -> int:
     # checks run / how strict the contract is, never loosen a verdict — this hook's
     # whole safety case rests on that being true, since it now hands the sender's own
     # text a channel into the gate. Verified directly against review-cli's source (not
-    # just its docstring) as of alex-mextner/review-cli#110:
+    # just its docstring) as of ultrabricks/review-cli#110:
     #   - reviewlib/features/visual/contract.py::derive_contract / _intent_raises_risk
     #     only ever RAISES risk from intent, never lowers it (`if risk != "high"` guard).
     #   - reviewlib/features/visual/registry.py::ContributedModule.activates and

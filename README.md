@@ -31,7 +31,7 @@ tg --file report.md "Weekly summary"
 
 **One-liner** (installs deps via bun, links `tg` into PATH, registers the agent skill):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alex-mextner/tg-cli/main/install.sh | bash
+curl -fsSL https://git.hyperide.ai/ultrabricks/tg-cli/raw/branch/main/install.sh | bash
 ```
 
 **Register the skill manually** (idempotent; run automatically by the installer):
@@ -54,7 +54,7 @@ blocks). Run automatically by the installer.
 
 **Manual clone:**
 ```bash
-git clone git@github.com:alex-mextner/tg-cli.git
+git clone https://git.hyperide.ai/ultrabricks/tg-cli.git
 cd tg-cli
 ln -sf "$(pwd)/tg" ~/.local/bin/tg
 ```
@@ -202,7 +202,7 @@ show `landing · claude — unreachable: not in tmux (tty ttys004, cwd …, name
 and gets a **second channel**: `/agent landing <text>` queues the message to its
 **Stop-hook inbox** (`~/.config/tg-cli/inbox/<key>/pending.jsonl`; key = the agent's
 `--name`, else a hash of its cwd). The Claude Code / Codex Stop hook installed by
-[agent-tools](https://github.com/alex-mextner/agent-tools) (`cc_hook_bridge`) reads the
+[agent-tools](https://git.hyperide.ai/ultrabricks/agent-tools) (`cc_hook_bridge`) reads the
 inbox at every turn end and hands the text to the agent as its next instruction; you get an
 explicit reply when it is queued and a 👌 reaction on your message once it is delivered.
 
@@ -580,11 +580,11 @@ tg sits at outbound-first / any-agent / thin-inbound; the "remote terminal" tool
 
 Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 
-- **[review-cli](https://github.com/alex-mextner/review-cli)** — agentic, priority-ordered failover multi-model code-review board (brainstorm/quorum, spec-web, dashboard)
-- **[rig-cli](https://github.com/alex-mextner/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
-- **[agent-tools](https://github.com/alex-mextner/agent-tools)** — the shared catalog `rig` applies: portable agent skills, agent-hooks, the global git-hook dispatcher, CI gates, and MCP servers
-- **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
-- **[3d-cli](https://github.com/alex-mextner/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
+- **[review-cli](https://git.hyperide.ai/ultrabricks/review-cli)** — agentic, priority-ordered failover multi-model code-review board (brainstorm/quorum, spec-web, dashboard)
+- **[rig-cli](https://git.hyperide.ai/ultrabricks/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
+- **[agent-tools](https://git.hyperide.ai/ultrabricks/agent-tools)** — the shared catalog `rig` applies: portable agent skills, agent-hooks, the global git-hook dispatcher, CI gates, and MCP servers
+- **[draw-cli](https://git.hyperide.ai/ultrabricks/draw-cli)** — text-to-image via Hugging Face
+- **[3d-cli](https://git.hyperide.ai/ultrabricks/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
 - **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
 
 Each CLI registers a skill into your agent harnesses (`<tool> install-skill`) so agents know it exists — see Install.
