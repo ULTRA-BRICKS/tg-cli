@@ -7877,7 +7877,18 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           const parent = sameProjectCandidates[0]
           log(`reply-route: replyTo=${action.replyToMessageId} → origin ${recognized.paneId} gone, routing to live parent ${parent.paneId} (same project ${recognized.cwd}) msg="${msgPreview}"`)
           const delivered = await injectVerbatim(parent.paneId)
-          if (delivered && parent.panePath) recordLastUserTarget(parent.paneId, parent.panePath)
+          if (delivered) {
+            if (parent.panePath) recordLastUserTarget(parent.paneId, parent.panePath)
+            // A same-project match is still a GUESS, not a confirmed identity
+            // match (no pid/session-id proof it's the same conversation) — a
+            // log line alone is invisible on Telegram, so the CTO could never
+            // tell "delivered exactly where I replied" apart from "your
+            // original target died, I redirected this elsewhere" (Alex
+            // escalation point 4: routing must never silently resolve a
+            // guess with zero visible signal). Fire-and-forget: never block
+            // or delay the actual delivery on this notice.
+            void sendMessage(ctx, `↩️ ${goneOriginLabel()} is gone — routed to ${labelFor(parent, candidates)} instead`)
+          }
           return delivered
         }
         // No single live parent for this project (none, or more than one) —

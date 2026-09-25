@@ -249,20 +249,29 @@ async function waitFor(pred: () => boolean, ms = 8000): Promise<void> {
   }
 }
 
-test('DEAD SENDER: a reply to a since-exited one-shot sender routes to the live parent agent in the same project, no picker', async () => {
+test('DEAD SENDER: a reply to a since-exited one-shot sender routes to the live parent agent in the same project, no picker, but a visible reroute notice', async () => {
   const h = makeHarness();
   const tg = startFakeTg();
   const daemon = await startDaemon(h.cfgDir, tg.port);
 
   tg.pushReply(600, 10, 500, 'чек');
 
-  await waitFor(() => injectedLines(h.injectLog).length > 0 || tg.sends.length > 0);
+  await waitFor(() => injectedLines(h.injectLog).length > 0);
+  // The reroute notice is sent fire-and-forget AFTER delivery — give it a
+  // moment to land before asserting on `tg.sends`.
+  await waitFor(() => tg.sends.length > 0);
   await Bun.sleep(300);
 
   const lines = injectedLines(h.injectLog);
   expect(lines.some((l) => l.startsWith(`${PANE_PARENT}\t`))).toBe(true);
   expect(lines.some((l) => l.startsWith(`${PANE_OTHER}\t`))).toBe(false);
+  // No inline-keyboard picker — this is still the fast, unambiguous path —
+  // but the CTO must SEE that a reroute happened rather than the reply
+  // landing exactly where he replied (Alex escalation point 4: a same-
+  // project guess is still a guess and must never be silent, even when
+  // it's the only candidate).
   expect(tg.sends.some((s) => s.hasMarkup)).toBe(false);
+  expect(tg.sends.some((s) => /is gone/i.test(s.text) && /routed to/i.test(s.text))).toBe(true);
   daemon.kill();
 }, 15_000);
 

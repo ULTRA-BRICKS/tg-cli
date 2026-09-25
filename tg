@@ -845,13 +845,19 @@ if (import.meta.main) {
   const AI_EMOJI = detectAiEmoji()
 
   // --- Window label → the `[window]` header bracket ---
-  // The agent identity for the header bracket. When this process runs under a live
-  // omp ancestor (tmux or headless), the omp session jsonl title wins. Otherwise
-  // every non-omp harness is byte-identical to before: inside tmux,
-  // resolveWindowAgentLabel reads the pane's window name AND cwd (a real user-chosen
-  // window name leads; a bare auto-rename default falls back to the cwd project
-  // basename → `rig-cli`, not `2.1.207`); outside tmux the label is empty.
-  // buildPrefix wraps the result in [] and styles it.
+  // ALWAYS the tmux window / cwd-basename label — NEVER the omp/harness
+  // session title. Alex escalation point 5 (2026-09-25): a message sent from
+  // inside a tmux pane under a live omp session used to render with the omp
+  // session's own jsonl title INSTEAD of the tmux window name, so the CTO saw
+  // e.g. "[Fix Missing Provisioned Skills in Rig]" with no tmux window at all
+  // — the two are orthogonal facts (which tmux window vs. what the agent is
+  // working on this turn) and conflating them silently dropped the window
+  // every time an omp ancestor was present. `getHarnessTitle` below surfaces
+  // the session title SEPARATELY (as the auto `--title` default), so both
+  // now always appear: inside tmux, resolveWindowAgentLabel reads the pane's
+  // window name AND cwd (a real user-chosen window name leads; a bare
+  // auto-rename default falls back to the cwd project basename → `rig-cli`,
+  // not `2.1.207`). buildPrefix wraps the result in [] and styles it.
   const getTmuxWindow = (): string => {
     if (!process.env.TMUX) return ""
     try {
@@ -874,7 +880,10 @@ if (import.meta.main) {
     return ""
   }
 
-  const getOmpSessionTitle = (ompPid: number | null): string => {
+  // The omp/harness session's own title (jsonl `type:title`/`session.title`).
+  // Surfaced as the auto `--title` default (below), NEVER as a substitute for
+  // the `[window]` bracket above — see the comment on getTmuxWindow.
+  const getHarnessTitle = (ompPid: number | null): string => {
     if (ompPid === null) return ""
     try {
       const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(ompPid), "-Fn"], {
@@ -924,18 +933,29 @@ if (import.meta.main) {
     process.exit(0)
   }
   // Resolve the window label only from here on: the `--detect-agent` info action
-  // and the real send need it (omp session title when under omp, else tmux window
-  // name / cwd-basename fallback), but the emoji/model info flags above must NOT
+  // and the real send need it, but the emoji/model info flags above must NOT
   // pay for ps/lsof/tmux subprocesses they never read.
   const ompAncestorPid = detectOmpAncestorPid()
-  const windowAgentLabel = getOmpSessionTitle(ompAncestorPid) || getTmuxWindow()
+  const tmuxWindow = getTmuxWindow()
+  const harnessTitle = getHarnessTitle(ompAncestorPid)
+  // ALWAYS the tmux window (never the harness title, see getTmuxWindow above).
+  // A live omp ancestor with NO tmux pane at all is a detached/headless ACP
+  // session — e.g. one orphaned by a tmux crash (Alex escalation point 2/3) —
+  // and gets an explicit "no tmux" marker instead of silently rendering with
+  // no window info whatsoever. A bare, non-agent invocation (no tmux, no
+  // harness ancestor — a cron job, a plain script) keeps the prior empty/no-
+  // bracket behavior: there is no session identity to report.
+  const windowAgentLabel = tmuxWindow || (ompAncestorPid !== null ? "no tmux" : "")
   if (parsed.action === "detectAgent") {
-    // The auto `[window]` label this session's messages get with no flag — the omp
-    // session title when under omp, else the resolved tmux window name (or its
-    // cwd-basename fallback), or "(none)" when neither applies. There is NO
-    // env-based subagent auto-detection anymore; a subagent self-labels with
-    // `--subagent <name>`.
+    // The auto `[window]` label this session's messages get with no flag —
+    // the resolved tmux window name (or its cwd-basename fallback), an
+    // explicit "no tmux" marker for a detached omp ancestor, or "(none)" when
+    // neither applies. The harness/session title (when present) is printed on
+    // a second line — it is now ALWAYS additional to [window], never a
+    // substitute for it. There is NO env-based subagent auto-detection
+    // anymore; a subagent self-labels with `--subagent`.
     console.log(windowAgentLabel || "(none)")
+    if (harnessTitle) console.log(`title: ${harnessTitle}`)
     process.exit(0)
   }
 
@@ -973,7 +993,17 @@ if (import.meta.main) {
   // harness can point the OUTBOUND sender at a mock Bot-API server (review qa bot harness).
   const API = `${process.env.TG_API_BASE || "https://api.telegram.org"}/bot${BOT_TOKEN}`
 
-  const { items, caption: rawCaption, format, title, tag, subagent, withOriginal, noPdf, pdfDevice, replyTo, topic, table, dryRun } = parsed
+  const { items, caption: rawCaption, format, title: explicitTitle, tag, subagent, withOriginal, noPdf, pdfDevice, replyTo, topic, table, dryRun } = parsed
+  // The header title defaults to the omp/harness session's own title when the
+  // caller gave no explicit `--title` (Alex escalation point 5) — but the
+  // content guards below (CJK/mixed-script, screenshot-mention, dictionary)
+  // must enforce ONLY on text the AGENT actually typed, matching their
+  // documented scope. `safeHarnessTitle` starts as the candidate and each
+  // guard DROPS it (never hard-fails) on a hit — the user did not author the
+  // omp session's own auto-generated title and cannot fix it, so it must
+  // never be able to block an otherwise-clean outgoing message (review
+  // finding). The final merge into `title` happens after every guard below.
+  let safeHarnessTitle = harnessTitle
 
   // The optional SECOND `[name]` bracket is a SUBAGENT self-label — explicit
   // only. `--subagent <name>` (parsed to `subagent`) wins; the `TG_AGENT` env is
@@ -1105,7 +1135,7 @@ if (import.meta.main) {
   // `--no-feature cjk-guard` for the rare legitimately-CJK message. See
   // features/cli/cjk-guard.ts.
   if (cjkGuardOn) {
-    for (const text of [caption, title ?? ""]) {
+    for (const text of [caption, explicitTitle ?? ""]) {
       if (!text) continue
       const stray = findStrayCjk(text)
       if (stray) {
@@ -1120,6 +1150,12 @@ if (import.meta.main) {
         console.error(`Error: ${formatMixedScriptError(mixed)}`)
         process.exit(1)
       }
+    }
+    // The harness-title candidate gets the SAME checks, but a hit silently
+    // drops it (see the comment on `safeHarnessTitle` above) instead of
+    // exiting.
+    if (safeHarnessTitle && (findStrayCjk(safeHarnessTitle) || findMixedScriptTokens(safeHarnessTitle))) {
+      safeHarnessTitle = ""
     }
   }
 
@@ -1142,13 +1178,14 @@ if (import.meta.main) {
     }
   })
   if (screenshotGuardOn && !hasAttachedPhoto) {
-    for (const text of [caption, title ?? ""]) {
+    for (const text of [caption, explicitTitle ?? ""]) {
       if (!text) continue
       if (mentionsScreenshot(text)) {
         console.error(`Error: ${formatScreenshotAttachError()}`)
         process.exit(1)
       }
     }
+    if (safeHarnessTitle && mentionsScreenshot(safeHarnessTitle)) safeHarnessTitle = ""
   }
 
   // Dictionary gate (tg-cli#302, ALWAYS on, no bypass flag): refuse to send a
@@ -1193,7 +1230,7 @@ if (import.meta.main) {
       // The --title and the --subagent label are header text the agent
       // authors; both are always plain (the header renderer escapes them).
       const hits = checkDictionary(dict.rules, [
-        { label: "--title", text: title ?? "", format: "plain" },
+        { label: "--title", text: explicitTitle ?? "", format: "plain" },
         { label: "--subagent", text: subagent ?? "", format: "plain" },
         ...dictFields,
       ])
@@ -1201,8 +1238,17 @@ if (import.meta.main) {
         console.error(formatDictionaryHits(hits, dictPath))
         process.exit(1)
       }
+      // The harness-title candidate gets the SAME dictionary check, but a hit
+      // silently drops it (see the `safeHarnessTitle` comment above) instead
+      // of refusing the send.
+      if (safeHarnessTitle && checkDictionary(dict.rules, [{ label: "harness-title", text: safeHarnessTitle, format: "plain" }]).length > 0) {
+        safeHarnessTitle = ""
+      }
     }
   }
+  // Every content guard above has now either passed the harness-title
+  // candidate or dropped it — merge it into the final header title.
+  const title = explicitTitle ?? (safeHarnessTitle || undefined)
 
   // Close the --table bypass: the parse-time gate (features/cli/args.ts) skips a
   // --table send because the rows arrive on stdin, which parseArgs never sees.

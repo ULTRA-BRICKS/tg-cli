@@ -3,6 +3,50 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.53.2
+
+**Fix (tg-ctl): a reply auto-rerouted to a same-project fallback (its recorded origin is gone) now surfaces a visible Telegram notice — it was previously silent.**
+
+- Confirmed production incident (Alex escalation, 2026-09-25, point 4): `handleReplyRoute`'s
+  dead-sender fallback already correctly refuses to guess when TWO OR MORE live sessions
+  share the replied-to message's project directory (falls to the existing button picker,
+  `tests/ctl-reply-dead-sender-integration.test.ts`), but the exactly-one-candidate fast
+  path delivered the reply SILENTLY — only a server log line recorded the reroute. The CTO
+  had no way to tell "delivered exactly where I replied" from "your original target died,
+  I redirected this to a different, unrelated session" — exactly what happened with the
+  duplicate PID 49221/77332 `omp` sessions in `/Users/ultra/tmp` today.
+- The single-candidate auto-route now sends a fire-and-forget Telegram notice
+  (`↩️ <project> is gone — routed to <label> instead`) after a successful delivery, using
+  the same distinct-label logic (`labelFor`/`distinctLabels`) the `/agent` picker already
+  uses. Never blocks or delays the actual delivery.
+- Tests: `tests/ctl-reply-dead-sender-integration.test.ts`'s single-candidate case now also
+  asserts the notice is sent with the expected content; the pre-existing two-candidate
+  ambiguity test is unchanged (still the picker, no regression).
+
+**Fix (tg): the `[window]` header bracket no longer silently substitutes the omp/harness session title for the real tmux window name — both now always show, separately.**
+
+- Confirmed production incident (Alex escalation, 2026-09-25, point 5): the window-label
+  resolution `getOmpSessionTitle(ompAncestorPid) || getTmuxWindow()` let a live omp
+  ancestor's own session jsonl title REPLACE the tmux window name even from inside a real
+  tmux pane — a message sent from a tmux window rendered e.g.
+  `[Fix Missing Provisioned Skills in Rig]` (the omp session title) with no tmux window
+  shown at all. The two facts are orthogonal (which tmux window vs. what the agent is
+  working on this turn); conflating them silently dropped the window every time an omp
+  ancestor was present.
+- The `[window]` bracket is now ALWAYS the tmux window name (or its cwd-basename
+  fallback), an explicit `no tmux` marker for a detached/headless omp ancestor (e.g. one
+  orphaned by a tmux crash), or empty for a bare non-agent invocation — never the harness
+  title. The harness/session title (renamed `getHarnessTitle`), when present, is now
+  surfaced as SEPARATE additional info: a second `title: …` line on `--detect-agent`, and
+  the auto `--title` default on a real send. A review finding fixed alongside this: the
+  CJK/screenshot/dictionary hard-fail guards now scope to an explicit `--title` only — the
+  auto harness title is silently dropped on a guard hit instead of blocking the send (the
+  CTO never typed the session's own auto-generated title and cannot fix it).
+- Tests: `tests/tg-omp-session-title-integration.test.ts` — a real tmux window name is
+  never replaced by the omp session title (both show); a detached omp ancestor with no
+  tmux shows the `no tmux` marker plus the title line; a stray-CJK harness title never
+  blocks an otherwise-clean send.
+
 ## 1.53.1
 
 **Fix (tg-ctl): serialize ACP `session/prompt` delivery per session (tg-cli#353 relapse).**
