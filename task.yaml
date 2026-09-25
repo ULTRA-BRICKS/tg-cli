@@ -1,0 +1,9 @@
+# task.yaml — task-cli's ticket config for this repo (committed; the per-repo source of
+# truth). This repo files its tickets as Forgejo issues against ultrabricks/tg-cli on
+# git.hyperide.ai — the require-ticket-before-commit / block-raw-ticket agent-hooks
+# resolve tickets through this config.
+version: 1
+backend: forgejo
+forgejo:
+  url: https://git.hyperide.ai
+  repo: ultrabricks/tg-cli
