@@ -17,15 +17,18 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - name: Install dependencies
         run: bun install
-      - name: Install pandoc + Chrome (md-pdf integration test)
+      - name: Install pandoc + lsof + Chrome (md-pdf integration test; tg-ctl status lock holder)
         run: |
           sudo apt-get update
-          sudo apt-get install -y pandoc
-          # Google Chrome is preinstalled on ubuntu-latest (/usr/bin/google-chrome,
-          # which findChrome() probes); install it only if a future image drops it.
+          # lsof: `tg-ctl status` finds the poller lock holder with `lsof -t`; stock Ubuntu images lack it
+          sudo apt-get install -y pandoc lsof
+          # Google Chrome is preinstalled on GitHub's ubuntu-latest (/usr/bin/google-chrome,
+          # which findChrome() probes) but not on a stock Ubuntu runner image (Forgejo / GARM),
+          # so install it when missing. curl, not wget: a stock image ships no wget.
           command -v google-chrome >/dev/null || {
-            wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-            sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
+            deb="${RUNNER_TEMP:-/tmp}/google-chrome-stable_current_amd64.deb"
+            curl -fsSL -o "$deb" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo apt-get install -y "$deb"
           }
       - name: Test
         run: bun test

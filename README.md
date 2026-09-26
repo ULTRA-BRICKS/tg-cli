@@ -29,10 +29,25 @@ tg --file report.md "Weekly summary"
 
 ## Install
 
-**One-liner** (installs deps via bun, links `tg` into PATH, registers the agent skill):
+Pick one — each ends with `tg` (and `tg-ctl`) on your PATH. Needs [Bun](https://bun.sh);
+macOS and Linux.
+
 ```bash
+# 1. one-liner — clones to ~/.local/share/tg-cli, installs deps via bun, links tg into ~/.local/bin, registers the agent skill
 curl -fsSL https://git.hyperide.ai/ultrabricks/tg-cli/raw/branch/main/install.sh | bash
+
+# 2. from a clone — to hack on it; `git pull` updates the installed tool
+git clone https://git.hyperide.ai/ultrabricks/tg-cli && cd tg-cli && ./install.sh
 ```
+
+- **Update:** re-run the one-liner · `git pull` (see *Update / deploy a merged change* below).
+- **Via rig:** list `tg` under `tools.items` (with `repo:` pointing at your clone) in
+  `~/.config/rig/config.yaml` — `rig apply commit` runs its `install.sh` and keeps the clone fresh.
+- **No uv / pipx:** `tg` is a Bun script, not a Python package. **Windows:** the `#!/usr/bin/env bun`
+  entry doesn't run from Cygwin / Git Bash yet.
+
+> The canonical repo is **git.hyperide.ai/ultrabricks/tg-cli**; `github.com/alex-mextner/tg-cli` is a
+> frozen, archived mirror.
 
 **Register the skill manually** (idempotent; run automatically by the installer):
 ```bash
@@ -51,13 +66,6 @@ blocks). Run automatically by the installer.
 > into each session, so treat that directory as trusted (only the installers write there).
 > `install-skill` is an exact-match subcommand — to send the literal text `install-skill`
 > as a message, pipe it (`echo install-skill | tg -`) or add any other token.
-
-**Manual clone:**
-```bash
-git clone https://git.hyperide.ai/ultrabricks/tg-cli.git
-cd tg-cli
-ln -sf "$(pwd)/tg" ~/.local/bin/tg
-```
 
 **Requirements:** [Bun](https://bun.sh)
 
@@ -583,8 +591,8 @@ Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 - **[review-cli](https://git.hyperide.ai/ultrabricks/review-cli)** — agentic, priority-ordered failover multi-model code-review board (brainstorm/quorum, spec-web, dashboard)
 - **[rig-cli](https://git.hyperide.ai/ultrabricks/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
 - **[agent-tools](https://git.hyperide.ai/ultrabricks/agent-tools)** — the shared catalog `rig` applies: portable agent skills, agent-hooks, the global git-hook dispatcher, CI gates, and MCP servers
-- **[draw-cli](https://git.hyperide.ai/ultrabricks/draw-cli)** — text-to-image via Hugging Face
-- **[3d-cli](https://git.hyperide.ai/ultrabricks/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
+- **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
+- **[3d-cli](https://github.com/alex-mextner/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
 - **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
 
 Each CLI registers a skill into your agent harnesses (`<tool> install-skill`) so agents know it exists — see Install.

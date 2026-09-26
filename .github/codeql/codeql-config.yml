@@ -21,5 +21,9 @@
 #
 # This is a SCOPE decision (which code the gate guards), not a per-finding
 # suppression of a real bug in shipped code.
+# `tests/` is out of scope for the same reason — never shipped — and it is also most of the
+# TypeScript here (4 MB vs features/' 1.5 MB): with it in the database the JS analysis ran out of
+# memory on the 6 GiB Forgejo runners ("CodeQL is out of memory", exit 99), so no SARIF at all.
 paths-ignore:
   - scripts
+  - tests

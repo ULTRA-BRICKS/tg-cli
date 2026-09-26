@@ -7,9 +7,37 @@ set -euo pipefail
 # ── identity ──────────────────────────────────────────────────────────────────
 TOOL="tg"
 REPO="tg-cli"
-GIT_OWNER="ultrabricks"
+FORGE="https://git.hyperide.ai/ultrabricks"   # canonical home; github.com/alex-mextner is an archived mirror
 ENTRY="tg"          # path inside repo root (not bin/)
 CLONE_BASE="${XDG_DATA_HOME:-$HOME/.local/share}"
+EXPECT_URL="$FORGE/$REPO.git"
+
+# Origins that are the same repo: the canonical Forgejo one and the pre-migration GitHub ones (a
+# GitHub origin is re-pointed at Forgejo — the GitHub copy is frozen). Compared as HOST + PATH, never
+# as a substring: an origin that merely contains "hyperide.ai" (git.hyperide.ai.evil.example,
+# evil.example/git.hyperide.ai/…) must not pass for the canonical repo and get pulled + installed.
+_url_host_path() {  # https / ssh / scp-style git URL -> "host path" (user@, :port, .git, trailing / dropped)
+  local _u _hp _path _host
+  _u=${1%/}; _u=${_u%.git}
+  case "$_u" in
+    https://*|ssh://*) _u=${_u#*://}; _hp=${_u%%/*}; _path=${_u#*/} ;;
+    *@*:*) _hp=${_u%%:*}; _path=${_u#*:} ;;
+    *) return 1 ;;
+  esac
+  [ "$_path" != "$_u" ] || return 1
+  case "$_hp" in *[!A-Za-z0-9._:@%~-]*) return 1 ;; esac  # e.g. `\` (a host separator to some parsers)
+  _host=${_hp##*@}; _host=${_host%%:*}
+  printf '%s %s\n' "$_host" "$_path"
+}
+_origin_is_canonical() {
+  [ "$(_url_host_path "$1")" = "git.hyperide.ai ultrabricks/$REPO" ]
+}
+_origin_is_legacy() {
+  case "$(_url_host_path "$1")" in
+    "github.com alex-mextner/$REPO"|"github.com ultrabricks/$REPO") return 0 ;;
+  esac
+  return 1
+}
 
 # ── locate source dir ─────────────────────────────────────────────────────────
 # When run from a local clone, BASH_SOURCE[0] resolves to the script file.
@@ -30,16 +58,21 @@ else
   fi
   mkdir -p "$CLONE_BASE"
   CLONE_DIR="$CLONE_BASE/$REPO"
-  EXPECT_URL="https://git.hyperide.ai/$GIT_OWNER/$REPO.git"
   if [[ -d "$CLONE_DIR/.git" ]]; then
     actual_url="$(git -C "$CLONE_DIR" remote get-url origin 2>/dev/null || echo "")"
-    if [[ "$actual_url" != "$EXPECT_URL" ]]; then
+    if _origin_is_legacy "$actual_url"; then
+      echo "tg: $REPO moved to $FORGE — re-pointing origin ($actual_url -> $EXPECT_URL)"
+      git -C "$CLONE_DIR" remote set-url origin "$EXPECT_URL"
+    elif ! _origin_is_canonical "$actual_url"; then
       echo "ERROR: $CLONE_DIR exists but its origin is '$actual_url', not $EXPECT_URL." >&2
       echo "       Remove that directory or fix its remote, then re-run." >&2
       exit 1
     fi
     echo "tg: updating existing clone at $CLONE_DIR"
-    git -C "$CLONE_DIR" pull --ff-only
+    # The validated origin (not whatever branch.*.remote names) and the branch that is checked out
+    # (a clone kept on a feature branch updates that branch; a detached HEAD takes origin HEAD).
+    _branch="$(git -C "$CLONE_DIR" symbolic-ref --quiet --short HEAD || echo HEAD)"
+    git -C "$CLONE_DIR" pull --ff-only origin "$_branch"
   else
     echo "tg: cloning $EXPECT_URL into $CLONE_DIR"
     git clone "$EXPECT_URL" "$CLONE_DIR"

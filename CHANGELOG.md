@@ -3,6 +3,16 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.53.3
+
+**Install from git.hyperide.ai; CI runs on Forgejo runners.**
+
+- README and `install.sh` install from `https://git.hyperide.ai/ultrabricks/tg-cli` (the GitHub
+  repo is an archived mirror), with the same install options as the rest of the ecosystem.
+- CI, CodeQL, secret-scan and the review-threads gate run on Forgejo's runners:
+  `review-threads.sh` counts unresolved Forgejo review conversations, and the gitleaks
+  release archive is checked against its pinned sha256 before it is unpacked.
+
 ## 1.53.2
 
 **Fix (tg-ctl): a reply auto-rerouted to a same-project fallback (its recorded origin is gone) now surfaces a visible Telegram notice — it was previously silent.**
