@@ -1,16 +1,16 @@
+import { appendFileSync } from 'node:fs';
+import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { afterEach, expect, test } from 'bun:test';
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 
-// tg-cli#339: every inbound route into an omp with NO tmux pane must ACP
-// session/load the live process-table session, then session/prompt. Never
-// tmux send-keys, never an ephemeral session/new --no-session sibling.
+// #339 / #450: preserve every no-tmux route, but deliver to the original process.
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const SESSION_ID = '01a07d8e-c12c-7433-903d-e98726bfda37';
-const OMP_PID = 7103;
+const OMP_PID = process.pid;
 const OMP_CWD = '/Users/u/work/review-cli';
 
 const reg = createDaemonRegistry();
@@ -114,42 +114,11 @@ async function waitFor(pred: () => boolean, ms = 12_000): Promise<void> {
   throw new Error(`waitFor timed out after ${ms}ms`);
 }
 
-function fakeOmpScript(acpLog: string): string {
-  return `#!/usr/bin/env bun
-const fs = require("fs");
-const logPath = ${JSON.stringify(acpLog)};
-if (!process.argv.includes("acp")) process.exit(0);
-function encode(msg) {
-  return JSON.stringify(msg) + "\\n";
-}
-let buf = "";
-process.stdin.on("data", (chunk) => {
-  buf += chunk.toString("utf8");
-  while (true) {
-    const nl = buf.indexOf("\\n");
-    if (nl < 0) break;
-    const json = buf.slice(0, nl).trim();
-    buf = buf.slice(nl + 1);
-    if (!json.startsWith("{")) continue;
-    let msg;
-    try { msg = JSON.parse(json); } catch { continue; }
-    fs.appendFileSync(logPath, json + "\\n");
-    if (msg.method === "initialize") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentInfo: { name: "oh-my-pi" } } }));
-    } else if (msg.method === "session/load") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { sessionId: msg.params.sessionId } }));
-    } else if (msg.method === "session/new") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "01sibling-new-session" } }));
-    } else if (msg.method === "session/prompt") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } }));
-    }
-  }
-});
-setInterval(() => {}, 1 << 30);
-`;
+function fakeOmpScript(spawnLog: string): string {
+  return `#!/bin/sh\nprintf 'FORBIDDEN ACP CLONE\\n' >> '${spawnLog}.spawned'\nexit 1\n`;
 }
 
-function makeHarness(opts: { routes?: unknown[] } = {}) {
+async function makeHarness(opts: { routes?: unknown[] } = {}) {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-omp-reply-'));
   writeFileSync(join(cfgDir, '.env'), ['TG_BOT_TOKEN=123:abc', 'TG_CHAT_ID=1', ''].join('\n'));
   writeFileSync(join(cfgDir, 'config.yaml'), ['control:', '  enabled: true', ''].join('\n'));
@@ -213,6 +182,11 @@ exit 0
   writeFileSync(acpLog, '');
   writeFileSync(join(binDir, 'omp'), fakeOmpScript(acpLog), { mode: 0o755 });
 
+  const endpoint = await startLiveEndpoint({ root: join(cfgDir, 'omp-live'),
+    snapshot: () => ({ sessionId: SESSION_ID, cwd: OMP_CWD, sessionFile, title: 'ReviewFix', busy: false }),
+    send: (text: string) => { appendFileSync(acpLog, JSON.stringify({ event: 'original-input', pid: process.pid, sessionId: SESSION_ID, text }) + '\n'); },
+  });
+  servers.push({ stop: () => endpoint.close() });
   return { cfgDir, binDir, tmuxLog, acpLog };
 }
 
@@ -237,12 +211,12 @@ function acp(h: { acpLog: string }): string {
   return existsSync(h.acpLog) ? readFileSync(h.acpLog, 'utf8') : '';
 }
 
-function assertLiveAcp(h: { acpLog: string; tmuxLog: string }, needle: string) {
+function assertOriginal(h: { acpLog: string; tmuxLog: string }, needle: string) {
   const log = acp(h);
-  expect(log).toContain('"method":"initialize"');
-  expect(log).toContain('"method":"session/load"');
+  expect(log).toContain('"event":"original-input"');
+  expect(existsSync(h.acpLog + '.spawned')).toBe(false);
   expect(log).toContain(SESSION_ID);
-  expect(log).toContain('"method":"session/prompt"');
+  expect(log).toContain('"event":"original-input"');
   expect(log).toContain(needle);
   expect(log).not.toContain('"method":"session/new"');
   expect(log).not.toContain('--no-session');
@@ -251,20 +225,20 @@ function assertLiveAcp(h: { acpLog: string; tmuxLog: string }, needle: string) {
   expect(tmux).not.toContain('send-keys');
 }
 
-test('reply-to-bot-message injects via ACP session/load into the live out-of-tmux omp', async () => {
-  const h = makeHarness({
+test('reply-to-bot-message injects via the original-process bridge into the live out-of-tmux omp', async () => {
+  const h = await makeHarness({
     routes: [{ id: 50, paneId: `omp:${OMP_PID}`, cwd: OMP_CWD, ts: 1 }],
   });
   const tg = startFakeTg();
   await startDaemon(h, tg.port);
   tg.pushReply(100, 11, 50, 'fix the inject path');
-  await waitFor(() => acp(h).includes('session/prompt'));
-  assertLiveAcp(h, 'fix the inject path');
+  await waitFor(() => acp(h).includes('original-input'));
+  assertOriginal(h, 'fix the inject path');
   expect(acp(h)).toContain('[TG from Alex');
 }, 20_000);
 
-test('/agent pick then text injects via ACP into the chosen live out-of-tmux omp', async () => {
-  const h = makeHarness();
+test('/agent pick then text injects into the chosen live out-of-tmux omp', async () => {
+  const h = await makeHarness();
   const tg = startFakeTg();
   await startDaemon(h, tg.port);
   tg.pushText(200, 20, '/agent');
@@ -277,14 +251,14 @@ test('/agent pick then text injects via ACP into the chosen live out-of-tmux omp
   await Bun.sleep(400);
   tg.pushText(202, 21, 'hello from pick');
   await waitFor(() => acp(h).includes('hello from pick'));
-  assertLiveAcp(h, 'hello from pick');
+  assertOriginal(h, 'hello from pick');
 }, 20_000);
 
-test('plain inbound with no tmux pane reaches the sole live omp via ACP session/load', async () => {
-  const h = makeHarness();
+test('plain inbound with no tmux pane reaches the sole live omp via the original-process bridge', async () => {
+  const h = await makeHarness();
   const tg = startFakeTg();
   await startDaemon(h, tg.port);
   tg.pushText(300, 30, 'plain inbound no pane');
-  await waitFor(() => acp(h).includes('session/prompt'));
-  assertLiveAcp(h, 'plain inbound no pane');
+  await waitFor(() => acp(h).includes('original-input'));
+  assertOriginal(h, 'plain inbound no pane');
 }, 20_000);

@@ -1,3 +1,5 @@
+import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
+import { appendFileSync } from 'node:fs';
 import { afterEach, expect, test } from 'bun:test';
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
@@ -21,7 +23,7 @@ import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const SESSION_A = '01a07d8e-c12c-7433-903d-e98726bfda37';
 const SESSION_B = '01b18e9f-d23d-8544-a14e-f98837cfeb48';
-const OMP_PID_A = 7103;
+const OMP_PID_A = process.pid;
 const OMP_PID_B = 7203;
 const OMP_CWD_A = '/Users/u/work/review-cli';
 const OMP_CWD_B = '/Users/u/work/task-cli';
@@ -111,42 +113,11 @@ async function waitFor(pred: () => boolean, ms = 12_000): Promise<void> {
   throw new Error(`waitFor timed out after ${ms}ms`);
 }
 
-function fakeOmpScript(acpLog: string): string {
-  return `#!/usr/bin/env bun
-const fs = require("fs");
-const logPath = ${JSON.stringify(acpLog)};
-if (!process.argv.includes("acp")) process.exit(0);
-function encode(msg) {
-  return JSON.stringify(msg) + "\\n";
-}
-let buf = "";
-process.stdin.on("data", (chunk) => {
-  buf += chunk.toString("utf8");
-  while (true) {
-    const nl = buf.indexOf("\\n");
-    if (nl < 0) break;
-    const json = buf.slice(0, nl).trim();
-    buf = buf.slice(nl + 1);
-    if (!json.startsWith("{")) continue;
-    let msg;
-    try { msg = JSON.parse(json); } catch { continue; }
-    fs.appendFileSync(logPath, json + "\\n");
-    if (msg.method === "initialize") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentInfo: { name: "oh-my-pi" } } }));
-    } else if (msg.method === "session/load") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { sessionId: msg.params.sessionId } }));
-    } else if (msg.method === "session/new") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "01sibling-new-session" } }));
-    } else if (msg.method === "session/prompt") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } }));
-    }
-  }
-});
-setInterval(() => {}, 1 << 30);
-`;
+function fakeOmpScript(log: string): string {
+  return `#!/bin/sh\nprintf 'FORBIDDEN\\n' >> '${log}.spawned'\nexit 1\n`;
 }
 
-function makeHarness() {
+async function makeHarness() {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-omp-anchor-'));
   writeFileSync(join(cfgDir, '.env'), ['TG_BOT_TOKEN=123:abc', 'TG_CHAT_ID=1', ''].join('\n'));
   writeFileSync(join(cfgDir, 'config.yaml'), ['control:', '  enabled: true', ''].join('\n'));
@@ -234,6 +205,10 @@ exit 0
   writeFileSync(acpLog, '');
   writeFileSync(join(binDir, 'omp'), fakeOmpScript(acpLog), { mode: 0o755 });
 
+  const ep = await startLiveEndpoint({ root: join(cfgDir, 'omp-live'),
+    snapshot: () => ({ sessionId: SESSION_A, sessionFile: sessionFileA, cwd: OMP_CWD_A, title: 'ReviewFix', busy: false }),
+    send: (text: string) => appendFileSync(acpLog, JSON.stringify({ event: 'original-input', sessionId: SESSION_A, text }) + '\n'),
+  }); servers.push({ stop: () => ep.close() });
   return { cfgDir, binDir, tmuxLog, acpLog };
 }
 
@@ -259,7 +234,7 @@ function acp(h: { acpLog: string }): string {
 }
 
 test('REGRESSION (tg-cli#78 anchor, no-tmux path): a non-reply message after an explicit /agent pick auto-binds to that same live omp, never re-asks', async () => {
-  const h = makeHarness();
+  const h = await makeHarness();
   const tg = startFakeTg();
   await startDaemon(h, tg.port);
 
@@ -293,4 +268,5 @@ test('REGRESSION (tg-cli#78 anchor, no-tmux path): a non-reply message after an 
 
   expect(rePicked).toBe(false);
   expect(wentToA).toBe(true);
+  expect(existsSync(h.acpLog + ".spawned")).toBe(false);
 }, 20_000);

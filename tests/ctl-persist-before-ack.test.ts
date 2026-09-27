@@ -1,3 +1,5 @@
+import { appendFileSync } from 'node:fs';
+import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { afterAll, expect, test } from 'bun:test';
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
@@ -195,11 +197,11 @@ writeFileSync(
 case "$*" in
   *tty*)
     printf '    1 ??\\n'
-    printf ' 7103 ttys004\\n'
+    printf ' ${process.pid} ttys004\\n'
     ;;
   *)
     printf '    1     0 /sbin/launchd\\n'
-    printf ' 7103     1 /opt/homebrew/bin/omp\\n'
+    printf ' ${process.pid}     1 /opt/homebrew/bin/omp\\n'
     ;;
 esac
 exit 0
@@ -209,7 +211,7 @@ exit 0
 writeFileSync(
   join(ffBinDir, 'lsof'),
   `#!/bin/sh
-printf 'p7103\\n'
+printf 'p${process.pid}\\n'
 printf 'fcwd\\n'
 printf 'n/Users/u/work/review-cli\\n'
 printf 'n${ffSessionFile}\\n'
@@ -220,42 +222,11 @@ exit 0
 
 const ffAcpLog = join(ffCfgDir, 'acp.log');
 writeFileSync(ffAcpLog, '');
-writeFileSync(
-  join(ffBinDir, 'omp'),
-  `#!/usr/bin/env bun
-const fs = require("fs");
-const logPath = process.env.OMP_ACP_LOG;
-if (!process.argv.includes("acp")) process.exit(0);
-function encode(msg) {
-  return JSON.stringify(msg) + "\\n";
-}
-let buf = "";
-process.stdin.on("data", (chunk) => {
-  buf += chunk.toString("utf8");
-  while (true) {
-    const nl = buf.indexOf("\\n");
-    if (nl < 0) break;
-    const json = buf.slice(0, nl).trim();
-    buf = buf.slice(nl + 1);
-    if (!json.startsWith("{")) continue;
-    let msg;
-    try { msg = JSON.parse(json); } catch { continue; }
-    if (logPath) fs.appendFileSync(logPath, json + "\\n");
-    if (msg.method === "initialize") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentInfo: { name: "oh-my-pi" } } }));
-    } else if (msg.method === "session/load") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { sessionId: msg.params.sessionId } }));
-    } else if (msg.method === "session/new") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "01fake-acp-session" } }));
-      process.stdout.write(encode({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "01fake-acp-session", update: { sessionUpdate: "session_info_update", title: "ReviewFix" } } }));
-    }
-    // session/prompt: log receipt but NEVER write a response — proves delivery is not gated on agent reply.
-  }
+writeFileSync(join(ffBinDir, 'omp'), `#!/bin/sh\nprintf 'FORBIDDEN\\n' >> '${ffAcpLog}.spawned'\nexit 1\n`, { mode: 0o755 });
+const ffEndpoint = await startLiveEndpoint({ root: join(ffCfgDir, 'omp-live'),
+  snapshot: () => ({ sessionId: '01a07d8e-c12c-7433-903d-e98726bfda37', sessionFile: ffSessionFile, cwd: '/Users/u/work/review-cli', title: 'ReviewFix', busy: true }),
+  send: (text: string) => { appendFileSync(ffAcpLog, JSON.stringify({ event: 'original-input', text }) + '\n'); },
 });
-setInterval(() => {}, 1 << 30);
-`,
-  { mode: 0o755 },
-);
 
 const ffSent: Array<Record<string, unknown>> = [];
 let ffServed = 0;
@@ -298,9 +269,10 @@ const ffReg = createDaemonRegistry();
 afterAll(async () => {
   await reapDaemons(ffReg);
   ffServer.stop(true);
+  await ffEndpoint.close();
 });
 
-test('omp ACP session/prompt is fire-and-forget — daemon does not block on unanswered prompt', async () => {
+test('original OMP acknowledgement does not wait for the busy model to finish a turn', async () => {
   const spawnT0 = Date.now();
   const logFd = openSync(join(ffCfgDir, 'daemon.log'), 'w');
   const daemon = await spawnDaemon(ffReg, {
@@ -321,7 +293,7 @@ test('omp ACP session/prompt is fire-and-forget — daemon does not block on una
   let promptAt = 0;
   while (Date.now() - spawnT0 < 12000) {
     const acp = existsSync(ffAcpLog) ? readFileSync(ffAcpLog, 'utf8') : '';
-    if (acp.includes('session/prompt')) {
+    if (acp.includes('original-input')) {
       promptAt = Date.now();
       break;
     }
@@ -329,13 +301,14 @@ test('omp ACP session/prompt is fire-and-forget — daemon does not block on una
   }
 
   const acp = existsSync(ffAcpLog) ? readFileSync(ffAcpLog, 'utf8') : '';
-  expect(acp).toContain('"method":"session/prompt"');
+  expect(acp).toContain('"event":"original-input"');
   expect(promptAt).toBeGreaterThan(0);
+  expect(existsSync(ffAcpLog + '.spawned')).toBe(false);
 
   // The old design blocked on acpCall(...120_000) here — with no response from the
   // fake omp, that would stall ~120s before the routing confirm could land. Fire-and-
   // forget must let the daemon make forward progress within a couple seconds of the
-  // prompt frame being written, even though the fake never answers session/prompt.
+  // prompt frame being written, even though the fake never answers original-input.
   const confirmT0 = Date.now();
   while (Date.now() - confirmT0 < 3000) {
     const confirm = ffSent.find((m) => String(m.text).includes('ReviewFix'));

@@ -245,7 +245,11 @@ test('status reports when a project-local Claude statusLine shadows the installe
     `${JSON.stringify({ statusLine: { type: 'command', command: 'printf project-only' } })}\n`,
   );
 
-  const proc = run(['status'], env, project);
+  // Isolate machine discovery: this fixture is about the invoking project,
+  // not whichever unrelated real OMP happens to be running on the host.
+  const bin = exitCodeShimDir('tmux', 0);
+  writeFileSync(join(bin, 'ps'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const proc = run(['status'], { ...env, PATH: `${bin}:${process.env.PATH ?? ''}` }, project);
   expect(proc.exitCode).toBe(0);
   const out = proc.stdout.toString();
   expect(out).toContain('usage telemetry: shadowed by');

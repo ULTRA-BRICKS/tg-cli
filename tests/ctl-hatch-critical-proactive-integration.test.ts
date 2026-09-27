@@ -1,3 +1,5 @@
+import { appendFileSync } from 'node:fs';
+import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 // tg-cli#403 acceptance criterion (d): the moment a CRITICAL hatch decision
 // lands for a request whose underlying process has already exited (the exact
 // original incident — a tap landing after the requesting command gave up
@@ -40,7 +42,7 @@ afterEach(async () => {
 });
 
 // Same fake `ps`/`lsof`/`omp` triplet as ctl-omp-acp-integration.test.ts: pid
-// 7103 is a live omp process whose cwd (via lsof) is LIVE_CWD and whose
+// ${process.pid} is a live omp process whose cwd (via lsof) is LIVE_CWD and whose
 // session jsonl (also via lsof) carries SESSION_ID.
 function writeFakeBins(cfgDir: string, sessionFile: string, acpLog: string): string {
   const binDir = join(cfgDir, 'bin');
@@ -52,11 +54,11 @@ function writeFakeBins(cfgDir: string, sessionFile: string, acpLog: string): str
 case "$*" in
   *tty*)
     printf '    1 ??\\n'
-    printf ' 7103 ttys004\\n'
+    printf ' ${process.pid} ttys004\\n'
     ;;
   *)
     printf '    1     0 /sbin/launchd\\n'
-    printf ' 7103     1 /opt/homebrew/bin/omp\\n'
+    printf ' ${process.pid}     1 /opt/homebrew/bin/omp\\n'
     ;;
 esac
 exit 0
@@ -66,7 +68,7 @@ exit 0
   writeFileSync(
     join(binDir, 'lsof'),
     `#!/bin/sh
-printf 'p7103\\n'
+printf 'p${process.pid}\\n'
 printf 'fcwd\\n'
 printf 'n${LIVE_CWD}\\n'
 printf 'n${sessionFile}\\n'
@@ -74,44 +76,11 @@ exit 0
 `,
     { mode: 0o755 },
   );
-  writeFileSync(
-    join(binDir, 'omp'),
-    `#!/usr/bin/env bun
-const fs = require("fs");
-const logPath = process.env.OMP_ACP_LOG;
-if (!process.argv.includes("acp")) process.exit(0);
-function encode(msg) { return JSON.stringify(msg) + "\\n"; }
-let buf = "";
-process.stdin.on("data", (chunk) => {
-  buf += chunk.toString("utf8");
-  while (true) {
-    const nl = buf.indexOf("\\n");
-    if (nl < 0) break;
-    const json = buf.slice(0, nl).trim();
-    buf = buf.slice(nl + 1);
-    if (!json.startsWith("{")) continue;
-    let msg;
-    try { msg = JSON.parse(json); } catch { continue; }
-    if (logPath) fs.appendFileSync(logPath, json + "\\n");
-    if (msg.method === "initialize") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentInfo: { name: "oh-my-pi" } } }));
-    } else if (msg.method === "session/load") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { sessionId: msg.params.sessionId } }));
-    } else if (msg.method === "session/new") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "01fake-acp-session" } }));
-    } else if (msg.method === "session/prompt") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } }));
-    }
-  }
-});
-setInterval(() => {}, 1 << 30);
-`,
-    { mode: 0o755 },
-  );
+  writeFileSync(join(binDir, 'omp'), `#!/bin/sh\nprintf 'FORBIDDEN\\n' >> '${acpLog}.spawned'\nexit 1\n`, { mode: 0o755 });
   return binDir;
 }
 
-function makeCfgDir(): { cfgDir: string; binDir: string; acpLog: string; sessionFile: string } {
+async function makeCfgDir() {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-hatch-proactive-'));
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
@@ -132,6 +101,10 @@ function makeCfgDir(): { cfgDir: string; binDir: string; acpLog: string; session
   const acpLog = join(cfgDir, 'acp.log');
   writeFileSync(acpLog, '');
   const binDir = writeFakeBins(cfgDir, sessionFile, acpLog);
+  const ep = await startLiveEndpoint({ root: join(cfgDir, 'omp-live'),
+    snapshot: () => ({ sessionId: SESSION_ID, sessionFile, cwd: LIVE_CWD, title: 'ReviewFix', busy: false }),
+    send: (text: string) => { appendFileSync(acpLog, JSON.stringify({ event: 'original-input', sessionId: SESSION_ID, text }) + '\n'); },
+  }); servers.push({ stop: () => ep.close() });
   return { cfgDir, binDir, acpLog, sessionFile };
 }
 
@@ -261,7 +234,7 @@ function daemonLog(cfgDir: string): string {
 }
 
 test('a late Deny on a disconnected hatch card carries parse_mode HTML', async () => {
-  const { cfgDir, binDir, acpLog } = makeCfgDir();
+  const { cfgDir, binDir, acpLog } = await makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
   const daemon = await startDaemon(cfgDir, binDir, acpLog, tg.port);
@@ -299,8 +272,8 @@ test('a late Deny on a disconnected hatch card carries parse_mode HTML', async (
   await daemon.exited;
 }, 25_000);
 
-test('a late CRITICAL hatch decision reaches a LIVE omp session via a real ACP session/prompt call', async () => {
-  const { cfgDir, binDir, acpLog } = makeCfgDir();
+test('a late CRITICAL hatch decision reaches a LIVE omp session via its exact original-process session identity', async () => {
+  const { cfgDir, binDir, acpLog } = await makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
   const daemon = await startDaemon(cfgDir, binDir, acpLog, tg.port);
@@ -314,7 +287,8 @@ test('a late CRITICAL hatch decision reaches a LIVE omp session via a real ACP s
     permissionEvent: 'PermissionRequest',
     critical: true,
     cwd: LIVE_CWD,
-    origin: { agent: 'omp' },
+    origin: { agent: 'omp', sessionId: SESSION_ID },
+    paneId: '%99', // A stale pane must not outrank the exact original session.
     // Grant protocol v1.1 (tg-cli#398) fields — a current agent-tools lib
     // always sends these; isGrantableRequest fail-closes without them.
     hookId,
@@ -336,10 +310,10 @@ test('a late CRITICAL hatch decision reaches a LIVE omp session via a real ACP s
   const allowData = tg.allowData()!;
   tg.push([tap(allowData, 501, 1)]);
 
-  expect(await until(() => existsSync(acpLog) && readFileSync(acpLog, 'utf8').includes('"method":"session/prompt"'), 15_000)).toBe(true);
+  expect(await until(() => existsSync(acpLog) && readFileSync(acpLog, 'utf8').includes('"event":"original-input"'), 15_000)).toBe(true);
   const acp = readFileSync(acpLog, 'utf8');
-  expect(acp).toContain('"method":"initialize"');
-  expect(acp).toContain('"method":"session/load"');
+  expect(existsSync(acpLog + '.spawned')).toBe(false);
+  expect(acp).not.toContain('session/load');
   expect(acp).toContain(SESSION_ID);
   // Never session/new for a MATCHED live session — attaching to the existing one.
   expect(acp).not.toContain('"method":"session/new"');
@@ -357,7 +331,7 @@ test('a late CRITICAL hatch decision reaches a LIVE omp session via a real ACP s
 }, 25_000);
 
 test('a late CRITICAL hatch decision for a cwd with NO live session never calls promptOmpAcp/spawns anything — durable record only', async () => {
-  const { cfgDir, binDir, acpLog } = makeCfgDir();
+  const { cfgDir, binDir, acpLog } = await makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
   const daemon = await startDaemon(cfgDir, binDir, acpLog, tg.port);

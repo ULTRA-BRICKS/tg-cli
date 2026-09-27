@@ -151,7 +151,7 @@ interface MockTg {
   delaySend: (ms: number) => void;
 }
 
-function mockTelegram(): MockTg {
+function mockTelegram(callbackDelayMs = 0): MockTg {
   const updateQueue: unknown[][] = [];
   const cards: unknown[] = [];
   const edits: string[] = [];
@@ -197,6 +197,7 @@ function mockTelegram(): MockTg {
         return Response.json({ ok: true, result: true });
       }
       if (url.pathname.endsWith('/answerCallbackQuery')) {
+        if (callbackDelayMs) await Bun.sleep(callbackDelayMs);
         answeredCbs.push((await req.json()) as { callback_query_id: string; text: string });
         return Response.json({ ok: true, result: true });
       }
@@ -414,7 +415,7 @@ test('POST-TIMEOUT REPLY: a text reply to the retained question card injects the
 
 test('LATE-DELIVER failure: an unreachable pane keeps the entry retained for a re-tap (answer not lost)', async () => {
   const cfgDir = makeCfgDir();
-  const tg = mockTelegram();
+  const tg = mockTelegram(150);
   servers.push(tg);
   await startDaemon(cfgDir, tg.port);
 
@@ -429,7 +430,7 @@ test('LATE-DELIVER failure: an unreachable pane keeps the entry retained for a r
   writeFileSync(join(cfgDir, 'pane-gone'), '1');
   tg.push([tap(productionData, 710, 1)]);
   expect(await until(() => daemonLog(cfgDir).includes('ask-late-deliver-failed'), 6000)).toBe(true);
-  expect(tg.answeredCbs().some((c) => c.text.includes('tap again'))).toBe(true);
+  expect(await until(() => tg.answeredCbs().some((c) => c.text.includes('tap again')), 6000)).toBe(true);
   expect(tg.edits().some((e) => e.includes('Selected answer: Production'))).toBe(false); // NOT marked answered
   // The retained entry is still on disk (recoverable by a re-tap).
   const state = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.questions.json'), 'utf8'));

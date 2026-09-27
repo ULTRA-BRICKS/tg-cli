@@ -1,33 +1,9 @@
 /**
- * @file Live omp (Oh My Pi) control via ACP — not tmux send-keys, not `omp --resume -p`.
- *
- * Accessed via: tg-ctl inbound inject / question taps → this module (pure
- * encode/decode + discovery) → the entrypoint owns the `omp acp` stdio child.
- *
- * Assumptions: the live binary is omp 18.1.14. Session titles live in omp's
- * own jsonl (`type:title` / `type:session`). ACP does not attach to a TUI
- * process's stdin; a pane AND an ACP child at once still use ACP only.
- *
- * Past bugs: PR 322 used `omp --resume --print`, which forks the session
- * parent-chain. Do not revive that. `omp join` is a collab relay, not local
- * attach. RPC `--mode=rpc` is NDJSON `{type:"prompt", message}` — we speak
- * ACP JSON-RPC instead. Framing is NDJSON (one JSON-RPC object per line);
- * LSP Content-Length makes `omp acp` exit 0 with empty stdout (tg-cli#341,
- * the 15s initialize timeout).
- *
- * ACP methods used (proven on omp 18.1.14, 2026-09-08):
- *   initialize                  → agentInfo.name "oh-my-pi"
- *   session/new {cwd, mcpServers:[]} → sessionId (no live session jsonl)
- *   session/load {cwd, mcpServers:[], sessionId} → the process-table session
- *   session/prompt {sessionId, prompt:[{type:"text", text}]}
- *   session/update              → session_info_update.title (name from omp)
- *   session/request_permission  → Telegram buttons; reply is the JSON-RPC result
- *                                 {outcome:{outcome:"selected", optionId}}
- *
- * Out-of-tmux replies (tg-cli#339): `tg` stamps route paneId omp:<pid>; the
- * daemon recognizes that origin and session/load-s the live session id, never
- * tmux send-keys and never an ephemeral session/new --no-session sibling.
- *
+ * OMP process/session discovery and legacy ACP frame compatibility helpers.
+ * Live delivery uses omp-live-runtime + the extension in the ORIGINAL process.
+ * Never use ACP session/load or --resume -p to attach to an already-live TUI:
+ * both create another history writer. Legacy framing exports remain for callers
+ * reading old question cards, not for starting processes in tg-ctl.
  */
 
 import { matchAgentCommand } from './discover';
@@ -37,6 +13,8 @@ import { uniqueProjectSelectorHits, type AgentCandidate } from './agent-match';
 import { normalizeTty, parseAgentNameFromCommand } from './unreachable';
 
 export interface LiveOmpAgent {
+  /** Verified live-process bridge generation, when installed. */
+  instanceId?: string;
   pid: number;
   cwd: string | null;
   sessionFile: string | null;
@@ -179,8 +157,8 @@ function pidsUnderPanes(panes: PaneInfo[], procs: ProcInfo[]): Map<number, strin
  * controlling tty at all. `isOmpLiveSessionCommand` already narrows `procs` to
  * the genuine top-level interactive CLI (never a worker, `omp acp` child, or a
  * `-p`/`--print` one-shot) — anything left IS a live conversational session, so
- * `preferOmpApiOverTmux` is always true for omp and ACP delivery (promptOmpAcp /
- * ensureOmpAcp) needs only the pid's cwd, never a tty or a pane.
+ * discovery keeps them visible. Delivery independently requires an authenticated
+ * original-process endpoint; cwd alone can NEVER authorize a destination.
  *
  * Past bug (tg-cli#405 follow-up): this used to additionally require a tty OR a
  * pane ("drop daemons with neither") and silently dropped a genuinely live omp

@@ -77,6 +77,14 @@ Feature modules live in `features/<feature-name>/` as **pure TypeScript modules*
 all external dependencies (spawns, fetch, file reads) are injected as function parameters so
 tests can pass fakes.
 
+### Live OMP identity (#450)
+
+Never use `omp acp session/load` or `omp --resume -p` to deliver to a live TUI: those
+create independent writers to its history. Use `tg-ctl omp-live` and the original-process
+extension. Missing endpoints fail closed; do not restore the old spawn fallback to satisfy
+legacy fixtures. See `docs/omp-original-process.md` for setup, receipt semantics, and the
+one-time saved restart needed by already-running OMP. Cwd/title are not process identity.
+
 ### Existing Features
 
 - `features/agent-detect/` — pure `detectAgentLabel(env)`: the historical env-based

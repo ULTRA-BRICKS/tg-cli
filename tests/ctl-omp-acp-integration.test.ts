@@ -1,3 +1,5 @@
+import { appendFileSync } from 'node:fs';
+import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { afterAll, expect, test } from 'bun:test';
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
@@ -46,11 +48,11 @@ writeFileSync(
 case "$*" in
   *tty*)
     printf '    1 ??\\n'
-    printf ' 7103 ttys004\\n'
+    printf ' ${process.pid} ttys004\\n'
     ;;
   *)
     printf '    1     0 /sbin/launchd\\n'
-    printf ' 7103     1 /opt/homebrew/bin/omp\\n'
+    printf ' ${process.pid}     1 /opt/homebrew/bin/omp\\n'
     ;;
 esac
 exit 0
@@ -60,7 +62,7 @@ exit 0
 writeFileSync(
   join(binDir, 'lsof'),
   `#!/bin/sh
-printf 'p7103\\n'
+printf 'p${process.pid}\\n'
 printf 'fcwd\\n'
 printf 'n/Users/u/work/review-cli\\n'
 printf 'n${sessionFile}\\n'
@@ -71,43 +73,11 @@ exit 0
 
 const acpLog = join(cfgDir, 'acp.log');
 writeFileSync(acpLog, '');
-writeFileSync(
-  join(binDir, 'omp'),
-  `#!/usr/bin/env bun
-const fs = require("fs");
-const logPath = process.env.OMP_ACP_LOG;
-if (!process.argv.includes("acp")) process.exit(0);
-function encode(msg) {
-  return JSON.stringify(msg) + "\\n";
-}
-let buf = "";
-process.stdin.on("data", (chunk) => {
-  buf += chunk.toString("utf8");
-  while (true) {
-    const nl = buf.indexOf("\\n");
-    if (nl < 0) break;
-    const json = buf.slice(0, nl).trim();
-    buf = buf.slice(nl + 1);
-    if (!json.startsWith("{")) continue;
-    let msg;
-    try { msg = JSON.parse(json); } catch { continue; }
-    if (logPath) fs.appendFileSync(logPath, json + "\\n");
-    if (msg.method === "initialize") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentInfo: { name: "oh-my-pi" } } }));
-    } else if (msg.method === "session/load") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { sessionId: msg.params.sessionId } }));
-    } else if (msg.method === "session/new") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "01fake-acp-session" } }));
-      process.stdout.write(encode({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "01fake-acp-session", update: { sessionUpdate: "session_info_update", title: "ReviewFix" } } }));
-    } else if (msg.method === "session/prompt") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } }));
-    }
-  }
+writeFileSync(join(binDir, 'omp'), `#!/bin/sh\nprintf 'FORBIDDEN\\n' >> '${acpLog}.spawned'\nexit 1\n`, { mode: 0o755 });
+const endpoint = await startLiveEndpoint({ root: join(cfgDir, 'omp-live'),
+  snapshot: () => ({ sessionId: '01a07d8e-c12c-7433-903d-e98726bfda37', cwd: '/Users/u/work/review-cli', sessionFile, title: 'ReviewFix', busy: false }),
+  send: (text: string) => { appendFileSync(acpLog, JSON.stringify({ event: 'original-input', pid: process.pid, sessionId: '01a07d8e-c12c-7433-903d-e98726bfda37', text }) + '\n'); },
 });
-setInterval(() => {}, 1 << 30);
-`,
-  { mode: 0o755 },
-);
 
 const sentMessages: Array<Record<string, unknown>> = [];
 let served = 0;
@@ -150,9 +120,10 @@ const reg = createDaemonRegistry();
 afterAll(async () => {
   await reapDaemons(reg);
   server.stop(true);
+  await endpoint.close();
 });
 
-test('Telegram text reaches fake omp ACP with TMUX unset; never tmux send-keys; name from omp title', async () => {
+test('Telegram name selector reaches original OMP with TMUX unset; never tmux send-keys or ACP clone', async () => {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'w');
   await spawnDaemon(reg, {
     tgCtlPath: TG_CTL,
@@ -172,16 +143,16 @@ test('Telegram text reaches fake omp ACP with TMUX unset; never tmux send-keys; 
   const t0 = Date.now();
   while (Date.now() - t0 < 12_000) {
     const acp = existsSync(acpLog) ? readFileSync(acpLog, 'utf8') : '';
-    if (acp.includes('session/prompt')) break;
+    if (acp.includes('original-input')) break;
     await Bun.sleep(100);
   }
 
   const acp = existsSync(acpLog) ? readFileSync(acpLog, 'utf8') : '';
-  expect(acp).toContain('"method":"initialize"');
-  expect(acp).toContain('"method":"session/load"');
+  expect(acp).toContain('"event":"original-input"');
+  expect(existsSync(acpLog + '.spawned')).toBe(false);
   expect(acp).toContain('01a07d8e-c12c-7433-903d-e98726bfda37');
   expect(acp).not.toContain('"method":"session/new"');
-  expect(acp).toContain('"method":"session/prompt"');
+  expect(acp).toContain('"event":"original-input"');
   expect(acp).toContain('deploy now');
   expect(acp).toContain('[TG from Alex');
   expect(acp).toContain('tg#10');

@@ -57,42 +57,8 @@ exit 0
   { mode: 0o755 },
 );
 
-// A fake `omp acp` that answers initialize/session-new/session-prompt
-// immediately (no wedge — this test is about DISCOVERY, not delivery
-// reliability) and logs every inbound frame so the test can see the prompt
-// text actually reached it.
-writeFileSync(
-  join(binDir, 'omp'),
-  `#!/usr/bin/env bun
-const fs = require("fs");
-const logPath = process.env.OMP_ACP_LOG;
-if (!process.argv.includes("acp")) process.exit(0);
-function encode(msg) { return JSON.stringify(msg) + "\\n"; }
-let buf = "";
-process.stdin.on("data", (chunk) => {
-  buf += chunk.toString("utf8");
-  while (true) {
-    const nl = buf.indexOf("\\n");
-    if (nl < 0) break;
-    const json = buf.slice(0, nl).trim();
-    buf = buf.slice(nl + 1);
-    if (!json.startsWith("{")) continue;
-    let msg;
-    try { msg = JSON.parse(json); } catch { continue; }
-    if (logPath) fs.appendFileSync(logPath, json + "\\n");
-    if (msg.method === "initialize") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentInfo: { name: "oh-my-pi" } } }));
-    } else if (msg.method === "session/new") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "headless-session-1" } }));
-    } else if (msg.method === "session/prompt") {
-      process.stdout.write(encode({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } }));
-    }
-  }
-});
-setInterval(() => {}, 1 << 30);
-`,
-  { mode: 0o755 },
-);
+// A missing bridge must be visible, but can never cause ACP session creation.
+writeFileSync(join(binDir, 'omp'), `#!/bin/sh\nprintf 'FORBIDDEN SPAWN\\n' >> '${join(cfgDir, 'acp.log')}'\nexit 1\n`, { mode: 0o755 });
 
 const acpLog = join(cfgDir, 'acp.log');
 writeFileSync(acpLog, '');
@@ -127,7 +93,7 @@ afterAll(async () => {
   server.stop(true);
 });
 
-test('a plain text message reaches a headless (no tty, no tmux pane) omp session via ACP, never the legacy no-tmux reply', async () => {
+test('headless original remains discoverable; missing bridge never spawns ACP or reports a missing tmux agent', async () => {
   await spawnDaemon(reg, {
     tgCtlPath: TG_CTL,
     cfgDir,
@@ -149,13 +115,13 @@ test('a plain text message reaches a headless (no tty, no tmux pane) omp session
   const t0 = Date.now();
   while (Date.now() - t0 < 10_000) {
     const log = readFileSync(acpLog, 'utf8');
-    if (log.includes('"method":"session/prompt"')) break;
+    if (sentMessages.some(m => String(m.text).includes('Original OMP bridge'))) break;
     await Bun.sleep(50);
   }
 
   const acpLogContent = readFileSync(acpLog, 'utf8');
-  expect(acpLogContent).toContain('"method":"session/prompt"');
-  expect(acpLogContent).toContain('headless reply test message');
+  expect(acpLogContent).toBe('');
+  expect(sentMessages.some(m => String(m.text).includes('Original OMP bridge'))).toBe(true);
   expect(sentMessages.some((m) => String(m.text) === NO_AGENT_REPLY)).toBe(false);
   expect(sentMessages.some((m) => String(m.text).includes('not in tmux'))).toBe(false);
 }, 15_000);

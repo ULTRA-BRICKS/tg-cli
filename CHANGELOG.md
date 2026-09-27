@@ -3,6 +3,26 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.0
+
+**Original-process OMP delivery; no ACP history clones (#450).**
+
+- Telegram replies, `/agent`, late grants and reminders now use an authenticated private
+  Unix socket hosted by the ORIGINAL interactive OMP process. Missing or stale endpoints
+  fail explicitly; no live-delivery path spawns `omp acp`, `session/load`, or `--resume -p`.
+- `tg-ctl omp-live install` installs the extension; existing OMPs need a saved stop/resume
+  once (verified `/reload` does not load new JS extensions in OMP 18.3).
+  `omp-live status --json` exposes verified PID/session/durable-session metadata without
+  bot credentials or authentication tokens. `omp-live send` supports stable request IDs.
+- Bind delivery to PID + random process instance + exact session. Retries are idempotent,
+  conflicting IDs reject, callbacks are serialized, and a queued receipt never claims
+  that the model has read or completed a request. Native hook-based approvals stay intact.
+- Stop anonymous reminder-created sessions. Old ACP question cards fail visibly rather
+  than approving a different process. A cwd or title alone cannot select a grant target.
+- Replace obsolete ACP child/eviction tests with original-socket tests for busy queues,
+  error retention, stale identities and no-takeover; retain no-tmux routing, picker/anchor,
+  durable batch recovery and late-grant regression scenarios against the real daemon.
+
 ## 1.53.3
 
 **Install from git.hyperide.ai; CI runs on Forgejo runners.**
