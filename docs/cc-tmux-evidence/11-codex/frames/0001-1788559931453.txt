@@ -1,0 +1,2 @@
+clear; CODEX_HOME=/private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-study-7122/codex codex --dangerously-bypass-hook-trust -C /private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-stud
+y-7122/repo

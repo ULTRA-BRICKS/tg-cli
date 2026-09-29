@@ -1,0 +1,2 @@
+clear; CC_HOME=/private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-study-27750/home CC_KEYCHAIN_SERVICE='Claude Code-credentials-c7f2104c' bash /Users/ultra/xp/tg-cli/.worktrees/304-cc-tmux-st
+udy/tools/cc-study/run-claude.sh

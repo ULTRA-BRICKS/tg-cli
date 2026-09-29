@@ -1,0 +1,9 @@
+.claude.json
+backups/.claude.json.backup.1788559258328
+history.jsonl
+policy-limits.json
+projects/-private-var-folders-1c-d4v7-mrs4b9085f6w7w9p35c0000gn-T-cc-study-57770-repo/a151a3e6-4469-4507-8849-681ac0988bd8.jsonl
+remote-settings.json
+sessions/58698.c2f6f9f0cb343a941c9322f4f216b71a4b0e894425c515556ce172149b67b661.key
+sessions/58698.json
+settings.json

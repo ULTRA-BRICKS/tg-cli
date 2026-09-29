@@ -1,0 +1,3 @@
+
+[2mResume this session with:[0m
+[2mclaude --resume b17e551b-c094-46e3-b261-6a8f9385c0f7[0m

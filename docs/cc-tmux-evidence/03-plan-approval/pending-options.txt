@@ -1,0 +1,5 @@
+   1. Create a LICENSE file at the repo root containing the standard MIT License text, with the copyright year (2026) and holder name filled in.
+   2. Verify the file is added to git status as untracked, but do not commit unless asked.
+   ❯ 1. Yes, auto-accept edits
+     2. Yes, manually approve edits
+     3. Tell Claude what to change

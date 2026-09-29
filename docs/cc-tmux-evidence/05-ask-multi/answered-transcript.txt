@@ -1,0 +1,14 @@
+# /private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-study-62112/home/.claude/projects/-private-var-folders-1c-d4v7-mrs4b9085f6w7w9p35c0000gn-T-cc-study-62112-repo/751eb3e9-a44c-4f41-a8bf-da53dbb43809.jsonl
+# total_records=17 showing_last=12
+6: type=attachment timestamp=2026-09-04T22:01:21.700Z isSidechain=False uuid=47b699f2 parentUuid=58bb9953 extra={"attachment": {"type": "deferred_tools_delta", "addedNames": ["CronCreate", "CronDelete", "CronList", "DesignSync", "EnterPlanMode", "EnterWorktree", "ExitPlanMode", "ExitWorktree", "Monitor", "Noteb
+7: type=attachment timestamp=2026-09-04T22:01:21.700Z isSidechain=False uuid=61add014 parentUuid=47b699f2 extra={"attachment": {"type": "agent_listing_delta", "addedTypes": ["claude", "claude-code-guide", "Explore", "general-purpose", "Plan", "statusline-setup"], "addedLines": ["- claude: Catch-all for any task
+8: type=attachment timestamp=2026-09-04T22:01:21.700Z isSidechain=False uuid=b8ec83c1 parentUuid=61add014 extra={"attachment": {"type": "skill_listing", "content": "- design: Create a design canvas - a multi-artboard visual design published as an Artifact that runs Claude Design's canvas editor (an early previe
+9: type=attachment timestamp=2026-09-04T22:01:21.701Z isSidechain=False uuid=8c61c86e parentUuid=b8ec83c1 extra={"attachment": {"type": "total_tokens_reminder", "text": "<total_tokens>15000000 tokens left</total_tokens>"}, "entrypoint": "cli"}
+10: type=ai-title extra={"aiTitle": "AskUserQuestion tool test"}
+11: type=assistant timestamp=2026-09-04T22:01:26.269Z isSidechain=False uuid=2c3f939b parentUuid=8c61c86e role=assistant content=[thinking]
+12: type=assistant timestamp=2026-09-04T22:01:27.450Z isSidechain=False uuid=050c4f14 parentUuid=2c3f939b role=assistant content=[tool_use:AskUserQuestion:toolu_01MV1i]
+13: type=user timestamp=2026-09-04T22:01:32.013Z isSidechain=False uuid=36ee0e0d parentUuid=050c4f14 role=user content=[tool_result:toolu_01MV1i:'Your questions have been answered: "Which color?"=']
+14: type=attachment timestamp=2026-09-04T22:01:32.015Z isSidechain=False uuid=0bd32d70 parentUuid=36ee0e0d extra={"attachment": {"type": "total_tokens_reminder", "text": "<total_tokens>14965054 tokens left</total_tokens>"}, "session_id": "751eb3e9-a44c-4f41-a8bf-da53dbb43809", "entrypoint": "cli"}
+15: type=assistant timestamp=2026-09-04T22:01:33.636Z isSidechain=False uuid=6196faa3 parentUuid=0bd32d70 role=assistant content=[thinking]
+16: type=assistant timestamp=2026-09-04T22:01:33.637Z isSidechain=False uuid=9b345d7d parentUuid=6196faa3 role=assistant content=[text:"Done! I've asked both questions. The user selected"]
+17: type=system subtype=turn_duration timestamp=2026-09-04T22:01:33.660Z isSidechain=False uuid=5e8cdbb4 parentUuid=9b345d7d extra={"subtype": "turn_duration", "durationMs": 7535, "messageCount": 11, "isMeta": false, "entrypoint": "cli"}

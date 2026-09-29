@@ -1,0 +1,10 @@
+.claude.json
+backups/.claude.json.backup.1788559193621
+history.jsonl
+policy-limits.json
+projects/-private-var-folders-1c-d4v7-mrs4b9085f6w7w9p35c0000gn-T-cc-study-46864-repo/6495872a-f699-49a2-b5e3-98ed1f530929.jsonl
+remote-settings.json
+sessions/47751.6ec1b91a5472638d4896de447905b74935f24927a38b7db986aa7c94a7588ded.key
+sessions/47751.json
+settings.json
+shell-snapshots/snapshot-zsh-1788559199559-fi4l0e.sh

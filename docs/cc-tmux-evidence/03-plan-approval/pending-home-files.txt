@@ -1,0 +1,10 @@
+.claude.json
+backups/.claude.json.backup.1788559231241
+history.jsonl
+plans/write-a-two-line-plan-iridescent-graham.md
+policy-limits.json
+projects/-private-var-folders-1c-d4v7-mrs4b9085f6w7w9p35c0000gn-T-cc-study-54721-repo/6da897a7-d540-4e30-a680-96886cd0e217.jsonl
+remote-settings.json
+sessions/55704.f3846ebc52941e757def8ccc92084f7af8447d99846c3550caeee9b52fe72856.key
+sessions/55704.json
+settings.json

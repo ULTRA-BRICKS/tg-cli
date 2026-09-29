@@ -1,0 +1,3 @@
+clear; XDG_CONFIG_HOME=/private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-study-99494/xdg/config XDG_DATA_HOME=/private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-study-99494/xdg/data
+ XDG_STATE_HOME=/private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-study-99494/xdg/state XDG_CACHE_HOME=/private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-study-99494/xdg/cache openc
+ode --pure --port 4097 --model 'zai/glm-5.2'

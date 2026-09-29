@@ -1,0 +1,5 @@
+date_utc=2026-09-04T22:09:39Z
+claude_version=2.1.261 (Claude Code)
+tmux_version=tmux 3.5a
+macos=26.5.1
+hook_timeout_sec=120

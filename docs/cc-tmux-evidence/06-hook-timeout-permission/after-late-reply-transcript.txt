@@ -1,0 +1,12 @@
+# /private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-study-27750/home/.claude/projects/-private-var-folders-1c-d4v7-mrs4b9085f6w7w9p35c0000gn-T-cc-study-27750-repo/b17e551b-c094-46e3-b261-6a8f9385c0f7.jsonl
+# total_records=10 showing_last=10
+1: type=mode extra={"mode": "normal"}
+2: type=permission-mode extra={"permissionMode": "default"}
+3: type=atis-latch extra={"atis": ""}
+4: type=file-history-snapshot extra={"messageId": "0dbd1fe9-bae9-437a-95d6-8df5ad056f50", "snapshot": {"messageId": "0dbd1fe9-bae9-437a-95d6-8df5ad056f50", "trackedFileBackups": {}, "timestamp": "2026-09-04T22:13:16.195Z"}, "isSnapshotU
+5: type=user timestamp=2026-09-04T22:13:16.194Z isSidechain=False uuid=0dbd1fe9 role=user text='Use the Bash tool to run exactly this command: echo study-06'
+6: type=attachment timestamp=2026-09-04T22:13:16.194Z isSidechain=False uuid=519ff3af parentUuid=0dbd1fe9 extra={"attachment": {"type": "deferred_tools_delta", "addedNames": ["CronCreate", "CronDelete", "CronList", "DesignSync", "EnterPlanMode", "EnterWorktree", "ExitPlanMode", "ExitWorktree", "Monitor", "Noteb
+7: type=attachment timestamp=2026-09-04T22:13:16.194Z isSidechain=False uuid=5a7b83d6 parentUuid=519ff3af extra={"attachment": {"type": "agent_listing_delta", "addedTypes": ["claude", "claude-code-guide", "Explore", "general-purpose", "Plan", "statusline-setup"], "addedLines": ["- claude: Catch-all for any task
+8: type=attachment timestamp=2026-09-04T22:13:16.194Z isSidechain=False uuid=126870bc parentUuid=5a7b83d6 extra={"attachment": {"type": "skill_listing", "content": "- design: Create a design canvas - a multi-artboard visual design published as an Artifact that runs Claude Design's canvas editor (an early previe
+9: type=attachment timestamp=2026-09-04T22:13:16.194Z isSidechain=False uuid=3d17ac55 parentUuid=126870bc extra={"attachment": {"type": "total_tokens_reminder", "text": "<total_tokens>15000000 tokens left</total_tokens>"}, "entrypoint": "cli"}
+10: type=ai-title extra={"aiTitle": "Echo study-06 to out.txt"}
