@@ -474,3 +474,26 @@ test('AskUserQuestion: promptTurnId comes from prompt_id/turn_id, NOT env.invoca
   );
   expect(req!.promptTurnId).toBe('prompt-a');
 });
+
+test('paneless native session asks skip pane defer only when truly outside tmux', () => {
+  const payload = {
+    session_id: 'native-session',
+    hook_event_name: 'PermissionRequest',
+    tool_name: 'Bash',
+    tool_input: { command: 'printf ok' },
+  };
+  const outside = normalizeHookPayload(payload, {
+    ...env,
+    paneId: undefined,
+    inTmux: false,
+    invocationNonce: 'outside-nonce',
+  });
+  const inside = normalizeHookPayload(payload, {
+    ...env,
+    paneId: undefined,
+    inTmux: true,
+    invocationNonce: 'inside-nonce',
+  });
+  expect(outside?.skipPaneDefer).toBe(true);
+  expect(inside?.skipPaneDefer).toBeUndefined();
+});

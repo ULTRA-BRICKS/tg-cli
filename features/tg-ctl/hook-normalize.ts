@@ -24,6 +24,7 @@ import { safeSliceEnd, truncateWithEllipsis } from './text-util';
 export interface HookEnv {
   agent: AgentKind; // from the --agent flag the installer wrote (default claude)
   paneId?: string; // process.env.TMUX_PANE of the hook process
+  inTmux?: boolean; // process.env.TMUX exists even when hook child omitted TMUX_PANE
   cwd?: string; // hook process cwd (payload.cwd wins when present)
   sessionName?: string; // tmux session of the pane
   windowName?: string; // tmux window name of the hook process
@@ -66,6 +67,31 @@ function invocationSeed(p: Record<string, unknown>): string {
   if (typeof p.prompt_id === 'string' && p.prompt_id) return p.prompt_id;
   if (typeof p.turn_id === 'string' && p.turn_id) return p.turn_id;
   return '';
+}
+
+function nativeSessionId(p: Record<string, unknown>): string {
+  if (typeof p.session_id === 'string' && p.session_id) return p.session_id;
+  if (typeof p.conversation_id === 'string' && p.conversation_id) return p.conversation_id;
+  return '';
+}
+
+function attachNativeSessionOrigin(
+  req: ButtonRequest,
+  p: Record<string, unknown>,
+  env: HookEnv,
+): ButtonRequest {
+  const sessionId = nativeSessionId(p);
+  if (!sessionId) return req;
+  req.origin = {
+    agent: env.agent,
+    sessionId,
+    ...(env.subagent ? { subagent: env.subagent } : {}),
+  };
+  // A native no-tmux hook is blocked on THIS socket, not in any tmux pane.
+  // Do not let it activate the conservative "unscoped prompt blocks every pane"
+  // guard while Telegram is waiting for the human decision.
+  if (!env.paneId && env.inTmux !== true) req.skipPaneDefer = true;
+  return req;
 }
 
 function asRecord(v: unknown): Record<string, unknown> | null {
@@ -235,7 +261,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
     // it would do O(plan) work that is discarded before sending.
     const plan = clampPlan(typeof input?.plan === 'string' ? input.plan.trim() : '');
     const body = plan ? `Proceed with this plan?\n\n${plan}` : 'The plan is ready. Proceed?';
-    return {
+    const req: ButtonRequest = {
       requestId: `${env.agent}-${hash(`${session}:${invocationSeed(p)}:${env.invocationNonce}:plan:${plan}`)}`,
       agent: env.agent,
       kind: 'permission',
@@ -253,6 +279,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       subagent: env.subagent,
       promptTurnId: env.invocationNonce,
     };
+    return attachNativeSessionOrigin(req, p, env);
   }
 
   // PermissionRequest (Claude Code or Codex): allow/deny a tool call.
@@ -263,7 +290,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
     const req = build(env, 'permission', `${session}:${invocationSeed(p)}:${env.invocationNonce}:perm:${toolName}:${detail}`, question, toolName, undefined, cwd, env.invocationNonce);
     req.permissionEvent = permissionEventOf(p);
     if (input) req.toolInput = input;
-    return req;
+    return attachNativeSessionOrigin(req, p, env);
   }
 
   return null;
@@ -339,7 +366,7 @@ function normalizeAskUserQuestions(p: Record<string, unknown>, env: HookEnv): Bu
     // A set member's lone answer must never late-deliver into the pane
     // (all-or-nothing) — see ButtonRequest.multiQuestion.
     if (questions.length > 1) req.multiQuestion = true;
-    out.push(req);
+    out.push(attachNativeSessionOrigin(req, p, env));
   }
   return out;
 }

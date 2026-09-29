@@ -76,6 +76,7 @@ writeFileSync(
   `#!/usr/bin/env bun
 const fs = require("fs");
 const logPath = process.env.OMP_ACP_LOG;
+if (logPath) fs.appendFileSync(logPath, "REPLY_TARGET=" + (process.env.TG_CTL_REPLY_TARGET || "-") + String.fromCharCode(10));
 if (!process.argv.includes("acp")) process.exit(0);
 function encode(msg) {
   return JSON.stringify(msg) + "\\n";
@@ -177,6 +178,7 @@ test('Telegram text reaches fake omp ACP with TMUX unset; never tmux send-keys; 
   }
 
   const acp = existsSync(acpLog) ? readFileSync(acpLog, 'utf8') : '';
+  expect(acp).toContain('REPLY_TARGET=omp:7103');
   expect(acp).toContain('"method":"initialize"');
   expect(acp).toContain('"method":"session/load"');
   expect(acp).toContain('01a07d8e-c12c-7433-903d-e98726bfda37');

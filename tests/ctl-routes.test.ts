@@ -41,10 +41,13 @@ test('appendRoute: dedups by id and caps to MAX_ROUTES', () => {
 });
 
 test('serialize → parse round-trips', () => {
-  const routes = [R(1, '%1', 10), { id: 2, paneId: '%2', cwd: '/x', ts: 20 }];
+  const routes = [
+    R(1, '%1', 10),
+    { id: 2, paneId: 'omp:200', cwd: '/x', parentPaneId: 'omp:100', ts: 20 },
+  ];
   expect(parseRoutes(serializeRoutes(routes))).toEqual([
-    { id: 1, paneId: '%1', cwd: undefined, ts: 10 },
-    { id: 2, paneId: '%2', cwd: '/x', ts: 20 },
+    { id: 1, paneId: '%1', cwd: undefined, parentPaneId: undefined, ts: 10 },
+    { id: 2, paneId: 'omp:200', cwd: '/x', parentPaneId: 'omp:100', ts: 20 },
   ]);
 });
 

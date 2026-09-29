@@ -15,6 +15,12 @@ export interface Route {
   id: number; // Telegram message_id of an outbound message
   paneId: string; // tmux pane, or omp:<pid> for an out-of-tmux omp origin
   cwd?: string;
+  // Explicit process-lineage fallback captured at SEND time. This is intentionally
+  // not inferred from cwd at reply time: unrelated sessions routinely share /tmp
+  // or the same repository root. Today the only synthetic headless origin is OMP,
+  // so this is another pane id / omp:<pid>; the shape stays generic for harnesses
+  // that gain their own direct-control ids later.
+  parentPaneId?: string;
   ts: number; // unix seconds (send time)
 }
 
@@ -36,7 +42,7 @@ export function parseRoutes(raw: string | null): Route[] {
     if (!r || typeof r !== 'object') continue;
     const rec = r as Record<string, unknown>;
     if (typeof rec.id !== 'number' || typeof rec.paneId !== 'string' || typeof rec.ts !== 'number') continue;
-    out.push({ id: rec.id, paneId: rec.paneId, cwd: typeof rec.cwd === 'string' ? rec.cwd : undefined, ts: rec.ts });
+    out.push({ id: rec.id, paneId: rec.paneId, cwd: typeof rec.cwd === 'string' ? rec.cwd : undefined, parentPaneId: typeof rec.parentPaneId === 'string' ? rec.parentPaneId : undefined, ts: rec.ts });
   }
   return out;
 }

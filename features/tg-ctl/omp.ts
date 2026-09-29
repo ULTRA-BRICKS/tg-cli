@@ -268,9 +268,19 @@ export function liveOmpPidFromOriginId(paneId: string): number | null {
 export function outboundOriginPaneId(opts: {
   tmuxPane?: string | null;
   ompAncestorPid?: number | null;
+  explicitReplyTarget?: string | null;
 }): string | null {
   const pane = opts.tmuxPane?.trim();
   if (pane) return pane;
+
+  // A tg-ctl-managed ACP helper controls another, real OMP session. Any `tg`
+  // subprocess it spawns inherits TG_CTL_REPLY_TARGET, while process ancestry
+  // only sees the transport helper itself. Accept ONLY the canonical omp:<pid>
+  // shape here so an inherited/forged arbitrary string can never become a tmux
+  // target or another routing namespace by accident.
+  const explicit = opts.explicitReplyTarget?.trim();
+  if (explicit && isLiveOmpOriginId(explicit)) return explicit;
+
   const pid = opts.ompAncestorPid;
   if (pid && pid > 0) return liveOmpPaneId(pid);
   return null;

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, writeFileSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, unlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
@@ -109,6 +109,211 @@ test('tg-ctl ask does not create inline buttons for unsupported Codex question h
       text: "native question forwarding isn't available for `codex` — answer in the terminal",
     },
   ]);
+}, 10_000);
+
+test('Codex PermissionRequest outside tmux uses native session identity and returns the Telegram decision to the waiting hook', async () => {
+  const cfgDir = makeCfgDir();
+  // Reproduce #373: a plain/headless Codex session has no tmux registration.
+  unlinkSync(join(cfgDir, 'tg-ctl.123.registration.json'));
+
+  let callbackData: string | null = null;
+  let callbackServed = false;
+  const sentMessages: Array<Record<string, unknown>> = [];
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/getUpdates')) {
+        if (callbackData && !callbackServed) {
+          callbackServed = true;
+          return Response.json({
+            ok: true,
+            result: [{
+              update_id: 180,
+              callback_query: {
+                id: 'cb_codex_session',
+                from: { id: 1, first_name: 'Alex' },
+                message: { message_id: 180, chat: { id: 1 }, date: Math.floor(Date.now() / 1000) },
+                data: callbackData,
+              },
+            }],
+          });
+        }
+        await Bun.sleep(25);
+        return Response.json({ ok: true, result: [] });
+      }
+      if (url.pathname.endsWith('/sendMessage')) {
+        const body = (await req.json()) as Record<string, any>;
+        sentMessages.push(body);
+        callbackData = body.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data ?? null;
+        return Response.json({ ok: true, result: { message_id: 180 } });
+      }
+      if (
+        url.pathname.endsWith('/answerCallbackQuery') ||
+        url.pathname.endsWith('/editMessageText') ||
+        url.pathname.endsWith('/editMessageReplyMarkup')
+      ) return Response.json({ ok: true, result: true });
+      return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+    },
+  });
+  servers.push(server);
+  await startDaemon(cfgDir, server.port);
+
+  const ask = startCodexAsk(cfgDir, server.port, {
+    hook_event_name: 'PermissionRequest',
+    session_id: 'codex-session-native-123',
+    turn_id: 'turn-1',
+    tool_name: 'Bash',
+    tool_input: { command: 'printf ok' },
+    cwd: cfgDir,
+  });
+  const stdout = await new Response(ask.stdout).text();
+  const stderr = await new Response(ask.stderr).text();
+  await ask.exited;
+
+  expect(sentMessages.length).toBeGreaterThan(0);
+  expect(sentMessages[0]?.text).toContain('Allow Bash?');
+  expect(stderr).toBe('');
+  expect(JSON.parse(stdout)).toMatchObject({
+    hookSpecificOutput: { decision: { behavior: 'allow' } },
+  });
+}, 10_000);
+
+test('Claude AskUserQuestion outside tmux uses native session identity and returns the selected answer', async () => {
+  const cfgDir = makeCfgDir();
+  unlinkSync(join(cfgDir, 'tg-ctl.123.registration.json'));
+
+  let callbackData: string | null = null;
+  let callbackServed = false;
+  const sentMessages: Array<Record<string, any>> = [];
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/getUpdates')) {
+        if (callbackData && !callbackServed) {
+          callbackServed = true;
+          return Response.json({
+            ok: true,
+            result: [{
+              update_id: 181,
+              callback_query: {
+                id: 'cb_claude_session',
+                from: { id: 1, first_name: 'Alex' },
+                message: { message_id: 181, chat: { id: 1 }, date: Math.floor(Date.now() / 1000) },
+                data: callbackData,
+              },
+            }],
+          });
+        }
+        await Bun.sleep(25);
+        return Response.json({ ok: true, result: [] });
+      }
+      if (url.pathname.endsWith('/sendMessage')) {
+        const body = (await req.json()) as Record<string, any>;
+        sentMessages.push(body);
+        callbackData = body.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data ?? null;
+        return Response.json({ ok: true, result: { message_id: 181 } });
+      }
+      if (
+        url.pathname.endsWith('/answerCallbackQuery') ||
+        url.pathname.endsWith('/editMessageText') ||
+        url.pathname.endsWith('/editMessageReplyMarkup')
+      ) return Response.json({ ok: true, result: true });
+      return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+    },
+  });
+  servers.push(server);
+  await startDaemon(cfgDir, server.port);
+
+  const ask = startAsk(cfgDir, server.port, {
+    hook_event_name: 'PreToolUse',
+    session_id: 'claude-session-native-123',
+    prompt_id: 'prompt-1',
+    tool_name: 'AskUserQuestion',
+    tool_input: {
+      questions: [{
+        header: 'Choice',
+        question: 'Continue?',
+        options: [{ label: 'A' }, { label: 'B' }],
+      }],
+    },
+    cwd: cfgDir,
+  });
+  const stdout = await new Response(ask.stdout).text();
+  await ask.exited;
+
+  expect(sentMessages.length).toBeGreaterThan(0);
+  expect(JSON.parse(stdout)).toMatchObject({
+    hookSpecificOutput: {
+      updatedInput: { answers: { 'Continue?': 'A' } },
+    },
+  });
+}, 10_000);
+
+test('Claude ExitPlanMode outside tmux uses native session identity and returns Proceed', async () => {
+  const cfgDir = makeCfgDir();
+  unlinkSync(join(cfgDir, 'tg-ctl.123.registration.json'));
+
+  let callbackData: string | null = null;
+  let callbackServed = false;
+  const sentMessages: Array<Record<string, any>> = [];
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/getUpdates')) {
+        if (callbackData && !callbackServed) {
+          callbackServed = true;
+          return Response.json({
+            ok: true,
+            result: [{
+              update_id: 182,
+              callback_query: {
+                id: 'cb_claude_plan',
+                from: { id: 1, first_name: 'Alex' },
+                message: { message_id: 182, chat: { id: 1 }, date: Math.floor(Date.now() / 1000) },
+                data: callbackData,
+              },
+            }],
+          });
+        }
+        await Bun.sleep(25);
+        return Response.json({ ok: true, result: [] });
+      }
+      if (url.pathname.endsWith('/sendMessage')) {
+        const body = (await req.json()) as Record<string, any>;
+        sentMessages.push(body);
+        callbackData = body.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data ?? null;
+        return Response.json({ ok: true, result: { message_id: 182 } });
+      }
+      if (
+        url.pathname.endsWith('/answerCallbackQuery') ||
+        url.pathname.endsWith('/editMessageText') ||
+        url.pathname.endsWith('/editMessageReplyMarkup')
+      ) return Response.json({ ok: true, result: true });
+      return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+    },
+  });
+  servers.push(server);
+  await startDaemon(cfgDir, server.port);
+
+  const ask = startAsk(cfgDir, server.port, {
+    hook_event_name: 'PreToolUse',
+    session_id: 'claude-plan-session-123',
+    prompt_id: 'prompt-plan-1',
+    tool_name: 'ExitPlanMode',
+    tool_input: { plan: 'Do the safe thing.' },
+    cwd: cfgDir,
+  });
+  const stdout = await new Response(ask.stdout).text();
+  await ask.exited;
+
+  expect(sentMessages.length).toBeGreaterThan(0);
+  expect(sentMessages[0]?.text).toContain('Proceed with this plan?');
+  expect(JSON.parse(stdout)).toMatchObject({
+    hookSpecificOutput: { permissionDecision: 'allow' },
+  });
 }, 10_000);
 
 test('tg-ctl ask fast-passes unsupported hooks before slow Telegram notices finish', async () => {
@@ -685,6 +890,26 @@ async function startDaemon(cfgDir: string, apiPort: number): Promise<Subprocess>
   closeSync(logFd);
   expect(existsSync(join(cfgDir, 'tg-ctl.123.sock'))).toBe(true);
   return daemon;
+}
+
+function startCodexAsk(cfgDir: string, apiPort: number, request: unknown): Subprocess {
+  const body = request && typeof request === 'object' && !Array.isArray(request)
+    ? { cwd: cfgDir, ...(request as Record<string, unknown>) }
+    : request;
+  const ask = Bun.spawn([process.execPath, TG_CTL, 'ask', '--agent', 'codex'], {
+    env: {
+      HOME: cfgDir,
+      TG_CTL_CONFIG_DIR: cfgDir,
+      TG_API_BASE: `http://127.0.0.1:${apiPort}`,
+    },
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  trackProc(reg, ask);
+  ask.stdin.write(JSON.stringify(body) + '\n');
+  ask.stdin.end();
+  return ask;
 }
 
 function startAsk(cfgDir: string, apiPort: number, request: unknown, extraEnv: Record<string, string> = {}): Subprocess {

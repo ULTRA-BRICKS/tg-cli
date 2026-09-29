@@ -195,13 +195,14 @@ export function findAgentInPane(
 // and a background ollama daemon is a sibling, never an ancestor, so it is
 // correctly ignored. The visited set guards against pid-reuse cycles in the
 // ps snapshot, matching findAgentInPane's robustness.
-export function findAgentInAncestry(
+export function findAgentsInAncestry(
   procs: ProcInfo[],
   startPid: number,
-): { agent: AgentKind; pid: number } | null {
+): Array<{ agent: AgentKind; pid: number }> {
   const byPid = new Map<number, ProcInfo>();
   for (const p of procs) byPid.set(p.pid, p);
 
+  const found: Array<{ agent: AgentKind; pid: number }> = [];
   const seen = new Set<number>();
   let pid: number | undefined = startPid;
   while (pid !== undefined && pid > 1 && !seen.has(pid)) {
@@ -209,10 +210,17 @@ export function findAgentInAncestry(
     const proc = byPid.get(pid);
     if (!proc) break;
     const agent = matchAgentCommand(proc.command);
-    if (agent) return { agent, pid: proc.pid };
+    if (agent) found.push({ agent, pid: proc.pid });
     pid = proc.ppid;
   }
-  return null;
+  return found;
+}
+
+export function findAgentInAncestry(
+  procs: ProcInfo[],
+  startPid: number,
+): { agent: AgentKind; pid: number } | null {
+  return findAgentsInAncestry(procs, startPid)[0] ?? null;
 }
 
 // Pick the injection target (spec §10 priority chain):

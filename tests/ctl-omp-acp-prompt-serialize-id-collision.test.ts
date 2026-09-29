@@ -118,10 +118,10 @@ process.stdin.on("data", (chunk) => {
         method: "session/request_permission",
         params: {
           sessionId,
-          toolCall: { title: "Run a command" },
+          toolCall: { title: "Deploy where?" },
           options: [
-            { optionId: "allow_once", name: "Allow", kind: "allow_once" },
-            { optionId: "reject_once", name: "Reject", kind: "reject_once" },
+            { optionId: "staging", name: "staging", kind: "allow_once" },
+            { optionId: "prod", name: "prod", kind: "allow_once" },
           ],
         },
       }));
@@ -219,16 +219,40 @@ test("a session/request_permission that reuses the in-flight session/prompt's id
 
   // The colliding permission request must still be forwarded to Telegram --
   // against the pre-fix (id-only) matcher it would be silently swallowed as
-  // the prompt's own response instead, and no card ("Run a command", the
+  // the prompt's own response instead, and no card ("Deploy where?", the
   // toolCall title) would ever appear among the sent messages (an earlier
   // routing-info message is expected too, so search rather than index [0]).
   const t0 = Date.now();
   while (Date.now() - t0 < 10_000) {
-    if (sentMessages.some((m) => JSON.stringify(m).includes("Run a command"))) break;
+    if (sentMessages.some((m) => JSON.stringify(m).includes("Deploy where?"))) break;
     await Bun.sleep(50);
   }
-  const forwarded = sentMessages.find((m) => JSON.stringify(m).includes("Run a command"));
+  const forwarded = sentMessages.find((m) => JSON.stringify(m).includes("Deploy where?"));
   expect(forwarded).toBeDefined();
+
+  // This is a QUESTION-shaped ACP elicitation (no reject option), not merely
+  // a permission approval. Prove the Telegram card carries the two choices,
+  // tap "prod", and verify the selected option is written back to the SAME
+  // ACP pipe before the outstanding session/prompt is released.
+  const keyboard = (forwarded?.reply_markup as { inline_keyboard?: Array<Array<{ text: string; callback_data: string }>> } | undefined)
+    ?.inline_keyboard ?? [];
+  const prod = keyboard.flat().find((b) => b.text === "prod");
+  expect(prod).toBeDefined();
+  updates.push({
+    update_id: 101,
+    callback_query: {
+      id: "cb-omp-question",
+      from: { id: 1, first_name: "Alex" },
+      message: { message_id: 77, chat: { id: 1 }, date: 3 },
+      data: prod!.callback_data,
+    },
+  });
+  const tTap = Date.now();
+  while (Date.now() - tTap < 10_000) {
+    if (readFileSync(acpLog, "utf8").includes('"optionId":"prod"')) break;
+    await Bun.sleep(50);
+  }
+  expect(readFileSync(acpLog, "utf8")).toContain('"optionId":"prod"');
 
   // The queue must NOT have advanced: only one session/prompt frame exists,
   // and no eviction happened -- the turn is still correctly outstanding.
@@ -238,7 +262,7 @@ test("a session/request_permission that reuses the in-flight session/prompt's id
   // A second reply while the (still-open) permission decision is outstanding
   // must queue, not race a second frame into the pipe.
   updates.push({
-    update_id: 101,
+    update_id: 102,
     message: { message_id: 11, from: { id: 1, first_name: "Alex" }, chat: { id: 1 }, date: 2, text: "/agent CollideSession second message" },
   });
   const t1 = Date.now();

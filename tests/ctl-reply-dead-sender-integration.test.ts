@@ -119,6 +119,7 @@ interface Harness {
 interface HarnessOpts {
   includeParentB?: boolean;
   omitParent?: boolean;
+  parentPaneId?: string;
 }
 
 function makeHarness(opts: HarnessOpts = {}): Harness {
@@ -137,7 +138,15 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
   );
   writeFileSync(
     join(cfgDir, 'tg-ctl.123.routes.json'),
-    JSON.stringify([{ id: 500, paneId: DEAD_ORIGIN, cwd: dirParent, ts: Math.floor(Date.now() / 1000) }]),
+    JSON.stringify([
+      {
+        id: 500,
+        paneId: DEAD_ORIGIN,
+        cwd: dirParent,
+        ...(opts.parentPaneId ? { parentPaneId: opts.parentPaneId } : {}),
+        ts: Math.floor(Date.now() / 1000),
+      },
+    ]),
   );
 
   mkdirSync(join(cfgDir, 'bin'));
@@ -249,8 +258,27 @@ async function waitFor(pred: () => boolean, ms = 8000): Promise<void> {
   }
 }
 
-test('DEAD SENDER: a reply to a since-exited one-shot sender routes to the live parent agent in the same project, no picker', async () => {
+test('DEAD ORIGIN without explicit lineage: a sole same-cwd agent is NOT assumed to be its parent', async () => {
   const h = makeHarness();
+  const tg = startFakeTg();
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushReply(599, 9, 500, 'go to the actual sender, not a random /tmp peer');
+
+  await waitFor(() => tg.sends.some((s) => s.hasMarkup) || injectedLines(h.injectLog).length > 0);
+  await Bun.sleep(300);
+
+  // Same cwd is project affinity, NOT process lineage. A dead headless sender
+  // can share /tmp (or a repo root) with an unrelated live OMP session. Without
+  // an explicit parent recorded at send time, silently choosing that session is
+  // a misroute; ask the human instead.
+  expect(tg.sends.some((s) => s.hasMarkup)).toBe(true);
+  expect(injectedLines(h.injectLog)).toHaveLength(0);
+  daemon.kill();
+}, 15_000);
+
+test('DEAD SENDER with explicit lineage: a reply routes to the recorded live parent, no picker', async () => {
+  const h = makeHarness({ parentPaneId: PANE_PARENT });
   const tg = startFakeTg();
   const daemon = await startDaemon(h.cfgDir, tg.port);
 

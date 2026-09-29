@@ -66,8 +66,14 @@ import { buildOutboundHistoryRecords, outboundHistoryText } from "./features/rep
 import { runReplies } from "./features/replies/cli"
 import { resolveWindowPanes } from "./features/replies/window"
 import { agentNameFromDisplayLine } from "./features/tg-ctl/agent-name"
-import { detectAgentViaAncestry, detectOmpAncestorPid, isProcessRunning } from "./features/branding/detect"
-import { outboundOriginPaneId, parseLsofJsonlPaths, parseOmpSessionMeta, pickPrimaryOmpSessionFile } from "./features/tg-ctl/omp"
+import { detectAgentViaAncestry, detectOmpAncestry, isProcessRunning } from "./features/branding/detect"
+import {
+  liveOmpPidFromOriginId,
+  outboundOriginPaneId,
+  parseLsofJsonlPaths,
+  parseOmpSessionMeta,
+  pickPrimaryOmpSessionFile,
+} from "./features/tg-ctl/omp"
 import { parseLsofCwd } from "./features/tg-ctl/unreachable"
 import { resolveWindowAgentLabel } from "./features/tg-ctl/agent-match"
 import { installSkill } from "./features/install-skill/install"
@@ -927,8 +933,21 @@ if (import.meta.main) {
   // and the real send need it (omp session title when under omp, else tmux window
   // name / cwd-basename fallback), but the emoji/model info flags above must NOT
   // pay for ps/lsof/tmux subprocesses they never read.
-  const ompAncestorPid = detectOmpAncestorPid()
-  const windowAgentLabel = getOmpSessionTitle(ompAncestorPid) || getTmuxWindow()
+  const ompAncestry = detectOmpAncestry()
+  const ompAncestorPid = ompAncestry.pids[0] ?? null
+  const ompParentAncestorPid = ompAncestry.pids[1] ?? null
+  // TG_CTL_REPLY_TARGET is meaningful only inside the tg-ctl-owned OMP ACP
+  // transport helper. A normal paneless OMP/script can set arbitrary env vars;
+  // never let that impersonate another live OMP route.
+  const explicitReplyTarget = ompAncestry.nearestIsAcpHelper
+    ? process.env.TG_CTL_REPLY_TARGET?.trim() || null
+    : null
+  const explicitReplyOmpPid = explicitReplyTarget ? liveOmpPidFromOriginId(explicitReplyTarget) : null
+  // Under tg-ctl ACP the nearest OMP process is the transport helper. Prefer
+  // the real session pid tg-ctl stamped into the helper's environment for both
+  // the visible session title and reply-route metadata.
+  const effectiveOmpPid = explicitReplyOmpPid ?? ompAncestorPid
+  const windowAgentLabel = getOmpSessionTitle(effectiveOmpPid) || getTmuxWindow()
   if (parsed.action === "detectAgent") {
     // The auto `[window]` label this session's messages get with no flag — the omp
     // session title when under omp, else the resolved tmux window name (or its
@@ -1489,6 +1508,7 @@ if (import.meta.main) {
   const originPaneId = outboundOriginPaneId({
     tmuxPane: TMUX_PANE,
     ompAncestorPid,
+    explicitReplyTarget,
   })
   const ROUTES_PATH = originPaneId
     ? ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).routes
@@ -1499,10 +1519,10 @@ if (import.meta.main) {
   // never matched the pane's project dir and every reply hit the picker. Returns
   // null when not in tmux / the query fails, so resolveRouteCwd degrades to cwd.
   const queryPanePath = (): string | null => {
-    if (!TMUX_PANE && ompAncestorPid) {
+    if (!TMUX_PANE && effectiveOmpPid) {
       try {
         const result = Bun.spawnSync(
-          ["lsof", "-a", "-p", String(ompAncestorPid), "-d", "cwd", "-Fn"],
+          ["lsof", "-a", "-p", String(effectiveOmpPid), "-d", "cwd", "-Fn"],
           { stdout: "pipe", stderr: "pipe" },
         )
         if (result.exitCode === 0) {
@@ -1548,6 +1568,13 @@ if (import.meta.main) {
         id: messageId,
         paneId: originPaneId,
         cwd: resolveRouteCwd({ queryPanePath, fallbackCwd: process.cwd() }),
+        // Only record a fallback parent when process ancestry proves it. A sole
+        // live session with the same cwd is NOT evidence of parentage (the real
+        // /tmp misroute that prompted this field).
+        parentPaneId:
+          !TMUX_PANE && !explicitReplyTarget && ompParentAncestorPid !== null
+            ? `omp:${ompParentAncestorPid}`
+            : undefined,
         ts: Math.floor(Date.now() / 1000),
       }
       // Serialize the read-modify-write across concurrent agents: two `tg` sends

@@ -5,6 +5,7 @@ import {
   matchAgentCommand,
   findAgentInPane,
   findAgentInAncestry,
+  findAgentsInAncestry,
   pickTargetPane,
   pickTargetPaneFromSet,
   panesWithRetry,
@@ -264,6 +265,19 @@ test('finds omp through an intermediate shell (omp → bash -lc → tg)', () => 
     proc(770, 760, 'tg status'),
   ];
   expect(findAgentInAncestry(procs, 760)).toEqual({ agent: 'omp', pid: 750 });
+});
+
+test('findAgentsInAncestry preserves explicit nested OMP lineage child → parent', () => {
+  const procs = [
+    proc(700, 1, '/opt/homebrew/bin/omp'),
+    proc(710, 700, 'bash -lc omp --print child'),
+    proc(720, 710, '/opt/homebrew/bin/omp --print child'),
+    proc(730, 720, 'bash -lc tg report'),
+  ];
+  expect(findAgentsInAncestry(procs, 730)).toEqual([
+    { agent: 'omp', pid: 720 },
+    { agent: 'omp', pid: 700 },
+  ]);
 });
 
 test('finds omp run from source via bun --preload through an intermediate shell (tg-cli#413 follow-up)', () => {

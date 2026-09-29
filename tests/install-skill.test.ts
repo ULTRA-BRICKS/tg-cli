@@ -69,6 +69,18 @@ test('SKILL.md and the blurb advertise --tag / --title and the four canonical ta
   expect(blurb).not.toContain('ОТВЕТ');
 });
 
+test('installed skill advertises synchronous generic human asks for harnesses without native question hooks', () => {
+  installSkill();
+  const skill = readFileSync(join(TH, '.agents/skills/tg/SKILL.md'), 'utf8');
+  const blurb = readFileSync(join(TH, '.agents/skills/.blurbs/tg.md'), 'utf8');
+
+  expect(skill).toContain('tg-ctl ask "');
+  expect(skill).toContain('synchronous');
+  expect(skill).toContain('without tmux');
+  expect(skill).toContain('pi');
+  expect(blurb).toContain('tg-ctl ask');
+});
+
 test('blurb in CLAUDE.md is idempotent and preserves existing content', () => {
   writeFileSync(join(TH, '.claude', 'CLAUDE.md'), '# personal\n\nmy notes\n');
   installSkill();

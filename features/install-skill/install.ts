@@ -67,6 +67,12 @@ tg help format                                      # what formatting is support
 - Report a finished task / status / blocker / question to the user's phone.
 - Send a generated artifact (file, photo, PDF) produced during a session.
 - Long or multi-step work — push a full status update, not a one-liner.
+- Need a SYNCHRONOUS human decision from a harness with no native question hook:
+  run \`tg-ctl ask "question"\` (optionally \`--timeout <seconds>\`). This works
+  without tmux and blocks until the Telegram Approve/Reject tap arrives. Exit 0
+  means approved; reject, timeout, missing daemon, or malformed response fail closed.
+  Use this fallback for shell-capable harnesses such as pi/CommandCode/Aider; Claude,
+  Codex, OMP and OpenCode should use their native hook/ACP/SSE adapters when available.
 
 ## Header tag + title (\`--tag\` / \`--title\`)
 The message header is \`✳️ [window]\`. The message BODY always stays BELOW it —
@@ -242,13 +248,18 @@ reply keeps the quote anchor and reaches the replied-to origin pane).
   transient network blip (3 attempts, jittered ~300ms→2.7s) before giving up,
   so a momentary hiccup no longer silently drops the message.
 
-## Two inbound channels — run inside tmux
-Replies are typed into your tmux pane. An agent started OUTSIDE tmux (no \`$TMUX\`)
-is listed by \`tg-ctl status\` as \`unreachable: not in tmux\` and only reachable via
-its Stop-hook inbox: a \`/agent <name> <text>\` is queued and delivered at your NEXT
-turn end (never while idle). Prefer starting inside tmux (\`claude-rotate --tmux <name>\`).
+## Inbound works with and without tmux
+\`tg-ctl\` prefers each harness's real control surface instead of assuming a pane:
+OMP uses ACP, OpenCode uses its HTTP/SSE API, and native Claude/Codex hook requests
+are session-scoped even when \`TMUX_PANE\` is absent. In tmux, pane injection remains
+the fast universal floor. Harnesses that have neither a native control API nor a
+live pane use the durable Stop-hook inbox for ordinary inbound text when supported.
 
-Always use \`tg\`, never direct curl to the Telegram API.
+For a question initiated BY such a harness, do not scrape its terminal UI. Call
+\`tg-ctl ask \"question\"\` synchronously; it is the owner-local Telegram decision
+bridge and does not require tmux.
+
+Always use \`tg\` / \`tg-ctl ask\`, never direct curl to the Telegram API.
 `;
 
 const SKILL_BLURB =
@@ -274,6 +285,8 @@ const SKILL_BLURB =
   'on iOS); `--with-original` sends both, `--no-pdf` sends the raw file. ' +
   'The user can reply by VOICE — a voice note is transcribed by a local Whisper ' +
   '(`tg voice setup`) and injected like a typed reply. ' +
+  'For a synchronous human approval from a shell-capable harness without a native prompt hook, ' +
+  'use `tg-ctl ask "question"`; it works without tmux and fails closed on reject/timeout. ' +
   'Use to report results/questions to the user. Never curl Telegram directly.';
 
 const HOOK_MARKER = '# agent-tools-awareness';

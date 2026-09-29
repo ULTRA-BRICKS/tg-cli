@@ -278,6 +278,12 @@ import {
 } from "./features/tg-ctl/hook-install"
 import { applyCodexHookTrustBypass, detectRig, NO_RIG_EXIT, runRigDelegate } from "./features/tg-ctl/rig-delegate"
 import { normalizeHookRequests, type HookEnv } from "./features/tg-ctl/hook-normalize"
+import {
+  genericAskDaemonAbandonMs,
+  parseGenericAskArgv,
+  resolveGenericAskVerdict,
+  type GenericAskTimeout,
+} from "./features/tg-ctl/generic-ask"
 import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
 import {
   aggregateUsage,
@@ -388,6 +394,8 @@ export const USAGE = `Usage:
   tg-ctl usage-schedule disable
                          # remove the scheduled usage-report launchd job
   tg-ctl ask             # internal: hook client, reads a ButtonRequest JSON from stdin
+  tg-ctl ask <question> [--timeout SEC]
+                         # universal shell-callable Telegram question; exit 0 only on Approve
                          # optional per-request timeoutMs field extends the wait,
                          # capped at 15 min (agent-tools sends 600000 for hatch asks)
   tg-ctl ask --verify-grant <approval_id> --hook <hook_id>
@@ -1338,7 +1346,16 @@ async function ensureOmpAcpSpawn(agent: OmpAcpTarget, key: string): Promise<OmpA
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env, TMUX: "" },
+    env: {
+      ...process.env,
+      TMUX: "",
+      // Any `tg` call made by the loaded OMP session runs inside this ACP
+      // helper process, so process ancestry points at the helper PID, NOT the
+      // interactive OMP session we are controlling. Stamp the canonical target
+      // explicitly; otherwise outbound routes become omp:<acp-helper-pid> and
+      // Telegram replies later look "gone" even while the real session is live.
+      ...(agent.pid ? { TG_CTL_REPLY_TARGET: liveOmpPaneId(agent.pid) } : {}),
+    },
   })
   const client: OmpAcpClient = {
     proc,
@@ -2544,21 +2561,30 @@ function startLauncher(ctx: Ctx, flags: StartFlags): void {
 // --- stop / status ---
 
 function stopDaemon(ctx: Ctx): void {
-  const pid = readPidFile(readFileOrNull(ctx.paths.pid))
-  const alive = pidStatus(pid, kill0)
-  if (alive === "absent") {
-    console.log("tg-ctl: not running")
+  // Use the SAME multi-source liveness chain as status. A launchd relaunch or a
+  // daemon that already acquired the singleton flock can be fully live while
+  // the pidfile is absent/stale; pidfile-only stop used to declare "not running"
+  // and leave that old binary serving Telegram across deploys (#438).
+  const pidfilePid = readPidFile(readFileOrNull(ctx.paths.pid))
+  const pidfileAlive = pidfilePid !== null && kill0(pidfilePid)
+  const lockPid = pidfileAlive ? null : lockHolderPid(ctx.paths.lock)
+  const hintPid = pidfileAlive ? pidfilePid : lockPid
+  const launchd = detectLaunchdDaemon(autostartEnv(ctx), hintPid)
+  const state = daemonRunState(pidfilePid, pidfileAlive, launchd, lockPid)
+  if (state.kind !== "running") {
+    if (pidfilePid !== null) {
+      try {
+        unlinkSync(ctx.paths.pid)
+      } catch {}
+      console.log(`tg-ctl: not running (cleaned stale pidfile, pid ${pidfilePid})`)
+    } else {
+      console.log("tg-ctl: not running")
+    }
     return
   }
-  if (alive === "stale") {
-    try {
-      unlinkSync(ctx.paths.pid)
-    } catch {}
-    console.log(`tg-ctl: not running (cleaned stale pidfile, pid ${pid})`)
-    return
-  }
+  const pid = state.pid
   try {
-    process.kill(pid!, "SIGTERM")
+    process.kill(pid, "SIGTERM")
   } catch (err) {
     console.error(`tg-ctl: SIGTERM failed for pid ${pid}: ${err}`)
     process.exit(1)
@@ -2572,19 +2598,22 @@ function stopDaemon(ctx: Ctx): void {
   // (review: restart can leave no daemon). Poll until the pid is gone or the
   // ceiling elapses.
   const deadlineMs = GRACEFUL_SHUTDOWN_MS + 2000
-  for (let waited = 0; waited < deadlineMs && kill0(pid!); waited += 100) Bun.sleepSync(100)
-  const stillAlive = kill0(pid!)
-  // Only unlink the pidfile when the process is truly gone. The daemon's own
-  // cleanExit removes its pidfile (ownsPidFile-guarded); unlinking here while it
-  // is STILL ALIVE would strip a live daemon's pidfile — `status` would then read
-  // no pid and falsely report "not running" (tg#93 in reverse). Fall back to the
-  // unlink only for a daemon that died without cleaning up.
-  if (!stillAlive) {
-    try {
-      unlinkSync(ctx.paths.pid)
-    } catch {}
+  for (let waited = 0; waited < deadlineMs && kill0(pid); waited += 100) Bun.sleepSync(100)
+  const stillAlive = kill0(pid)
+  // restart MUST NOT start a replacement until the previous owner is confirmed
+  // dead. Returning success here used to let deploy/restart launch into the old
+  // flock holder; the successor then no-op exited, leaving either stale code or
+  // eventually no daemon at all (#438).
+  if (stillAlive) {
+    console.error(`tg-ctl: daemon pid ${pid} is still alive after SIGTERM; refusing to continue`)
+    process.exit(1)
   }
-  console.log(stillAlive ? `tg-ctl: SIGTERM sent (pid ${pid}, still exiting)` : `tg-ctl: stopped (pid ${pid})`)
+  // The daemon normally removes its own pidfile (ownsPidFile-guarded); this is
+  // only cleanup for a process that died before doing so.
+  try {
+    unlinkSync(ctx.paths.pid)
+  } catch {}
+  console.log(`tg-ctl: stopped (pid ${pid})`)
 }
 
 // --- enable / disable: OS autostart self-registration (the agenttools_service contract) ---
@@ -3486,6 +3515,7 @@ export function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     hookId: typeof rec.hookId === "string" && rec.hookId ? rec.hookId : undefined,
     timeoutMs:
       typeof rec.timeoutMs === "number" && Number.isFinite(rec.timeoutMs) && rec.timeoutMs > 0 ? rec.timeoutMs : undefined,
+    skipPaneDefer: rec.skipPaneDefer === true ? true : undefined,
     origin: readAskAdditiveOrigin(rec.origin),
     operation: readAskAdditiveOperation(rec.operation),
   }
@@ -3522,6 +3552,16 @@ function canForwardButtonRequest(req: ButtonRequest): boolean {
 
 function hookMatchesRegistration(regs: Registration[], req: ButtonRequest): boolean {
   return registrationSetAllowsHook(regs, req, resolve)
+}
+
+function isGenericCliAsk(req: ButtonRequest): boolean {
+  return req.origin?.agent === "tg-ctl-generic" && !req.paneId
+}
+
+function isNativeSessionScopedAsk(req: ButtonRequest): boolean {
+  if (req.paneId) return false
+  if (req.agent !== "claude" && req.agent !== "codex") return false
+  return req.origin?.agent === req.agent && Boolean(req.origin?.sessionId)
 }
 
 // One-line, greppable descriptors for the ask-forward log. They identify which
@@ -3823,6 +3863,8 @@ async function forwardAndPostQuestion(
   // (the underlying process actually exits/gets killed — armPendingSocketClose's
   // 'close' handler still retires it exactly as for any other request).
   if (!req.paneId && req.critical !== true) {
+    const abandonMs = clampRequestTimeoutMs(req.timeoutMs, UNSCOPED_ABANDON_MS)
+    log(`unscoped-abandon-armed: req=${req.requestId} ms=${abandonMs} skipPaneDefer=${req.skipPaneDefer === true}`)
     entry.timer = setTimeout(() => {
       if (rt.pending.get(pendingKey) !== entry) return
       rt.pending.delete(pendingKey)
@@ -3836,7 +3878,7 @@ async function forwardAndPostQuestion(
     // Contract §1 (tg-cli#398): a per-request timeoutMs (hatch asks carry
     // 600000) overrides the unscoped-abandon default, clamped to the 15-min
     // cap (clampRequestTimeoutMs). Absent → UNSCOPED_ABANDON_MS unchanged.
-    }, clampRequestTimeoutMs(req.timeoutMs, UNSCOPED_ABANDON_MS))
+    }, abandonMs)
   }
   rt.pending.set(pendingKey, entry)
   const conn = armPendingSocketClose(ctx, rt, entry, pendingKey)
@@ -3979,7 +4021,16 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
   // Hatch permissions skip the pane/cwd registration set (tg-cli#333): non-tmux
   // omp sessions are never registered, and hatch is the documented exception to
   // no-long-inline-process. canForwardButtonRequest still runs below.
-  if (!isHatchPermissionRequest(req) && !hookMatchesRegistration(registrations, req)) {
+  // Generic CLI asks are accepted over the same owner-only (0600) local
+  // socket without a harness registration. This is what makes `tg-ctl ask`
+  // usable from instruction-file harnesses such as pi/commandcode, which have
+  // no agents-hooks bridge to create/refresh a tmux registration.
+  if (
+    !isHatchPermissionRequest(req) &&
+    !isGenericCliAsk(req) &&
+    !isNativeSessionScopedAsk(req) &&
+    !hookMatchesRegistration(registrations, req)
+  ) {
     log(
       `ask-forward dropped: reason=not-registered ${describeAskRequest(req)} reg=${describeRegistration(registrations)}`,
     )
@@ -4672,6 +4723,7 @@ async function askDaemon(ctx: Ctx): Promise<void> {
   const env: HookEnv = {
     agent: hookAgentFromArgv(),
     paneId: process.env.TMUX_PANE || undefined,
+    inTmux: Boolean(process.env.TMUX),
     cwd: process.cwd(),
     sessionName: tmuxSessionName(),
     windowName: tmuxWindowName(),
@@ -4741,6 +4793,50 @@ async function askDaemon(ctx: Ctx): Promise<void> {
       `ask-forward multi-question not-completed: req=${reqs[0].requestId} n=${reqs.length} pane=${reqs[0].paneId ?? "-"} — declined, timed out, or partial; local UI takes over`,
     )
   }
+}
+
+// Generic shell-callable question primitive (tg-cli#149): any harness that can
+// execute a command can ask the human through Telegram, even when it has no
+// native hooks/control bridge (pi/commandcode today). Only a verified Telegram
+// tap can exit 0; transport/config/timeout failures deny fail-closed.
+async function runGenericAsk(ctx: Ctx, question: string, timeout: GenericAskTimeout): Promise<number> {
+  if (timeout.warning) log(`generic-ask: ${timeout.warning}`)
+  const timeoutMs = timeout.seconds * 1000
+  const req: ButtonRequest = {
+    requestId: crypto.randomUUID(),
+    agent: "claude",
+    kind: "permission",
+    question,
+    cwd: process.cwd(),
+    // Give the daemon a cleanup margin beyond the CLI's own deadline. The
+    // daemon's existing clamp caps this at its 15-minute global maximum.
+    timeoutMs: genericAskDaemonAbandonMs(timeout.seconds),
+    skipPaneDefer: true,
+    // Owner-only local socket provenance; this deliberately bypasses harness
+    // registration because instruction-file harnesses have no bridge to create it.
+    origin: { agent: "tg-ctl-generic" },
+  }
+  log(`generic-ask requested: requestId=${req.requestId} timeoutS=${timeout.seconds} cwd=${req.cwd}`)
+  const attempt = await oneAskAttempt(ctx, JSON.stringify(req), timeoutMs)
+  if (attempt.kind === "dropped") {
+    console.error("denied: daemon unreachable — is it running? try `tg-ctl start`")
+    log(`generic-ask denied: requestId=${req.requestId} reason=daemon-unreachable`)
+    return 1
+  }
+  if (attempt.kind === "timeout") {
+    console.error(`denied: timeout after ${timeout.seconds}s`)
+    log(`generic-ask denied: requestId=${req.requestId} reason=timeout`)
+    return 1
+  }
+  const verdict = resolveGenericAskVerdict(attempt.raw)
+  if (verdict.exitCode === 0) {
+    console.log(verdict.detail ? `approved: ${verdict.detail}` : "approved")
+    log(`generic-ask approved: requestId=${req.requestId}`)
+    return 0
+  }
+  console.error(verdict.reason)
+  log(`generic-ask denied: requestId=${req.requestId} reason=${verdict.reason}`)
+  return 1
 }
 
 function codexConfigDir(home: string): string {
@@ -6469,6 +6565,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // questions.ts — hatch is structurally headless), so there is no live prompt here
       // for an inbound message to actually collide with; excluding it restores the
       // original bounded-wedge invariant for everything else, unchanged.
+      if (pb.req.skipPaneDefer === true) continue
       if (!pb.req.paneId && pb.req.critical !== true) return true
       if (pb.req.paneId === paneId) return true
     }
@@ -7855,36 +7952,24 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           await sendMessage(ctx, noAgentReplyNow())
           return false
         }
-        // DEAD-SENDER FALLBACK: the origin was a disposable/one-shot sender —
-        // a subagent process (or a synthetic omp:<pid> from a headless script,
-        // tg-cli#363) dispatched by a live orchestrator, sent once, and exited —
-        // so its pane/pid will NEVER become visible again. routes.json still
-        // names it, but forcing the human to pick every time loses the reply's
-        // content behind a card when the right target is obvious: the live
-        // agent that owns the SAME project directory (recognized.cwd) is that
-        // sender's parent/active session, and the natural place for a reply
-        // meant for its now-gone child. Scoping the auto-route to an EXACT cwd
-        // match keeps this narrower than "trust any single visible candidate"
-        // (the bug this guard replaced, tg-cli#53): a flaky/partial snapshot
-        // that merely drops the origin pane cannot spuriously produce a
-        // DIFFERENT pane sharing the exact recorded cwd, so it cannot resurrect
-        // that regression. Several same-project candidates are still genuinely
-        // ambiguous (which one is "the parent"?) and fall through to the picker.
-        const sameProjectCandidates = recognized.cwd
-          ? candidates.filter((c) => routeMatchesPane({ recognizedCwd: recognized.cwd, panePath: c.panePath }))
-          : []
-        if (sameProjectCandidates.length === 1) {
-          const parent = sameProjectCandidates[0]
-          log(`reply-route: replyTo=${action.replyToMessageId} → origin ${recognized.paneId} gone, routing to live parent ${parent.paneId} (same project ${recognized.cwd}) msg="${msgPreview}"`)
-          const delivered = await injectVerbatim(parent.paneId)
-          if (delivered && parent.panePath) recordLastUserTarget(parent.paneId, parent.panePath)
-          return delivered
+        // DEAD-SENDER FALLBACK: auto-route only when the outbound route captured
+        // an EXPLICIT process-lineage parent at send time. Exact cwd equality is
+        // project affinity, not parentage: unrelated OMP sessions commonly share
+        // /tmp or a repository root (live tg#17659 incident). Guessing from cwd
+        // silently delivered replies to the wrong harness.
+        if (recognized.parentPaneId) {
+          const parent = candidates.find((c) => c.paneId === recognized.parentPaneId)
+          if (parent) {
+            log(`reply-route: replyTo=${action.replyToMessageId} → origin ${recognized.paneId} gone, routing to explicit parent ${parent.paneId} msg="${msgPreview}"`)
+            const delivered = await injectVerbatim(parent.paneId)
+            if (delivered && parent.panePath) recordLastUserTarget(parent.paneId, parent.panePath)
+            return delivered
+          }
+          log(`reply-route: replyTo=${action.replyToMessageId} → recorded parent ${recognized.parentPaneId} is not live`)
         }
-        // No single live parent for this project (none, or more than one) —
-        // the recognized origin is unconfirmed and ambiguous, so post the
-        // picker rather than guess. Name the agent they meant so a genuinely
-        // terminated one reads as "that agent is gone" rather than a silent re-ask (CTO ask, #72).
-        log(`reply-route: replyTo=${action.replyToMessageId} → origin ${recognized.paneId} NOT visible in snapshot → picker (${candidates.length} candidates, ${sameProjectCandidates.length} same-project)`)
+        // No proven live parent — the recognized origin is unconfirmed, so ask
+        // rather than infer lineage from cwd or a sole visible candidate.
+        log(`reply-route: replyTo=${action.replyToMessageId} → origin ${recognized.paneId} NOT visible in snapshot → picker (${candidates.length} candidates, explicitParent=${recognized.parentPaneId ?? "-"} )`)
         return postReplyPicker(candidates, goneNotice())
       }
       // origin pane visible but not a same-project agent → genuinely reused/gone;
@@ -11025,6 +11110,11 @@ if (import.meta.main) {
   const configDir = resolveConfigDir(home)
   const fileEnv = loadEnv(join(configDir, ".env"))
   const env = { ...fileEnv, ...process.env }
+  const genericAsk = cmd === "ask" ? parseGenericAskArgv(process.argv.slice(3)) : null
+  if (cmd === "ask" && genericAsk && !genericAsk.question.trim()) {
+    console.error("denied: empty question")
+    process.exit(1)
+  }
 
   // usage-schedule-check is a LOCAL date check that shells out to `rig`/`tg` directly (no
   // Bot API call via ctx) — runs before the bot-token gate, same reasoning as voice-setup.
@@ -11048,6 +11138,10 @@ if (import.meta.main) {
 
   const token = env.TG_BOT_TOKEN ?? ""
   const botId = botIdFromToken(token)
+  if (cmd === "ask" && genericAsk && (!botId || !env.TG_CHAT_ID)) {
+    console.error("denied: no bot credentials configured")
+    process.exit(1)
+  }
   if ((cmd === "ask" || cmd === "codex-usage-hook") && (!botId || !env.TG_CHAT_ID)) {
     process.exit(0)
   }
@@ -11122,6 +11216,10 @@ if (import.meta.main) {
       }
       await verifyGrantDaemon(ctx, verifyArgv, stdinPayload)
       process.exit(0)
+    }
+    if (genericAsk) {
+      if (genericAsk.warning) log(`generic-ask: ${genericAsk.warning}`)
+      process.exit(await runGenericAsk(ctx, genericAsk.question, genericAsk.timeout))
     }
     await askDaemon(ctx)
     process.exit(0)

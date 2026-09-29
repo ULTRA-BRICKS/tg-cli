@@ -6,7 +6,7 @@
 // loaded by the test run. (A real `launchctl load` would register a RunAtLoad agent into the
 // tester's session and actually start the daemon — exactly the side effect this avoids.)
 import { expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -479,6 +479,33 @@ function waitForLivePid(pidFile: string, tries = 120): number {
   }
   return 0;
 }
+
+test('stop finds a live daemon by the flock holder when its pidfile is missing (#438)', () => {
+  const { env, cfg } = fakeEnv();
+  const fullEnv = { ...env, TG_API_BASE: 'http://127.0.0.1:1' };
+  const pidFile = join(cfg, 'tg-ctl.123456.pid');
+  let pid = 0;
+  try {
+    expect(run(['start'], fullEnv).exitCode).toBe(0);
+    pid = waitForLivePid(pidFile);
+    expect(pid).toBeGreaterThan(0);
+    unlinkSync(pidFile);
+    expect(pidAlive(pid)).toBe(true);
+
+    const stopped = run(['stop'], fullEnv);
+    expect(stopped.exitCode).toBe(0);
+    expect(stopped.stdout.toString()).toContain(`stopped (pid ${pid})`);
+    expect(pidAlive(pid)).toBe(false);
+  } finally {
+    if (pid > 0 && pidAlive(pid)) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // already gone
+      }
+    }
+  }
+}, 20_000);
 
 // restart while the old daemon is ALIVE must leave a LIVE successor — the whole
 // point of the graceful reload is that a restart never drops the channel. The

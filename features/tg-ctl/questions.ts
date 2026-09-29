@@ -160,6 +160,10 @@ export interface ButtonRequest {
   // clamped to ASK_TIMEOUT_MAX_MS (clampRequestTimeoutMs). agent-tools sends
   // 600000 for hatch asks so a card stays live 10 min.
   timeoutMs?: number;
+  // A paneless local CLI ask (tg-ctl ask "...") is not a prompt open in any
+  // harness pane. It must never activate the conservative "unscoped question
+  // blocks every pane" guard while a human is thinking in Telegram.
+  skipPaneDefer?: boolean;
   origin?: AskOrigin;
   // OPAQUE: computed by the agent-tools lib; the daemon only compares it when
   // consuming a grant (grants.ts).
