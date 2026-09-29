@@ -89,6 +89,72 @@ export function pidStatus(pid: number | null, kill0: (pid: number) => boolean): 
   return kill0(pid) ? 'running' : 'stale';
 }
 
+// The launchd job found running this daemon, as the caller probed it (see autostart.ts's
+// selectLaunchdDaemonJob). undefined when launchd runs no such job — or on a host without launchd.
+export interface LaunchdDaemon {
+  label: string;
+  pid: number;
+}
+
+// What the pidfile says about a daemon launchd is already known to be running: nothing useful
+// (absent, or the same pid), a pid that is dead, or a DIFFERENT live pid.
+export type PidfileNote = { kind: 'stale'; pid: number } | { kind: 'other-live'; pid: number };
+
+// Who owns the live daemon process, and what the pidfile says about it.
+//   'launchd'      — a launchd job runs it; `note` carries any pidfile disagreement so `status` can
+//                    report a stale/mismatched pidfile WITHOUT calling the daemon down.
+//   'manual'       — no supervisor job runs it, so it was started by hand (`tg-ctl start`).
+//   'unattributed' — it is running, but this platform has no supervisor probe (only launchd is
+//                    probed today), so claiming "manual" would be a guess: a systemd --user unit
+//                    with Restart= supervises the daemon exactly the way launchd does.
+export type DaemonRunState =
+  | { kind: 'running'; owner: 'launchd'; pid: number; label: string; note?: PidfileNote }
+  | { kind: 'running'; owner: 'manual' | 'unattributed'; pid: number }
+  | { kind: 'stale-pidfile'; pid: number }
+  | { kind: 'not-running' };
+
+// Decide the daemon's run state from the two independent sources of truth: the (informational)
+// pidfile and the supervisor probe. launchd WINS when both point at a live process — it owns the
+// supervised instance, and the pidfile is the one that goes stale (a KeepAlive relaunch after
+// `tg-ctl restart` leaves the old pid, or no pidfile at all, behind). Pure: `pidAlive` is the
+// caller's kill(0) result, `launchd` its probe, and `supervisorProbed` says whether this platform
+// has one at all (macOS today) — without it a live pidfile is reported as running but NOT claimed
+// to be hand-started.
+export function daemonRunState(
+  pidfilePid: number | null,
+  pidAlive: boolean,
+  launchd: LaunchdDaemon | undefined,
+  supervisorProbed: boolean,
+): DaemonRunState {
+  if (launchd) {
+    const base = { kind: 'running', owner: 'launchd', pid: launchd.pid, label: launchd.label } as const;
+    if (pidfilePid === null || pidfilePid === launchd.pid) return base;
+    return { ...base, note: pidAlive ? { kind: 'other-live', pid: pidfilePid } : { kind: 'stale', pid: pidfilePid } };
+  }
+  if (pidfilePid !== null && pidAlive) return { kind: 'running', owner: supervisorProbed ? 'manual' : 'unattributed', pid: pidfilePid };
+  if (pidfilePid !== null) return { kind: 'stale-pidfile', pid: pidfilePid };
+  return { kind: 'not-running' };
+}
+
+// The first line of `tg-ctl status`. Names the OWNER of a live daemon (launchd vs a hand-started
+// one) so "not running" can no longer mean "running, but not the way the pidfile expected".
+export function daemonStatusLine(state: DaemonRunState, botId: string): string {
+  const suffix = ` — bot ${botId}`;
+  if (state.kind === 'not-running') return `tg-ctl: not running${suffix}`;
+  if (state.kind === 'stale-pidfile') return `tg-ctl: not running (stale pidfile, pid ${state.pid})${suffix}`;
+  if (state.owner === 'manual') return `tg-ctl: running (manual, pid ${state.pid})${suffix}`;
+  // 'unattributed' keeps the original wording — it says WHAT is running without guessing WHO
+  // started it on a platform whose supervisor we do not probe.
+  if (state.owner === 'unattributed') return `tg-ctl: running (pid ${state.pid})${suffix}`;
+  const note =
+    state.note === undefined
+      ? ''
+      : state.note.kind === 'stale'
+        ? `; stale pidfile pid ${state.note.pid}`
+        : `; pidfile points at a different live pid ${state.note.pid}`;
+  return `tg-ctl: running (launchd, pid ${state.pid})${suffix} (job ${state.label}${note})`;
+}
+
 // Does the pidfile on disk belong to US? `cleanExit` (and any other shutdown
 // path) MUST gate its `unlink(pidfile)` on this. The bug it guards (tg#93): on a
 // launchd relaunch a daemon that is shutting down — or whose ownership a newer

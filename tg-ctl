@@ -36,13 +36,19 @@ import {
   autostartUnitPath,
   buildDisablePlan,
   buildEnablePlan,
+  defaultConfigDir,
+  launchdJobConfigDir,
   launchdJobIsPersistent,
-  parseLaunchctlListLabels,
+  parseLaunchctlListRows,
   parseLaunchctlPrintArgv,
+  parseLaunchctlPrintEnvironment,
+  parseLaunchctlPrintPid,
   selectExternalLaunchdSupervisor,
+  selectLaunchdDaemonJob,
   type AutostartCommand,
   type AutostartEnv,
   type AutostartKind,
+  type LaunchctlListRow,
   type ProbedLaunchdJob,
 } from "./features/tg-ctl/autostart"
 import {
@@ -130,7 +136,17 @@ import {
 } from "./features/tg-ctl/schedule-store"
 import { normalizeRichHtml, validateRichHtml } from "./features/render/rich"
 import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
-import { botIdFromToken, ctlPaths, ownsPidFile, pidStatus, planLegacyLastUserTargetMigration, readPidFile } from "./features/tg-ctl/lock"
+import {
+  botIdFromToken,
+  ctlPaths,
+  daemonRunState,
+  daemonStatusLine,
+  ownsPidFile,
+  pidStatus,
+  planLegacyLastUserTargetMigration,
+  readPidFile,
+  type LaunchdDaemon,
+} from "./features/tg-ctl/lock"
 import {
   abandonedLongOutageText,
   abandonedMultiText,
@@ -175,6 +191,7 @@ import {
   withClaudeStatusLineTelemetry,
   withCodexUsageHook,
 } from "./features/tg-ctl/hook-install"
+import { codexUsageHookInConfigToml, planCodexHooksJsonMigration } from "./features/tg-ctl/codex-hooks-migration"
 import { applyCodexHookTrustBypass, detectRig, NO_RIG_EXIT, runRigDelegate } from "./features/tg-ctl/rig-delegate"
 import { normalizeHookRequests, type HookEnv } from "./features/tg-ctl/hook-normalize"
 import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
@@ -311,6 +328,10 @@ const CLAUDE_QUESTION_HOOK_CMD = "tg-ctl ask"
 const CLAUDE_HARNESS_HOOK_CMD = "tg-ctl harness-event"
 const CLAUDE_STATUSLINE_TELEMETRY_CMD = "tg-ctl harness-event --agent claude"
 const CODEX_USAGE_HOOK_CMD = "tg-ctl codex-usage-hook"
+// Backup suffix for the one-way migration of the LEGACY Codex hooks.json entry (tg-cli#316).
+// Deliberately NOT the installer's own `.bak`: that one holds the pre-INSTALL file, and a
+// migration must not overwrite it.
+const CODEX_HOOKS_MIGRATION_BACKUP_SUFFIX = ".pre-migration.bak"
 const CODEX_TRANSCRIPT_TAIL_BYTES = 500_000
 
 // Spec §5.2 no-tmux guard, verbatim.
@@ -1189,15 +1210,21 @@ function singleRegisteredCwd(regs: Registration[]): string | null {
 }
 
 function composeStatus(ctx: Ctx, statusCwd: string | null): string {
+  const env = autostartEnv(ctx)
+  // ONE read-only launchd probe object (its `launchctl print` results are memoized), shared by the
+  // running line and the autostart line below.
+  const launchd = realLaunchctlProbe()
+  const launchdRows = launchdListRows(env, launchd)
   const pid = readPidFile(readFileOrNull(ctx.paths.pid))
-  const alive = pidStatus(pid, kill0)
-  const lines: string[] = [
-    alive === "running"
-      ? `tg-ctl: running (pid ${pid}) — bot ${ctx.botId}`
-      : alive === "stale"
-        ? `tg-ctl: not running (stale pidfile, pid ${pid}) — bot ${ctx.botId}`
-        : `tg-ctl: not running — bot ${ctx.botId}`,
-  ]
+  // The pidfile is informational (spec §6) and goes stale whenever launchd's KeepAlive relaunches
+  // the daemon, so it is NOT the last word on "is it running" — ask launchd too (tg-cli#316).
+  const runState = daemonRunState(
+    pid,
+    pidStatus(pid, kill0) === "running",
+    detectLaunchdDaemon(env, launchd, launchdRows),
+    env.platform === "darwin",
+  )
+  const lines: string[] = [daemonStatusLine(runState, ctx.botId)]
   // Show every LIVE registered session (the per-pane set), not just one — a
   // multi-session operator must SEE that all their panes are registered to
   // forward. Prune against the live snapshot so closed panes don't show as ghosts
@@ -1234,13 +1261,28 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
       : `offset: ${readOffset(readFileOrNull(ctx.paths.offset))} ` +
           `(file age ${Math.round((Date.now() - offsetMtime) / 1000)}s)`,
   )
-  // Guide the user when q→buttons isn't wired (the hook is what forwards an
-  // agent's question to Telegram — without it the feature is silently dead).
+  lines.push(...composeClaudeHookLines(ctx, statusScopeCwd))
+  lines.push(composeCodexTelemetryLine(ctx))
+  // Autostart (the shared service-management lifecycle): an installed unit means the daemon
+  // comes back at login. Mirrors the q→buttons line — installed reports the kind/label, absent
+  // gets a hint. On the no-op fallback (no launchd/systemd) there's no unit to find.
+  //
+  // Two mechanisms can autostart the daemon: tg-ctl's OWN `enable` unit (the file existence check),
+  // OR an EXTERNAL launchd job that supervises this tg-ctl binary, wired outside tg-ctl (e.g. rig's
+  // `ai.hyperide.tg-ctl` LaunchAgent). We check the own unit first (it carries the precise kind/label
+  // and is cheap), then consult the launchd probe for an external supervisor before declaring "NOT
+  // enabled" — otherwise status lies while launchd keeps the daemon alive across reboots (tg-cli#88).
+  lines.push(composeAutostartLine(env, autostartKind(env), () => probeLaunchdJobs(env, launchd, launchdRows)))
+  return lines.join("\n")
+}
+
+// The three Claude Code hook lines of `status`. Guides the user when q→buttons isn't wired (the
+// hook is what forwards an agent's question to Telegram — without it the feature is silently dead).
+function composeClaudeHookLines(ctx: Ctx, statusScopeCwd: string): string[] {
   const hooksRaw = readFileOrNull(join(ctx.home, ".claude", "settings.json"))
   let questionHooksOk = false
   let harnessHooksOk = false
   let statusLineTelemetryOk = false
-  let codexUsageTelemetryOk = false
   let shadowingStatusLine: string | null = null
   if (hooksRaw) {
     try {
@@ -1253,48 +1295,58 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
       }
     } catch {}
   }
-  const codexHooksRaw = readFileOrNull(join(codexConfigDir(ctx.home), "hooks.json"))
-  if (codexHooksRaw) {
-    try {
-      const codexHooksSettings = JSON.parse(codexHooksRaw)
-      codexUsageTelemetryOk = codexUsageHookInstalled(codexHooksSettings, CODEX_USAGE_HOOK_CMD)
-    } catch {}
-  }
-  lines.push(
-    questionHooksOk
-      ? "q→buttons hooks: installed (Claude Code)"
-      : "q→buttons hooks: NOT installed — run `tg-ctl install-hooks`",
-  )
-  lines.push(
+  return [
+    questionHooksOk ? "q→buttons hooks: installed (Claude Code)" : "q→buttons hooks: NOT installed — run `tg-ctl install-hooks`",
     harnessHooksOk
       ? "limit/error hooks: installed (Claude Code StopFailure)"
       : "limit/error hooks: NOT installed — run `tg-ctl install-hooks`",
-  )
-  lines.push(
     shadowingStatusLine
       ? `usage telemetry: shadowed by ${shadowingStatusLine} — run \`tg-ctl install-hooks\` from that scope or remove the override`
       : statusLineTelemetryOk
         ? "usage telemetry: installed (Claude Code statusLine)"
         : "usage telemetry: NOT installed — run `tg-ctl install-hooks`",
-  )
-  lines.push(
-    codexUsageTelemetryOk
-      ? "Codex usage telemetry: installed (Stop hook transcript collector)"
-      : "Codex usage telemetry: NOT installed — run `tg-ctl install-hooks`, then trust it via Codex `/hooks`",
-  )
-  // Autostart (the shared service-management lifecycle): an installed unit means the daemon
-  // comes back at login. Mirrors the q→buttons line — installed reports the kind/label, absent
-  // gets a hint. On the no-op fallback (no launchd/systemd) there's no unit to find.
-  //
-  // Two mechanisms can autostart the daemon: tg-ctl's OWN `enable` unit (the file existence check),
-  // OR an EXTERNAL launchd job that supervises this tg-ctl binary, wired outside tg-ctl (e.g. rig's
-  // `ai.hyperide.tg-ctl` LaunchAgent). We check the own unit first (it carries the precise kind/label
-  // and is cheap), then probe launchd for an external supervisor before declaring "NOT enabled" —
-  // otherwise status lies while launchd keeps the daemon alive across reboots (tg-cli#88).
-  const env = autostartEnv(ctx)
-  const kind = autostartKind(env)
-  lines.push(composeAutostartLine(env, kind))
-  return lines.join("\n")
+  ]
+}
+
+// The `Codex usage telemetry:` line. Codex reads hooks from TWO files and rig now provisions our
+// Stop hook into `config.toml`, so config.toml is checked FIRST and the legacy `hooks.json` only as
+// a fallback — reading hooks.json alone reported "NOT installed" for a hook that was live in
+// config.toml (tg-cli#316). The line names the file it was found in, because the two differ in what
+// the user must still do: a hook rig manages in config.toml is already trusted, while a legacy
+// hooks.json entry needs a manual Codex `/hooks` trust review AND should be migrated away.
+function composeCodexTelemetryLine(ctx: Ctx): string {
+  const codexDir = codexConfigDir(ctx.home)
+  const configToml = readFileOrNull(join(codexDir, "config.toml"))
+  const inConfigToml = configToml !== null && codexUsageHookInConfigToml(configToml, CODEX_USAGE_HOOK_CMD)
+  const hooksJsonPath = join(codexDir, "hooks.json")
+  const inHooksJson = codexUsageHookInLegacyHooksJson(hooksJsonPath)
+  if (inConfigToml) {
+    const line = `Codex usage telemetry: installed (Stop hook transcript collector, ${join(codexDir, "config.toml")})`
+    // BOTH files carrying the hook is the exact state codex warns about (`loading hooks from both
+    // …`) — the one `status` exists to make visible, so it must not read as simply "installed".
+    return inHooksJson
+      ? `${line} — but the legacy ${hooksJsonPath} still carries it too (codex warns about loading hooks from both); run \`tg-ctl install-hooks\` to migrate it away`
+      : line
+  }
+  if (inHooksJson) {
+    return (
+      `Codex usage telemetry: installed (Stop hook transcript collector, legacy ${hooksJsonPath}) — ` +
+      "trust it via Codex `/hooks`; `tg-ctl install-hooks` moves it into config.toml once rig provisions it there"
+    )
+  }
+  return "Codex usage telemetry: NOT installed — run `tg-ctl install-hooks`, then trust it via Codex `/hooks`"
+}
+
+// Does the LEGACY Codex hooks file still carry our usage-telemetry Stop hook? A missing or
+// hand-broken file simply answers no.
+function codexUsageHookInLegacyHooksJson(hooksJsonPath: string): boolean {
+  const raw = readFileOrNull(hooksJsonPath)
+  if (!raw) return false
+  try {
+    return codexUsageHookInstalled(JSON.parse(raw), CODEX_USAGE_HOOK_CMD)
+  } catch {
+    return false
+  }
 }
 
 // The three Claude Code hook commands the daemon owns, as one unit. Shared by
@@ -1382,6 +1434,66 @@ function installCodexUsageTelemetryDirect(codexHooksPath: string, codexRaw: stri
   }
 }
 
+// Retire the LEGACY `hooks.json` usage-telemetry entry once the same Stop hook is provisioned in
+// `config.toml` (tg-cli#316). PR #200 taught install-hooks to SKIP writing hooks.json in that case,
+// but skipping a write never removes what an EARLIER install already put there — so codex kept
+// warning `loading hooks from both …` until the file was deleted by hand. Backs the file up before
+// touching it (a distinct suffix from the installer's own `.bak`, and written ONCE so a later run
+// can never replace the earliest pre-migration snapshot), removes the file outright when our hook
+// was the only thing in it, and prints exactly what it did. Idempotent: a second run finds nothing
+// to migrate and says so.
+function migrateLegacyCodexHooksJson(codexHooksPath: string): void {
+  const raw = readFileOrNull(codexHooksPath)
+  const plan = planCodexHooksJsonMigration(raw, CODEX_USAGE_HOOK_CMD)
+  if (plan.action === "none") {
+    console.log(`tg-ctl: no legacy Codex usage-telemetry Stop entry in ${codexHooksPath} — nothing to migrate.`)
+    return
+  }
+  const backupPath = `${codexHooksPath}${CODEX_HOOKS_MIGRATION_BACKUP_SUFFIX}`
+  const backupExisted = existsSync(backupPath)
+  // The backup is the migration's ENTIRE safety story, so a failed backup ABORTS it — never
+  // "swallow the error and delete anyway", which would destroy the file while the success message
+  // pointed at a backup that was never written.
+  if (!backupExisted) {
+    try {
+      writeFileSync(backupPath, raw as string)
+    } catch (err) {
+      console.error(`tg-ctl: could not back up ${codexHooksPath} to ${backupPath} (${err}) — leaving the legacy entry in place.`)
+      return
+    }
+  }
+  const backupNote = backupExisted ? ` (earlier backup kept: ${backupPath})` : ` (backup: ${backupPath})`
+  try {
+    if (plan.action === "delete") {
+      unlinkSync(codexHooksPath)
+      console.log(`tg-ctl: migrated the legacy Codex usage-telemetry Stop entry out of ${codexHooksPath} — it held nothing else, so the file was removed${backupNote}.`)
+      return
+    }
+    writeFileSync(codexHooksPath, plan.json)
+    console.log(`tg-ctl: removed the legacy Codex usage-telemetry Stop entry from ${codexHooksPath}; its other hooks were kept${backupNote}.`)
+  } catch (err) {
+    console.error(`tg-ctl: could not rewrite ${codexHooksPath} (${err}) — the pre-migration copy is at ${backupPath}.`)
+  }
+}
+
+// Did the rig apply we just ran leave our Stop hook in the AUTHORITATIVE artifact rig owns
+// (`config.toml`)? When it did, the direct hooks.json write must be skipped (that write is what
+// recreates the dual source codex warns about) AND any legacy hooks.json entry is migrated away.
+//
+// This is deliberately reachable ONLY from the path where a PRESENT rig just applied successfully.
+// Trusting an arbitrarily OLD config.toml would be unsafe: rig writes a RESOLVED absolute
+// invocation, so a config.toml left behind by an uninstalled rig can name a path that no longer
+// exists — and migrating on the strength of it would delete the still-working hooks.json fallback
+// and leave the machine with no telemetry hook at all. Right after rig itself wrote the file, the
+// invocation is current by construction.
+function settleCodexTelemetryFromConfigToml(codexHooksPath: string, message: string): boolean {
+  const configToml = readFileOrNull(join(dirname(codexHooksPath), "config.toml"))
+  if (!configToml || !codexUsageHookInConfigToml(configToml, CODEX_USAGE_HOOK_CMD)) return false
+  console.log(message)
+  migrateLegacyCodexHooksJson(codexHooksPath)
+  return true
+}
+
 // Rig-aware Codex hook provisioning (tg#8672). When rig is present it owns the codex hook
 // bridge (writes ~/.codex/config.toml), so writing tg-ctl's own hook straight into
 // ~/.codex/hooks.json makes codex warn about loading hooks from both files. Delegate to
@@ -1434,12 +1546,10 @@ function installCodexUsageTelemetry(codexHooksPath: string, codexRaw: string | n
   }
   // rig succeeded. Check the AUTHORITATIVE artifact rig actually writes (~/.codex/config.toml),
   // re-read from disk — NOT the pre-delegation snapshot — to see whether rig now provisions the
-  // usage-telemetry Stop hook itself.
-  const codexConfigToml = readFileOrNull(join(dirname(codexHooksPath), "config.toml"))
-  if (codexConfigToml && codexConfigToml.includes(CODEX_USAGE_HOOK_CMD)) {
-    console.log("tg-ctl: rig now provisions the codex usage-telemetry Stop hook (~/.codex/config.toml) — skipping the direct hooks.json write.")
-    return 0
-  }
+  // usage-telemetry Stop hook itself; if it does, any legacy hooks.json entry is migrated away.
+  const rigOwnsIt =
+    "tg-ctl: rig now provisions the codex usage-telemetry Stop hook (~/.codex/config.toml) — skipping the direct hooks.json write."
+  if (settleCodexTelemetryFromConfigToml(codexHooksPath, rigOwnsIt)) return 0
   // rig does not fold in the telemetry hook yet — write it directly so telemetry is not lost.
   // Re-read hooks.json FRESH (rig apply may have touched ~/.codex) rather than reusing the stale
   // pre-delegation snapshot.
@@ -1725,75 +1835,98 @@ function autostartUnitInstalled(env: AutostartEnv): boolean {
   return path !== undefined && existsSync(path)
 }
 
-// The impure launchd probe behind detectExternalLaunchdSupervisor, factored out so the detection
-// flow can be unit-tested with a fake probe (no real launchctl). `listLabels` runs `launchctl list`;
-// `printDump(label)` runs `launchctl print <domain>/<label>`. Each returns undefined on failure so
-// the caller skips that job instead of crashing.
+// The impure launchd probe behind the two status detections, factored out so both flows can be
+// unit-tested with a fake probe (no real launchctl). `listRows` runs `launchctl list` (labels + live
+// pids); `printDump(label)` runs `launchctl print <domain>/<label>` and MEMOIZES, so a label probed
+// for the running line is not printed a second time for the autostart line. Each returns undefined
+// on failure so the caller skips that job instead of crashing. Read-only throughout: `list` and
+// `print` only — never load/bootstrap/stop.
 interface LaunchctlProbe {
-  listLabels(): string[] | undefined
+  listRows(): LaunchctlListRow[] | undefined
   printDump(label: string): string | undefined
 }
 
-// The real probe: `launchctl list` for labels, `launchctl print <domain>/<label>` per label. A
-// LaunchAgent lives in the per-user `gui/<uid>` domain; under root (uid 0) daemons live in `system`
-// instead (`gui/0/<label>` just errors), so pick the domain by uid.
+// The real probe. A LaunchAgent lives in the per-user `gui/<uid>` domain; under root (uid 0) daemons
+// live in `system` instead (`gui/0/<label>` just errors), so pick the domain by uid. One instance per
+// `status` call — its dump cache lives exactly that long.
 function realLaunchctlProbe(): LaunchctlProbe {
   const uid = process.getuid?.() ?? 0
   const domain = uid === 0 ? "system" : `gui/${uid}`
+  const dumps = new Map<string, string | undefined>()
   return {
-    listLabels() {
+    listRows() {
       const r = Bun.spawnSync(["launchctl", "list"], { stdout: "pipe", stderr: "ignore" })
       if (r.exitCode !== 0 || !r.stdout) return undefined
-      return parseLaunchctlListLabels(new TextDecoder().decode(r.stdout))
+      return parseLaunchctlListRows(new TextDecoder().decode(r.stdout))
     },
     printDump(label) {
+      if (dumps.has(label)) return dumps.get(label)
       const r = Bun.spawnSync(["launchctl", "print", `${domain}/${label}`], { stdout: "pipe", stderr: "ignore" })
-      if (r.exitCode !== 0 || !r.stdout) return undefined
-      return new TextDecoder().decode(r.stdout)
+      const dump = r.exitCode !== 0 || !r.stdout ? undefined : new TextDecoder().decode(r.stdout)
+      dumps.set(label, dump)
+      return dump
     },
   }
 }
 
-// Probe launchd (macOS only) for an EXTERNAL job that supervises this tg-ctl binary — autostart wired
-// outside `tg-ctl enable` (e.g. rig's `ai.hyperide.tg-ctl` LaunchAgent). Returns the supervising
-// label, or undefined when none / not macOS / launchctl unavailable. Used by `status` to stop lying
-// "NOT enabled" while launchd keeps the daemon alive across reboots (tg-cli#88). Read-only.
-//
-// Builds a ProbedLaunchdJob per loaded label (its argv + whether it's persistent per the `properties`
-// line) from the probe, then hands selection to the PURE selectExternalLaunchdSupervisor (which
-// excludes tg-ctl's OWN label, requires the `run` subcommand against THIS binary, and rejects a
-// loaded-but-temporary job). `probe` is injectable for tests; defaults to the real launchctl probe.
-// Fully wrapped so a launchctl hiccup, a non-macOS host, or a missing binary never crashes `status`.
-function detectExternalLaunchdSupervisor(env: AutostartEnv, probe: LaunchctlProbe = realLaunchctlProbe()): string | undefined {
-  if (env.platform !== "darwin") return undefined
-  if (!env.binPath) return undefined
+// Read every loaded launchd job in `rows`, recording the facts `status` needs: its argv, whether it
+// is persistent (the `properties` line), its live pid, and the tg-ctl config dir it would serve.
+// Both selections over these jobs are PURE (selectLaunchdDaemonJob / selectExternalLaunchdSupervisor);
+// this function owns only the spawns. It deliberately does NOT skip tg-ctl's own label — a daemon
+// started by `tg-ctl enable` is launchd-owned too, and the autostart selector excludes that label
+// itself. A launchctl hiccup or a missing binary yields an empty list rather than crashing `status`.
+function probeLaunchdJobs(env: AutostartEnv, probe: LaunchctlProbe, rows: LaunchctlListRow[]): ProbedLaunchdJob[] {
+  if (env.platform !== "darwin" || !env.binPath) return []
   try {
-    const labels = probe.listLabels()
-    if (!labels) return undefined
     const jobs: ProbedLaunchdJob[] = []
-    for (const label of labels) {
-      if (label === LAUNCHD_LABEL) continue
-      const dump = probe.printDump(label)
+    for (const row of rows) {
+      const dump = probe.printDump(row.label)
       if (dump === undefined) continue
-      jobs.push({ label, argv: parseLaunchctlPrintArgv(dump), persistent: launchdJobIsPersistent(dump) })
+      jobs.push({
+        label: row.label,
+        argv: parseLaunchctlPrintArgv(dump),
+        persistent: launchdJobIsPersistent(dump),
+        pid: row.pid ?? parseLaunchctlPrintPid(dump),
+        configDir: launchdJobConfigDir(parseLaunchctlPrintEnvironment(dump)),
+      })
     }
-    return selectExternalLaunchdSupervisor(jobs, env.binPath)
+    return jobs
   } catch {
-    return undefined
+    return []
   }
 }
 
-// The `autostart:` status line. Gathers the impure facts — own-unit file existence and (only when
-// that's absent, to skip the launchctl probe otherwise) the external-launchd-supervisor probe — then
-// hands them to the PURE autostartStatusLine for precedence + formatting (own-unit before external).
-// Keeps composeStatus slim and isolates the one impure probe behind status logic.
-function composeAutostartLine(env: AutostartEnv, kind: AutostartKind): string {
+// The loaded jobs `launchctl list` reports, or [] off launchd / on a probe failure.
+function launchdListRows(env: AutostartEnv, probe: LaunchctlProbe): LaunchctlListRow[] {
+  if (env.platform !== "darwin" || !env.binPath) return []
+  try {
+    return probe.listRows() ?? []
+  } catch {
+    return []
+  }
+}
+
+// The launchd job running THIS bot's daemon right now, or undefined when none is (tg-cli#316).
+// Only jobs with a LIVE pid can be the running daemon, so only those are dumped — a few dozen
+// `launchctl print` calls instead of one per loaded job. The autostart line reuses whatever this
+// already cached in the probe.
+function detectLaunchdDaemon(env: AutostartEnv, probe: LaunchctlProbe, rows: LaunchctlListRow[]): LaunchdDaemon | undefined {
+  const running = rows.filter((row) => row.pid !== undefined)
+  const jobs = probeLaunchdJobs(env, probe, running)
+  return selectLaunchdDaemonJob(jobs, env.binPath, env.configDir, defaultConfigDir(env.home))
+}
+
+// The `autostart:` status line. Gathers the impure facts — own-unit file existence and (ONLY when
+// that's absent, since autostartStatusLine prefers the own unit) the external-supervisor probe —
+// then hands them to the PURE autostartStatusLine for precedence + formatting. `probeAll` is a
+// thunk precisely so the full per-label sweep is skipped whenever the own unit already answers the
+// question; the running line's dumps are already cached, so the sweep only pays for the rest.
+function composeAutostartLine(env: AutostartEnv, kind: AutostartKind, probeAll: () => ProbedLaunchdJob[]): string {
   const ownInstalled = kind !== "none" && autostartUnitInstalled(env)
-  // Only probe launchd when the own unit is absent — autostartStatusLine prefers the own unit, so the
-  // probe would be wasted work otherwise. The probe itself no-ops off launchd / on non-macOS.
-  const external = !ownInstalled && kind === "launchd" ? detectExternalLaunchdSupervisor(env) : undefined
+  const external = !ownInstalled && kind === "launchd" ? selectExternalLaunchdSupervisor(probeAll(), env.binPath) : undefined
   return autostartStatusLine(kind, ownInstalled, external)
 }
+
 
 // Run one plan command. Returns true on success. An `optional` command that fails is treated as
 // success (e.g. `launchctl unload` when nothing was loaded yet). stderr is surfaced on a hard

@@ -164,8 +164,9 @@ test('daemon round-trip: old owner message still delivered, guard replies, /stat
 
   // (a) prompt from allowed sender → inject attempted → no panes → guard reply.
   expect(sent[0]?.text).toBe(NO_AGENT_REPLY);
-  // (b) /status → composed status names THIS daemon as running.
-  expect(sent[1]?.text).toContain(`tg-ctl: running (pid ${daemon.pid})`);
+  // (b) /status → composed status names THIS daemon as running, and as MANUALLY started: it was
+  // spawned by this test, not by a launchd job serving this config dir (tg-cli#316).
+  expect(sent[1]?.text).toContain(`tg-ctl: running (manual, pid ${daemon.pid})`);
   expect(sent[1]?.text).toContain('offset: 105');
   expect(sent[1]?.text).toContain('usage telemetry: shadowed by');
   expect(sent[1]?.text).toContain(join(statusProject, '.claude', 'settings.json'));

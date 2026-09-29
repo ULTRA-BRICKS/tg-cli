@@ -60,6 +60,12 @@ I/O, fetch, signals, `bun:ffi`):
   injection. The lifecycle subcommands follow the shared agent-tools service-management
   contract (`agenttools_service`): `run` = foreground/blocking; `start` = background detached
   daemon; `status` = running?/pid/bot/target/autostart; `stop` = stop the background daemon;
+  `status`'s running line names the OWNER of the live process — `running (launchd, pid N)` vs
+  `running (manual, pid N)` — because the pidfile is informational (spec §6) and goes stale
+  whenever a supervising LaunchAgent's KeepAlive relaunches the daemon; it therefore ALSO asks
+  launchd (one read-only `launchctl list` + `launchctl print` pass per `status`, shared with the
+  autostart line) and reports a stale/mismatched pidfile alongside the live pid instead of
+  calling the daemon down (tg-cli#316).
   `enable` = install OS autostart AND start now; `disable` = remove autostart AND stop. A bare
   `tg-ctl` (no subcommand) prints HELP and never launches. OS-autostart matrix lives in
   `features/tg-ctl/autostart.ts`, mirroring the lib's SEMANTICS: macOS → launchd LaunchAgent

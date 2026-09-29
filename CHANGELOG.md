@@ -3,6 +3,34 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.46.0
+
+**Fix: `tg-ctl` stops reporting a live daemon as down and a live Codex hook as missing, and it now
+retires the legacy Codex `hooks.json` entry (#316; follow-ups from #308 / PR #200).**
+
+- **`install-hooks` migrates the legacy Codex hook away.** PR #200 taught it to SKIP writing
+  `$CODEX_HOME/hooks.json` once rig provisions the same usage-telemetry Stop hook in
+  `config.toml` — but skipping a write never removes what an EARLIER install put there, so Codex
+  kept printing `loading hooks from both …/hooks.json and …/config.toml` until the file was
+  deleted by hand. `install-hooks` now checks the `[hooks]` table of `config.toml` FIRST (on every
+  path, including a machine where rig is no longer installed) and, when our hook is provisioned
+  there, removes the legacy `hooks.json` entry: the file is backed up to
+  `hooks.json.pre-migration.bak` (a suffix distinct from the installer's own `.bak`, written once),
+  other hooks in the file are preserved, and the file is deleted outright when ours was all it
+  held. Idempotent — a second run prints `nothing to migrate`.
+- **`status` finds the Codex telemetry hook in `config.toml`.** It used to read `hooks.json` only
+  and reported `NOT installed` for a hook that was live in `config.toml`. It now checks
+  `config.toml` first, falls back to the legacy `hooks.json`, and names the file it found it in
+  (the legacy line also says the hook still needs a Codex `/hooks` trust review).
+- **`status` recognizes a launchd-owned daemon.** The pidfile is informational and goes stale
+  whenever a supervising LaunchAgent's KeepAlive relaunches the daemon, so `status` reported
+  `not running` for an instance with days of uptime. It now also asks launchd (read-only:
+  `launchctl list` + `launchctl print`, one pass shared with the autostart line — it never loads,
+  bootstraps or stops anything) and reports `running (launchd, pid N)` / `running (manual, pid N)`
+  / `not running`, surfacing a stale or mismatched pidfile next to the live pid instead of calling
+  the daemon down. A launchd job is only credited when it serves the SAME config dir, so a second
+  bot's LaunchAgent is never reported as this one's.
+
 ## 1.45.3
 
 **Feature: delegate codex hooks to rig (scoped) + gate the codex hook-trust bypass.** Codex hook
