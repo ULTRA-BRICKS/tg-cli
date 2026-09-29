@@ -403,6 +403,8 @@ Defined in `features/auto-attach/feature-flags.ts` as a default-ON map. Overrida
 Specs are authoritative. They live in `docs/specs/<feature>.md`. Read the relevant spec before
 touching any feature.
 
+Roadmap and priorities: docs/ROADMAP.md (source of truth since 2026-09-29).
+
 ---
 
 ## Conventions
