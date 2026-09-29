@@ -412,8 +412,11 @@ test(
     closeSync(logFd);
 
     await waitFor(() => existsSync(tokenFile));
-    await Bun.sleep(150);
-    crashed.kill();
+    expect(existsSync(tokenFile)).toBe(true);
+    // The token stamp precedes the fixture's SIGKILL. Wait for the actual exit
+    // so the replacement cannot lose the singleton lock to the dying daemon.
+    await crashed.exited;
+    expect(crashed.signalCode).toBe('SIGKILL');
 
     const pending = parseTopics(readFileSync(topicsFile, 'utf8')).find((b) => b.threadId === 44);
     expect(pending?.status).toBe('awaiting-model');

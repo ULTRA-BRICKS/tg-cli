@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, writeFileSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
@@ -570,92 +570,88 @@ test('daemon returns hook output before slow Telegram callback cleanup finishes'
   });
 }, 10_000);
 
-test('daemon edits the Telegram prompt when the hook client disconnects before answering', async () => {
-  const cfgDir = makeCfgDir();
-  const edited: unknown[] = [];
-  let sent = false;
-  const server = Bun.serve({
-    port: 0,
-    async fetch(req) {
-      const url = new URL(req.url);
-      if (url.pathname.endsWith('/getUpdates')) return Response.json({ ok: true, result: [] });
-      if (url.pathname.endsWith('/sendMessage')) {
-        sent = true;
-        return Response.json({ ok: true, result: { message_id: 77 } });
+// The real daemon owns send completion and socket retirement. HTTP receipt alone
+// cannot distinguish a posted card from an in-flight send.
+for (const phase of ['posted', 'in-flight'] as const) {
+  test(`daemon expires the Telegram prompt when the hook disconnects (${phase})`, async () => {
+    const cfgDir = makeCfgDir();
+    const edited: unknown[] = [];
+    const keyboards: unknown[] = [];
+    const sendResponse = Promise.withResolvers<void>();
+    let sendStarted = false;
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname.endsWith('/getUpdates')) return Response.json({ ok: true, result: [] });
+        if (url.pathname.endsWith('/sendMessage')) {
+          sendStarted = true;
+          if (phase === 'in-flight') await sendResponse.promise;
+          return Response.json({ ok: true, result: { message_id: 77 } });
+        }
+        if (url.pathname.endsWith('/editMessageText')) {
+          edited.push(await req.json());
+          return Response.json({ ok: true, result: true });
+        }
+        if (url.pathname.endsWith('/editMessageReplyMarkup')) {
+          keyboards.push(await req.json());
+          return Response.json({ ok: true, result: true });
+        }
+        return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+      },
+    });
+    servers.push(server);
+    try {
+      await startDaemon(cfgDir, server.port);
+      const ask = startAsk(cfgDir, server.port, {
+        requestId: 'q_disconnect',
+        agent: 'claude',
+        kind: 'question',
+        question: 'Continue?',
+      });
+      const posted = () => readFileSync(join(cfgDir, 'daemon.log'), 'utf8')
+        .includes('ask-forward posted: agent=claude kind=question req=q_disconnect');
+      const questionsFile = join(cfgDir, 'tg-ctl.123.questions.json');
+
+      if (phase === 'posted') {
+        // This acknowledgement is emitted only after the daemon accepts the API response.
+        await waitForEvent(posted);
+      } else {
+        await waitForEvent(() => sendStarted);
+        expect(posted()).toBe(false);
+        expect(existsSync(questionsFile)).toBe(false);
       }
-      if (url.pathname.endsWith('/editMessageText')) {
-        edited.push(await req.json());
-        return Response.json({ ok: true, result: true });
+      ask.kill(9);
+      await ask.exited;
+      expect(ask.signalCode).toBe('SIGKILL');
+
+      if (phase === 'in-flight') {
+        // Retirement persists the question store even for an unscoped dead card.
+        // Observe it before releasing HTTP so this exercises post-send reconciliation.
+        await waitForEvent(() => existsSync(questionsFile));
+        expect(posted()).toBe(false);
+        expect(edited).toEqual([]);
+        sendResponse.resolve();
       }
-      return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
-    },
-  });
-  servers.push(server);
-  const daemon = await startDaemon(cfgDir, server.port);
+      await waitForEvent(() => edited.length > 0 && keyboards.length > 0);
+      expect(edited).toEqual([
+        { chat_id: 1, message_id: 77, text: 'expired — answer in terminal' },
+      ]);
+      expect(keyboards).toEqual([
+        { chat_id: 1, message_id: 77 },
+      ]);
+    } finally {
+      sendResponse.resolve();
+    }
+  }, 10_000);
+}
 
-  const ask = startAsk(cfgDir, server.port, {
-    requestId: 'q_disconnect',
-    agent: 'claude',
-    kind: 'question',
-    question: 'Continue?',
-  });
-
-  const t0 = Date.now();
-  while (Date.now() - t0 < 5000 && !sent) await Bun.sleep(50);
-  expect(sent).toBe(true);
-  ask.kill(9);
-  await ask.exited;
-
-  const t1 = Date.now();
-  while (Date.now() - t1 < 5000 && edited.length === 0) await Bun.sleep(50);
-  expect(edited).toEqual([
-    { chat_id: 1, message_id: 77, text: 'expired — answer in terminal' },
-  ]);
-}, 10_000);
-
-test('daemon expires the Telegram prompt when hook disconnects while sendMessage is in flight', async () => {
-  const cfgDir = makeCfgDir();
-  const edited: unknown[] = [];
-  let sendStarted = false;
-  const server = Bun.serve({
-    port: 0,
-    async fetch(req) {
-      const url = new URL(req.url);
-      if (url.pathname.endsWith('/getUpdates')) return Response.json({ ok: true, result: [] });
-      if (url.pathname.endsWith('/sendMessage')) {
-        sendStarted = true;
-        await Bun.sleep(300);
-        return Response.json({ ok: true, result: { message_id: 88 } });
-      }
-      if (url.pathname.endsWith('/editMessageText')) {
-        edited.push(await req.json());
-        return Response.json({ ok: true, result: true });
-      }
-      return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
-    },
-  });
-  servers.push(server);
-  const daemon = await startDaemon(cfgDir, server.port);
-
-  const ask = startAsk(cfgDir, server.port, {
-    requestId: 'q_race',
-    agent: 'claude',
-    kind: 'question',
-    question: 'Continue?',
-  });
-
-  const t0 = Date.now();
-  while (Date.now() - t0 < 5000 && !sendStarted) await Bun.sleep(25);
-  expect(sendStarted).toBe(true);
-  ask.kill(9);
-  await ask.exited;
-
-  const t1 = Date.now();
-  while (Date.now() - t1 < 5000 && edited.length === 0) await Bun.sleep(50);
-  expect(edited).toEqual([
-    { chat_id: 1, message_id: 88, text: 'expired — answer in terminal' },
-  ]);
-}, 10_000);
+async function waitForEvent(observed: () => boolean): Promise<void> {
+  const started = Date.now();
+  while (!observed() && Date.now() - started < 5000) await Bun.sleep(25);
+  expect(observed()).toBe(true);
+}
 
 function makeCfgDir(): string {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-buttons-fail-'));
