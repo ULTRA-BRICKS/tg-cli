@@ -77,13 +77,21 @@ Feature modules live in `features/<feature-name>/` as **pure TypeScript modules*
 all external dependencies (spawns, fetch, file reads) are injected as function parameters so
 tests can pass fakes.
 
-### Live OMP identity (#450)
+### Live OMP identity (#450, #458, #462)
 
 Never use `omp acp session/load` or `omp --resume -p` to deliver to a live TUI: those
 create independent writers to its history. Use `tg-ctl omp-live` and the original-process
-extension. Missing endpoints fail closed; do not restore the old spawn fallback to satisfy
-legacy fixtures. See `docs/omp-original-process.md` for setup, receipt semantics, and the
-one-time saved restart needed by already-running OMP. Cwd/title are not process identity.
+extension. The endpoint belongs to the top-level TUI session only: OMP rebinds extension
+factories for every in-process task subagent, and a subagent binding must never claim,
+close or withdraw it (#462). The owner republishes a missing endpoint at `turn_end`/
+`agent_end`; a status probe that times out lists the host as alive-busy. An OMP in a tmux
+pane with NO endpoint gets `tmux send-keys` into its own pane (its original TUI — no second
+writer, no spawn), but only on a proven-absent endpoint (`endpoint_unavailable`); every
+other endpoint error fails closed. An OMP outside tmux without an endpoint fails closed; do
+not restore the old spawn fallback to satisfy legacy fixtures. `tg-ctl status` names every
+omp without a bridge. Claude Code and Codex stay tmux-only. See
+`docs/omp-original-process.md` for setup, receipt semantics, and the one-time saved restart
+needed by already-running OMP. Cwd/title are not process identity.
 
 ### Existing Features
 

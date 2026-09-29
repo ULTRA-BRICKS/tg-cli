@@ -345,7 +345,26 @@ export function describeLiveOmp(a: LiveOmpAgent): string {
     `title ${a.title ?? '-'}`,
     `pid ${a.pid}`,
   ];
-  return `${liveOmpLabel(a)} · omp — ACP (${parts.join(', ')})`;
+  return `${liveOmpLabel(a)} · omp — ${a.instanceId ? 'bridge' : 'NO bridge'} (${parts.join(', ')})`;
+}
+
+/**
+ * `tg-ctl status` block naming every live omp WITHOUT an original-process endpoint
+ * (#458), and how each is reached meanwhile. Empty when every omp is bridged.
+ */
+export function describeUnbridgedOmp(agents: readonly LiveOmpAgent[]): string[] {
+  const missing = agents.filter((a) => !a.instanceId);
+  if (missing.length === 0) return [];
+  return [
+    `omp without bridge: ${missing.length}`,
+    ...missing.map((a) => {
+      const name = (a.name ?? '').trim();
+      const label = name && name !== liveOmpLabel(a) ? `${liveOmpLabel(a)} (--name ${name})` : liveOmpLabel(a);
+      const reach = a.paneId ? `pane ${a.paneId} → tmux send-keys into its own TUI` : 'no tmux → unreachable until it loads the bridge';
+      return `  - ${label} · pid ${a.pid} · ${reach}`;
+    }),
+    '  fix: tg-ctl omp-live install, then save/stop + resume each once (never a second copy)',
+  ];
 }
 
 // --- ACP framing (NDJSON JSON-RPC over stdio; omp 18.1.14) ---

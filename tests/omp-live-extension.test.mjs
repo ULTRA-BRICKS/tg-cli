@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, lstat, readFile, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import extension from '../features/tg-ctl/omp-live-extension.mjs';
@@ -79,4 +79,83 @@ test('idle delivery starts a turn and a concurrent newly-started turn is not int
   // OMP's real implementation queues followUp even while idle. Aside starts idle
   // work and remains non-interrupting if another turn wins the admission race.
   assert.equal(f.received[0].options.deliverAs, 'aside');
+});
+
+async function endpointFiles(root, row) {
+  const metadataPath = join(root, `${row.pid}-${row.instanceId}.json`);
+  const meta = JSON.parse(await readFile(metadataPath, 'utf8'));
+  return { metadataPath, socketPath: meta.socket };
+}
+const present = async path => { try { await lstat(path); return true; } catch { return false; } };
+
+test('#462: an in-process subagent bind, start and shutdown never withdraw the main endpoint', async t => {
+  const f = await setup(t);
+  await f.handlers.get('session_start')({}, f.ctx);
+  const [main] = await listLiveEndpoints(f.root);
+  const files = await endpointFiles(f.root, main);
+  // OMP 18.3 re-binds the SAME prepared factory for every in-process task subagent.
+  const sub = new Map();
+  extension({ on: (name, fn) => sub.set(name, fn), sendUserMessage: () => { throw new Error('a subagent must never receive Telegram input'); } });
+  const subCtx = { ...f.ctx, hasUI: false, getAgentId: () => 'TaskWorker',
+    sessionManager: { getSessionId: () => 'sub-session', getHeader: () => ({ title: 'Worker' }) } };
+  await sub.get('session_start')({}, subCtx);
+  await sub.get('turn_end')?.({}, subCtx);
+  await sub.get('agent_end')?.({}, subCtx);
+  await sub.get('session_shutdown')({}, subCtx);
+
+  const after = await listLiveEndpoints(f.root);
+  assert.deepEqual(after.map(r => [r.instanceId, r.sessionId]), [[main.instanceId, 'ext-session']]);
+  assert.equal(await present(files.metadataPath), true);
+  assert.equal((await lstat(files.socketPath)).isSocket(), true);
+  const receipt = await sendLiveMessage({ root: f.root, pid: process.pid, instanceId: main.instanceId, sessionId: 'ext-session', requestId: 'after-subagent', text: 'still reachable' });
+  assert.equal(receipt.accepted, true);
+  assert.deepEqual(f.received.map(r => r.text), ['still reachable']);
+
+  // The main session still owns (and on shutdown removes) its own endpoint.
+  await f.handlers.get('session_shutdown')();
+  assert.deepEqual(await listLiveEndpoints(f.root), []);
+  assert.equal(await present(files.metadataPath), false);
+  assert.equal(await present(files.socketPath), false);
+});
+
+test('#458: turn_end/agent_end republish a missing main endpoint and keep a present one stable', async t => {
+  const f = await setup(t);
+  await f.handlers.get('session_start')({}, f.ctx);
+  const [first] = await listLiveEndpoints(f.root);
+  await f.handlers.get('turn_end')({}, f.ctx);
+  assert.deepEqual((await listLiveEndpoints(f.root)).map(r => r.instanceId), [first.instanceId]);
+
+  // Registration withdrawn behind the session's back (registry wiped, pruned, …).
+  await rm(f.root, { recursive: true, force: true });
+  assert.deepEqual(await listLiveEndpoints(f.root), []);
+  await f.handlers.get('agent_end')({}, f.ctx);
+  const healed = await listLiveEndpoints(f.root);
+  assert.equal(healed.length, 1);
+  assert.notEqual(healed[0].instanceId, first.instanceId);
+  await sendLiveMessage({ root: f.root, pid: process.pid, instanceId: healed[0].instanceId, requestId: 'healed', text: 'after heal' });
+  assert.deepEqual(f.received.map(r => r.text), ['after heal']);
+});
+
+test('#458: a failed startup publish is retried at turn_end without repeating the warning', async t => {
+  const f = await setup(t);
+  await mkdir(f.root, { mode: 0o755 });
+  await f.handlers.get('session_start')({}, f.ctx);
+  await f.handlers.get('turn_end')({}, f.ctx);
+  assert.equal(f.notifications.length, 1);
+  assert.deepEqual(await listLiveEndpoints(f.root).catch(() => []), []);
+  await chmod(f.root, 0o700);
+  await f.handlers.get('turn_end')({}, f.ctx);
+  assert.equal((await listLiveEndpoints(f.root)).length, 1);
+});
+
+test('#458: a stale reloaded binding never re-claims from the current owner at turn_end', async t => {
+  const f = await setup(t);
+  await f.handlers.get('session_start')({}, f.ctx);
+  const handlers2 = new Map();
+  extension({ on: (event, fn) => handlers2.set(event, fn), sendUserMessage: () => {} });
+  t.after(() => handlers2.get('session_shutdown')());
+  await handlers2.get('session_start')({}, f.ctx);
+  const [current] = await listLiveEndpoints(f.root);
+  await f.handlers.get('turn_end')({}, f.ctx);
+  assert.deepEqual((await listLiveEndpoints(f.root)).map(r => r.instanceId), [current.instanceId]);
 });

@@ -3,6 +3,27 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.1
+
+**OMP subagents no longer withdraw the Telegram bridge; self-heal and tmux fallback (#462, #458).**
+
+- OMP 18.3 binds the omp-live extension factory again for every in-process task subagent,
+  and each bind closed the previous owner's endpoint while the subagent itself refused to
+  publish — the first task spawn permanently removed the main session's bridge
+  (`endpoint_unavailable`). Only the original interactive TUI session now claims the
+  endpoint; a subagent's bind, start, turns and shutdown never touch it (#462).
+- The owner republishes a missing endpoint at `turn_end`/`agent_end`; a failed publish
+  warns once per outage. A status probe that times out (now 1 s, was 350 ms) lists the
+  host as alive-busy instead of dropping it, and a timed-out send says the text may still
+  arrive instead of suggesting a reinstall. A socket error after connect is now
+  `endpoint_connection_lost`, never `endpoint_unavailable`.
+- An OMP in a tmux pane without an endpoint is reached by `tmux send-keys` into its own
+  pane (its original TUI: no second writer, no spawn), only when the endpoint is proven
+  absent; outside tmux it still fails closed. Omp reply-routes defer while the pane has an
+  open forwarded question, like every tmux pane.
+- `tg-ctl status` shows each live OMP's bridge state and names every one without a bridge;
+  the daemon installs the omp-live extension at startup when `~/.omp/agent` exists.
+
 ## 1.54.0
 
 **Original-process OMP delivery; no ACP history clones (#450).**

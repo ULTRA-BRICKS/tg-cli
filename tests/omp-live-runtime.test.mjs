@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, readdir, rm, stat, symlink, chmod, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fork } from 'node:child_process';
 import { once } from 'node:events';
 import { startLiveEndpoint, listLiveEndpoints, sendLiveMessage, requestEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
@@ -132,6 +132,30 @@ test('cross-process delivery preserves the original receiver PID and does not st
   const [observed] = await responseEvent;
   assert.equal(receipt.pid, child.pid);
   assert.deepEqual(observed, { pid: child.pid, text: 'handoff' });
+});
+
+test('#458: a host too busy to answer the status probe is listed alive-busy; a send times out, never "unavailable"', { timeout: 20_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'omp-live-slow-'));
+  const child = fork(new URL('./omp-live-fixture.mjs', import.meta.url), [root], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+  let socketDir = null;
+  t.after(async () => {
+    // The blocked host cannot run its SIGTERM cleanup; kill it and remove its private socket dir.
+    if (child.exitCode === null) { child.kill('SIGKILL'); await once(child, 'exit'); }
+    if (socketDir?.startsWith('/tmp/ol-')) await rm(socketDir, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
+  });
+  await once(child, 'message');
+  const [name] = (await readdir(root)).filter(n => n.endsWith('.json'));
+  socketDir = dirname(JSON.parse(await readFile(join(root, name), 'utf8')).socket);
+  const blocking = once(child, 'message');
+  child.send({ blockMs: 60_000 });
+  await blocking;
+  const started = Date.now();
+  const rows = await listLiveEndpoints(root);
+  assert(Date.now() - started < 2_000, 'status probe stays bounded');
+  assert.deepEqual(rows.map(r => [r.pid, r.sessionId, r.busy]), [[child.pid, 'child-original', true]]);
+  // The endpoint exists: a caller must never read this as "no endpoint" and type into the TUI too.
+  await assert.rejects(sendLiveMessage({ root, pid: child.pid, requestId: 'while-blocked', text: 'queued' }), /endpoint_timeout/);
 });
 
 

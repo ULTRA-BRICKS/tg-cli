@@ -140,6 +140,7 @@ import {
 } from "./features/tg-ctl/unreachable"
 import {
   describeLiveOmp,
+  describeUnbridgedOmp,
   findLiveOmpAgents,
   liveOmpLabel,
   liveOmpPaneId,
@@ -157,7 +158,7 @@ import {
 } from "./features/tg-ctl/omp"
 import { defaultRegistryRoot, listLiveEndpoints, sendLiveMessage } from "./features/tg-ctl/omp-live-runtime.mjs"
 import { selectOriginalEndpoint, originalRequestId, type OriginalOmpEndpoint, type OriginalOmpTarget } from "./features/tg-ctl/omp-live-routing"
-import { runOmpLiveCommand } from "./tools/omp-live-cli.mjs"
+import { installOmpLiveExtension, runOmpLiveCommand } from "./tools/omp-live-cli.mjs"
 import {
   DEFAULT_TASK_VIEW,
   TASK_STATES,
@@ -391,7 +392,7 @@ export const USAGE = `Usage:
                          # internal: consume an outstanding grant WITHOUT an id —
                          # matched by hook + operation + the daemon-observed route
                          # (for hooks with no env channel); same reply shape
-  tg-ctl omp-live install        # install the original-process extension; saved stop/resume required once
+  tg-ctl omp-live install        # install the original-process extension (the daemon also does at startup); saved stop/resume required once
   tg-ctl omp-live status --json  # verified live PIDs and exact sessions (no bot credentials)
   tg-ctl omp-live send <pid> --request-id <id> <text...>  # queued receipt, never a clone
   tg-ctl install-hooks   # wire q→buttons + StopFailure + Claude/Codex usage telemetry
@@ -1188,7 +1189,11 @@ async function refreshOriginalHosts(): Promise<void> {
   })().finally(() => { originalProbe = null })
   return originalProbe
 }
-async function deliverOriginalOmp(target: OriginalOmpTarget, text: string, messageId?: number | string): Promise<{ ok: true } | { ok: false; error: string }> {
+// `paneId`: the tmux pane this exact OMP runs in, when known. An OMP with NO
+// endpoint there is still the original process — typing into its own TUI is its
+// normal input path, not a second history writer and not a spawn (#458).
+async function deliverOriginalOmp(target: OriginalOmpTarget, text: string, messageId?: number | string, paneId?: string | null): Promise<{ ok: true } | { ok: false; error: string }> {
+  let code: string
   try {
     await refreshOriginalHosts()
     const host = selectOriginalEndpoint(target, originalHosts)
@@ -1197,10 +1202,29 @@ async function deliverOriginalOmp(target: OriginalOmpTarget, text: string, messa
     log(`omp-live: accepted pid=${receipt.pid} instance=${receipt.instanceId} session=${receipt.sessionId} request=${receipt.requestId}`)
     return { ok: true }
   } catch (err) {
-    const code = err instanceof Error && /^[a-z_]+$/.test(err.message) ? err.message : 'delivery_failed'
-    log(`omp-live: rejected reason=${code} (no replacement process started)`)
-    return { ok: false, error: `Original OMP bridge: ${code}. Run tg-ctl omp-live install. Save/stop the original before resuming it once to load the bridge; never start a second copy. No second agent was started.` }
+    code = err instanceof Error && /^[a-z_]+$/.test(err.message) ? err.message : 'delivery_failed'
   }
+  // Only a proven-absent endpoint may fall back: any other code means the endpoint
+  // exists (or may have accepted the text), and typing it again would duplicate it.
+  if (code === 'endpoint_unavailable' && paneId && !paneId.startsWith("omp:") && target.pid !== undefined) {
+    const res = await typeIntoOwnOmpPane(paneId, target.pid, text)
+    if (res) return res
+  }
+  log(`omp-live: rejected reason=${code} (no replacement process started)`)
+  // A timed-out or dropped connection already handed the text to a live, busy host.
+  if (code === 'endpoint_timeout' || code === 'endpoint_connection_lost') {
+    return { ok: false, error: `Original OMP bridge: ${code}. The original OMP is busy; the text may still arrive when it frees up — check before resending. No second agent was started.` }
+  }
+  return { ok: false, error: `Original OMP bridge: ${code}. Run tg-ctl omp-live install. Save/stop the original before resuming it once to load the bridge; never start a second copy. No second agent was started.` }
+}
+// null = the pane no longer hosts exactly this OMP pid; the caller fails closed.
+async function typeIntoOwnOmpPane(paneId: string, pid: number, text: string): Promise<{ ok: true } | { ok: false; error: string } | null> {
+  const { panes, procs } = snapshot()
+  const pane = panes.find((p) => p.paneId === paneId)
+  const hosted = pane ? findAgentInPane(pane, procs) : null
+  if (hosted?.agent !== "omp" || hosted.pid !== pid) return null
+  log(`omp-live: no endpoint for pid=${pid} — tmux send-keys into its own pane ${paneId} (original process, no spawn)`)
+  return executeInjectSteps(buildTextInjectPlan(paneId, text))
 }
 async function replyOmpAcpPermission(_req: ButtonRequest, _optionId: string): Promise<{ ok: false; error: string }> {
   // Retained old ACP cards cannot be approved against a newly spawned process.
@@ -1275,7 +1299,7 @@ async function routeGrantNotice(ctx: Ctx, req: ButtonRequest, text: string, deli
     }
     // No exact session/pane identity: retain in scoped inbox, never guess by cwd.
     if (target) {
-      const res = await deliverOriginalOmp(target, text, deliveryId)
+      const res = await deliverOriginalOmp(target, text, deliveryId, req.paneId)
       if (res.ok) return true
       log(`grant-notice omp route failed (falling back to inbox) session=${target.sessionId ?? "-"}: ${res.error}`)
     }
@@ -1766,6 +1790,7 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
   if (liveOmp.length > 0) {
     lines.push(`omp (original-process): ${liveOmp.length}`)
     for (const a of liveOmp) lines.push(`  - ${describeLiveOmp(a)}`)
+    lines.push(...describeUnbridgedOmp(liveOmp))
   }
   const offsetMtime = fileMtimeMs(ctx.paths.offset)
   lines.push(
@@ -1898,6 +1923,20 @@ function ensureClaudeHooksOnStartup(ctx: Ctx): void {
     }
   } catch (err) {
     log(`ensureClaudeHooksOnStartup failed: ${err}`)
+  }
+}
+
+// #458: every NEW interactive omp must load the original-process bridge without a
+// manual step. Only where omp is actually used (its agent dir exists); the installer
+// is idempotent and refuses user-owned or differently-managed loaders. Best-effort.
+async function ensureOmpLiveExtensionOnStartup(ctx: Ctx): Promise<void> {
+  const agentRoot = join(ctx.home, ".omp", "agent")
+  if (!existsSync(agentRoot)) return
+  try {
+    const res = await installOmpLiveExtension(agentRoot)
+    if (res.changed) log(`omp-live: installed the original-process extension at ${res.path} (new omp sessions load it)`)
+  } catch (err) {
+    log(`omp-live: extension not installed: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
 
@@ -6663,8 +6702,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
       const live = liveOmpForPane(paneId, found.target.agentPid)
       const cwd = found.target.pane.panePath || live?.cwd || "/"
-      log(`inject: omp original-process pane=${paneId} cwd=${cwd} (not tmux send-keys)`)
-      const result = await deliverOriginalOmp(live ?? { cwd, pid: found.target.agentPid }, deferText, sourceMessageId ?? undefined)
+      log(`inject: omp original-process pane=${paneId} cwd=${cwd} (endpoint first; own-pane tmux only without one)`)
+      const result = await deliverOriginalOmp(live ?? { cwd, pid: found.target.agentPid }, deferText, sourceMessageId ?? undefined, paneId)
       if (!result.ok) {
         log(`inject aborted: ${result.error}`)
         await sendMessage(ctx, result.error)
@@ -6711,7 +6750,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (!live) return { ok: false, error: `omp ${paneId} is no longer running` }
       const cwd = live.cwd ?? "/"
       log(`injectToPane: omp original-process pane=${paneId} cwd=${cwd} (not tmux send-keys)`)
-      const res = await deliverOriginalOmp(live, wrapped, sourceMessageId ?? undefined)
+      const res = await deliverOriginalOmp(live, wrapped, sourceMessageId ?? undefined, live.paneId)
       return res.ok ? { ok: true } : { ok: false, error: res.error }
     }
     if (shouldDeferInbound(paneId)) {
@@ -6725,8 +6764,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (hosted?.agent === "omp") {
       const live = liveOmpForPane(paneId, hosted.pid)
       const cwd = pane?.panePath || live?.cwd || "/"
-      log(`injectToPane: omp original-process pane=${paneId} cwd=${cwd} (not tmux send-keys)`)
-      const res = await deliverOriginalOmp(live ?? { cwd, pid: hosted.pid }, wrapped, sourceMessageId ?? undefined)
+      log(`injectToPane: omp original-process pane=${paneId} cwd=${cwd} (endpoint first; own-pane tmux only without one)`)
+      const res = await deliverOriginalOmp(live ?? { cwd, pid: hosted.pid }, wrapped, sourceMessageId ?? undefined, paneId)
       return res.ok ? { ok: true } : { ok: false, error: res.error }
     }
     const res = await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
@@ -6893,7 +6932,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
       const ompCwd = live.cwd ?? "/"
       log(`injectPrewrapped: omp original-process pane=${paneId} cwd=${ompCwd} (not tmux send-keys)`)
-      const res = await deliverOriginalOmp(live, prewrappedText, sourceMessageId ?? undefined)
+      const res = await deliverOriginalOmp(live, prewrappedText, sourceMessageId ?? undefined, live.paneId)
       if (!res.ok) {
         await sendMessage(ctx, res.error)
         return false
@@ -6914,8 +6953,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const hosted = pane ? findAgentInPane(pane, procs) : null
     if (hosted?.agent === "omp") {
       const live = liveOmpForPane(paneId, hosted.pid)
-      log(`injectPrewrapped: omp original-process pane=${paneId} cwd=${cwd} (not tmux send-keys)`)
-      const res = await deliverOriginalOmp(live ?? { cwd: cwd || "/", pid: hosted.pid }, prewrappedText, sourceMessageId ?? undefined)
+      log(`injectPrewrapped: omp original-process pane=${paneId} cwd=${cwd} (endpoint first; own-pane tmux only without one)`)
+      const res = await deliverOriginalOmp(live ?? { cwd: cwd || "/", pid: hosted.pid }, prewrappedText, sourceMessageId ?? undefined, paneId)
       if (!res.ok) {
         await sendMessage(ctx, res.error)
         return false
@@ -6955,7 +6994,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const target = ompHits[0]
       const cwd = target.cwd ?? "/"
       log(`agent-route: selector="${selector}" → omp original-process pid=${target.pid} title=${liveOmpLabel(target)} cwd=${cwd}`)
-      const res = await deliverOriginalOmp(target, wrapped, messageId ?? undefined)
+      const res = await deliverOriginalOmp(target, wrapped, messageId ?? undefined, target.paneId)
       if (!res.ok) {
         await sendMessage(ctx, res.error, out)
         return false
@@ -7336,7 +7375,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const injectVerbatim = async (paneId: string): Promise<boolean> => {
       const live = matchLiveOmpOrigin(paneId, listLiveOmpAgents())
       if (live) {
-        const res = await deliverOriginalOmp(live, action.injectText, action.messageId)
+        // Same defer-while-waiting rule as every tmux pane: never type into an open question.
+        if (live.paneId && shouldDeferInbound(live.paneId)) {
+          markDeferredForAck(enqueueDeferred(live.paneId, action.injectText, action.messageId, relatedReactionMessageId))
+          return true
+        }
+        const res = await deliverOriginalOmp(live, action.injectText, action.messageId, live.paneId)
         if (!res.ok) {
           await sendMessage(ctx, res.error)
           return false
@@ -9775,7 +9819,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const res = retained.req.omp
       ? await replyOmpAcpPermission(retained.req, optionIdForAnswer(retained.req, answer.value, answer.label))
       : retained.req.agent === "omp"
-        ? await deliverOriginalOmp(liveOmpForPane(paneId) ?? { cwd: retained.req.cwd ?? "/" }, wrapInbound(ctx.cfg.injectWrap, "tg", answer.label), `answer:${action.requestId}`)
+        ? await deliverOriginalOmp(liveOmpForPane(paneId) ?? { cwd: retained.req.cwd ?? "/" }, wrapInbound(ctx.cfg.injectWrap, "tg", answer.label), `answer:${action.requestId}`, paneId)
         : await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
     if (!res.ok) {
       // The pane is unreachable (gone / no longer an agent). ROLL BACK the claim:
@@ -10183,6 +10227,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // only writes when a rewrite actually gutted them. Best-effort — a failure here
   // must never block the daemon from entering its poll loop.
   ensureClaudeHooksOnStartup(ctx)
+  await ensureOmpLiveExtensionOnStartup(ctx)
 
   await refreshOriginalHosts()
   log(`daemon up — pid ${process.pid}, bot ${ctx.botId}, offset ${offset}`)

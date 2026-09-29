@@ -18,7 +18,7 @@ install adds one extension loader. Existing OMP needs a one-time saved stop/resu
 /reload in OMP 18.3 reloads plugins, not JS extension modules. Never resume a second copy.
 `;
 
-async function install(agentRoot) {
+export async function installOmpLiveExtension(agentRoot) {
   if (!agentRoot.startsWith('/')) throw new Error('agent_root_must_be_absolute');
   const directory = join(agentRoot, 'extensions');
   await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -62,7 +62,7 @@ async function main(args) {
     return;
   }
   if (args[0] === 'install' && (args.length === 1 || (args.length === 3 && args[1] === '--agent-root'))) {
-    console.log(JSON.stringify(await install(args[2] ?? join(homedir(), '.omp', 'agent'))));
+    console.log(JSON.stringify(await installOmpLiveExtension(args[2] ?? join(homedir(), '.omp', 'agent'))));
     return;
   }
   if (args[0] === 'send') {

@@ -15,6 +15,9 @@ const FRAME_MAX = 100_000;
 const TEXT_MAX = 64_000;
 const META_MAX = 32_000;
 const TIMEOUT_MS = 2_000;
+// Discovery probe budget. A timeout still lists the host (alive-busy), so this only
+// bounds status latency; 350 ms dropped live hosts mid tool call (#458).
+const STATUS_PROBE_MS = 1_000;
 const MAX_RECEIPTS = 4096;
 const MAX_CONNECTIONS = 32;
 const HEX32 = /^[a-f0-9]{32}$/;
@@ -193,6 +196,14 @@ export async function startLiveEndpoint({ root = defaultRegistryRoot(), snapshot
     await unlink(socketPath).catch(e => { if (e.code !== 'ENOENT') throw e; });
     if (fallbackDir) await rmdir(fallbackDir).catch(e => { if (e.code !== 'ENOENT') throw e; });
   };
+  // Self-heal probe (#458): this generation's registration is still discoverable.
+  const published = async () => {
+    if (closed) return false;
+    try {
+      const [metadata, socket] = await Promise.all([lstat(metadataPath), lstat(socketPath)]);
+      return metadata.isFile() && socket.isSocket();
+    } catch { return false; }
+  };
   try {
     await new Promise((res, rej) => { server.once('error', rej); server.listen(socketPath, res); });
     await chmod(socketPath, 0o600);
@@ -200,7 +211,7 @@ export async function startLiveEndpoint({ root = defaultRegistryRoot(), snapshot
     // Runtime errors remain contained; the process's next reload can republish.
     server.on('error', () => {});
   } catch (e) { await close(); throw e; }
-  return { metadataPath, instanceId, pid, refresh, close };
+  return { metadataPath, instanceId, pid, refresh, published, close };
 }
 
 /** One request per connection, bounded and authenticated. Does not spawn any processes. */
@@ -210,12 +221,14 @@ export async function requestEndpoint(meta, payload, timeoutMs = TIMEOUT_MS) {
   if (wire.length > FRAME_MAX) throw failure('frame_too_large');
   return await new Promise((resolveResult, reject) => {
     const socket = createConnection(meta.socket);
-    let buffer = Buffer.alloc(0), settled = false;
+    let buffer = Buffer.alloc(0), settled = false, connected = false;
     const finish = (err, result) => { if (settled) return; settled = true; clearTimeout(timer); socket.destroy(); err ? reject(err) : resolveResult(result); };
     const timer = setTimeout(() => finish(failure('endpoint_timeout')), timeoutMs);
-    socket.on('error', () => finish(failure('endpoint_unavailable')));
+    // Only a failure BEFORE connect proves nothing reached the host; callers may
+    // treat `endpoint_unavailable` as "no endpoint", so never report it after connect.
+    socket.on('error', () => finish(failure(connected ? 'endpoint_connection_lost' : 'endpoint_unavailable')));
     socket.on('end', () => { if (!settled) finish(failure('incomplete_reply')); });
-    socket.on('connect', () => socket.write(wire));
+    socket.on('connect', () => { connected = true; socket.write(wire); });
     socket.on('data', chunk => {
       buffer = Buffer.concat([buffer, chunk]);
       if (buffer.length > FRAME_MAX) { finish(failure('response_too_large')); return; }
@@ -273,9 +286,14 @@ async function probed(root, exactPid) {
   if (candidates.length > 256) throw failure('registry_capacity_exceeded');
   const rows = (await Promise.all(candidates.map(async meta => {
     try {
-      const status = await requestEndpoint(meta, { op: 'status' }, 350);
+      const status = await requestEndpoint(meta, { op: 'status' }, STATUS_PROBE_MS);
       return { meta, status: publicSnapshot(status, meta.pid, meta.instanceId) };
-    } catch { return null; }
+    } catch (e) {
+      // A live, private socket that accepted the connection but did not answer in
+      // time is a host whose event loop is busy — alive-busy, not gone (#458).
+      if (e?.code !== 'endpoint_timeout') return null;
+      try { return { meta, status: { ...publicSnapshot(meta, meta.pid, meta.instanceId), busy: true } }; } catch { return null; }
+    }
   }))).filter(Boolean);
   return rows.sort((a,b) => a.status.pid-b.status.pid || a.status.instanceId.localeCompare(b.status.instanceId));
 }

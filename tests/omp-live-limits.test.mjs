@@ -23,7 +23,9 @@ test('unrelated stalled endpoint cannot delay a send to the requested original',
  const before=Date.now();await sendLiveMessage({root:f.root,pid:process.pid,requestId:'target',text:'only target'});
  assert(Date.now()-before<500,'target send must not await a different host');
  assert.deepEqual(f.received,['only target']);
- const start=Date.now();assert.equal((await listLiveEndpoints(f.root)).length,1);assert(Date.now()-start<1000);
+ // #458: a live host that accepts but does not answer is listed alive-busy, within one bounded probe.
+ const start=Date.now();const rows=await listLiveEndpoints(f.root);assert(Date.now()-start<2000);
+ assert.deepEqual(rows.find(r=>r.pid===other.pid)?.busy,true);assert.equal(rows.length,2);
 });
 test('more than 256 dead owned records do not disable the one live original',async t=>{
  const f=await fixture(t);
