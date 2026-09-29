@@ -1,0 +1,24 @@
+1788559229976	0001	0 0 zsh 0,2	no-session-file
+1788559231019	0002	0 0 zsh 40,4	no-session-file
+1788559232056	0003	1 0 2.1.261 125,46	pid=55704 status=idle waitingFor=None statusUpdatedAt=1788559231838
+1788559233121	0004	1 0 2.1.261 2,46	pid=55704 status=busy waitingFor=None statusUpdatedAt=1788559233038
+1788559234192	0005	1 0 2.1.261 2,46	pid=55704 status=busy waitingFor=None statusUpdatedAt=1788559233038
+1788559235261	0006	1 0 2.1.261 2,46	pid=55704 status=busy waitingFor=None statusUpdatedAt=1788559233038
+1788559236329	0007	1 0 2.1.261 2,46	pid=55704 status=busy waitingFor=None statusUpdatedAt=1788559233038
+1788559237397	0008	1 0 2.1.261 2,46	pid=55704 status=busy waitingFor=None statusUpdatedAt=1788559233038
+1788559238467	0008	1 0 2.1.261 2,46	pid=55704 status=busy waitingFor=None statusUpdatedAt=1788559233038
+1788559239529	0009	1 0 2.1.261 2,46	pid=55704 status=busy waitingFor=None statusUpdatedAt=1788559233038
+1788559240596	0010	1 0 2.1.261 2,46	pid=55704 status=busy waitingFor=None statusUpdatedAt=1788559233038
+1788559241662	0011	1 0 2.1.261 2,46	pid=55704 status=busy waitingFor=None statusUpdatedAt=1788559233038
+1788559242733	0012	1 0 2.1.261 2,46	pid=55704 status=busy waitingFor=None statusUpdatedAt=1788559233038
+1788559243816	0013	1 0 2.1.261 2,46	pid=55704 status=busy waitingFor=None statusUpdatedAt=1788559233038
+1788559244889	0014	1 0 2.1.261 2,46	pid=55704 status=busy waitingFor=None statusUpdatedAt=1788559233038
+1788559245956	0015	1 0 2.1.261 2,46	pid=55704 status=busy waitingFor=None statusUpdatedAt=1788559233038
+1788559247023	0016	1 0 2.1.261 2,46	pid=55704 status=busy waitingFor=None statusUpdatedAt=1788559233038
+1788559248090	0017	1 0 2.1.261 2,46	pid=55704 status=busy waitingFor=None statusUpdatedAt=1788559233038
+1788559249159	0018	1 0 2.1.261 3,43	pid=55704 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559248373
+1788559250224	0018	1 0 2.1.261 3,43	pid=55704 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559248373
+1788559251290	0019	1 0 2.1.261 8,45	pid=55704 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559248373
+1788559252356	0019	1 0 2.1.261 8,45	pid=55704 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559248373
+1788559253422	0019	1 0 2.1.261 8,45	pid=55704 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559248373
+1788559254489	0020	0 0 zsh 28,4	no-session-file

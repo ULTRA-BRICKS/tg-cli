@@ -1,0 +1,25 @@
+1788559779850	0001	0 0 zsh 0,2	no-session-file
+1788559780889	0001	0 0 zsh 0,2	no-session-file
+1788559781935	0002	1 0 2.1.261 0,0	pid=71856 status=None waitingFor=None statusUpdatedAt=None
+1788559783011	0003	1 0 2.1.261 2,46	pid=71856 status=idle waitingFor=None statusUpdatedAt=1788559781946
+1788559784088	0003	1 0 2.1.261 2,46	pid=71856 status=idle waitingFor=None statusUpdatedAt=1788559781946
+1788559785152	0004	1 0 2.1.261 106,46	pid=71856 status=idle waitingFor=None statusUpdatedAt=1788559781946
+1788559786216	0005	1 0 2.1.261 2,46	pid=71856 status=busy waitingFor=None statusUpdatedAt=1788559785992
+1788559787289	0006	1 0 2.1.261 2,46	pid=71856 status=busy waitingFor=None statusUpdatedAt=1788559785992
+1788559788353	0007	1 0 2.1.261 1,19	pid=71856 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559787966
+1788559789419	0008	1 0 2.1.261 2,46	pid=71856 status=busy waitingFor=None statusUpdatedAt=1788559789064
+1788559790489	0009	1 0 2.1.261 2,46	pid=71856 status=busy waitingFor=None statusUpdatedAt=1788559789064
+1788559791551	0010	1 0 2.1.261 2,46	pid=71856 status=busy waitingFor=None statusUpdatedAt=1788559789064
+1788559792612	0011	1 0 2.1.261 2,46	pid=71856 status=busy waitingFor=None statusUpdatedAt=1788559789064
+1788559793676	0012	1 0 2.1.261 2,46	pid=71856 status=busy waitingFor=None statusUpdatedAt=1788559789064
+1788559794743	0013	1 0 2.1.261 2,46	pid=71856 status=idle waitingFor=None statusUpdatedAt=1788559794427
+1788559795810	0013	1 0 2.1.261 2,46	pid=71856 status=idle waitingFor=None statusUpdatedAt=1788559794427
+1788559796875	0014	0 0 2.1.261 0,3	no-session-file
+1788559797911	0015	0 0 zsh 71,4	no-session-file
+1788559798950	0015	0 0 zsh 71,4	no-session-file
+1788559799985	0015	0 0 zsh 71,4	no-session-file
+1788559801023	0016	0 0 2.1.261 0,0	no-session-file
+1788559802065	0017	1 0 2.1.261 2,46	pid=78072 status=idle waitingFor=None statusUpdatedAt=1788559801129
+1788559803128	0017	1 0 2.1.261 2,46	pid=78072 status=idle waitingFor=None statusUpdatedAt=1788559801129
+1788559804185	0018	1 0 zsh 70,48	pid=78072 status=idle waitingFor=None statusUpdatedAt=1788559801129
+1788559805248	0018	1 0 zsh 70,48	pid=78072 status=idle waitingFor=None statusUpdatedAt=1788559801129

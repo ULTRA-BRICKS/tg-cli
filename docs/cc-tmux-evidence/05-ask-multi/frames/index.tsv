@@ -1,0 +1,18 @@
+1788559278661	0001	0 0 zsh 0,2	no-session-file
+1788559279699	0002	0 0 2.1.261 0,0	no-session-file
+1788559280740	0003	1 0 2.1.261 163,46	pid=63502 status=idle waitingFor=None statusUpdatedAt=1788559280436
+1788559281805	0004	1 0 2.1.261 2,46	pid=63502 status=busy waitingFor=None statusUpdatedAt=1788559281727
+1788559282864	0005	1 0 2.1.261 2,46	pid=63502 status=busy waitingFor=None statusUpdatedAt=1788559281727
+1788559283926	0006	1 0 2.1.261 2,46	pid=63502 status=busy waitingFor=None statusUpdatedAt=1788559281727
+1788559284986	0007	1 0 2.1.261 2,46	pid=63502 status=busy waitingFor=None statusUpdatedAt=1788559281727
+1788559286049	0008	1 0 2.1.261 2,46	pid=63502 status=busy waitingFor=None statusUpdatedAt=1788559281727
+1788559287115	0009	1 0 2.1.261 2,46	pid=63502 status=busy waitingFor=None statusUpdatedAt=1788559281727
+1788559288173	0010	1 0 2.1.261 0,13	pid=63502 status=waiting waitingFor='input needed' statusUpdatedAt=1788559287525
+1788559289235	0011	1 0 2.1.261 0,13	pid=63502 status=waiting waitingFor='input needed' statusUpdatedAt=1788559287525
+1788559290298	0011	1 0 2.1.261 0,13	pid=63502 status=waiting waitingFor='input needed' statusUpdatedAt=1788559287525
+1788559291364	0012	1 0 2.1.261 0,21	pid=63502 status=waiting waitingFor='input needed' statusUpdatedAt=1788559287525
+1788559292440	0013	1 0 2.1.261 2,46	pid=63502 status=busy waitingFor=None statusUpdatedAt=1788559291951
+1788559293503	0014	1 0 2.1.261 2,46	pid=63502 status=busy waitingFor=None statusUpdatedAt=1788559291951
+1788559294564	0015	1 0 2.1.261 2,46	pid=63502 status=idle waitingFor=None statusUpdatedAt=1788559293666
+1788559295626	0015	1 0 2.1.261 2,46	pid=63502 status=idle waitingFor=None statusUpdatedAt=1788559293666
+1788559296688	0016	1 0 2.1.261 2,46	no-session-file

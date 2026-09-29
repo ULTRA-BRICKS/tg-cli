@@ -1,0 +1,4 @@
+1788559788014	001	PermissionRequest	start pid=74353 sleep=0 reply= detach=0
+1788559788034	001	PermissionRequest	end
+1788559793154	002	PostToolUse	start pid=75470 sleep=0 reply= detach=0
+1788559793173	002	PostToolUse	end

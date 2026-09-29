@@ -1,0 +1,19 @@
+1788559257087	0001	0 0 zsh 0,2	no-session-file
+1788559258127	0002	0 0 zsh 0,5	no-session-file
+1788559259167	0003	1 0 2.1.261 2,46	pid=58698 status=idle waitingFor=None statusUpdatedAt=1788559259116
+1788559260238	0004	1 0 2.1.261 156,46	pid=58698 status=idle waitingFor=None statusUpdatedAt=1788559259116
+1788559261305	0005	1 0 2.1.261 2,46	pid=58698 status=busy waitingFor=None statusUpdatedAt=1788559261163
+1788559262372	0006	1 0 2.1.261 2,46	pid=58698 status=busy waitingFor=None statusUpdatedAt=1788559261163
+1788559263436	0007	1 0 2.1.261 2,46	pid=58698 status=busy waitingFor=None statusUpdatedAt=1788559261163
+1788559264496	0008	1 0 2.1.261 0,13	pid=58698 status=waiting waitingFor='input needed' statusUpdatedAt=1788559263598
+1788559265565	0008	1 0 2.1.261 0,13	pid=58698 status=waiting waitingFor='input needed' statusUpdatedAt=1788559263598
+1788559266633	0008	1 0 2.1.261 0,13	pid=58698 status=waiting waitingFor='input needed' statusUpdatedAt=1788559263598
+1788559267700	0008	1 0 2.1.261 0,13	pid=58698 status=waiting waitingFor='input needed' statusUpdatedAt=1788559263598
+1788559268760	0009	1 0 2.1.261 0,15	pid=58698 status=waiting waitingFor='input needed' statusUpdatedAt=1788559263598
+1788559269823	0010	1 0 2.1.261 2,46	pid=58698 status=busy waitingFor=None statusUpdatedAt=1788559269383
+1788559270884	0011	1 0 2.1.261 2,46	pid=58698 status=busy waitingFor=None statusUpdatedAt=1788559269383
+1788559271945	0012	1 0 2.1.261 2,46	pid=58698 status=busy waitingFor=None statusUpdatedAt=1788559269383
+1788559273009	0013	1 0 2.1.261 2,46	pid=58698 status=idle waitingFor=None statusUpdatedAt=1788559272409
+1788559274071	0013	1 0 2.1.261 2,46	pid=58698 status=idle waitingFor=None statusUpdatedAt=1788559272409
+1788559275130	0013	1 0 2.1.261 2,46	pid=58698 status=idle waitingFor=None statusUpdatedAt=1788559272409
+1788559276192	0014	0 0 2.1.261 0,3	no-session-file
