@@ -15,15 +15,16 @@ const styledBracket = (label: string): string => `[${toSansBold(label)}]`;
 // carries (or omits) the `[name]` bracket. This is the actual send path a
 // subagent would exercise, not just the pure parseArgs/buildPrefix units.
 //
-// The load-bearing guarantees (post-rename, no env auto-detection):
+// The load-bearing guarantees (docs/specs/agent-role-model.md §4.3):
 //   1. `tg --subagent <name>` → sendMessage text contains `[<name>]`.
 //   2. The deprecated `--agent <name>` alias behaves identically.
 //   3. TG_AGENT env acts as the same-precedence fallback for the flag.
-//   4. An explicit flag WINS over TG_AGENT.
-//   5. REGRESSION: no flag, no TG_AGENT → NO second bracket — and crucially,
+//   4. An explicit flag WINS over TG_AGENT; then RIG_AGENT_ID (omp task subagent / detached
+//      child), then RIG_DETACHED_AGENT=1 (→ `[detached]`).
+//   5. REGRESSION: no flag, no subagent env → NO second bracket — and crucially,
 //      the presence of CLAUDE_CODE_CHILD_SESSION does NOT resurrect a guessed
-//      `[subagent]` bracket (the old broken auto-detection is gone: that env is
-//      not a reliable main-vs-subagent signal).
+//      `[subagent]` bracket (that env is set on the main thread too, so it is
+//      not a role signal).
 
 const TG_SCRIPT = join(import.meta.dir, '..', 'tg');
 
@@ -120,6 +121,45 @@ test('an explicit --subagent WINS over TG_AGENT env', async () => {
   expect(sent).toHaveLength(1);
   expect(sent[0].text as string).toContain(styledBracket('flag-over-env'));
   expect(sent[0].text as string).not.toContain(styledBracket('env-loses'));
+});
+
+// Launcher/harness-written env: omp sets RIG_AGENT_ID on a task subagent's shell, a rig
+// launcher sets RIG_AGENT_ID / RIG_DETACHED_AGENT=1 on a detached child at exec.
+test('RIG_AGENT_ID labels a subagent with no flag (omp task subagent / detached child)', async () => {
+  sent = [];
+  const { exitCode } = await runSend(['from an omp subagent'], { RIG_AGENT_ID: 'RoleAudit' });
+  expect(exitCode).toBe(0);
+  expect(sent).toHaveLength(1);
+  expect(sent[0].text as string).toContain(styledBracket('RoleAudit'));
+});
+
+test('RIG_DETACHED_AGENT=1 without an id labels the anonymous detached child', async () => {
+  sent = [];
+  const { exitCode } = await runSend(['from a detached child'], { RIG_DETACHED_AGENT: '1' });
+  expect(exitCode).toBe(0);
+  expect(sent).toHaveLength(1);
+  expect(sent[0].text as string).toContain(styledBracket('detached'));
+});
+
+test('precedence --subagent > TG_AGENT > RIG_AGENT_ID > RIG_DETACHED_AGENT', async () => {
+  const env = { TG_AGENT: 'from-tg-agent', RIG_AGENT_ID: 'from-rig', RIG_DETACHED_AGENT: '1' };
+  sent = [];
+  await runSend(['--subagent', 'from-flag', 'one'], env);
+  await runSend(['two'], env);
+  await runSend(['three'], { RIG_AGENT_ID: 'from-rig', RIG_DETACHED_AGENT: '1' });
+  await runSend(['four'], { RIG_DETACHED_AGENT: '1' });
+  expect(sent.map((m) => (m.text as string).includes(styledBracket('from-flag')))).toEqual([true, false, false, false]);
+  expect(sent[1].text as string).toContain(styledBracket('from-tg-agent'));
+  expect(sent[2].text as string).toContain(styledBracket('from-rig'));
+  expect(sent[3].text as string).toContain(styledBracket('detached'));
+});
+
+test('an omp MAIN session (RIG_DETACHED_AGENT empty, no RIG_AGENT_ID) is sent exactly like a bare coordinator', async () => {
+  sent = [];
+  await runSend(['from the coordinator'], {});
+  await runSend(['from the coordinator'], { RIG_DETACHED_AGENT: '' });
+  expect(sent).toHaveLength(2);
+  expect(sent[1].text).toBe(sent[0].text);
 });
 
 test('REGRESSION: no flag, no TG_AGENT → no second bracket (1:1 path unchanged)', async () => {

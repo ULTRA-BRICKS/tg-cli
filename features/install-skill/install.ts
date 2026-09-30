@@ -135,11 +135,13 @@ and a subagent may call \`tg\` itself, ALWAYS pass \`--subagent <descriptive-nam
 subagent so the recipient can tell WHICH subagent sent a message, not just that some AI
 did: \`tg --subagent hyperide-fixer "done, PR #123 open"\` → \`✳️ [window] [hyperide-fixer] …\`.
 
-There is NO env-based auto-detection of a subagent (\`CLAUDE_CODE_CHILD_SESSION\` is not a
-reliable main-vs-subagent signal), so the subagent bracket is explicit-only: pass
-\`--subagent\` whenever the identity matters. \`TG_AGENT\` env has the same effect (flag wins).
-The deprecated alias \`--agent\` still works. Check the resolved \`[window]\` label for the
-current shell: \`tg --detect-agent\`.
+A subagent run as its own process is labelled with no flag: omp sets \`RIG_AGENT_ID\` on its
+task subagents, and a detached child gets \`RIG_AGENT_ID=<name>\` (or \`RIG_DETACHED_AGENT=1\` →
+\`[detached]\`) from its launcher. Claude Code, Codex and opencode run in-process subagents
+with the SAME environment as you, so those MUST pass \`--subagent\`. Precedence: \`--subagent\` >
+\`TG_AGENT\` env > \`RIG_AGENT_ID\` > \`RIG_DETACHED_AGENT\`. \`CLAUDE_CODE_CHILD_SESSION\` is NOT a
+signal (Claude Code sets it on the main thread too). The deprecated alias \`--agent\` still
+works. Check the resolved \`[window]\` label for the current shell: \`tg --detect-agent\`.
 
 (Not the same flag as \`tg-ctl\`'s own \`--agent <name>\` — that one selects a closed
 harness kind for inbound telemetry, on a different binary.)
@@ -264,7 +266,8 @@ const SKILL_BLURB =
   'requires it. ' +
   'If you are an ORCHESTRATOR dispatching subagents that may call `tg` themselves, ' +
   'ALWAYS pass `--subagent <descriptive-name>` from each subagent so the recipient can ' +
-  'tell WHICH subagent sent a message — there is no env-based auto-detection, and the ' +
+  'tell WHICH subagent sent a message — an in-process Claude Code/Codex/opencode subagent ' +
+  'shares your env, so it cannot be guessed (omp and detached children label themselves), and the ' +
   'main agent auto-labels `[window]` from its tmux window/cwd with no flag. ' +
   '`--format html` auto-sends a native Rich Message (tables, ' +
   'headings, lists, LaTeX formulas) when the body has a rich tag like `<table>`/' +

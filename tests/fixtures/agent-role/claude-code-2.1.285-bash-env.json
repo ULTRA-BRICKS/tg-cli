@@ -1,0 +1,18 @@
+{
+  "main": {
+    "AI_AGENT": "claude-code_2-1-285_agent",
+    "CLAUDE_CODE_CHILD_SESSION": "1",
+    "CLAUDE_CODE_ENTRYPOINT": "sdk-cli",
+    "CLAUDE_CODE_SESSION_ATTENDED": "0",
+    "CLAUDE_CODE_SESSION_ID": "7cfdd700-a9fe-4065-b1cc-d5b0a1ba10e5",
+    "CLAUDECODE": "1"
+  },
+  "subagent": {
+    "AI_AGENT": "claude-code_2-1-285_agent",
+    "CLAUDE_CODE_CHILD_SESSION": "1",
+    "CLAUDE_CODE_ENTRYPOINT": "sdk-cli",
+    "CLAUDE_CODE_SESSION_ATTENDED": "0",
+    "CLAUDE_CODE_SESSION_ID": "7cfdd700-a9fe-4065-b1cc-d5b0a1ba10e5",
+    "CLAUDECODE": "1"
+  }
+}

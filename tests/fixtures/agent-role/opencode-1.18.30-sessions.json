@@ -1,0 +1,12 @@
+{
+  "_source": "Rows recorded 2026-09-30 from ~/.local/share/opencode/opencode.db (opencode 1.18.30, `session` table: 112 of 11169 rows have parent_id). Mapped to the SDK `Session` shape (`parent_id` column -> `parentID`, @opencode-ai/sdk types.gen.d.ts `Session.parentID?: string`). Titles of `task` child sessions end in `(@<agent> subagent)`; top-level rows have a NULL parent. Child and parent run in ONE opencode process, so process env cannot tell them apart.",
+  "subagentChild": {
+    "id": "ses_f1cb6d331ffe85gC3OhCalZBt4",
+    "parentID": "ses_f1cb765c1ffe3TwnqOoA4WA2aF",
+    "title": "Audit wearable CAD (@explore subagent)"
+  },
+  "topLevel": {
+    "id": "ses_f0b65a1bdffeeoWYjVCzy1GJY6",
+    "title": "Adversarial code review of discovery.py diff"
+  }
+}

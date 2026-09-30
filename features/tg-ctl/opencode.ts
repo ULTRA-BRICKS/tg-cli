@@ -4,6 +4,7 @@
 // opencode event payloads into tg-ctl button requests and reply HTTP plans.
 
 import type { ButtonOption, ButtonRequest } from './questions';
+import { opencodeSessionRole, type OpencodeSessionRecord } from '../agent-role/role';
 
 export interface OpencodeEvent {
   type?: string;
@@ -16,11 +17,15 @@ export interface OpencodeReplyPlan {
   body: { answers: string[][] } | { reply: 'once' | 'reject'; message?: string };
 }
 
-export function opencodeEventToButtonRequest(event: OpencodeEvent): ButtonRequest | null {
+// `session` is the opencode session record of `properties.sessionID` (`GET /session/:id`),
+// fetched by the caller: a child session (`parentID` set) is a `task` subagent and its
+// ask is labelled with it (docs/specs/agent-role-model.md §3).
+export function opencodeEventToButtonRequest(event: OpencodeEvent, session?: OpencodeSessionRecord): ButtonRequest | null {
   const p = event.properties ?? {};
   const sessionId = stringField(p, 'sessionID') ?? stringField(p, 'sessionId');
   const requestId = stringField(p, 'requestID') ?? stringField(p, 'requestId') ?? stringField(p, 'id');
   if (!sessionId || !requestId) return null;
+  const subagent = opencodeSessionRole(session).label;
 
   if (event.type === 'question.asked' || event.type === 'question.v2.asked') {
     if (Array.isArray(p.questions) && p.questions.length !== 1) return null;
@@ -40,6 +45,7 @@ export function opencodeEventToButtonRequest(event: OpencodeEvent): ButtonReques
       question,
       options,
       opencode: { sessionId, requestId, replyKind },
+      ...(subagent ? { subagent } : {}),
     };
   }
 
@@ -54,6 +60,7 @@ export function opencodeEventToButtonRequest(event: OpencodeEvent): ButtonReques
       title,
       question: [title, ...details].join('\n'),
       opencode: { sessionId, requestId, replyKind },
+      ...(subagent ? { subagent } : {}),
     };
   }
 

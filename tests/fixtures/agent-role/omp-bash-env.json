@@ -1,0 +1,17 @@
+{
+  "_source": "Live capture 2026-09-30, omp fork (oh-my-pi f7f04f2b8b). subagent = `env` inside an in-process task subagent's bash (agent RoleAudit). coordinator = `env` inside a MAIN session's bash of an `omp -p` launched WITH RIG_AGENT_ID=InheritedLeak and a nested PI_SESSION_FILE in its own env: omp `unset -v`s both on the main session (src/hook-identity-env.ts, sdk.ts hookIdentityAgentId). RIG_OMP_SESSION is session membership, inherited by both.",
+  "coordinator": {
+    "AGENT": "1",
+    "CLAUDECODE": "1",
+    "RIG_DETACHED_AGENT": "",
+    "RIG_OMP_SESSION": "omp-015e701eda0f"
+  },
+  "subagent": {
+    "AGENT": "1",
+    "CLAUDECODE": "1",
+    "OMP_LAUNCH_CWD": "/Users/me/xp/tg-cli",
+    "PI_SESSION_FILE": "/Users/me/.omp/agent/sessions/-xp-tg-cli/2026-09-30T19-04-56-854Z_01a0f3b4-a316-7489-a77b-09c13e9f2a38/RoleAudit.jsonl",
+    "RIG_AGENT_ID": "RoleAudit",
+    "RIG_OMP_SESSION": "omp-015e701eda0f"
+  }
+}

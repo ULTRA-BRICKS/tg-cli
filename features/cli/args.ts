@@ -67,8 +67,10 @@ export type ParseResult =
       // agent needs NO flag — its `[window]` bracket already carries the project
       // (resolveSessionName derives it from the tmux window / cwd). This
       // flag is for a Task-tool SUBAGENT to identify WHICH subagent sent the
-      // message (e.g. `--subagent hyperide-fixer`); there is no reliable env
-      // signal to auto-detect that, so it is explicit.
+      // message (e.g. `--subagent hyperide-fixer`). Claude Code / Codex / opencode
+      // in-process subagents share the parent's env, so no env signal can
+      // label them (docs/specs/agent-role-model.md); omp / detached children
+      // are labelled from RIG_AGENT_ID without a flag.
       subagent?: string;
       // code-as-pdf: also attach the raw original file alongside the rendered
       // PDF (`--with-original`). Default is PDF-only for code/config files.

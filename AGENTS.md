@@ -58,8 +58,11 @@ I/O, fetch, signals, `bun:ffi`):
   name, or its cwd basename when the window is auto-renamed to a version/shell/launcher;
   outside tmux the harness session title; the harness title is the auto `--title` badge in
   tmux; explicit flag wins over
-  `TG_AGENT` env; there is NO env-based auto-detection — `CLAUDE_CODE_CHILD_SESSION` is not
-  a reliable main-vs-subagent signal; deprecated alias `--agent`; `--detect-agent` prints
+  `TG_AGENT` env, which wins over the launcher's `RIG_AGENT_ID` (omp sets it on its task
+  subagents; detached children get it from their launcher) and `RIG_DETACHED_AGENT=1`
+  (→ `detached`); `CLAUDE_CODE_CHILD_SESSION` is NOT a role signal; Claude Code / Codex /
+  opencode IN-PROCESS subagents share their parent's env and MUST pass the flag; deprecated
+  alias `--agent`; `--detect-agent` prints
   the resolved `[window]` label (+ `title: <secondary>`); NOT the same flag as `tg-ctl`'s own `--agent`),
   `--reply-to <message_id>` (thread the message UNDER an inbound one — `reply_to_message_id`
   on sendMessage, `reply_parameters` on sendRichMessage; the `answer` tag requires it),
@@ -131,11 +134,15 @@ never counted as lost: harnesses prune transcripts and reply-route log lines car
 
 ### Existing Features
 
-- `features/agent-detect/` — pure `detectAgentLabel(env)`: the historical env-based
-  subagent auto-detection (tg#6254). NO LONGER wired into the outbound `[subagent]` label
-  (removed because `CLAUDE_CODE_CHILD_SESSION` mislabelled the orchestrator itself); kept
-  because open PRs still evolve it. The outbound subagent bracket is explicit-only now
-  (`--subagent`/`TG_AGENT`). The `[window]` label is the primary name from
+- `features/agent-role/` — pure coordinator-vs-subagent model (`docs/specs/agent-role-model.md`,
+  the single source every consumer follows): `senderRole` (outbound `tg`: `--subagent` >
+  `TG_AGENT` > `RIG_AGENT_ID` > `RIG_DETACHED_AGENT=1` → `detached`), `hookPayloadRole` (a Claude
+  Code / Codex hook's TOP-LEVEL `agent_id`/`agent_type`, wired into `hook-normalize` so
+  `ButtonRequest.subagent` comes from the payload first), `envRole` (hook process env),
+  `opencodeSessionRole` (`session.parentID`; adapter-only until the daemon subscribes to opencode
+  SSE, tg-cli#533). There is NO positive "I am the coordinator" marker
+  and NO guessing from `CLAUDE_CODE_CHILD_SESSION` (set on the main thread too); the old
+  `features/agent-detect/` is deleted. The `[window]` label is the primary name from
   `resolveSessionName` (`features/tg-ctl/session-name.ts`).
 - `features/auto-attach/` — path detection → attach files, R1-R4 text rules, line-spec quotes,
   worktree-aware + recursive path resolution, transmitter with Telegram message/caption limits.

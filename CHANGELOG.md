@@ -3,6 +3,28 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.32
+
+- **One coordinator-vs-subagent model (`docs/specs/agent-role-model.md`).** A run is a subagent
+  only when a trusted signal says so: the harness's own top-level `agent_id`/`agent_type` on a
+  Claude Code / Codex hook payload, an opencode session's `parentID`, or the launcher env
+  (`RIG_AGENT_ID=<name>`, `RIG_DETACHED_AGENT=1`; omp sets the former on every task subagent's
+  shell and clears it on the main session's). Everything else is the coordinator — there is no
+  positive "I am the coordinator" marker to leak into children. New `features/agent-role/` with
+  per-harness fixtures (`tests/fixtures/agent-role/`: a live Claude Code subagent capture, omp
+  subagent/main bash env, Codex hook schema + recorded rollouts, opencode.db sessions).
+- **`tg` labels omp/detached subagents with no flag.** The `[subagent]` bracket precedence is now
+  `--subagent` > `TG_AGENT` > `RIG_AGENT_ID` > `RIG_DETACHED_AGENT=1` (→ `[detached]`). Claude
+  Code / Codex / opencode in-process subagents share their parent's env, so they still pass
+  `--subagent`.
+- **`tg-ctl ask` cards name the real subagent.** `ButtonRequest.subagent` comes from the hook
+  payload's top-level `agent_id` first (label `<agent_type>#<last 8 id chars>`), then the hook process
+  env. The `features/agent-detect/` auto-detection is deleted: `tg-ctl ask` still ran it, and
+  `CLAUDE_CODE_CHILD_SESSION=1` is set on the Claude Code MAIN thread too, so every permission
+  card, coordinator's included, was labelled `subagent=subagent`. The opencode adapter takes the
+  session record (`opencodeEventToButtonRequest(event, session)`) and labels a child session's ask;
+  the daemon has no opencode SSE subscriber yet (tg-cli#533), so that path is adapter-only.
+
 ## 1.54.31
 
 - **Claude Code and Codex are tmux-only (#456).** `/agent <name> <text>` (or a bare

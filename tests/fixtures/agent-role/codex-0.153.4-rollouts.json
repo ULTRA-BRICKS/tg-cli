@@ -1,0 +1,42 @@
+{
+  "_source": "session_meta payloads (first line) of three REAL rollouts recorded by Codex 0.153.4 under ~/.codex/sessions/2026/09/13 (home path anonymized): the user's own thread, a spawn_agent subagent thread (nickname Anscombe) and that subagent's guardian-review thread. `session_id` is the ROOT thread for all three; `id` is the thread itself; a spawned thread's `id` is the `agent_id` its hook payloads carry (codex-0.153.4-hooks.json) while their `session_id` stays the parent's.",
+  "coordinator": {
+    "session_id": "01a09b1e-7e7a-70c1-bffe-ddd8f05e74b3",
+    "id": "01a09b1e-7e7a-70c1-bffe-ddd8f05e74b3",
+    "originator": "codex_exec",
+    "cli_version": "0.153.4",
+    "source": "exec",
+    "thread_source": "user"
+  },
+  "spawnedSubagent": {
+    "session_id": "01a09b1e-7e7a-70c1-bffe-ddd8f05e74b3",
+    "id": "01a09b1f-2948-77d1-b8fa-a84b096047ca",
+    "forked_from_id": "01a09b1e-7e7a-70c1-bffe-ddd8f05e74b3",
+    "parent_thread_id": "01a09b1e-7e7a-70c1-bffe-ddd8f05e74b3",
+    "originator": "codex_exec",
+    "cli_version": "0.153.4",
+    "source": {
+      "subagent": {
+        "thread_spawn": {
+          "parent_thread_id": "01a09b1e-7e7a-70c1-bffe-ddd8f05e74b3",
+          "depth": 1,
+          "agent_path": "/root/release_pr792",
+          "agent_nickname": "Anscombe",
+          "agent_role": null
+        }
+      }
+    },
+    "thread_source": "subagent",
+    "agent_nickname": "Anscombe",
+    "agent_path": "/root/release_pr792"
+  },
+  "guardianReview": {
+    "session_id": "01a09b1e-7e7a-70c1-bffe-ddd8f05e74b3",
+    "id": "01a09b1f-2a19-7f63-9020-520dc556436e",
+    "parent_thread_id": "01a09b1f-2948-77d1-b8fa-a84b096047ca",
+    "originator": "codex_exec",
+    "cli_version": "0.153.4",
+    "source": { "subagent": { "other": "guardian" } },
+    "thread_source": "guardian_review"
+  }
+}

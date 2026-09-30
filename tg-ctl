@@ -16,7 +16,7 @@ import { dlopen, FFIType } from "bun:ffi"
 import { appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "fs"
 import { createConnection, createServer, type Server, type Socket } from "net"
 import { basename, dirname, isAbsolute, join, resolve } from "path"
-import { detectAgentLabel } from "./features/agent-detect/detect"
+import { envRole } from "./features/agent-role/role"
 import {
   buildAgentSelectMessage,
   dedupeCandidates,
@@ -5479,7 +5479,7 @@ async function askDaemon(ctx: Ctx): Promise<void> {
     cwd: process.cwd(),
     sessionName: tmuxSessionName(),
     windowName: tmuxWindowName(),
-    subagent: detectAgentLabel(process.env) || undefined,
+    subagent: envRole(process.env).label,
     invocationNonce: crypto.randomUUID(),
   }
   const reqs = normalizeHookRequests(payload, env)

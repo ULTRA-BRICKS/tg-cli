@@ -14,7 +14,7 @@
 // explicit tag badge, and/or an explicit `--title`. `[agent]` reuses the SAME
 // styling as `[window]` (styleWindowName) — just another bracketed label:
 //   ✳️ [window]                          (no agent, no tag, no title)
-//   ✳️ [window] [agent]                  (--agent / auto-detected subagent)
+//   ✳️ [window] [agent]                  (--subagent / TG_AGENT / RIG_AGENT_ID subagent)
 //   ✳️ [window] <title>                  (--title only)
 //   ✳️ [window] 🔵 ANSWER               (--tag only, unicode fallback)
 //   ✳️ [window] [agent] 🔵 ANSWER — <title>  (agent + tag + title, all compose)
@@ -35,10 +35,10 @@ export function buildPrefix(opts: {
   aiEmoji: string;
   model: string;
   tmuxWindow: string;
-  // Explicit SUBAGENT self-label (`--subagent <name>` / `TG_AGENT`). Rendered as
-  // its own bracket right after `[window]`, styled identically (styleWindowName)
-  // — see the header-shape table above. There is no env-based auto-detection;
-  // the MAIN agent passes nothing and gets no second bracket.
+  // SUBAGENT label (`--subagent <name>` / `TG_AGENT` / the launcher's `RIG_AGENT_ID`,
+  // resolved by features/agent-role). Rendered as its own bracket right after
+  // `[window]`, styled identically (styleWindowName) — see the header-shape table
+  // above. The MAIN agent passes nothing and gets no second bracket.
   agentLabel?: string;
   // Explicit message tag (`--tag`). The CLI validates this to a lowercase-english
   // word (answer/decision/problem/report) before it reaches here; resolveTag
@@ -92,7 +92,7 @@ export function buildPrefix(opts: {
     if (styled.tag) forceHtml = true; // the <b> Cyrillic fallback forces HTML
   }
 
-  // --- Optional agent label (`--agent` / auto-detected) right after [window]. ---
+  // --- Optional subagent label (`--subagent` / env signals) right after [window]. ---
   // Same bracket styling as the window name — it is a sender-identity label,
   // not a differently-branded element, so it gets no special color/emoji.
   if (agentLabel) {

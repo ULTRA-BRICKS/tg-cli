@@ -526,7 +526,7 @@ into the pane) follows as the header title. Outside tmux the harness title IS th
 (falling back to the cwd project). This is the MAIN/orchestrator agent's identity; it
 never needs a flag. Check what the current shell resolves to: `tg --detect-agent`.
 
-**`[subagent]` — a subagent self-label, explicit.** Agent branding (above) identifies
+**`[subagent]` — a subagent label.** Agent branding (above) identifies
 which MODEL is talking; it cannot tell apart the several subagents an orchestrator fans
 work out to (Claude Code's Task tool and equivalents). A subagent adds a second bracket
 by passing its name explicitly:
@@ -542,11 +542,16 @@ same way (Sans-Serif Bold, `<b>` fallback for Cyrillic). `TG_AGENT` is the env
 equivalent (same effect as the flag; the explicit flag wins). The deprecated `--agent`
 alias still parses to the same field.
 
-**No env-based auto-detection.** Earlier versions tried to auto-detect a subagent from
-`CLAUDE_CODE_CHILD_SESSION` / Claude sidechain metadata, but that env is NOT a reliable
-main-vs-subagent signal (it appears on subprocesses of the main session too), so it
-mislabelled the orchestrator itself as a generic `[subagent]`. That path was removed: a
-subagent bracket now comes ONLY from an explicit `--subagent`/`TG_AGENT`.
+**Which signals label a subagent** (`docs/specs/agent-role-model.md`): precedence is
+`--subagent` > `TG_AGENT` > `RIG_AGENT_ID` > `RIG_DETACHED_AGENT=1` (→ `[detached]`). The last
+two are written by the harness or the launcher on the child process — omp sets
+`RIG_AGENT_ID` on each task subagent's shell (and clears it on the main session's), and
+detached children (`omp -p`, `claude -p`, `codex exec`, `opencode run` started by a rig
+launcher) get them at exec — so those subagents need no flag. Claude Code, Codex and
+opencode run their in-process subagents with the SAME environment as the coordinator, so
+those MUST pass `--subagent`. There is no positive "coordinator" marker, and
+`CLAUDE_CODE_CHILD_SESSION` is NOT a signal (Claude Code sets it on the main thread too —
+it once mislabelled the orchestrator as a generic `[subagent]`; that auto-detection is gone).
 
 Note: `tg-ctl`'s OWN `--agent <name>` is a DIFFERENT flag on a DIFFERENT binary, and
 comes in two shapes: `tg-ctl ask --agent codex` takes a CLOSED harness-kind selector

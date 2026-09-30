@@ -30,6 +30,7 @@ import { convertMdToPdf, isConvertibleMd, type ConvertDeps } from "./features/md
 import { applyCodePdfToPlan, convertCodeToPdf, resolveDevice } from "./features/code-pdf/convert"
 import { applyAutolink, linkifyTicketsCompound } from "./features/autolink-tasks/render"
 import { styleTaskTitle, styleWindowName } from "./features/prefix-style/style"
+import { senderRole } from "./features/agent-role/role"
 import {
   EMBEDDABLE_EMOJI_MAP,
   SUBSTRING_FALLBACK_EXCLUDED_KEYS,
@@ -216,11 +217,16 @@ Options:
                        agent needs NO flag — its [window] bracket already carries
                        the session name (the tmux window name, or its cwd basename
                        when the window is auto-renamed to a version/shell; outside
-                       tmux the harness session title). There is NO
-                       env-based subagent auto-detection: pass this flag to
-                       identify a subagent. Also: TG_AGENT env (same effect as the
-                       flag). Deprecated alias: --agent. Check the auto [window]
-                       label for the current shell: --detect-agent.
+                       tmux the harness session title). A subagent that
+                       dispatched itself as a separate process is labelled from
+                       its launcher env with no flag (RIG_AGENT_ID=<name>, or
+                       RIG_DETACHED_AGENT=1 → [detached]; omp sets RIG_AGENT_ID
+                       on its task subagents). Claude Code / Codex / opencode
+                       IN-PROCESS subagents share their parent's env, so they
+                       MUST pass this flag. Precedence: --subagent > TG_AGENT
+                       env > RIG_AGENT_ID > RIG_DETACHED_AGENT. Deprecated
+                       alias: --agent. Check the auto [window] label for the
+                       current shell: --detect-agent.
   --reply-to <id>      thread the outbound message UNDER an inbound Telegram
                        message (sets reply_to_message_id). The id is the inbound
                        message's Telegram message_id — the tg-ctl daemon surfaces
@@ -1062,14 +1068,15 @@ if (import.meta.main) {
   // finding). The session name is resolved from it after every guard below.
   let safeHarnessTitle = harnessTitle
 
-  // The optional SECOND `[name]` bracket is a SUBAGENT self-label — explicit
-  // only. `--subagent <name>` (parsed to `subagent`) wins; the `TG_AGENT` env is
-  // the same-precedence fallback for a subagent that sets it once in its shell.
-  // The MAIN/orchestrator agent passes neither and gets NO second bracket — its
-  // identity is the `[window]` label (the session's primary name) above. There is deliberately NO
-  // env-based auto-detection: `CLAUDE_CODE_CHILD_SESSION` is not a reliable
-  // main-vs-subagent signal, so a guessed `[subagent]` bracket is never emitted.
-  const AGENT_LABEL = subagent || env.TG_AGENT?.trim() || undefined
+  // The optional SECOND `[name]` bracket is a SUBAGENT label. `--subagent <name>`
+  // (parsed to `subagent`) wins, then the trusted subagent env signals: `TG_AGENT`,
+  // then the launcher's `RIG_AGENT_ID` / `RIG_DETACHED_AGENT=1` (omp sets the
+  // former on its task subagents) — docs/specs/agent-role-model.md. The
+  // MAIN/orchestrator agent passes neither and gets NO second bracket — its
+  // identity is the `[window]` label (the session's primary name) above. There is
+  // deliberately NO guessing: `CLAUDE_CODE_CHILD_SESSION` is set on a Claude Code
+  // main thread too, so it is never a role signal.
+  const AGENT_LABEL = senderRole(subagent, env).label
 
   // Forum-topic thread id (docs/specs/tg-forum-topics.md §8): the explicit
   // `--topic <id>` flag wins; otherwise fall back to the TG_TOPIC env (merged

@@ -20,6 +20,7 @@
 import type { AgentKind } from './types';
 import type { ButtonOption, ButtonRequest, ButtonRequestKind, DecisionLabels } from './questions';
 import { safeSliceEnd, truncateWithEllipsis } from './text-util';
+import { hookPayloadRole } from '../agent-role/role';
 
 export interface HookEnv {
   agent: AgentKind; // from the --agent flag the installer wrote (default claude)
@@ -66,6 +67,15 @@ function invocationSeed(p: Record<string, unknown>): string {
   if (typeof p.prompt_id === 'string' && p.prompt_id) return p.prompt_id;
   if (typeof p.turn_id === 'string' && p.turn_id) return p.turn_id;
   return '';
+}
+
+// The harness's own subagent identity on a RAW payload (top-level agent_id, written
+// by Claude Code / Codex only inside a spawned subagent) outranks the hook process
+// env label: a subagent inside a detached child keeps its own identity
+// (docs/specs/agent-role-model.md §4.2).
+function withPayloadRole(p: Record<string, unknown>, env: HookEnv): HookEnv {
+  const role = hookPayloadRole(p);
+  return role ? { ...env, subagent: role.label } : env;
 }
 
 function asRecord(v: unknown): Record<string, unknown> | null {
@@ -211,6 +221,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
     };
   }
 
+  const roleEnv = withPayloadRole(p, env);
   const cwd = typeof p.cwd === 'string' ? p.cwd : undefined;
   const session = typeof p.session_id === 'string' ? p.session_id.slice(0, 8) : '';
   const input = asRecord(p.tool_input);
@@ -251,7 +262,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       cwd: cwd ?? env.cwd,
       sessionName: env.sessionName,
       windowName: env.windowName,
-      subagent: env.subagent,
+      subagent: roleEnv.subagent,
       promptTurnId: env.invocationNonce,
     };
   }
@@ -261,7 +272,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
     if (!toolName) return null;
     const detail = input ? summarizeInput(toolName, input) : '';
     const question = detail ? `Allow ${toolName}? ${detail}` : `Allow ${toolName}?`;
-    const req = build(env, 'permission', `${session}:${invocationSeed(p)}:${env.invocationNonce}:perm:${toolName}:${detail}`, question, toolName, undefined, cwd, env.invocationNonce);
+    const req = build(roleEnv, 'permission', `${session}:${invocationSeed(p)}:${env.invocationNonce}:perm:${toolName}:${detail}`, question, toolName, undefined, cwd, env.invocationNonce);
     req.permissionEvent = permissionEventOf(p);
     if (input) req.toolInput = input;
     Object.assign(req, harnessOrigin(p));
@@ -314,6 +325,7 @@ function normalizeAskUserQuestions(p: Record<string, unknown>, env: HookEnv): Bu
   // are keyed by question text) — a malformed payload, so: local UI.
   const texts = questions.map((q) => asRecord(q)?.question);
   if (new Set(texts).size !== texts.length) return null;
+  const roleEnv = withPayloadRole(p, env);
   const cwd = typeof p.cwd === 'string' ? p.cwd : undefined;
   const session = typeof p.session_id === 'string' ? p.session_id.slice(0, 8) : '';
   const out: ButtonRequest[] = [];
@@ -334,7 +346,7 @@ function normalizeAskUserQuestions(p: Record<string, unknown>, env: HookEnv): Bu
     // index against the new options — review finding). A true re-fire of the
     // same call keeps the same id, so tg-cli#97 dedup/replay is unchanged.
     const seed = `${session}:${invocationSeed(p)}:q:${q.question}:${options.map((o) => o.label).join('\u001F')}`;
-    const req = build(env, 'question', seed, q.question, title, options, cwd, invocationSeed(p));
+    const req = build(roleEnv, 'question', seed, q.question, title, options, cwd, invocationSeed(p));
     // Carried so the answer envelope can echo the original input (schema-valid
     // wholesale) instead of a lossy rebuild — see buildClaudeQuestionAnswerOutput.
     req.toolInput = input;
