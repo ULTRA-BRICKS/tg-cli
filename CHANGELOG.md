@@ -3,6 +3,21 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.14
+
+- **Forum topics: one bot-created topic per session (#467).** With `control.topics` (or
+  `private_topics`) on, a registry session gets its own topic on its first outbound — a `tg` send
+  or a question/permission card — so idle sessions open none. The daemon is the only caller of
+  `createForumTopic`; the topic is stored as the session's `threadId` and bound in topics.json, so
+  replies in it route back to the session. A topic already bound to the session's pane is adopted
+  instead. `tg` needs no `--topic`/`TG_TOPIC`: with neither (and no `--reply-to`) it asks the
+  daemon over the hook socket which session it runs in and posts into that topic. A resumed or
+  restarted session keeps its topic and posts "📂 name — reattached" there. A topic that rejects a
+  post (fresh private topic, closed, deleted) gets one retry after 1 s, then the post goes to
+  General with a notice; a deleted topic (or one that keeps failing for 10 min) is recreated on the
+  next outbound, at most once per 24 h. The General fallback now also covers photos, documents and
+  albums, not just text.
+
 ## 1.54.13
 
 - **Forum topics: inbound triage replaces the spawn wizard (#457).** Creating a topic no longer

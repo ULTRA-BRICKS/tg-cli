@@ -47,8 +47,7 @@ const server = Bun.serve({
       const threadId = form.get('message_thread_id') as string | null;
       multipart.push({ method: url.pathname.split('/').pop() ?? '', threadId });
       if (rejectThread && threadId !== null) {
-        // Multipart has NO advisory fallback (documented limitation): a stale env
-        // topic makes the media send hard-fail, exactly as the docs say.
+        // The advisory fallback resends the upload without the thread.
         return Response.json({ ok: false, description: 'Bad Request: message thread not found' }, { status: 400 });
       }
       return Response.json({ ok: true, result: { message_id: 1 } });
@@ -163,10 +162,7 @@ test('--topic carries message_thread_id on the multipart --photo path too (end-t
   expect(photo?.threadId).toBe('7');
 });
 
-test('DOCUMENTED LIMIT: a --photo with a STALE TG_TOPIC hard-fails (no multipart advisory fallback)', async () => {
-  // The advisory General fallback covers text/rich sends only; a media send with
-  // a stale env topic still fails. This pins that documented behavior so it can't
-  // drift silently — if a future change adds multipart fallback, update this test.
+test('a --photo with a STALE TG_TOPIC falls back to General like a text send (multipart advisory fallback)', async () => {
   multipart = [];
   rejectThread = true;
   try {
@@ -184,10 +180,8 @@ test('DOCUMENTED LIMIT: a --photo with a STALE TG_TOPIC hard-fails (no multipart
       stderr: 'pipe',
     });
     await new Response(proc.stderr).text();
-    // Hard fail (non-zero) — NOT a silent General retry.
-    expect(await proc.exited).not.toBe(0);
-    const photo = multipart.find((m) => m.method === 'sendPhoto');
-    expect(photo?.threadId).toBe('88');
+    expect(await proc.exited).toBe(0);
+    expect(multipart.filter((m) => m.method === 'sendPhoto').map((m) => m.threadId)).toEqual(['88', null]);
   } finally {
     rejectThread = false;
   }

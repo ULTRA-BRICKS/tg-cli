@@ -171,7 +171,7 @@ import {
   type HookSessionSighting,
   type PendingHookSighting,
 } from "./features/tg-ctl/harness-sessions"
-import { reconcile, RENAME_DEBOUNCE_MS, sessionKey, type PendingRenames, type Registry, type RegistryEvent } from "./features/tg-ctl/session-registry"
+import { reconcile, RENAME_DEBOUNCE_MS, sessionKey, type PendingRenames, type Registry, type RegistryEvent, type SessionEntry, type SessionKey } from "./features/tg-ctl/session-registry"
 import { parseRegistry, rekeyStores, resolveLocatorToSession, runMigration, serializeRegistry, type MigrationIo, type MigrationStore } from "./features/tg-ctl/session-registry-store"
 import {
   checkPaneSession,
@@ -184,6 +184,19 @@ import {
   sessionAtPane,
   sessionDeliveryTarget,
 } from "./features/tg-ctl/session-target"
+import {
+  createTopicEnsurer,
+  findSessionForCard,
+  findSessionForLookup,
+  HARNESS_AGENT,
+  noteTopicMiss,
+  paneLocatorOf,
+  parseResolveSessionRequest,
+  parseTopicResult,
+  topicTitleFor,
+  type SessionLookup,
+} from "./features/tg-ctl/session-topics"
+import { isThreadRejection, isTopicDeletedError } from "./features/transport/telegram"
 import { installOmpLiveExtension, runOmpLiveCommand } from "./tools/omp-live-cli.mjs"
 import {
   DEFAULT_TASK_VIEW,
@@ -740,12 +753,17 @@ async function sendMessage(ctx: Ctx, text: string, extra: Record<string, unknown
   return typeof messageId === "number" ? messageId : null
 }
 
-// Shared by every initial-post call site (forwardAndPostQuestion, ompPermissionSink) so the
-// parse_mode/reply_markup shape can't drift between them — a divergent copy is exactly how a
-// hatch card's parse_mode threading silently stops matching between the two flows.
-async function sendButtonCard(ctx: Ctx, payload: ButtonMessagePayload): Promise<number | null> {
+// Shared by every initial-post call site so the parse_mode/reply_markup shape can't drift
+// between them — a divergent copy is exactly how a hatch card's parse_mode threading silently
+// stops matching between flows.
+// `sessionKey`: the card's registry session, when the payload is threaded into its topic — the
+// send then gets the §4.5 thread-not-found fallback to General.
+async function sendButtonCard(ctx: Ctx, payload: ButtonMessagePayload, sessionKey: SessionKey | null = null): Promise<number | null> {
   const extra: Record<string, unknown> = { reply_markup: payload.reply_markup }
   if (payload.parse_mode) extra.parse_mode = payload.parse_mode
+  if (payload.message_thread_id !== undefined && sessionKey !== null) {
+    return sendToSessionTopic(ctx, sessionKey, payload.message_thread_id, payload.text, extra)
+  }
   return sendMessage(ctx, payload.text, extra)
 }
 
@@ -1533,13 +1551,228 @@ function scanSessionRegistry(ctx: Ctx, discovery: NonNullable<typeof liveOmpCach
       for (const line of migration.log) log(`session-registry: ${line}`)
       sessionRegistry = migration.registry
     }
-    const serialized = serializeRegistry(sessionRegistry)
-    if (serialized !== sessionRegistryWritten) {
-      atomicWrite(ctx.paths.sessions, serialized)
-      sessionRegistryWritten = serialized
-    }
+    persistSessionRegistry(ctx)
+    followSessionTopics(ctx, prev, events)
   } catch (err) {
     log(`session-registry: scan failed: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+function persistSessionRegistry(ctx: Ctx): void {
+  if (!sessionRegistry) return
+  const serialized = serializeRegistry(sessionRegistry)
+  if (serialized === sessionRegistryWritten) return
+  atomicWrite(ctx.paths.sessions, serialized)
+  sessionRegistryWritten = serialized
+}
+
+function currentRegistry(ctx: Ctx): Registry {
+  sessionRegistry ??= parseRegistry(readFileOrNull(ctx.paths.sessions))
+  return sessionRegistry
+}
+
+// --- One forum topic per session (docs/specs/session-registry-and-topics.md §4.2–§4.5, tg-cli#467) ---
+// The daemon is the ONLY caller of createForumTopic. A session's topic is created lazily on its
+// first outbound — a `tg` send (the hook-socket `resolve-session` ask) or a question/permission
+// card — so idle sessions open no topics. It is stored as the registry entry's `threadId` and
+// mirrored into topics.json as a bound binding, which is what the inbound triage (§4.4) routes
+// by. A resumed or restarted session keeps its topic and says "reattached" there.
+// How long an outbound waits for its topic before posting to General (the create goes on, and
+// the next outbound uses the topic): `tg` gives the lookup 2 s in all.
+const TOPIC_WAIT_MS = 1200
+// Fresh private-chat topics reject bot writes for a moment (telegram-bot-api #905): retry once.
+const TOPIC_THREAD_RETRY_MS = 1000
+// A bot without topic capability (or a failing createForumTopic) is re-asked at most this often.
+const TOPIC_CAPABILITY_TTL_MS = 10 * 60_000
+// Per entry, when its topic was last recreated after a deletion (§4.2's 24 h cap). Held in
+// memory: a daemon restart forgets it, which at worst allows one extra recreate (tg-cli#498).
+const topicRecreatedAt = new Map<SessionKey, number>()
+let topicCapability: { at: number; ok: boolean } | null = null
+let topicEnsurer: ((key: SessionKey) => Promise<number | null>) | null = null
+
+function liveEntry(ctx: Ctx, key: string): SessionEntry | null {
+  return currentRegistry(ctx).sessions.find((e) => e.key === key && e.state === "live") ?? null
+}
+
+// Replace one entry's topic fields and persist (the daemon is sessions.json's only writer).
+function patchSessionEntry(ctx: Ctx, key: SessionKey, patch: Partial<Pick<SessionEntry, "threadId" | "topicMisses">>): SessionEntry | null {
+  const reg = currentRegistry(ctx)
+  const prev = reg.sessions.find((e) => e.key === key)
+  if (!prev) return null
+  const next = { ...prev, ...patch }
+  sessionRegistry = { ...reg, sessions: reg.sessions.map((e) => (e === prev ? next : e)) }
+  try {
+    persistSessionRegistry(ctx)
+  } catch (err) {
+    log(`session topics: registry write failed: ${err}`)
+  }
+  return next
+}
+
+// Mirror an entry's topic into topics.json as a bound binding on its current pane locator, so
+// the inbound triage delivers the topic's messages to it. No write when already so bound.
+function bindTopicToEntry(ctx: Ctx, threadId: number, entry: SessionEntry): void {
+  const locator = paneLocatorOf(entry)
+  if (!locator) return
+  const topics = parseTopics(readFileOrNull(ctx.paths.topics))
+  const existing = findTopic(topics, threadId)
+  if (existing?.status === "bound" && existing.paneId === locator && existing.path === entry.cwd) return
+  const ts = Math.floor(Date.now() / 1000)
+  const binding = existing
+    ? { ...markBound(existing, locator, ts), path: entry.cwd }
+    : attachTopic(threadId, { paneId: locator, name: topicTitleFor(entry), path: entry.cwd, harness: HARNESS_AGENT[entry.harness] }, ts)
+  writeSessionTopics(ctx, appendTopic(topics, binding))
+}
+
+function writeSessionTopics(ctx: Ctx, topics: TopicBinding[]): void {
+  try {
+    atomicWrite(ctx.paths.topics, serializeTopics(topics))
+  } catch (err) {
+    log(`session topics: topics.json write failed: ${err}`)
+  }
+}
+
+// Private-chat topics need the bot's threaded mode (getMe.has_topics_enabled); a supergroup
+// forum is not gated by it. Cached for TOPIC_CAPABILITY_TTL_MS either way.
+async function topicsCapable(ctx: Ctx): Promise<boolean> {
+  if (ctx.chatId < 0) return true
+  if (topicCapability && Date.now() - topicCapability.at < TOPIC_CAPABILITY_TTL_MS) return topicCapability.ok
+  const result = (await botPost(ctx, "getMe", {}))?.result
+  const ok = !(result && typeof result === "object" && "has_topics_enabled" in result && result.has_topics_enabled === false)
+  topicCapability = { at: Date.now(), ok }
+  if (!ok) log("session topics: getMe.has_topics_enabled=false — sessions stay in General")
+  return ok
+}
+
+async function createSessionTopic(ctx: Ctx, key: SessionKey): Promise<number | null> {
+  const entry = liveEntry(ctx, key)
+  if (!entry) return null
+  // A topic already bound to this session's pane (the attach picker, a flat /new spawn, a
+  // binding from before the registry) is adopted, never duplicated. Its cwd must match: a pane
+  // id is reused freely.
+  const locator = paneLocatorOf(entry)
+  const own = locator ? topicForPane(parseTopics(readFileOrNull(ctx.paths.topics)), locator) : null
+  if (own && (own.path === undefined || own.path === entry.cwd)) {
+    patchSessionEntry(ctx, key, { threadId: own.threadId })
+    log(`session topics: ${key} adopted topic ${own.threadId}`)
+    return own.threadId
+  }
+  if (!(await topicsCapable(ctx))) return null
+  const resp = await botPostResult(ctx, "createForumTopic", { chat_id: ctx.chatId, name: topicTitleFor(entry) })
+  const result = resp.ok ? resp.json.result : undefined
+  const threadId = result && typeof result === "object" && "message_thread_id" in result ? result.message_thread_id : undefined
+  if (typeof threadId !== "number") {
+    log(`session topics: createForumTopic for ${key} failed: ${resp.ok ? "no message_thread_id" : resp.description}`)
+    // Only a capability answer (not a forum / topics off / no rights) holds every session in
+    // General for the TTL; a transient failure (429, 5xx, network) retries on the next outbound.
+    if (!resp.ok && (isThreadRejection(resp.description) || /not enough rights/i.test(resp.description))) {
+      topicCapability = { at: Date.now(), ok: false }
+    }
+    return null
+  }
+  // Logged BEFORE the write: a crash in between leaves one orphan topic, findable here (§4.2).
+  log(`topic created ${threadId} for ${key}`)
+  const bound = patchSessionEntry(ctx, key, { threadId, topicMisses: null })
+  if (bound) bindTopicToEntry(ctx, threadId, bound)
+  return threadId
+}
+
+// The session's topic, created on first use; null when topics are off or unavailable, or when
+// the create takes longer than TOPIC_WAIT_MS (the caller then posts to General).
+function sessionTopic(ctx: Ctx, key: SessionKey): Promise<number | null> {
+  if (!ctx.cfg.topics && !ctx.cfg.privateTopics) return Promise.resolve(null)
+  topicEnsurer ??= createTopicEnsurer({
+    threadIdOf: (k) => currentRegistry(ctx).sessions.find((e) => e.key === k)?.threadId ?? null,
+    create: (k) => createSessionTopic(ctx, k),
+  })
+  return Promise.race([topicEnsurer(key), Bun.sleep(TOPIC_WAIT_MS).then(() => null)])
+}
+
+// A threaded send fell back to General (§4.5): count the miss, recreate the topic once it is
+// proven gone, and tell the human why the session posts in General (once per miss run).
+async function noteSessionTopicMiss(ctx: Ctx, key: SessionKey, threadId: number, description: string): Promise<void> {
+  const entry = liveEntry(ctx, key)
+  if (!entry || entry.threadId !== threadId) return
+  const now = Date.now()
+  const { misses, recreate } = noteTopicMiss(entry.topicMisses, now, {
+    deleted: isTopicDeletedError(description),
+    lastRecreatedAt: topicRecreatedAt.get(key) ?? null,
+  })
+  const name = entry.name.primary || entry.key
+  if (recreate) {
+    topicRecreatedAt.set(key, now)
+    patchSessionEntry(ctx, key, { threadId: null, topicMisses: null })
+    writeSessionTopics(ctx, parseTopics(readFileOrNull(ctx.paths.topics)).filter((t) => t.threadId !== threadId))
+    log(`session topics: topic ${threadId} of ${key} is gone (${description}) — recreating on the next outbound`)
+    await sendMessage(ctx, `⚠️ [${name}] its topic is gone — posted here; a new topic opens with its next message`)
+    return
+  }
+  patchSessionEntry(ctx, key, { topicMisses: misses })
+  log(`session topics: topic ${threadId} of ${key} rejected a send (${description}) — miss ${misses?.count ?? 0}, posted to General`)
+  if (misses?.count === 1) await sendMessage(ctx, `⚠️ [${name}] its topic is not accepting messages (${description}) — posting here in General for now`)
+}
+
+function clearSessionTopicMisses(ctx: Ctx, key: SessionKey): void {
+  if (liveEntry(ctx, key)?.topicMisses) patchSessionEntry(ctx, key, { topicMisses: null })
+}
+
+// Post into a session's topic with the private-topic fallback (§4.5): a thread rejection is
+// retried once after 1 s; a second one posts to General (after the notice) and counts a miss.
+// A threaded success clears the miss counter. Any other failure returns null, like sendMessage.
+// The CLI side of the same fallback is `send()` in features/transport/telegram.ts
+// (`threadRetryDelayMs`); a change to what counts as a rejection belongs in both.
+async function sendToSessionTopic(ctx: Ctx, key: SessionKey, threadId: number, text: string, extra: Record<string, unknown> = {}): Promise<number | null> {
+  const body = { chat_id: ctx.chatId, text, ...extra, message_thread_id: threadId }
+  let resp = await botPostResult(ctx, "sendMessage", body)
+  if (!resp.ok && isThreadRejection(resp.description) && !isTopicDeletedError(resp.description)) {
+    await Bun.sleep(TOPIC_THREAD_RETRY_MS)
+    resp = await botPostResult(ctx, "sendMessage", body)
+  }
+  if (resp.ok) {
+    clearSessionTopicMisses(ctx, key)
+    const result = resp.json.result
+    const messageId = result && typeof result === "object" && "message_id" in result ? result.message_id : undefined
+    return typeof messageId === "number" ? messageId : null
+  }
+  if (!isThreadRejection(resp.description) && !isTopicDeletedError(resp.description)) return null
+  await noteSessionTopicMiss(ctx, key, threadId, resp.description)
+  return sendMessage(ctx, text, extra)
+}
+
+// hook-socket `resolve-session` (§4.3): which live session is this `tg` in, and its topic.
+async function handleResolveSession(ctx: Ctx, socket: Socket, q: SessionLookup): Promise<void> {
+  let entry = findSessionForLookup(currentRegistry(ctx), q)
+  // A session that started since the last scan: scan now, off the 30 s cadence.
+  if (!entry) {
+    const fresh = refreshSessionRegistry()
+    entry = fresh ? findSessionForLookup(fresh, q) : null
+  }
+  const threadId = entry ? await sessionTopic(ctx, entry.key) : null
+  const answer = entry ? { key: entry.key, name: entry.name.primary, threadId } : { key: null, name: null, threadId: null }
+  socket.end(`${JSON.stringify(answer)}\n`)
+}
+
+// Scan follow-up: a session that moved or came back keeps its topic — the binding follows its
+// new pane locator — and a new process of it (resume, restart) posts "reattached" there. A
+// tmux move of the same process says nothing.
+function followSessionTopics(ctx: Ctx, prev: Registry, events: RegistryEvent[]): void {
+  if (!ctx.cfg.topics && !ctx.cfg.privateTopics) return
+  // Forget the recreate cap of entries the registry has dropped.
+  const sessions = currentRegistry(ctx).sessions
+  for (const key of topicRecreatedAt.keys()) {
+    if (!sessions.some((e) => e.key === key)) topicRecreatedAt.delete(key)
+  }
+  for (const ev of events) {
+    if (ev.kind !== "readopted" && ev.kind !== "relocated") continue
+    const entry = liveEntry(ctx, ev.key)
+    if (!entry || entry.threadId === null) continue
+    const threadId = entry.threadId
+    bindTopicToEntry(ctx, threadId, entry)
+    const before = prev.sessions.find((e) => e.key === ev.key)
+    if (ev.kind === "readopted" || before?.locators.pid !== entry.locators.pid) {
+      log(`session topics: ${entry.key} reattached to topic ${threadId}`)
+      void sendToSessionTopic(ctx, entry.key, threadId, `📂 ${entry.name.primary || entry.key} — reattached`)
+    }
   }
 }
 
@@ -4028,8 +4261,13 @@ async function forwardAndPostQuestion(
   rt.pending.set(pendingKey, entry)
   const conn = armPendingSocketClose(ctx, rt, entry, pendingKey)
 
-  const payload = buildButtonMessage(ctx.chatId, req)
-  const messageId = await sendButtonCard(ctx, payload)
+  // The card goes into its session's topic (spec §4.3), created on this first card if need be.
+  // The asking session is req.sessionKey (resolved on arrival, §2.6), else looked up by origin/pane.
+  const cardSession = (req.sessionKey ? liveEntry(ctx, req.sessionKey) : null)
+    ?? findSessionForCard(currentRegistry(ctx), { agent: req.agent, sessionId: req.origin?.sessionId, paneId: req.paneId })
+  const threadId = cardSession ? await sessionTopic(ctx, cardSession.key) : null
+  const payload = buildButtonMessage(ctx.chatId, req, threadId)
+  const messageId = await sendButtonCard(ctx, payload, threadId !== null && cardSession ? cardSession.key : null)
   if (messageId === null) {
     // botPost already logged the low-level send failure; tie it to THIS abandoned
     // forward so the drop is greppable. No card posted → nothing to late-deliver.
@@ -4137,6 +4375,24 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
   }
   if (parsedLine && typeof parsedLine === "object" && (parsedLine as { tgctl?: unknown }).tgctl === "verify-grant") {
     await handleVerifyGrantRequest(ctx, rt, socket, parsedLine as Record<string, unknown>)
+    return
+  }
+  // `tg`'s session-topic lines (spec §4.3/§4.5, tg-cli#467), also dispatched before
+  // normalization. An old daemon drops them as unparsable with a `null` reply, which `tg`
+  // reads as "no topic" and posts to General.
+  const lookup = parseResolveSessionRequest(parsedLine)
+  if (lookup) {
+    await handleResolveSession(ctx, socket, lookup)
+    return
+  }
+  const topicResult = parseTopicResult(parsedLine)
+  if (topicResult) {
+    socket.end()
+    const entry = liveEntry(ctx, topicResult.key)
+    if (entry?.threadId === topicResult.threadId) {
+      if (topicResult.ok) clearSessionTopicMisses(ctx, entry.key)
+      else await noteSessionTopicMiss(ctx, entry.key, topicResult.threadId, topicResult.description)
+    }
     return
   }
   let req: ButtonRequest | null = null

@@ -320,8 +320,8 @@ control:
 ```
 
 Default **OFF**: with the flag off, a forum-topic message falls through to the normal flat
-routing, so existing 1:1 behaviour is unchanged. What's wired today is the **routing half** — an
-inbound topic message routes to its bound pane.
+routing, so existing 1:1 behaviour is unchanged. With it on, each session posts into its own
+topic and an inbound topic message routes to its bound pane.
 
 Caveats while this is experimental:
 
@@ -336,9 +336,12 @@ Caveats while this is experimental:
   session.
 - **A gone session answers, it does not respawn.** A message in a topic whose session exited gets
   "`<name>` is not running — resume with …"; nothing is delivered elsewhere.
-- **An agent's own `tg` replies** thread into a topic only with `tg --topic <id>` / `TG_TOPIC`
-  (a flat `/new` with `private_topics` stamps it); a `TG_TOPIC` stale id falls back to General for
-  text sends.
+- **An agent's own posts go to its session's topic.** Each session gets one bot-created topic on
+  its first `tg` send or question/permission card; `tg` finds it by asking the daemon, so no
+  `--topic`/`TG_TOPIC` is needed (either one still overrides, and `--reply-to` stays under the
+  replied message). A resumed session keeps its topic and says "reattached" there. A topic that
+  rejects a post is retried once, then the post (text or media) goes to General with a notice; a
+  deleted topic is recreated on the next post.
 
 See `docs/specs/tg-forum-topics.md` (§9 increment plan) for the design of this shipped behaviour. It
 is superseded by `docs/specs/session-registry-and-topics.md` (one bot-created topic per existing

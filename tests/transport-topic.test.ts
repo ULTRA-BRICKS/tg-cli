@@ -307,3 +307,95 @@ test('readErrorDescription returns the raw text on a non-JSON HTTP error, null o
   expect(await readErrorDescription(resp(false, '<html>502 Bad Gateway</html>'))).toBe('<html>502 Bad Gateway</html>');
   expect(await readErrorDescription(resp(true, 'not json but 2xx'))).toBeNull();
 });
+
+// --- session-resolved topic (tg-cli#467, spec §4.5): retry once, then General, then stay there ---
+// A fetch stub whose thread-carrying sends are rejected `rejections` times (JSON or multipart),
+// recording whether each send carried the thread.
+function installCountingRejectFetch(rejections: number, description = 'Bad Request: message thread not found'): Array<{ threaded: boolean; form: boolean }> {
+  const sent: Array<{ threaded: boolean; form: boolean }> = [];
+  let left = rejections;
+  let nextId = 300;
+  globalThis.fetch = (async (_url: string, init?: { body?: unknown }) => {
+    const body = init?.body;
+    const form = body instanceof FormData;
+    const threaded = body instanceof FormData ? body.has('message_thread_id') : 'message_thread_id' in JSON.parse(String(body));
+    sent.push({ threaded, form });
+    if (threaded && left > 0) {
+      left--;
+      return mockResponse(false, { ok: false, description });
+    }
+    return mockResponse(true, { ok: true, result: { message_id: nextId++ } });
+  }) as unknown as typeof fetch;
+  return sent;
+}
+
+test('a resolved topic that rejects once is retried after the delay and stays threaded', async () => {
+  const sent = installCountingRejectFetch(1);
+  const fallbacks: string[] = [];
+  const t = createTelegramTransport({
+    ...CTX,
+    messageThreadId: 5,
+    threadIdAdvisory: true,
+    threadRetryDelayMs: 1,
+    onThreadFallback: (d) => void fallbacks.push(d),
+  });
+  await t.sendMessage('first send into a fresh private topic', 'plain');
+  expect(sent).toEqual([
+    { threaded: true, form: false },
+    { threaded: true, form: false },
+  ]);
+  expect(fallbacks).toEqual([]);
+});
+
+test('a resolved topic rejected twice lands in General, reports the fallback once, and later parts skip the topic', async () => {
+  const sent = installCountingRejectFetch(2);
+  const fallbacks: string[] = [];
+  const t = createTelegramTransport({
+    ...CTX,
+    messageThreadId: 5,
+    threadIdAdvisory: true,
+    threadRetryDelayMs: 1,
+    onThreadFallback: (d) => void fallbacks.push(d),
+  });
+  await t.sendMessage('part 1', 'plain');
+  await t.sendMessage('part 2', 'plain');
+  expect(sent).toEqual([
+    { threaded: true, form: false },
+    { threaded: true, form: false },
+    { threaded: false, form: false },
+    { threaded: false, form: false },
+  ]);
+  expect(fallbacks).toEqual(['Bad Request: message thread not found']);
+});
+
+test('a deleted resolved topic (TOPIC_ID_INVALID) lands in General at once, without the retry', async () => {
+  const sent = installCountingRejectFetch(2, 'Bad Request: TOPIC_ID_INVALID');
+  const fallbacks: string[] = [];
+  const t = createTelegramTransport({
+    ...CTX,
+    messageThreadId: 5,
+    threadIdAdvisory: true,
+    threadRetryDelayMs: 1,
+    onThreadFallback: (d) => void fallbacks.push(d),
+  });
+  await t.sendMessage('into a deleted topic', 'plain');
+  expect(sent).toEqual([
+    { threaded: true, form: false },
+    { threaded: false, form: false },
+  ]);
+  expect(fallbacks).toEqual(['Bad Request: TOPIC_ID_INVALID']);
+});
+
+test('an advisory thread rejection on a photo upload falls back to General instead of failing the send', async () => {
+  const sent = installCountingRejectFetch(1);
+  const fallbacks: string[] = [];
+  const t = createTelegramTransport({ ...CTX, messageThreadId: 5, threadIdAdvisory: true, onThreadFallback: (d) => void fallbacks.push(d) });
+  await t.sendPhoto(memItem('a.png'), 'cap', 'plain');
+  await t.sendMediaGroup('photo', [memItem('a.png'), memItem('b.png')], 'cap', 'plain');
+  expect(sent).toEqual([
+    { threaded: true, form: true },
+    { threaded: false, form: true },
+    { threaded: false, form: true },
+  ]);
+  expect(fallbacks).toHaveLength(1);
+});

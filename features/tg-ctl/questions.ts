@@ -171,6 +171,8 @@ export interface ButtonMessagePayload {
   // top, everything else collapsed in a <blockquote expandable>). Every other kind stays plain
   // text, this field unset, exactly as before.
   parse_mode?: 'HTML';
+  // The forum topic of the card's session (spec §4.3, tg-cli#467); absent → General.
+  message_thread_id?: number;
   reply_markup: {
     inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
   };
@@ -344,11 +346,13 @@ export function questionCapability(agent: AgentKind): QuestionCapability {
   }
 }
 
-export function buildButtonMessage(chatId: number, req: ButtonRequest): ButtonMessagePayload {
+// `threadId`: the asking session's forum topic, when it has one — the card is posted there.
+export function buildButtonMessage(chatId: number, req: ButtonRequest, threadId: number | null = null): ButtonMessagePayload {
   return {
     chat_id: chatId,
     text: buildQuestionText(req),
     parse_mode: hatchParseMode(req),
+    ...(threadId !== null ? { message_thread_id: threadId } : {}),
     reply_markup: {
       inline_keyboard: buildInlineKeyboard(req),
     },

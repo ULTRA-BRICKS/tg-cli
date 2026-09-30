@@ -76,6 +76,7 @@ import { parseRegistry } from "./features/tg-ctl/session-registry-store"
 import { resolveRouteSession, type RouteOrigin } from "./features/tg-ctl/session-target"
 import { resolveSessionName, titleFromPaneTitle } from "./features/tg-ctl/session-name"
 import { installSkill } from "./features/install-skill/install"
+import { askDaemon, parseResolvedSession, tmuxServerPidFromEnv, type ResolvedSession } from "./features/cli/session-topic"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
 import { planLineSpecs } from "./features/auto-attach/line-spec"
 import { buildSendPlan } from "./features/auto-attach/normalize"
@@ -111,6 +112,9 @@ import {
   runGitReal,
 } from "./features/auto-attach/worktree"
 import { isEscalationTag } from "./features/render/tag"
+// How long `tg` waits for the daemon's session-topic answer (or its result ack) before
+// posting to General as before (the daemon answers within ~1.2 s, spec §4.3).
+const SESSION_LOOKUP_TIMEOUT_MS = 2000
 
 // Shared verdict for BOTH escalation-format checks in this file (the parse-time
 // warning attached by parseArgs, and the --table final-body check): print the
@@ -227,8 +231,9 @@ Options:
                        outbound message so an agent's reply threads into its
                        bound topic instead of General (forum chats only). Falls
                        back to the TG_TOPIC env when the flag is absent; the flag
-                       wins. No flag and no TG_TOPIC → posts to General (today's
-                       behavior).
+                       wins. With neither (and no --reply-to), a tg inside a
+                       registry session posts into that session's own topic when
+                       control.topics is on; otherwise to General.
   --table              read delimited rows from STDIN (TSV, or "a | b" per line),
                        render an aligned monospace table wrapped in <pre>, and
                        send it. The plain FALLBACK grid; a REAL native bordered
@@ -2124,6 +2129,32 @@ if (import.meta.main) {
     }
   }
 
+  // Session topic (docs/specs/session-registry-and-topics.md §4.3, tg-cli#467): with no
+  // --topic / TG_TOPIC, ask the daemon which registry session this `tg` runs in; it answers
+  // with that session's topic, creating it on the first ask. Skipped for a --reply-to send
+  // (the reply belongs under the message it answers, wherever that is), outside any session,
+  // and when topics are off. The thread is ADVISORY: a rejection retries once after 1 s,
+  // then falls back to General, and the outcome is reported so the daemon counts misses.
+  let resolvedSession: ResolvedSession | null = null
+  let topicFallback: string | null = null
+  const ctlCfg = resolveControlConfig(parseControlConfig(configYamlRaw))
+  const ctlSocket = ctlPaths(configDir, botIdFromToken(BOT_TOKEN)).socket
+  if (messageThreadId === undefined && replyTo === undefined && hasSessionIdentity && (ctlCfg.topics || ctlCfg.privateTopics)) {
+    resolvedSession = parseResolvedSession(
+      await askDaemon(ctlSocket, {
+        kind: "resolve-session",
+        tmuxPane: process.env.TMUX_PANE ?? null,
+        tmuxServerPid: tmuxServerPidFromEnv(process.env.TMUX),
+        ancestorPids: ancestor ? [ancestor.pid] : [],
+      }, SESSION_LOOKUP_TIMEOUT_MS),
+    )
+    if (resolvedSession?.threadId) {
+      messageThreadId = resolvedSession.threadId
+      threadIdAdvisory = true
+    }
+  }
+  const sessionTopic = resolvedSession?.threadId ? resolvedSession : null
+
   // Build the bot-bound transport (api + chat + the route recorder + an
   // optional --reply-to anchor), then hand it to the transmitter, which applies
   // caption-overflow + the >4096 split + the photos→text→documents ordering on
@@ -2136,6 +2167,9 @@ if (import.meta.main) {
     replyToMessageId: replyTo,
     messageThreadId,
     threadIdAdvisory,
+    ...(sessionTopic
+      ? { threadRetryDelayMs: 1000, onThreadFallback: (description: string) => void (topicFallback = description) }
+      : {}),
   })
   // fileCheckDeps: defined earlier (before code-as-pdf/md-as-pdf), reused here
   // unchanged so the pre- and post-conversion checks agree on what "ok" means.
@@ -2143,6 +2177,18 @@ if (import.meta.main) {
     checkFile: (path) => checkAttachmentFile(path, fileCheckDeps),
     allowFlood: !floodCapOn,
   })
+  // Tell the daemon how the threaded send went (§4.5): a success clears the session's miss
+  // counter; a General fallback counts a miss, and the daemon posts the notice and, once
+  // the topic is proven gone, recreates it. Best-effort, bounded like the lookup.
+  if (sessionTopic) {
+    await askDaemon(ctlSocket, {
+      kind: "topic-result",
+      key: sessionTopic.key,
+      threadId: sessionTopic.threadId,
+      ok: topicFallback === null,
+      ...(topicFallback !== null ? { description: topicFallback } : {}),
+    }, SESSION_LOOKUP_TIMEOUT_MS, false)
+  }
 
   // Reaction lifecycle (tg-cli#114): an `--tag answer --reply-to <id>` send means
   // message <id> is now ANSWERED — flip its reaction to the done mark (👌, the
@@ -2189,7 +2235,6 @@ if (import.meta.main) {
   // Fire-and-forget: the daemon's flock makes repeated starts a no-op, and
   // NOTHING in this block may ever break a send — hence the swallow-all catch.
   try {
-    const ctlCfg = resolveControlConfig(parseControlConfig(configYamlRaw))
     if (MODEL && shouldAutoStart(process.env, ctlCfg)) {
       Bun.spawn(
         [
