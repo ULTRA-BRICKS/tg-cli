@@ -61,6 +61,7 @@ export function inboundHistoryRecords(updates: TgUpdate[], opts: InboundOpts): H
     const m = u.message;
     if (!m) continue; // callback queries + non-message updates are not history
     if (!senderAllowed(m.from?.id, opts)) continue; // a group member is never logged
+    if (m.chat.id !== opts.chatId) continue; // the daemon serves its configured chat only
     // Owner inbound is not dropped by age (#183): if Telegram delivered it after
     // daemon downtime it is still a real request and belongs in recall.
     const from = m.from?.first_name || m.from?.username || 'tg';

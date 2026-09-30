@@ -24,6 +24,7 @@
 
 import { agentInboxKey } from './unreachable';
 import { hatchEnvVarName, type AskOperation, type AskOrigin, type ButtonRequest } from './questions';
+import { isRecord } from './guards';
 
 // hgr- + 12 lowercase hex (crypto.randomBytes(6) in the entrypoint).
 export const GRANT_ID_RE = /^hgr-[0-9a-f]{12}$/;
@@ -304,10 +305,6 @@ export function grantExistsFor(grants: GrantRecord[], requestId: string): boolea
 // --- (de)serialization: versioned, fail-soft, pruned on both directions ---
 
 const GRANT_STORE_VERSION = 1;
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return Boolean(v) && typeof v === 'object' && !Array.isArray(v);
-}
 
 function optStr(v: unknown): string | undefined {
   return typeof v === 'string' && v ? v : undefined;

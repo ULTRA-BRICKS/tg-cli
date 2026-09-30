@@ -304,6 +304,10 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
     // Sender allowlist FIRST (spec §9: from.id, not chat id — a group member
     // must not inject prompts).
     if (!senderAllowed(m.from?.id, opts)) continue;
+    // Only the configured chat: every reply, ack and delivery-ledger key (tg-cli#299) is that
+    // chat's, and Telegram message ids are unique per chat only — an allowed sender writing
+    // from another chat would collide with, and be suppressed as, an earlier message here.
+    if (m.chat.id !== opts.chatId) continue;
 
     // Owner text/media inbound is NOT dropped by age (#183): a message Telegram
     // delivered after daemon downtime or while agents were busy is still a real

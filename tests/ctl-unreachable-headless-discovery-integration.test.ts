@@ -101,7 +101,9 @@ test('a fully headless claude session (no tty anywhere, parented under launchd) 
   // agent-naming reply replaced it, exactly as it does when a tty IS available.
   expect(sentMessages.some((m) => String(m.text).startsWith('Claude Code not in tmux'))).toBe(false);
 
-  const queuedReply = sentMessages.find((m) => String(m.text).includes('queued to its Stop-hook inbox'));
+  // The no-agent listing for tg#11 explains the inbox too; both replies race, so match the
+  // reply to tg#10 by its own wording, not by list order.
+  const queuedReply = sentMessages.find((m) => String(m.text).includes('— queued to its Stop-hook inbox'));
   expect(queuedReply?.text).toContain('landing is running outside tmux (tty none, cwd /Users/u/work/landing)');
 
   const pending = join(cfgDir, 'inbox', 'landing', 'pending.jsonl');

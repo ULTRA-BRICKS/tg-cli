@@ -111,6 +111,23 @@ omp without a bridge. Claude Code and Codex stay tmux-only. See
 `docs/omp-original-process.md` for setup, receipt semantics, and the one-time saved restart
 needed by already-running OMP. Cwd/title are not process identity.
 
+### Exactly-once inbound delivery (#517, #299)
+
+Every inbound Telegram message is keyed by (chat_id, message_id) in the append-only, fsynced
+ledger `tg-ctl.<bot>.delivery.jsonl` (`features/tg-ctl/delivery-ledger.ts`, pure; the daemon owns
+the I/O). The three sinks — `deliverOriginalOmp` (omp-live bridge and its own-pane fallback),
+`injectInbound` (tmux send-keys), the Stop-hook inbox — go through `deliverInboundOnce`: a
+delivered or in-flight message is not sent again; otherwise a durable claim, the send, the
+outcome. New delivery paths must reach one of these sinks with the source message id, never
+call `executeInjectSteps` directly for inbound text. Updates already processed are skipped on
+replay (Telegram redelivery, pending-batch journal). A claim a kill left open is reported to the
+CTO at startup ("may not have reached"), never re-sent; picker holds lost by a restart, expired
+pickers and failed deferred flushes are reported too. `tg-ctl audit-delivery` reports
+delivered / not delivered / duplicated / held messages and update-id gaps over the ledger, the
+history log, the daemon log and harness transcripts (`features/tg-ctl/delivery-audit.ts`). A
+message with no ledger record, no surviving transcript and no log line is "no evidence left",
+never counted as lost: harnesses prune transcripts and reply-route log lines carry no message id.
+
 ### Existing Features
 
 - `features/agent-detect/` — pure `detectAgentLabel(env)`: the historical env-based

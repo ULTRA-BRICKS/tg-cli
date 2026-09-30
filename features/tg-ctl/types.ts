@@ -497,6 +497,9 @@ export interface CtlPaths {
   pendingBatch: string; // durable local journal of a not-yet-fully-processed getUpdates batch —
   // written BEFORE the offset advances so a crash between telling Telegram we have it and
   // finishing the work can never lose it; see runDaemon recovery-on-startup
+  // Append-only, fsynced inbound delivery ledger keyed by (chat_id, message_id): every sink
+  // checks it so a replayed message is never sent twice (tg-cli#299, delivery-ledger.ts)
+  deliveryLedger: string;
   awarenessNudge: string; // durable per-agent silence-nudge state (tg-ctl#363)
   unansweredReminder: string; // which open questions got their one reminder + the live reminder message (tg-cli#464)
   runInfo: string; // which commit the running daemon loaded (pid + sha), for stale-code detection (tg-cli#279)

@@ -3,6 +3,36 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.28
+
+- **Inbound Telegram messages reach an agent exactly once (#517, #299).** Root cause of the 7x copy of
+  tg#17641 in one omp session (2026-09-21): the since-removed ACP watchdog (#352/#359, removed by
+  #451) evicted a "wedged" `omp acp` client after 120 s without traffic and re-sent its in-flight
+  prompt through a fresh `session/load` — six times while the machine's network was down. The
+  replay paths that remained could still repeat a message: Telegram redelivering an update after a
+  lost offset write, the pending-batch journal replayed after a kill, a deferred backlog restored
+  after a SIGKILL mid-flush, an omp restarted between two sends. Now every sink (the omp-live
+  bridge, tmux send-keys, the Stop-hook inbox) consults a durable ledger keyed by
+  (chat_id, message_id) — `tg-ctl.<bot>.delivery.jsonl`, append-only and fsynced: a claim before
+  the send, the outcome after. A delivered message is never sent again; an update already
+  processed is skipped whole; a claim a kill left without an outcome is reported to the CTO
+  ("may not have reached …"), never re-typed.
+  A message whose claim cannot be written to the ledger (full or read-only disk) is not sent and
+  is reported like any failed delivery.
+- **Only the configured chat is served (#517).** A message from any chat other than `TG_CHAT_ID`
+  is ignored, even from an allowed sender: Telegram message ids are unique per chat, so another
+  chat's message 42 would collide in the ledger with this chat's message 42, and every reply and
+  reaction already went to `TG_CHAT_ID`.
+- **Undeliverable messages are reported, not dropped (#517).** A deferred message the flush cannot
+  type, a picker nobody tapped within 10 minutes, and a picker the daemon lost on restart each get
+  a "⚠️ tg#N was not delivered …" reply under the CTO's message.
+- **`tg-ctl audit-delivery` (#517).** Read-only report over the whole retained history: messages
+  delivered, not delivered (a failure the ledger recorded), sent per the daemon log but with no
+  transcript left, and with no evidence left either way (no ledger record, transcript pruned — not
+  counted as lost); messages typed more than once into one session; held messages; update-id gaps,
+  with dates. Reads omp, Claude Code (including prompts queued while the agent was busy) and Codex
+  transcripts. `--since/--until`, `--json`, `--transcripts`, `--history`, `--log`.
+
 ## 1.54.27
 
 - **Reply quotes are never empty (#461).** A reply to an agent's rich report (anything `tg

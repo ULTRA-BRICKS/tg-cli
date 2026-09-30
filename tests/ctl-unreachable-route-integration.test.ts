@@ -101,7 +101,9 @@ test('/agent <name> to an agent outside tmux queues to its inbox and replies exp
   const t0 = Date.now();
   while (Date.now() - t0 < 10_000 && sentMessages.length < 2) await Bun.sleep(100);
 
-  const queuedReply = sentMessages.find((m) => String(m.text).includes('queued to its Stop-hook inbox'));
+  // The no-agent listing for tg#11 explains the inbox too; both replies race, so match the
+  // reply to tg#10 by its own wording, not by list order.
+  const queuedReply = sentMessages.find((m) => String(m.text).includes('— queued to its Stop-hook inbox'));
   expect(queuedReply?.text).toContain('landing is running outside tmux (tty ttys004, cwd /Users/u/work/landing)');
 
   const pending = join(cfgDir, 'inbox', 'landing', 'pending.jsonl');

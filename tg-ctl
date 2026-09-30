@@ -13,7 +13,7 @@
 // instance already owns the bot.
 
 import { dlopen, FFIType } from "bun:ffi"
-import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs"
+import { appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "fs"
 import { createConnection, createServer, type Server, type Socket } from "net"
 import { basename, dirname, isAbsolute, join, resolve } from "path"
 import { detectAgentLabel } from "./features/agent-detect/detect"
@@ -345,6 +345,21 @@ import {
 } from "./features/tg-ctl/routes"
 import { parseLastUserTarget, serializeLastUserTarget, withSessionKey, type LastUserTarget } from "./features/tg-ctl/last-user-target"
 import { parseHistory, type HistoryRecord } from "./features/replies/history"
+import {
+  applyLedgerEvents,
+  compactLedger,
+  decideDelivery,
+  emptyLedgerState,
+  ledgerKey,
+  lostPickerHolds,
+  orphanedClaims,
+  parseLedger,
+  serializeLedgerEvents,
+  type LedgerEvent,
+  type LedgerHold,
+  type LedgerState,
+} from "./features/tg-ctl/delivery-ledger"
+import { AUDIT_USAGE, buildAuditReport, formatAuditReport, logDeliveryIds, parseAuditArgs, transcriptCopies, type InjectedCopy } from "./features/tg-ctl/delivery-audit"
 import { appendHistoryFile } from "./features/replies/history-file"
 import { inboundHistoryRecords } from "./features/replies/inbound"
 import { isLikelySlashCommand, parsePendingBatch, serializePendingBatch, stepUpdates } from "./features/tg-ctl/updates"
@@ -438,6 +453,9 @@ export const USAGE = `Usage:
                          # \`code:\` names the commit the daemon loaded — STALE when its
                          # checkout has newer daemon code (merged but not restarted);
                          # also lists agents running OUTSIDE tmux as unreachable (tg-cli#306)
+  tg-ctl audit-delivery [--since DATE] [--until DATE] [--json] [--transcripts DIR]...
+                         # report inbound messages never delivered, delivered twice, or
+                         # never received (update-id gaps), with dates; read-only
   tg-ctl inbox           # pending Stop-hook inbox entries per agent (the tmux-free channel)
   tg-ctl inbox queue <name|dir> <text…>
                          # queue text to a non-tmux agent's Stop-hook inbox by hand
@@ -1359,10 +1377,111 @@ async function refreshOriginalHosts(): Promise<void> {
   })().finally(() => { originalProbe = null })
   return originalProbe
 }
+// --- Inbound delivery ledger (tg-cli#299, features/tg-ctl/delivery-ledger.ts) ---
+// Opened by runDaemon; null in every other process (ask, status, …), which never
+// delivers an inbound message, so every gate below passes straight through there.
+// Keyed by the daemon's one chat (TG_CHAT_ID): every route and reply goes to it.
+let deliveryLedger: { path: string; chat: number; state: LedgerState } | null = null
+
+function openDeliveryLedger(path: string, chat: number): LedgerState {
+  const events = parseLedger(readFileOrNull(path))
+  const kept = compactLedger(events)
+  if (kept) {
+    try {
+      atomicWrite(path, serializeLedgerEvents(kept))
+    } catch (err) {
+      log(`delivery ledger compaction failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  const state = applyLedgerEvents(emptyLedgerState(), kept ?? events)
+  deliveryLedger = { path, chat, state }
+  return state
+}
+
+// Folds `events` into the live state, then appends and fsyncs them: a claim must be
+// on disk before the text leaves the daemon, or a kill right after the send would
+// forget the send happened. Returns whether the events reached the disk.
+function recordDelivery(events: LedgerEvent[]): boolean {
+  const ledger = deliveryLedger
+  if (!ledger || events.length === 0) return true
+  applyLedgerEvents(ledger.state, events)
+  try {
+    const fd = openSync(ledger.path, "a", 0o600)
+    try {
+      const buf = Buffer.from(serializeLedgerEvents(events))
+      for (let off = 0; off < buf.length; ) off += writeSync(fd, buf, off)
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    return true
+  } catch (err) {
+    // The in-memory state still blocks a second send in this run; only a restart
+    // could repeat a message whose record never reached the disk.
+    log(`delivery ledger append failed: ${err instanceof Error ? err.message : String(err)}`)
+    return false
+  }
+}
+
+function recordHeld(messageId: number | null, target: string, hold: LedgerHold): void {
+  if (messageId === null || !deliveryLedger) return
+  recordDelivery([{ ts: Date.now(), event: "queued", chat: deliveryLedger.chat, msg: messageId, target, hold }])
+}
+
+// A held message the daemon gave up on outside any sink (an expired picker or topic
+// hold, a picker lost by a restart) — the CTO is told separately.
+function recordFailed(messageId: number, target: string, error: string): void {
+  if (!deliveryLedger) return
+  recordDelivery([{ ts: Date.now(), event: "failed", chat: deliveryLedger.chat, msg: messageId, target, error }])
+}
+
+// THE gate every sink puts in front of an inbound Telegram message (the omp-live
+// bridge, tmux send-keys, the Stop-hook inbox): a message already delivered, or in
+// flight, is not sent again — it reports success, since it did arrive. Otherwise a
+// durable claim, the send, then its outcome; a claim that cannot reach the disk sends
+// nothing (a restart could not know it went out) and fails the delivery instead.
+// `messageId` null: not an inbound message (a key press, a synthetic notice) — sent as is.
+async function deliverInboundOnce<R extends { ok: true } | { ok: false; error: string }>(
+  messageId: number | null | undefined,
+  target: string,
+  send: () => Promise<R>,
+): Promise<R | { ok: true } | { ok: false; error: string }> {
+  const ledger = deliveryLedger
+  if (!ledger || messageId === null || messageId === undefined) return send()
+  const base = { chat: ledger.chat, msg: messageId, target }
+  const decision = decideDelivery(ledger.state.messages.get(ledgerKey(ledger.chat, messageId)))
+  if (decision.kind === "suppress") {
+    log(`delivery: tg#${messageId} → ${target} suppressed — already ${decision.prior.state} to ${decision.prior.target}`)
+    recordDelivery([{ ts: Date.now(), event: "duplicate", ...base, prior: decision.prior.state }])
+    return { ok: true }
+  }
+  if (!recordDelivery([{ ts: Date.now(), event: "claimed", ...base }])) {
+    const error = "the delivery ledger could not be written, so it was not sent"
+    recordDelivery([{ ts: Date.now(), event: "failed", ...base, error }])
+    return { ok: false, error }
+  }
+  let res: R
+  try {
+    res = await send()
+  } catch (err) {
+    recordDelivery([{ ts: Date.now(), event: "failed", ...base, error: err instanceof Error ? err.message : String(err) }])
+    throw err
+  }
+  const outcome: { ok: true } | { ok: false; error: string } = res
+  recordDelivery([outcome.ok ? { ts: Date.now(), event: "delivered", ...base } : { ts: Date.now(), event: "failed", ...base, error: outcome.error }])
+  return res
+}
+
 // `paneId`: the tmux pane this exact OMP runs in, when known. An OMP with NO
 // endpoint there is still the original process — typing into its own TUI is its
 // normal input path, not a second history writer and not a spawn (#458).
+// A numeric `messageId` is an inbound Telegram message: sent at most once (tg-cli#299).
 async function deliverOriginalOmp(target: OriginalOmpTarget, text: string, messageId?: number | string, paneId?: string | null): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (typeof messageId !== "number") return sendOriginalOmp(target, text, messageId, paneId)
+  return deliverInboundOnce(messageId, paneId ?? `omp:${target.pid ?? "?"}`, () => sendOriginalOmp(target, text, messageId, paneId))
+}
+
+async function sendOriginalOmp(target: OriginalOmpTarget, text: string, messageId?: number | string, paneId?: string | null): Promise<{ ok: true } | { ok: false; error: string }> {
   let code: string
   try {
     await refreshOriginalHosts()
@@ -2018,6 +2137,56 @@ async function ackDeliveredInboxes(ctx: Ctx): Promise<void> {
   }
 }
 
+// `tg-ctl audit-delivery` (tg-cli#299): read-only report of inbound messages that never
+// reached an agent, reached one twice, or never arrived (update-id gaps). See delivery-audit.ts.
+function runAuditDelivery(ctx: Ctx, argv: string[]): number {
+  const args = parseAuditArgs(argv)
+  if (args.kind === "help") {
+    console.log(AUDIT_USAGE)
+    return 0
+  }
+  if (args.kind === "error") {
+    console.error(`tg-ctl audit-delivery: ${args.message}\n${AUDIT_USAGE}`)
+    return 2
+  }
+  const history = [ctx.paths.history, ...args.history].flatMap((p) => parseHistory(readFileOrNull(p)))
+  const logs = [ctx.paths.log, join(ctx.configDir, "launchd.tg-ctl.err.log"), ...args.logs].map((p) => readFileOrNull(p) ?? "").join("\n")
+  const roots = args.transcripts ?? [join(ctx.home, ".omp", "agent", "sessions"), join(ctx.home, ".claude", "projects"), join(ctx.home, ".codex", "sessions")]
+  // Transcripts last written before the window cannot hold a delivery inside it. No inbound
+  // history and no --since: no lower bound, every transcript is read.
+  const oldest = args.since ?? history.reduce((min, r) => (r.direction === "user" ? Math.min(min, r.ts) : min), Infinity)
+  const minMtimeMs = Number.isFinite(oldest) ? oldest * 1000 : 0
+  const copies: InjectedCopy[] = []
+  const walk = (dir: string): void => {
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      const path = join(dir, e.name)
+      if (e.isDirectory()) walk(path)
+      else if (e.name.endsWith(".jsonl") && (fileMtimeMs(path) ?? -1) >= minMtimeMs) {
+        const raw = readFileOrNull(path)
+        if (raw) copies.push(...transcriptCopies(raw, path))
+      }
+    }
+  }
+  for (const root of roots) walk(root)
+  const report = buildAuditReport({
+    chatId: ctx.chatId,
+    history,
+    ledger: parseLedger(readFileOrNull(ctx.paths.deliveryLedger)),
+    copies,
+    logAttempts: logDeliveryIds(logs),
+    sinceSec: args.since,
+    untilSec: args.until,
+  })
+  process.stdout.write(args.json ? `${JSON.stringify(report, null, 2)}\n` : formatAuditReport(report))
+  return 0
+}
+
 // `tg-ctl inbox [queue <selector> <text…>]` — the CLI view of the tmux-free channel.
 function runInboxCommand(ctx: Ctx, argv: string[]): number {
   const agents = listUnreachableAgents()
@@ -2145,6 +2314,11 @@ async function executeInjectSteps(steps: InjectStep[]): Promise<{ ok: true } | I
     }
   }
   return { ok: true }
+}
+
+// Types an inbound Telegram message (`messageId`) into a tmux pane at most once (tg-cli#299).
+function injectInbound(messageId: number | null, paneId: string, steps: InjectStep[]): Promise<{ ok: true } | InjectFailure> {
+  return deliverInboundOnce(messageId, paneId, () => executeInjectSteps(steps))
 }
 
 function executeInjectStepsSync(steps: InjectStep[]): { ok: true } | InjectFailure {
@@ -6538,6 +6712,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // best-effort; see comment above
     }
   }
+  // Before anything can deliver: every sink consults it (tg-cli#299). The claims and picker
+  // holds a previous run left open are reported right before the poll loop starts.
+  const ledgerAtStart = openDeliveryLedger(ctx.paths.deliveryLedger, ctx.chatId)
+  const interruptedClaims = orphanedClaims(ledgerAtStart)
+  const lostPickers = lostPickerHolds(ledgerAtStart)
   const pendingButtons = new Map<string, PendingButton>()
   // Per-resource-key concurrent dispatch (tg-cli#357): actions sharing a key (same topic
   // thread, same pending token, same question requestId) still run strictly in enqueue order;
@@ -6876,24 +7055,47 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // /agent (and unrecognized-reply) selection awaiting a button tap: token →
   // message + candidate list. `prewrapped` = inject the message verbatim (a reply
   // already carries its wrap/anchor) instead of wrapping it again.
-  const pendingAgent = new Map<
-    string,
-    {
-      message: string
-      candidates: AgentCandidate[]
-      messageId: number | null
-      sourceMessageId: number | null
-      relatedReactionMessageId: number | null
-      timer: ReturnType<typeof setTimeout>
-      prewrapped?: boolean
-      // Select-only picker: there is no message on the button itself. Bare
-      // `/agent` uses this to arm a one-shot route for the next ordinary inbound
-      // message; control pickers (/stop, /kill) only hand back the selector.
-      selectOnly?: boolean
-      armNextMessage?: boolean
-      threadId?: number | null
-    }
-  >()
+  type PendingAgentEntry = {
+    message: string
+    candidates: AgentCandidate[]
+    messageId: number | null
+    sourceMessageId: number | null
+    relatedReactionMessageId: number | null
+    timer: ReturnType<typeof setTimeout>
+    prewrapped?: boolean
+    // Select-only picker: there is no message on the button itself. Bare
+    // `/agent` uses this to arm a one-shot route for the next ordinary inbound
+    // message; control pickers (/stop, /kill) only hand back the selector.
+    selectOnly?: boolean
+    armNextMessage?: boolean
+    threadId?: number | null
+  }
+  const pendingAgent = new Map<string, PendingAgentEntry>()
+  const PICKER_TTL_MS = 10 * 60_000
+  // The one notice for an inbound message the daemon gave up on (tg-cli#299): a reply
+  // under the CTO's own message, so he sees exactly which one to resend.
+  const tellUndelivered = async (messageId: number, notice: string): Promise<void> => {
+    log(`undelivered: tg#${messageId} ${notice}`)
+    await sendMessage(ctx, `⚠️ tg#${messageId} ${notice}`, { reply_parameters: { message_id: messageId, allow_sending_without_reply: true } })
+  }
+  // A picker holds its message only in memory until a tap: the ledger records the hold
+  // (a restart loses it and startup reports it), and a picker nobody taps reports its
+  // message as not delivered instead of dropping it silently.
+  const armPendingAgent = (token: string, entry: Omit<PendingAgentEntry, "timer">): void => {
+    const timer = setTimeout(() => void expirePendingAgent(token), PICKER_TTL_MS)
+    pendingAgent.set(token, { ...entry, timer })
+    if (!entry.selectOnly) recordHeld(entry.sourceMessageId, "picker", "picker")
+  }
+  const expirePendingAgent = async (token: string): Promise<void> => {
+    const entry = pendingAgent.get(token)
+    if (!entry) return
+    pendingAgent.delete(token)
+    if (entry.selectOnly || entry.sourceMessageId === null) return
+    if (entry.messageId !== null) void clearMessageKeyboard(ctx, entry.messageId)
+    const error = "nobody picked an agent within 10 minutes"
+    recordFailed(entry.sourceMessageId, "picker", error)
+    await tellUndelivered(entry.sourceMessageId, `was not delivered: ${error}. Resend it if it still matters.`)
+  }
   let agentTokenSeq = 0
   const SELECTED_AGENT_TTL_MS = 10 * 60_000
   type SelectedAgentRoute = {
@@ -7098,6 +7300,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const item: DeferredInbound = { text: wrappedText, sourceMessageId, relatedReactionMessageId, delivered: false, ...(key ? { sessionKey: key } : {}) }
     deferred.enqueue(paneId, item)
     persistDeferred()
+    recordHeld(sourceMessageId, paneId, "deferred")
     return item
   }
   const markDeferredForAck = (item: DeferredInbound): void => {
@@ -7108,23 +7311,30 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // already-taken batch and (b) becomes an unhandled rejection in the
     // fire-and-forget flushDeferred call. executeInjectSteps normally returns
     // {ok:false} on tmux errors, but a spawn/exception could still escape — treat
-    // any throw as a failed paste (drop + log), exactly like {ok:false}.
+    // any throw as a failed paste, exactly like {ok:false}. A failed item is not
+    // re-queued (no future answer may ever flush it), so the CTO is told (tg-cli#299).
+    let error: string
     try {
-      const res = await executeInjectSteps(buildTextInjectPlan(paneId, item.text, { sessionKey: item.sessionKey }))
-      if (!res.ok) log(`deferred flush into ${paneId} failed: ${res.error}`)
+      const res = await injectInbound(item.sourceMessageId, paneId, buildTextInjectPlan(paneId, item.text, { sessionKey: item.sessionKey }))
+      if (res.ok) {
+        item.delivered = true
+        await setSeenReactions(item.sourceMessageId, item.relatedReactionMessageId)
+        return true
+      }
+      log(`deferred flush into ${paneId} failed: ${res.error}`)
       // The pane hosts a different session now (§2.6): nothing was typed. Name
       // the move and hand the text back through the picker instead of dropping it.
-      if (!res.ok && res.sessionMismatch) {
+      if (res.sessionMismatch) {
         await postRoutePicker(listAgentCandidates(), item.text, `${res.error} — pick where this goes:`, item.sourceMessageId, item.relatedReactionMessageId)
+        return false
       }
-      if (!res.ok) return false
+      error = res.error
     } catch (err) {
       log(`deferred flush into ${paneId} threw: ${err}`)
-      return false
+      error = err instanceof Error ? err.message : String(err)
     }
-    item.delivered = true
-    await setSeenReactions(item.sourceMessageId, item.relatedReactionMessageId)
-    return true
+    if (item.sourceMessageId !== null) await tellUndelivered(item.sourceMessageId, `was not delivered to ${paneId}: ${error}. Resend it if it still matters.`)
+    return false
   }
   const flushDeferred = async (paneId: string): Promise<void> => {
     if (!deferred.has(paneId)) return
@@ -7143,8 +7353,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // flushDeferred again. Fresh messages enqueued DURING a round are drained
       // next round while the pane stays free; otherwise they'd sit until the next
       // unrelated question. Inject FAILURES do NOT re-defer: there may be no
-      // future question to flush them, so they are logged + dropped rather than
-      // wedging the queue forever (review finding).
+      // future question to flush them, so they are reported to the CTO rather
+      // than wedging the queue forever (review finding, tg-cli#299).
       for (;;) {
         const queue = deferred.take(paneId)
         if (queue.length === 0) return
@@ -7168,12 +7378,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // in sync so a reload restores exactly what is still queued. Persisting once
       // HERE (not per delivered item) means a hard SIGKILL mid-flush — after some
       // items typed into the pane but before this runs — leaves those already-
-      // delivered items still on disk, so a restart RE-PASTES them: at-least-once,
-      // a deliberate bias to no-LOSS over no-duplicate (persisting after each take
-      // would instead lose the not-yet-injected tail on a mid-flush crash — worse).
-      // The GRACEFUL path never hits this: the cooperative drain lets the flush
-      // finish before exit; only a SIGKILL escalation (past GRACEFUL_SHUTDOWN_MS)
-      // can duplicate, and a duplicate queued line is far less bad than a lost one.
+      // delivered items still on disk. The restart does not re-paste them: each
+      // item's delivery is in the ledger, which the flush consults (tg-cli#299).
+      // Persisting after each take instead would lose the not-yet-injected tail.
       persistDeferred()
     }
   }
@@ -7626,7 +7833,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       recordIfAutoBound()
       return true
     }
-    const result = await executeInjectSteps(buildPlan(found.target))
+    const result = await injectInbound(sourceMessageId, paneId, buildPlan(found.target))
     if (!result.ok) {
       log(`inject aborted: ${result.error}`)
       await sendMessage(ctx, result.error)
@@ -7677,7 +7884,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const res = await deliverOriginalOmp(live ?? { cwd, pid: hosted.pid }, wrapped, sourceMessageId ?? undefined, paneId)
       return res.ok ? { ok: true } : { ok: false, error: res.error }
     }
-    const res = await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
+    const res = await injectInbound(sourceMessageId, paneId, buildTextInjectPlan(paneId, wrapped))
     return res.ok ? { ok: true } : { ok: false, error: res.error }
   }
 
@@ -7753,14 +7960,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       await sendMessage(ctx, "couldn't post the agent picker — try a narrower /agent <window>", messageExtra)
       return false
     }
-    const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
-    pendingAgent.set(token, {
+    armPendingAgent(token, {
       message,
       candidates: subset,
       messageId,
       sourceMessageId,
       relatedReactionMessageId: null,
-      timer,
       selectOnly: message.trim() === "",
       armNextMessage: message.trim() === "" && options.armNextMessage === true,
       threadId: options.threadId ?? null,
@@ -7807,14 +8012,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       await sendMessage(ctx, "couldn't post the agent picker — try a narrower /agent <window>")
       return false
     }
-    const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
-    pendingAgent.set(token, {
+    armPendingAgent(token, {
       message: prewrappedText,
       candidates: subset,
       messageId,
       sourceMessageId,
       relatedReactionMessageId,
-      timer,
       prewrapped: true,
     })
     queueAckReaction(sourceMessageId, DEFER_REACTION)
@@ -7880,7 +8083,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (recordAnchor) recordLastUserTarget(paneId, cwd)
       return true
     }
-    const res = await executeInjectSteps(buildTextInjectPlan(paneId, prewrappedText, { sessionKey }))
+    const res = await injectInbound(sourceMessageId, paneId, buildTextInjectPlan(paneId, prewrappedText, { sessionKey }))
     if (!res.ok) {
       await sendMessage(ctx, res.error, out)
       return false
@@ -7942,11 +8145,18 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       await sendMessage(ctx, `refusing: inbox key '${key}' is shared by several live sessions — give them distinct --name values:\n${lines.join("\n")}`, out)
       return false
     }
+    let queued: { ok: true } | { ok: false; error: string }
     try {
-      queueToInbox(ctx, key, { id: messageId, ts: new Date().toISOString(), from, text, wrapped })
+      queued = await deliverInboundOnce(messageId, `inbox:${key}`, async (): Promise<{ ok: true }> => {
+        queueToInbox(ctx, key, { id: messageId, ts: new Date().toISOString(), from, text, wrapped })
+        return { ok: true }
+      })
     } catch (err) {
-      log(`agent-route: inbox write failed for ${key}: ${err}`)
-      await sendMessage(ctx, `${unreachableLabel(target)} is outside tmux and its inbox could not be written: ${err}`, out)
+      queued = { ok: false, error: String(err) }
+    }
+    if (!queued.ok) {
+      log(`agent-route: inbox write failed for ${key}: ${queued.error}`)
+      await sendMessage(ctx, `${unreachableLabel(target)} is outside tmux and its inbox could not be written: ${queued.error}`, out)
       return false
     }
     log(`agent-route: selector="${selector}" → outside tmux ${key} (pid ${target.pid}) — queued to inbox`)
@@ -8312,7 +8522,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         markDeferredForAck(enqueueDeferred(paneId, action.injectText, action.messageId, relatedReactionMessageId, sessionKey))
         return true
       }
-      const res = await executeInjectSteps(buildTextInjectPlan(paneId, action.injectText, { sessionKey }))
+      const res = await injectInbound(action.messageId, paneId, buildTextInjectPlan(paneId, action.injectText, { sessionKey }))
       if (!res.ok) {
         await sendMessage(ctx, res.error)
         return false
@@ -8342,14 +8552,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         await sendMessage(ctx, "couldn't post the reply picker")
         return false
       }
-      const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
-      pendingAgent.set(token, {
+      armPendingAgent(token, {
         message: action.injectText,
         candidates: sorted,
         messageId,
         sourceMessageId: action.messageId,
         relatedReactionMessageId,
-        timer,
         prewrapped: true,
       })
       queueAckReaction(action.messageId, DEFER_REACTION)
@@ -8786,6 +8994,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     for (const hold of dropped) {
       log(`topic ${hold.threadId}: hold ${why} with ${hold.payloads.length} undelivered message(s)`)
       if (hold.pickerMessageId !== null) void clearMessageKeyboard(ctx, hold.pickerMessageId)
+      for (const p of hold.payloads) recordFailed(p.messageId, `thread:${hold.threadId}`, `topic hold ${why}`)
       await sendToTopic(hold.threadId, holdExpiredReply(hold.payloads.length))
     }
   }
@@ -8816,6 +9025,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const { kept, evicted } = capHolds(holdPayload(topicHolds, action.threadId, action.payload, Math.floor(Date.now() / 1000)))
     setTopicHolds(kept)
     log(`topic ${action.threadId}: unknown topic — held message ${action.payload.messageId}`)
+    recordHeld(action.payload.messageId, `thread:${action.threadId}`, "topic-hold")
     // ✍️ ("noted, queued") instead of 👀: the message has not reached a session yet.
     queueAckReaction(action.payload.messageId, DEFER_REACTION)
     await answerDroppedHolds(evicted, "evicted (too many held topics)")
@@ -10712,7 +10922,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     answeredButtons.set(action.requestId, { value: answer, label: answer, at: answeredAt, delivery: "pane" })
     persistQuestions()
 
-    const res = await executeInjectSteps(buildTextInjectPlan(paneId, answer, { sessionKey: retained.req.sessionKey }))
+    const res = await injectInbound(action.messageId, paneId, buildTextInjectPlan(paneId, answer, { sessionKey: retained.req.sessionKey }))
     if (!res.ok) {
       answeredButtons.delete(action.requestId)
       abandonedButtons.set(action.requestId, { req: retained.req, messageId: retained.messageId, at: retained.at })
@@ -11021,6 +11231,18 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   await refreshOriginalHosts()
   log(`daemon up — pid ${process.pid}, bot ${ctx.botId}, offset ${offset}`)
 
+  // A killed run's open claims and in-memory picker holds (tg-cli#299): never re-sent — the
+  // text may already be in the agent — and never silent. Recorded first, so a restart during
+  // the notice cannot repeat it.
+  for (const c of interruptedClaims) {
+    recordDelivery([{ ts: Date.now(), event: "uncertain", chat: c.chat, msg: c.msg, target: c.target }])
+    await tellUndelivered(c.msg, `may not have reached ${c.target}: the daemon restarted while delivering it. Resend it if the agent did not get it.`)
+  }
+  for (const p of lostPickers) {
+    recordFailed(p.msg, p.target, "the daemon restarted while it waited for an agent pick")
+    await tellUndelivered(p.msg, "was not delivered: the daemon restarted while it waited for you to pick an agent. Resend it if it still matters.")
+  }
+
   let recoveryQueue: TgUpdate[] | null = null
   {
     const leftover = parsePendingBatch(readFileOrNull(ctx.paths.pendingBatch))
@@ -11313,9 +11535,28 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (json.result.length > 0) {
         atomicWrite(ctx.paths.pendingBatch, serializePendingBatch(json.result))
       }
+      // An update this daemon already finished — Telegram redelivering it after a lost offset
+      // write, or the journal replaying it after a kill — is skipped whole (tg-cli#299). One it
+      // only half-processed runs again; the sinks' ledger gate keeps whatever already went out
+      // from going out twice. The offset still advances past the whole raw batch.
+      const processedUpdates = deliveryLedger?.state.processedUpdates
+      const updates = processedUpdates ? json.result.filter((u) => !processedUpdates.has(u.update_id)) : json.result
+      if (updates.length < json.result.length) log(`skipping ${json.result.length - updates.length} already-processed update(s)`)
+      const batchOffset = json.result.reduce((next, u) => Math.max(next, u.update_id + 1), offset)
+      const receivedAt = Math.floor(Date.now() / 1000)
+      recordDelivery(
+        updates.map((u): LedgerEvent => {
+          const m = u.message
+          const sender = m?.from?.id
+          if (m && m.chat.id === ctx.chatId && sender !== undefined && (sender === ctx.chatId || ctx.cfg.allowedSenders.includes(sender))) {
+            return { ts: Date.now(), event: "received", update: u.update_id, date: m.date, chat: ctx.chatId, msg: m.message_id }
+          }
+          return { ts: Date.now(), event: "received", update: u.update_id, date: m?.date ?? receivedAt }
+        }),
+      )
 
       await refreshOriginalHosts()
-      const step = stepUpdates(json.result, {
+      const step = stepUpdates(updates, {
         cfg: ctx.cfg,
         chatId: ctx.chatId,
         nowSec: Math.floor(Date.now() / 1000),
@@ -11362,8 +11603,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // i.e. a crash before this line, including mid-write of the journal itself, which a POSIX
       // atomic rename makes never partially-visible. Anything past this line is recoverable from
       // OUR OWN journal instead of relying on Telegram redelivery.
-      if (step.newOffset !== offset) {
-        offset = step.newOffset
+      const newOffset = Math.max(step.newOffset, batchOffset)
+      if (newOffset !== offset) {
+        offset = newOffset
         writeFileSync(ctx.paths.offset, `${offset}\n`)
       }
 
@@ -11380,7 +11622,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // replied-to id is in the routes map AND still maps to a live same-project
       // agent pane is stamped with that pane; everything else uses the default
       // discovered target.
-      if (json.result.length > 0) {
+      if (updates.length > 0) {
         const found = discover()
         const targetPane = found.ok ? found.target.pane.paneId : null
         const histRoutes = parseRoutes(readFileOrNull(ctx.paths.routes))
@@ -11441,7 +11683,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         }
         appendHistory(
           ctx.paths.history,
-          inboundHistoryRecords(json.result, {
+          inboundHistoryRecords(updates, {
             chatId: ctx.chatId,
             allowedSenders: ctx.cfg.allowedSenders,
             pane: targetPane,
@@ -11481,6 +11723,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         }),
       )
 
+      // Every action for these updates ran: a later replay of any of them is skipped whole.
+      recordDelivery(updates.map((u): LedgerEvent => ({ ts: Date.now(), event: "processed", update: u.update_id })))
+
       // The batch fully completed — the journal is no longer needed. Best-effort:
       // if this unlink fails the next startup replays the same batch (idempotent/dedupe-tolerant
       // downstream, matching the rest of the codebase's at-least-once handling, e.g. the Stop-hook
@@ -11516,7 +11761,7 @@ if (import.meta.main) {
   }
   // Internal one-shot child spawned by `harness-event`; intentionally absent
   // from USAGE and guarded by persisted retry state before it can inject text.
-  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event", "codex-usage-hook", "auto-continue-once", "usage-schedule", "usage-schedule-check", "inbox"].includes(cmd)) {
+  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event", "codex-usage-hook", "auto-continue-once", "usage-schedule", "usage-schedule-check", "inbox", "audit-delivery"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
   }
@@ -11620,6 +11865,9 @@ if (import.meta.main) {
   }
   if (cmd === "inbox") {
     process.exit(runInboxCommand(ctx, process.argv.slice(3)))
+  }
+  if (cmd === "audit-delivery") {
+    process.exit(runAuditDelivery(ctx, process.argv.slice(3)))
   }
   if (cmd === "ask") {
     // Grant-protocol client (tg-cli#398): `--verify-grant <approval_id> --hook
