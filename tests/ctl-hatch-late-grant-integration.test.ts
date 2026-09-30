@@ -2,8 +2,9 @@
 // and the grace/pull paths, end-to-end against a real daemon + fake Telegram.
 // The retained-entry tap paths live in tests/ctl-hatch-approval-retry-integration.test.ts;
 // everything here is about CONSUMING a minted grant and the windows that bound it:
-//   (a) grace-only late tap (retained entry gone after a daemon restart) → grant +
-//       notice DELIVERED to the origin route (the Stop-hook inbox), no no-menu skip
+//   (a) grace-only late tap (retained entry gone after a daemon restart) → grant
+//       minted; a paneless Claude Code origin gets NO inbox write (cc/codex are
+//       tmux-only, tg-cli#456) — the card names the token path instead
 //   (b) token path allows EXACTLY once (second consume denies)
 //   (c) wrong --hook denies
 //   (d) wrong-command denies WITHOUT consuming; a following correct verify allows
@@ -186,11 +187,6 @@ function grantStoreOf(cfgDir: string): { grants?: Array<Record<string, unknown>>
   return JSON.parse(readFileSync(p, 'utf8')) as { grants?: Array<Record<string, unknown>>; grace?: Array<Record<string, unknown>> };
 }
 
-function inboxPending(cfgDir: string): string {
-  const p = join(cfgDir, 'inbox', 'hatch-worker', 'pending.jsonl');
-  return existsSync(p) ? readFileSync(p, 'utf8') : '';
-}
-
 const HOOK_ID = 'grant-hook';
 const HATCH_REQUEST_ID = `hatch-${HOOK_ID}-aaaaaaaaaaaa`;
 const SUBAGENT = 'hatch-worker';
@@ -251,7 +247,7 @@ function allowEnvelope(): Record<string, unknown> {
   return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } };
 }
 
-test('(a)+(j) GRACE-ONLY tap after a daemon restart: grant minted from the grace store, notice DELIVERED to the origin inbox route, reply envelope shapes pinned', async () => {
+test('(a)+(j) GRACE-ONLY tap after a daemon restart: grant minted from the grace store, a paneless claude origin gets no inbox write, reply envelope shapes pinned', async () => {
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
@@ -281,16 +277,18 @@ test('(a)+(j) GRACE-ONLY tap after a daemon restart: grant minted from the grace
   const grant = grantStoreOf(cfgDir).grants![0]!;
   expect(grant.request_id).toBe(HATCH_REQUEST_ID);
   expect(grant.hook_id).toBe(HOOK_ID);
-  // The daemon-observed route (the SAME identity the notice is delivered by): the
-  // inbox key derived from the ask's routing fields.
+  // The daemon-observed route identity the pull model binds to: derived from the
+  // ask's routing fields (a name, not a delivery channel).
   expect(grant.route).toBe(INBOX_ROUTE);
 
-  // DELIVERED to the origin route — no permission menu, no pane, no no-menu skip.
-  expect(await until(() => inboxPending(cfgDir).includes(String(grant.approval_id)), 5000)).toBe(true);
-  expect(inboxPending(cfgDir)).toContain(HATCH_REQUEST_ID);
+  // A Claude Code origin with no tmux pane is tmux-only (tg-cli#456): nothing is
+  // queued to the Stop-hook inbox; the card says the notice could not be delivered
+  // and names the token path.
+  expect(await until(() => daemonLog(cfgDir).includes('hatch-grant-notice-failed'), 5000)).toBe(true);
+  expect(existsSync(join(cfgDir, 'inbox', SUBAGENT))).toBe(false);
+  expect(await until(() => tg.edits().some((e) => e.includes('could NOT be delivered') && e.includes(`approved:${String(grant.approval_id)}`)), 5000)).toBe(true);
   const logText = daemonLog(cfgDir);
   expect(logText).toContain('hatch-grant-minted');
-  expect(logText).toContain('hatch-grant-notice-delivered');
   expect(logText).not.toContain('ask-late-deliver-permission-pane-skip reason=no-menu');
 
   // (j) the token consume reply carries requestId + approvalId at TOP level, in the

@@ -1,6 +1,6 @@
-// Agents running OUTSIDE tmux (tg-cli#306): discovery from the process table, the
-// per-agent inbox KEY shared with the Stop-hook reader in agent-tools, and the
-// human-facing texts (status lines, the "queued" reply, the no-agent listing).
+// Agents running OUTSIDE tmux (tg-cli#306, tg-cli#456): discovery from the process
+// table, the inbox KEY shared with agent-tools, and the human-facing texts (status
+// lines, the no-agent listing, the `/agent` refusal).
 //
 // PURE — the tg-ctl entrypoint runs `ps -axo pid=,tty=` / `lsof -a -p <pid> -d cwd -Fn`
 // and hands the raw stdout here. Everything below is plain data work.
@@ -8,24 +8,24 @@
 // WHY: tg-ctl discovers agents via `tmux list-panes` and delivers via `tmux send-keys`,
 // so an interactive `claude`/`codex`/`opencode` started from a plain terminal tab does
 // not exist for it — silently (incident 2026-09-05: agents `landing` and `rig-fable`).
-// This module makes such agents VISIBLE (status + picker list them as unreachable with
-// the reason) and gives them a tmux-free delivery channel: an inbox file the harness's
-// Stop hook (agent-tools `cc_hook_bridge`) reads at the agent's next turn end.
+// This module makes such agents VISIBLE (status + the no-agent reply list them as
+// unreachable with the reason) and turns `/agent <name> …` to one into a one-line
+// refusal naming how to start it inside tmux. Claude Code and Codex are tmux-only
+// (tg-cli#456, CTO 2026-09-29); only omp works outside tmux, through omp-live (omp.ts).
+// The Stop-hook inbox that used to carry `/agent` text to them delivered only at the
+// agent's next turn end, so an idle session never got it (17 messages stranded).
 //
 // THE INBOX KEY CONTRACT (shared with agent-tools `lib/agenttools_tg_inbox` — the two
-// implementations MUST stay byte-identical, both READMEs document it):
+// implementations MUST stay byte-identical, both READMEs document it). tg-ctl still
+// derives it for the grant route identity (grants.ts `inbox:<key>`) and for omp's
+// grant-notice fallback, which the omp Stop bridge consumes at its next yield:
 //   key = sanitized(--name value)                  when the agent argv carries `--name X`
 //       = "cwd-" + sha256(cwd)[:16] (hex)          otherwise
 //   sanitized(x) = every char outside [A-Za-z0-9._-] → "_", truncated to 64 chars;
 //                  an empty result counts as "no name".
 //   cwd is the agent process's working directory with trailing "/" stripped ("/" stays).
 //   inbox dir = <tg-cli config dir>/inbox/<key>/   (config dir = $TG_CTL_CONFIG_DIR or
-//               ~/.config/tg-cli)
-//   pending.jsonl            — appended by the daemon (one JSON object per line)
-//   delivered-<pid>-<ts>.jsonl — ONE file per Stop-hook consumption, written whole
-//                              (temp + rename) — never a shared append target, so the
-//                              daemon's claim can never race an in-flight hook write
-//   acked.jsonl              — appended by the daemon after it reacted on Telegram
+//               ~/.config/tg-cli) — file layout in inbox.ts
 
 import { createHash } from 'crypto';
 import type { AgentKind, PaneInfo, ProcInfo } from './types';
@@ -270,8 +270,8 @@ function pidsUnderPanes(panes: PaneInfo[], procs: ProcInfo[]): Set<number> {
 // Past bug (tg-cli#413 follow-up): for claude/codex/opencode this used to additionally
 // require a `ttyByPid` entry ("drop anything with no controlling terminal"), which
 // silently dropped a genuinely live, fully headless session (launched detached, no tty
-// at all — e.g. under launchd/a daemon supervisor) even though delivery here never needs
-// a tty: the whole mechanism is the Stop-hook inbox (pid/cwd/name only).
+// at all — e.g. under launchd/a daemon supervisor) even though listing it (and naming
+// it in the `/agent` refusal) never needs a tty: pid/cwd/name only.
 // `isInteractiveAgentCommand` already independently excludes headless CLI *shapes*
 // (`--print`, `daemon`, `exec`, …) for those three harnesses, so the tty requirement
 // added nothing but a silent drop THERE. A tty is still required for pi/aider/omp/unknown
@@ -329,28 +329,10 @@ export function unreachableLabel(a: UnreachableAgent): string {
   return a.name ?? (cwdBasename(a.cwd) || null) ?? `pid ${a.pid}`;
 }
 
-// The inbox key, or null when it is UNKNOWN: an unnamed agent whose cwd lsof could not
-// resolve has no honest key — fabricating one from the pid would point status at an
-// empty directory ("0 queued") while a message sits in the real cwd-keyed inbox.
-export function unreachableKey(a: UnreachableAgent): string | null {
-  if (a.name && sanitizeAgentName(a.name)) return agentInboxKey(a.name, '');
-  return a.cwd ? agentInboxKey(null, a.cwd) : null;
-}
-
-// Other LIVE agents that would read the SAME inbox as `target` — two sessions whose
-// distinct `--name` values sanitize to one key (`a/b` and `a?b` → `a_b`), or two
-// unnamed sessions in one cwd. Queueing to a shared key could hand a message to the
-// wrong session, so the caller refuses when this is non-empty.
-export function inboxKeyCollisions(target: UnreachableAgent, agents: UnreachableAgent[]): UnreachableAgent[] {
-  const key = unreachableKey(target);
-  if (key === null) return [];
-  return agents.filter((a) => a.pid !== target.pid && unreachableKey(a) === key);
-}
-
 // Match a typed `/agent <selector>` against unreachable agents: exact (case-insensitive)
 // on the `--name`, then on the cwd basename. STRICT on purpose — this is the fallback
-// consulted only after no tmux pane matched, and queueing to the wrong agent's inbox is
-// a silent misroute, so no fuzzy tier here.
+// consulted only after no tmux pane matched, and the refusal names a specific session,
+// so no fuzzy tier here.
 export function matchUnreachable(selector: string, agents: UnreachableAgent[]): UnreachableAgent[] {
   const sel = selector.trim().toLowerCase();
   if (!sel) return [];
@@ -360,35 +342,50 @@ export function matchUnreachable(selector: string, agents: UnreachableAgent[]): 
 }
 
 // One status line per unreachable agent (used by `tg-ctl status` and /status).
-export function describeUnreachable(a: UnreachableAgent, pendingCount: number): string {
-  const label = unreachableLabel(a);
+export function describeUnreachable(a: UnreachableAgent): string {
   const parts = [`tty ${a.tty ?? 'none'}`, `cwd ${a.cwd ?? '?'}`, `name ${a.name ?? '-'}`, `pid ${a.pid}`];
-  const pending = pendingCount > 0 ? `, ${pendingCount} queued` : '';
-  return `${label} · ${a.agent} — unreachable: not in tmux (${parts.join(', ')})${pending}`;
+  return `${unreachableLabel(a)} · ${a.agent} — unreachable: not in tmux (${parts.join(', ')})`;
 }
 
 export const UNREACHABLE_HINT =
-  'Not in tmux → no direct injection; a message sent with `/agent <name> <text>` is queued to its ' +
-  'Stop-hook inbox and delivered when the agent next ends a turn (an idle agent gets it only at its ' +
-  'next turn). To make it fully reachable, restart it inside tmux: `claude-rotate --tmux <name>`.';
+  'Only omp works outside tmux (via omp-live); Claude Code, Codex and the other harnesses are tmux-only — ' +
+  'Telegram cannot reach them there. Restart it inside tmux: `claude-rotate --tmux <name>` (Claude Code) or ' +
+  '`tmux new-window -n <name> <harness>`.';
 
 // The reply for a message that could not be injected anywhere. With unreachable agents
 // present it LISTS them (the whole point of #306: never a silent drop, never a bare
 // "not in tmux" when the agent is right there); without any it is the legacy text.
 export function noAgentReplyText(legacy: string, agents: UnreachableAgent[]): string {
   if (agents.length === 0) return legacy;
-  const lines = agents.map((a) => `  - ${describeUnreachable(a, 0)}`);
-  return (
-    `No agent in tmux. Running OUTSIDE tmux (unreachable for direct injection):\n${lines.join('\n')}\n` +
-    UNREACHABLE_HINT
-  );
+  const lines = agents.map((a) => `  - ${describeUnreachable(a)}`);
+  return `No agent in tmux. Running OUTSIDE tmux (unreachable):\n${lines.join('\n')}\n${UNREACHABLE_HINT}`;
 }
 
-// The reply after a message was queued to an unreachable agent's inbox.
-export function queuedReplyText(a: UnreachableAgent): string {
+// A label as one POSIX shell word: bare when it has no shell metacharacters, else
+// single-quoted with each embedded `'` spelled `'\''`.
+function shellWord(s: string): string {
+  return /^[A-Za-z0-9._@%+=:,/-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+// How to start this agent inside tmux: `claude-rotate --tmux <name>` for Claude Code (it
+// opens the tmux window AND passes `--name`), a named tmux window for any other harness.
+// Named like the agent is listed; a placeholder when neither --name nor cwd is known.
+export function tmuxStartCommand(a: UnreachableAgent): string {
+  const label = a.name ?? (cwdBasename(a.cwd) || null);
+  const name = label === null ? '<name>' : shellWord(label);
+  return a.agent === 'claude' ? `claude-rotate --tmux ${name}` : `tmux new-window -n ${name} ${a.agent}`;
+}
+
+// The ONE-line reply to `/agent <selector> …` that matched only agents outside tmux
+// (tg-cli#456): who it is, that nothing was sent or queued, and how to start it in tmux.
+export function outsideTmuxRefusalText(selector: string, hits: UnreachableAgent[]): string {
+  const who =
+    hits.length === 1
+      ? `${unreachableLabel(hits[0])} · ${hits[0].agent} runs outside tmux`
+      : `'${selector}' matches ${hits.length} sessions outside tmux (${hits.map((a) => `${unreachableLabel(a)} · ${a.agent} pid ${a.pid}`).join(', ')})`;
+  const starts = [...new Set(hits.map(tmuxStartCommand))].join(' or ');
   return (
-    `${unreachableLabel(a)} is running outside tmux (tty ${a.tty ?? 'none'}, cwd ${a.cwd ?? '?'}) — queued to its ` +
-    'Stop-hook inbox; delivered when the agent next ends a turn (an idle agent receives it only at its ' +
-    'next turn). You get a 👌 reaction on this message once it is delivered.'
+    `${who} — Telegram cannot reach ${hits.length === 1 ? 'it' : 'them'} there (only omp works outside tmux), ` +
+    `so nothing was sent or queued. Start it in tmux: ${starts}`
   );
 }

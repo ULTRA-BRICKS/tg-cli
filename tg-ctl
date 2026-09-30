@@ -113,29 +113,33 @@ import {
 import { isAllowedReaction, reactionForStage } from "./features/tg-ctl/reactions"
 import {
   ACKED_FILE,
+  CLAIM_SWEEP_PREFIX,
   INBOX_DIR_MODE,
   INBOX_FILE_MODE,
   PENDING_FILE,
-  idsToAck,
+  STRANDED_PREFIX,
   inboxDirFor,
   inboxRoot,
   isDeliveredBatchFile,
+  isStrandedFile,
+  isSweepClaimFile,
   parseInboxLines,
   serializeInboxEntry,
+  splitStrandedLines,
+  strandedReportMarker,
+  strandedReportText,
   type InboxEntry,
+  type StrandedGroup,
 } from "./features/tg-ctl/inbox"
 import {
   agentInboxKey,
   describeUnreachable,
   findUnreachableAgents,
-  inboxKeyCollisions,
   matchUnreachable,
   noAgentReplyText,
+  outsideTmuxRefusalText,
   parseLsofCwd,
   parsePidTtyList,
-  queuedReplyText,
-  unreachableKey,
-  unreachableLabel,
   UNREACHABLE_HINT,
   type UnreachableAgent,
 } from "./features/tg-ctl/unreachable"
@@ -437,10 +441,10 @@ export const USAGE = `Usage:
   tg-ctl status          # is it running? pid / bot / target pane / autostart;
                          # \`code:\` names the commit the daemon loaded — STALE when its
                          # checkout has newer daemon code (merged but not restarted);
-                         # also lists agents running OUTSIDE tmux as unreachable (tg-cli#306)
-  tg-ctl inbox           # pending Stop-hook inbox entries per agent (the tmux-free channel)
-  tg-ctl inbox queue <name|dir> <text…>
-                         # queue text to a non-tmux agent's Stop-hook inbox by hand
+                         # also lists agents running OUTSIDE tmux as unreachable — Claude Code
+                         # and Codex are tmux-only (tg-cli#456)
+  tg-ctl inbox           # pending Stop-hook inbox entries (omp's grant-notice fallback) and the
+                         # archived cc/codex backlog (tg-cli#456)
   tg-ctl stop            # stop the daemon (found via pidfile, flock holder or launchd job);
                          # exits 1 if it is still alive after the SIGTERM drain
   tg-ctl restart [--if-stale]
@@ -1887,9 +1891,8 @@ function noAgentReplyNow(): string {
   return noAgentReplyText(NO_AGENT_REPLY, unreachable)
 }
 
-// Count the lines of a JSONL file (0 when absent/unreadable, or the key is unknown).
-function pendingInboxCount(ctx: Ctx, key: string | null): number {
-  if (key === null) return 0
+// Entries in a key's pending.jsonl (0 when absent/unreadable).
+function pendingInboxCount(ctx: Ctx, key: string): number {
   const raw = readFileOrNull(join(inboxDirFor(ctx.configDir, key), PENDING_FILE))
   return raw ? parseInboxLines(raw).entries.length : 0
 }
@@ -1905,7 +1908,7 @@ function tightenInboxModes(dir: string, file?: string): void {
 
 // Append ONE entry to an agent's pending inbox: mkdir -p + a single O_APPEND write of
 // one complete line (never a torn record for the consuming Stop hook). Throws on IO
-// failure — the caller turns that into an explicit Telegram reply.
+// failure. omp's grant-notice fallback is the only caller (tg-cli#456).
 function queueToInbox(ctx: Ctx, key: string, entry: InboxEntry): void {
   const dir = inboxDirFor(ctx.configDir, key)
   mkdirSync(dir, { recursive: true, mode: INBOX_DIR_MODE })
@@ -1914,9 +1917,13 @@ function queueToInbox(ctx: Ctx, key: string, entry: InboxEntry): void {
   tightenInboxModes(dir, pending)
 }
 
-// Deliver an operation-bound grant notice to its exact origin. A recorded pane
-// uses its original route; OMP uses a verified session-bound socket. No session
-// identity means the durable scoped inbox, never a cwd/name guess or a spawn.
+// Deliver an operation-bound grant notice to its exact origin. A recorded pane uses its
+// original route; OMP uses a verified session-bound socket and, when that is unavailable,
+// the durable scoped inbox its Stop bridge consumes at the next yield — never a cwd/name
+// guess or a spawn. Claude Code / Codex without a pane get nothing: they are tmux-only
+// (tg-cli#456), and their inbox delivered only at a turn end an idle or exited session
+// never reaches — every message stranded there was such a notice. The card then names
+// the token path.
 async function routeGrantNotice(ctx: Ctx, req: ButtonRequest, text: string, deliveryId: string): Promise<boolean> {
   const ompOrigin = req.origin?.agent === "omp" || req.agent === "omp"
   if (req.paneId && !ompOrigin) {
@@ -1928,20 +1935,22 @@ async function routeGrantNotice(ctx: Ctx, req: ButtonRequest, text: string, deli
       return false
     }
   }
-  if (ompOrigin) {
-    await refreshOriginalHosts()
-    let target: OriginalOmpTarget | null = null
-    if (req.origin?.sessionId) target = { cwd: req.cwd, sessionId: req.origin.sessionId }
-    else if (req.paneId) {
-      const live = liveOmpForPane(req.paneId)
-      if (live) target = live
-    }
-    // No exact session/pane identity: retain in scoped inbox, never guess by cwd.
-    if (target) {
-      const res = await deliverOriginalOmp(target, text, deliveryId, req.paneId)
-      if (res.ok) return true
-      log(`grant-notice omp route failed (falling back to inbox) session=${target.sessionId ?? "-"}: ${res.error}`)
-    }
+  if (!ompOrigin) {
+    log(`grant-notice: ${req.agent} origin has no tmux pane — nothing queued (Claude Code/Codex are tmux-only)`)
+    return false
+  }
+  await refreshOriginalHosts()
+  let target: OriginalOmpTarget | null = null
+  if (req.origin?.sessionId) target = { cwd: req.cwd, sessionId: req.origin.sessionId }
+  else if (req.paneId) {
+    const live = liveOmpForPane(req.paneId)
+    if (live) target = live
+  }
+  // No exact session/pane identity: retain in scoped inbox, never guess by cwd.
+  if (target) {
+    const res = await deliverOriginalOmp(target, text, deliveryId, req.paneId)
+    if (res.ok) return true
+    log(`grant-notice omp route failed (falling back to inbox) session=${target.sessionId ?? "-"}: ${res.error}`)
   }
   try {
     queueToInbox(ctx, agentInboxKey(req.origin?.subagent ?? req.subagent ?? null, req.cwd ?? "/"), {
@@ -1969,30 +1978,11 @@ function listInboxKeys(ctx: Ctx): string[] {
   }
 }
 
-// React 👌 on a delivered message. Returns false ONLY for a failure worth retrying
-// (network error, 5xx, 429) — a definitive Telegram refusal (4xx: message gone,
-// REACTION_INVALID) is final and counts as done, so a batch never wedges on it.
-async function reactDelivered(ctx: Ctx, messageId: number): Promise<boolean> {
-  const emoji = reactionForStage("done")
-  if (!isAllowedReaction(emoji)) return true
-  const r = await botPostResult(ctx, "setMessageReaction", {
-    chat_id: ctx.chatId,
-    message_id: messageId,
-    reaction: [{ type: "emoji", emoji }],
-  })
-  if (r.ok) return true
-  const retryable = r.status === undefined || r.status === 429 || r.status >= 500
-  log(`inbox: 👌 reaction on tg#${messageId} failed (${r.status ?? "network"}: ${r.description}) — ${retryable ? "will retry" : "final"}`)
-  return !retryable
-}
-
-// Ack what the Stop hook delivered. The hook publishes each consumption as ONE complete
-// `delivered-<pid>-<ts>.jsonl` (temp + rename), so a file we see is whole and no in-
-// flight hook write can be lost to our unlink. Per file: react 👌 on every Telegram id,
-// archive into acked.jsonl, unlink. A batch whose reaction hit a RETRYABLE failure is
-// left on disk for the next sweep (review finding: a transient Bot API outage must not
-// discard the promised receipt). Never throws into the poll loop.
-async function ackDeliveredInboxes(ctx: Ctx): Promise<void> {
+// Archive what the omp Stop bridge delivered. The hook publishes each consumption as ONE
+// complete `delivered-<pid>-<ts>.jsonl` (temp + rename), so a file we see is whole and no
+// in-flight hook write can be lost to our unlink: append it to acked.jsonl, unlink.
+// Never throws into the poll loop.
+function archiveDeliveredInboxes(ctx: Ctx): void {
   for (const key of listInboxKeys(ctx)) {
     const dir = inboxDirFor(ctx.configDir, key)
     try {
@@ -2001,80 +1991,153 @@ async function ackDeliveredInboxes(ctx: Ctx): Promise<void> {
         const path = join(dir, name)
         const raw = readFileOrNull(path) ?? ""
         const parsed = parseInboxLines(raw)
-        let allReacted = true
-        for (const id of idsToAck(parsed.entries)) {
-          if (!(await reactDelivered(ctx, id))) allReacted = false
-        }
-        if (!allReacted) continue // keep the batch; retried next sweep
         if (parsed.entries.length > 0 || parsed.malformed > 0) {
-          log(`inbox ${key}: ${parsed.entries.length} delivered by the Stop hook (${parsed.malformed} malformed) — acked`)
+          log(`inbox ${key}: ${parsed.entries.length} delivered by the Stop hook (${parsed.malformed} malformed) — archived`)
         }
         if (raw) appendFileSync(join(dir, ACKED_FILE), raw.endsWith("\n") ? raw : `${raw}\n`, { mode: INBOX_FILE_MODE })
         unlinkSync(path)
       }
     } catch (err) {
-      log(`inbox ${key}: ack sweep failed: ${err}`)
+      log(`inbox ${key}: delivered-batch sweep failed: ${err}`)
     }
   }
 }
 
-// `tg-ctl inbox [queue <selector> <text…>]` — the CLI view of the tmux-free channel.
-function runInboxCommand(ctx: Ctx, argv: string[]): number {
-  const agents = listUnreachableAgents()
-  if (argv[0] === "queue") {
-    const selector = argv[1] ?? ""
-    const text = argv.slice(2).join(" ").trim()
-    if (!selector || !text) {
-      console.error("usage: tg-ctl inbox queue <name|dir> <text…>")
-      return 1
-    }
-    const hits = matchUnreachable(selector, agents)
-    if (hits.length !== 1) {
-      console.error(
-        hits.length === 0
-          ? `no agent outside tmux matches '${selector}' (running: ${agents.map(unreachableLabel).join(", ") || "none"})`
-          : `'${selector}' is ambiguous: ${hits.map((a) => describeUnreachable(a, 0)).join("; ")}`,
-      )
-      return 1
-    }
-    const key = unreachableKey(hits[0])
-    if (key === null) {
-      console.error(`${unreachableLabel(hits[0])}: inbox key unknown (no --name and its cwd could not be resolved) — cannot queue`)
-      return 1
-    }
-    const clashes = inboxKeyCollisions(hits[0], agents)
-    if (clashes.length > 0) {
-      console.error(`refusing: inbox key '${key}' is shared with another live session (${clashes.map((a) => describeUnreachable(a, 0)).join("; ")}) — give them distinct --name values`)
-      return 1
-    }
+// Every archived stranded-*.jsonl, per inbox key (read-only).
+function strandedInboxGroups(ctx: Ctx): StrandedGroup[] {
+  const groups: StrandedGroup[] = []
+  for (const key of listInboxKeys(ctx)) {
+    const dir = inboxDirFor(ctx.configDir, key)
+    let names: string[]
     try {
-      queueToInbox(ctx, key, {
-        id: null,
-        ts: new Date().toISOString(),
-        from: "tg-ctl",
-        text,
-        wrapped: wrapInbound(ctx.cfg.injectWrap, "tg-ctl", text),
-      })
+      names = readdirSync(dir).filter(isStrandedFile).sort()
     } catch (err) {
-      console.error(`could not write the inbox for ${key}: ${err}`)
-      return 1
+      log(`inbox ${key}: cannot list stranded files: ${err}`)
+      continue
     }
-    console.log(`queued to ${key} (${describeUnreachable(hits[0], pendingInboxCount(ctx, key))})`)
-    return 0
+    for (const name of names) groups.push({ key, entries: parseInboxLines(readFileOrNull(join(dir, name)) ?? "").entries })
   }
-  const keys = listInboxKeys(ctx)
-  if (agents.length === 0 && keys.length === 0) {
-    console.log("inbox: no agent outside tmux, no inbox on disk")
-    return 0
+  return groups
+}
+
+// One-time retirement of the cc/codex Stop-hook inbox (tg-cli#456). Until the marker
+// exists: claim every pending.jsonl (rename — the same atomic claim the Stop hook uses,
+// so a racing hook either got it first or finds none), split it, archive what the retired
+// channel stranded as stranded-<stamp>.jsonl and append omp's still-live grant notices
+// back to pending.jsonl for the omp hook (an omp fallback queued by the previous daemon
+// or during a failed-send retry is never swallowed). The stranded entries are listed ONCE
+// to the CTO through the daemon's own reply path, then the marker is written. A failed
+// send keeps the built report and the next poll retries ONLY the send: re-sweeping would
+// churn omp's pending.jsonl and could archive (and report) an omp notice queued since —
+// or one whose grant expired in between — as stranded. The sweep is synchronous, so no
+// routeGrantNotice append interleaves.
+let strandedReportDone = false
+let strandedReportUnsent: { text: string | null; count: number; complete: boolean } | null = null
+async function reportStrandedInbox(ctx: Ctx): Promise<void> {
+  if (strandedReportDone) return
+  const marker = strandedReportMarker(ctx.configDir)
+  if (existsSync(marker)) {
+    strandedReportDone = true
+    return
   }
-  for (const a of agents) console.log(`  - ${describeUnreachable(a, pendingInboxCount(ctx, unreachableKey(a)))}`)
-  const live = new Set(agents.map(unreachableKey).filter((k): k is string => k !== null))
-  for (const key of keys) {
-    if (live.has(key)) continue
+  if (strandedReportUnsent === null) strandedReportUnsent = sweepStrandedInbox(ctx)
+  const { text, count, complete } = strandedReportUnsent
+  if (text !== null && (await sendMessage(ctx, text)) === null) {
+    log("inbox: the stranded-message report did not send — retrying the send next poll")
+    return
+  }
+  strandedReportDone = true
+  strandedReportUnsent = null
+  // A key whose claim could not be archived keeps its claim-sweep-*.jsonl; without the
+  // marker the next daemon start sweeps it again, so those messages are never lost.
+  if (!complete) {
+    log(`inbox: some pending.jsonl could not be archived — not writing ${marker}; the next start retries the sweep`)
+  } else {
+    try {
+      writeFileSync(marker, `${JSON.stringify({ reportedAt: new Date().toISOString(), messages: count })}\n`, { mode: 0o600 })
+    } catch (err) {
+      log(`inbox: could not write ${marker} (a restart would report the stranded messages again): ${err}`)
+    }
+  }
+  if (count > 0) log(`inbox: ${count} stranded cc/codex message(s) reported once, archived as ${STRANDED_PREFIX}*.jsonl (tg-cli#456)`)
+}
+
+// Claim, split and archive every pending.jsonl — and any claim-sweep-*.jsonl an earlier
+// sweep left behind (crash or failed archive) — once; returns the report over the whole
+// archive (this sweep's and any earlier daemon's unreported stranded-*.jsonl) and whether
+// every claim was archived.
+function sweepStrandedInbox(ctx: Ctx): { text: string | null; count: number; complete: boolean } {
+  // An omp grant: its origin says omp, it routes to an omp session, or — an omp ask with
+  // no origin block (routeGrantNotice also treats `agent: "omp"` as omp) — its grace
+  // record's original request came from omp.
+  const store = parseGrantStore(readFileOrNull(ctx.paths.grants), Date.now())
+  const ompGraceRequests = new Set(store.grace.filter((r) => r.req.agent === "omp").map((r) => r.requestId))
+  const liveOmpApprovals = new Map(
+    store.grants
+      .filter((g) => g.consumed_at === null && (g.origin?.agent === "omp" || g.route?.startsWith("acp:") || ompGraceRequests.has(g.request_id)))
+      .map((g) => [g.approval_id, g.request_id] as const),
+  )
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-")
+  let complete = true
+  for (const key of listInboxKeys(ctx)) {
+    const dir = inboxDirFor(ctx.configDir, key)
+    const pending = join(dir, PENDING_FILE)
+    let claims: string[]
+    try {
+      claims = readdirSync(dir).filter(isSweepClaimFile).sort().map((n) => join(dir, n))
+      if (existsSync(pending)) {
+        const claim = join(dir, `${CLAIM_SWEEP_PREFIX}${process.pid}-${stamp}.jsonl`)
+        try {
+          renameSync(pending, claim)
+          claims.push(claim)
+        } catch (err) {
+          // The omp Stop hook claimed it between the check and the rename: it consumes
+          // that file itself, so nothing is left to archive — not a failed sweep.
+          if (!(err instanceof Error && "code" in err && err.code === "ENOENT")) throw err
+        }
+      }
+    } catch (err) {
+      log(`inbox ${key}: could not claim the stranded pending.jsonl: ${err}`)
+      complete = false
+      continue
+    }
+    // Replaying a claim after a crash must not duplicate: its archive is named after the
+    // claim and rewritten whole, and a kept omp line already back in pending.jsonl is skipped.
+    for (const claim of claims) {
+      try {
+        const { keep, stranded } = splitStrandedLines(readFileSync(claim, "utf8"), liveOmpApprovals)
+        const archive = join(dir, `${STRANDED_PREFIX}${basename(claim).slice(CLAIM_SWEEP_PREFIX.length)}`)
+        if (stranded.length > 0) writeFileSync(archive, `${stranded.join("\n")}\n`, { mode: INBOX_FILE_MODE })
+        const pendingLines = new Set((readFileOrNull(pending) ?? "").split("\n"))
+        const fresh = keep.filter((l) => !pendingLines.has(l))
+        if (fresh.length > 0) appendFileSync(pending, `${fresh.join("\n")}\n`, { mode: INBOX_FILE_MODE })
+        unlinkSync(claim)
+      } catch (err) {
+        log(`inbox ${key}: could not archive ${claim} (left in place; the next start retries it): ${err}`)
+        complete = false
+      }
+    }
+  }
+  const groups = strandedInboxGroups(ctx)
+  return { text: strandedReportText(groups, inboxRoot(ctx.configDir)), count: groups.reduce((n, g) => n + g.entries.length, 0), complete }
+}
+
+// `tg-ctl inbox` — what the Stop-hook inbox still holds: omp's grant-notice fallback
+// (pending, delivered at that omp's next yield) and the archived cc/codex backlog.
+// Read-only: Claude Code and Codex are tmux-only, nothing can be queued (tg-cli#456).
+function runInboxCommand(ctx: Ctx, argv: string[]): number {
+  if (argv.length > 0) {
+    console.error("usage: tg-ctl inbox   (`inbox queue` is gone: Claude Code and Codex are tmux-only, tg-cli#456)")
+    return 1
+  }
+  const lines: string[] = []
+  for (const key of listInboxKeys(ctx)) {
     const n = pendingInboxCount(ctx, key)
-    if (n > 0) console.log(`  - ${key}: ${n} queued, agent not running (delivered when an agent with this key next ends a turn)`)
+    if (n > 0) lines.push(`  - ${key}: ${n} pending (omp grant notice, delivered at that omp's next yield)`)
   }
-  console.log(UNREACHABLE_HINT)
+  const archived = strandedInboxGroups(ctx).reduce((n, g) => n + g.entries.length, 0)
+  if (archived > 0) lines.push(`  archived: ${archived} stranded cc/codex message(s) in ${inboxRoot(ctx.configDir)}/*/${STRANDED_PREFIX}*.jsonl`)
+  console.log(lines.length > 0 ? lines.join("\n") : "inbox: nothing pending")
   return 0
 }
 
@@ -2457,11 +2520,12 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
         : "target: no agent pane found",
   )
   // Agents that run OUTSIDE tmux (tg-cli#306) — listed, not omitted, with the reason
-  // and how to reach them; the silent-invisibility this replaces was the incident.
+  // and how to restart them in tmux (tmux-only, tg-cli#456); the silent-invisibility
+  // this replaces was the incident.
   const unreachable = listUnreachableAgents()
   if (unreachable.length > 0) {
-    lines.push(`unreachable (not in tmux): ${unreachable.length}`)
-    for (const a of unreachable) lines.push(`  - ${describeUnreachable(a, pendingInboxCount(ctx, unreachableKey(a)))}`)
+    lines.push(`unreachable (not in tmux, tmux-only): ${unreachable.length}`)
+    for (const a of unreachable) lines.push(`  - ${describeUnreachable(a)}`)
     lines.push(`  ${UNREACHABLE_HINT}`)
   }
   const liveOmp = listLiveOmpAgents()
@@ -7889,15 +7953,25 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return true
   }
 
+  // `/agent <selector> …` that matched no tmux pane, checked against the non-omp agents
+  // running OUTSIDE tmux. Claude Code and Codex are tmux-only (tg-cli#456): a ONE-line
+  // refusal naming how to start it inside tmux — nothing is sent or queued (the Stop-hook
+  // inbox this replaces delivered only at a turn end an idle session never reached).
+  // true when it refused (the caller stops), false when nothing outside tmux matches.
+  const refuseOutsideTmux = async (selector: string, out: Record<string, unknown> = {}): Promise<boolean> => {
+    const hits = matchUnreachable(selector, listUnreachableAgents())
+    if (hits.length === 0) return false
+    log(`agent-route: selector="${selector}" → outside tmux (${hits.map((a) => `${a.agent} pid ${a.pid}`).join(", ")}) — refused, tmux-only`)
+    await sendMessage(ctx, outsideTmuxRefusalText(selector, hits), out)
+    return true
+  }
+
   // A `/agent <selector> <message>` whose selector matched NO tmux pane: try the agents
-  // running OUTSIDE tmux (tg-cli#306). An exact match queues the (already wrapped) text
-  // to that agent's Stop-hook inbox and replies with WHERE it went and WHEN it arrives;
-  // an ambiguous match lists the choices; no match returns null so the caller keeps its
-  // legacy "no agent matching" error. Never a silent drop.
-  const tryQueueUnreachable = async (
+  // running OUTSIDE tmux. An omp gets the (already wrapped) text through its original-
+  // process bridge; any other harness gets the tmux-only refusal. No match returns null
+  // so the caller keeps its legacy "no agent matching" error. Never a silent drop.
+  const tryRouteOutsideTmux = async (
     selector: string,
-    from: string,
-    text: string,
     wrapped: string,
     messageId: number | null,
     out: Record<string, unknown> = {},
@@ -7920,38 +7994,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       await sendMessage(ctx, `→ ${liveOmpLabel(target)} · omp (original-process)`, out)
       return true
     }
-    const agents = listUnreachableAgents()
-    const hits = matchUnreachable(selector, agents)
-    if (hits.length === 0) return null
-    if (hits.length > 1) {
-      const lines = hits.map((a) => `  - ${describeUnreachable(a, 0)}`)
-      await sendMessage(ctx, `'${selector}' matches several agents outside tmux — give them distinct --name values:\n${lines.join("\n")}`, out)
-      return false
-    }
-    const target = hits[0]
-    const key = unreachableKey(target)
-    if (key === null) {
-      await sendMessage(ctx, `${unreachableLabel(target)} is outside tmux and has no inbox key (no --name, cwd unresolved) — restart it with --name or inside tmux`, out)
-      return false
-    }
-    // Two live sessions reading ONE inbox (names that sanitize alike, or two unnamed
-    // sessions in one cwd) could hand this message to the wrong one — refuse, never guess.
-    const clashes = inboxKeyCollisions(target, agents)
-    if (clashes.length > 0) {
-      const lines = [target, ...clashes].map((a) => `  - ${describeUnreachable(a, 0)}`)
-      await sendMessage(ctx, `refusing: inbox key '${key}' is shared by several live sessions — give them distinct --name values:\n${lines.join("\n")}`, out)
-      return false
-    }
-    try {
-      queueToInbox(ctx, key, { id: messageId, ts: new Date().toISOString(), from, text, wrapped })
-    } catch (err) {
-      log(`agent-route: inbox write failed for ${key}: ${err}`)
-      await sendMessage(ctx, `${unreachableLabel(target)} is outside tmux and its inbox could not be written: ${err}`, out)
-      return false
-    }
-    log(`agent-route: selector="${selector}" → outside tmux ${key} (pid ${target.pid}) — queued to inbox`)
-    await sendMessage(ctx, queuedReplyText(target), out)
-    return true
+    return (await refuseOutsideTmux(selector, out)) ? false : null
   }
 
   const routePrewrappedAgentMessage = async (
@@ -7964,8 +8007,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const msgPreview = prewrappedText.slice(0, 60).replace(/\n/g, " ")
     if (candidates.length === 0) {
       if (route.selector) {
-        const queued = await tryQueueUnreachable(route.selector, "tg", route.rest, prewrappedText, sourceMessageId)
-        if (queued !== null) return queued
+        const routed = await tryRouteOutsideTmux(route.selector, prewrappedText, sourceMessageId)
+        if (routed !== null) return routed
       }
       log(`media-agent-route: no candidates — selector=${route.selector || "(none)"} msg="${msgPreview}"`)
       await sendMessage(ctx, noAgentReplyNow())
@@ -7984,8 +8027,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         log(`media-agent-route: selector="${route.selector}" → ambiguous (${m.matches.length} matches: ${names}) → picker`)
         return postRoutePicker(m.matches, prewrappedText, undefined, sourceMessageId)
       }
-      const queued = await tryQueueUnreachable(route.selector, "tg", route.rest, prewrappedText, sourceMessageId)
-      if (queued !== null) return queued
+      const routed = await tryRouteOutsideTmux(route.selector, prewrappedText, sourceMessageId)
+      if (routed !== null) return routed
       const found = resolveGoneAgentAnchor("media-agent-route", route.selector, candidates, true)
       if (found) {
         const { anchor, label } = found
@@ -8055,8 +8098,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (candidates.length === 0) {
       if (action.selector && action.rest.trim()) {
         const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, action.rest, action.messageId)
-        const queued = await tryQueueUnreachable(action.selector, action.from, action.rest, wrapped, action.messageId, out)
-        if (queued !== null) return queued
+        const routed = await tryRouteOutsideTmux(action.selector, wrapped, action.messageId, out)
+        if (routed !== null) return routed
+      } else if (action.selector && (await refuseOutsideTmux(action.selector, out))) {
+        return false
       }
       log(`agent-route: no candidates — selector=${action.selector || "(none)"} msg="${msgPreview}"`)
       await sendMessage(ctx, noAgentReplyNow(), out)
@@ -8130,8 +8175,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // Report the miss clearly so the user knows their intent was not routed.
       if (action.rest.trim()) {
         const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, action.rest, action.messageId)
-        const queued = await tryQueueUnreachable(action.selector, action.from, action.rest, wrapped, action.messageId, out)
-        if (queued !== null) return queued
+        const routed = await tryRouteOutsideTmux(action.selector, wrapped, action.messageId, out)
+        if (routed !== null) return routed
         // The named target is not live ANYWHERE tg-ctl can see — see agent-match.ts's
         // "gone-agent (dead subagent) fallback" comment for the full rationale. FLAT
         // chat only: a bound topic already carries its own stronger routing signal (the
@@ -8151,6 +8196,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           await sendMessage(ctx, goneAgentFallbackReplyText(action.selector, label, res.deferred), out)
           return true
         }
+      } else if (await refuseOutsideTmux(action.selector, out)) {
+        return false
       }
       const names = candidates.map((c) => c.windowName).join(", ")
       log(`agent-route: selector="${action.selector}" → NO match among [${names}] — reporting error`)
@@ -11044,11 +11091,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const regMtime = fileMtimeMs(ctx.paths.registration)
       if (regMtime !== null && regMtime > lastAgentSeenMs) lastAgentSeenMs = regMtime
       discover()
-      // An agent running OUTSIDE tmux keeps the daemon alive too (tg-cli#306): idle-exiting
-      // while one is up would make its queued inbox messages vanish exactly the way the
-      // incident did. The same sweep acks what the Stop hook delivered since last poll.
+      // An agent running OUTSIDE tmux keeps the daemon alive too (tg-cli#306): its
+      // question cards and hatch asks still come through the daemon socket, and a
+      // `/agent` to it must get the tmux-only refusal, not silence. The same tick archives
+      // what the omp Stop bridge delivered and, once, reports the stranded cc/codex inbox.
       if (listUnreachableAgents().length > 0 || listLiveOmpAgents().length > 0) lastAgentSeenMs = Date.now()
-      await ackDeliveredInboxes(ctx)
+      archiveDeliveredInboxes(ctx)
+      await reportStrandedInbox(ctx)
       if (Date.now() - lastAgentSeenMs > ctx.cfg.idleExitMin * 60_000) {
         log(`no agent pane for ${ctx.cfg.idleExitMin} min — idle exit`)
         cleanExit(0)

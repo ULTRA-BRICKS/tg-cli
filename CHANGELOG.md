@@ -3,6 +3,28 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.31
+
+- **Claude Code and Codex are tmux-only (#456).** `/agent <name> <text>` (or a bare
+  `/agent <name>`) to a Claude Code / Codex session running outside tmux gets a one-line
+  refusal naming how to start it in tmux — `claude-rotate --tmux <name>`, or
+  `tmux new-window -n <name> codex` — and nothing is queued. The Stop-hook inbox that used to
+  take such messages delivered only at the agent's next turn end, so an idle session never
+  got them. A belated hatch approval for a Claude Code / Codex ask with no tmux pane is not
+  queued either; the card names the token path. omp outside tmux is unchanged (omp-live, with
+  its grant-notice inbox fallback). `tg-ctl status` and the no-agent reply list agents outside
+  tmux with the restart hint instead of a queue count; `tg-ctl inbox queue` is gone and
+  `tg-ctl inbox` shows omp's pending grant notices and the archive.
+- **The stranded inbox is reported once and archived.** On its first poll the daemon moves
+  every leftover `inbox/<key>/pending.jsonl` entry to `stranded-<stamp>.jsonl` — except an
+  omp grant notice whose grant is still live, which stays pending for the omp hook — lists
+  those messages in one Telegram message (oldest first, key and preview each), and writes
+  `inbox-stranded-report.json` so a restart never repeats it. A failed send keeps the built
+  report and the next poll retries only the send; the inbox is not swept again. A key whose
+  claimed backlog could not be archived keeps its `claim-sweep-*.jsonl` and the marker is not
+  written, so the next start sweeps it again instead of losing it — without duplicating what
+  a crashed sweep had already archived or put back.
+
 ## 1.54.27
 
 - **Reply quotes are never empty (#461).** A reply to an agent's rich report (anything `tg

@@ -107,7 +107,8 @@ pane with NO endpoint gets `tmux send-keys` into its own pane (its original TUI 
 writer, no spawn), but only on a proven-absent endpoint (`endpoint_unavailable`); every
 other endpoint error fails closed. An OMP outside tmux without an endpoint fails closed; do
 not restore the old spawn fallback to satisfy legacy fixtures. `tg-ctl status` names every
-omp without a bridge. Claude Code and Codex stay tmux-only. See
+omp without a bridge. Claude Code and Codex stay tmux-only (#456): outside tmux they are
+listed and refused, never queued — do not restore the Stop-hook inbox for them. See
 `docs/omp-original-process.md` for setup, receipt semantics, and the one-time saved restart
 needed by already-running OMP. Cwd/title are not process identity.
 
@@ -171,12 +172,18 @@ needed by already-running OMP. Cwd/title are not process identity.
   the title leads; cwd basename is the fallback tier. Shared by the `tg` header, the `/agent`
   picker, `tg-ctl status`, the history label and question cards; never a `no tmux` placeholder),
   `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker),
-  `unreachable.ts` + `inbox.ts` (tg-cli#306: agents OUTSIDE tmux — a `ps pid,tty` scan +
-  lsof cwd finds interactive agent processes in no pane; they are listed as `unreachable:
-  not in tmux` and a `/agent <name> <text>` is queued to `<config>/inbox/<key>/pending.jsonl`,
-  which the agent-tools Stop hook (`cc_hook_bridge`) consumes at the agent's next turn end;
-  the inbox KEY — sanitized `--name`, else `cwd-<sha256(cwd)[:16]>` — is shared byte-for-byte
-  with agent-tools `lib/agenttools_tg_inbox`, test vectors mirrored in both suites),
+  `unreachable.ts` + `inbox.ts` (tg-cli#306, tg-cli#456: agents OUTSIDE tmux — a `ps pid,tty`
+  scan + lsof cwd finds interactive agent processes in no pane; they are listed as
+  `unreachable: not in tmux`. Claude Code and Codex are tmux-only: `/agent <name> …` to one
+  gets a one-line refusal naming how to start it in tmux (`claude-rotate --tmux <name>`,
+  else `tmux new-window -n <name> <harness>`) and nothing is queued. The Stop-hook inbox
+  (`<config>/inbox/<key>/pending.jsonl`) now carries only omp's grant-notice fallback (an omp
+  whose omp-live endpoint is unreachable), consumed at that omp's next yield; a cc/codex grant
+  notice with no pane is not queued (the card names the token path). The retired channel's
+  backlog was claimed once to `stranded-*.jsonl`, listed to the CTO through the daemon's reply
+  path, marked done in `<config>/inbox-stranded-report.json`. The inbox KEY — sanitized
+  `--name`, else `cwd-<sha256(cwd)[:16]>` — stays shared byte-for-byte with agent-tools
+  `lib/agenttools_tg_inbox` (it is also the grant route identity), test vectors mirrored),
   `last-user-target.ts` (tg-cli#78 anchor fix: the pane of the CTO's OWN last CONFIRMED
   inbound delivery — auto-bound, a recognized reply, or an explicit picker/`/agent`
   selection — distinct from the removed `lastMessagePane` mechanism, which used to track

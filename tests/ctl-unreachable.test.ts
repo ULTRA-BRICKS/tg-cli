@@ -3,16 +3,15 @@ import {
   agentInboxKey,
   describeUnreachable,
   findUnreachableAgents,
-  inboxKeyCollisions,
   isInteractiveAgentCommand,
   matchUnreachable,
   noAgentReplyText,
+  outsideTmuxRefusalText,
   parseAgentNameFromCommand,
   parseLsofCwd,
   parsePidTtyList,
-  queuedReplyText,
   sanitizeAgentName,
-  unreachableKey,
+  tmuxStartCommand,
   unreachableLabel,
   type UnreachableAgent,
 } from '../features/tg-ctl/unreachable';
@@ -280,31 +279,10 @@ test('a headless pi/aider (no per-shape headless detection) is still dropped wit
 
 // --- labels, keys, matching, texts ---
 
-test('unreachableLabel/unreachableKey: name first, cwd basename fallback, pid when neither', () => {
+test('unreachableLabel: name first, cwd basename fallback, pid when neither', () => {
   expect(unreachableLabel(ua())).toBe('landing');
-  expect(unreachableKey(ua())).toBe('landing');
-  const anon = ua({ name: null, command: 'claude', cwd: '/Users/ultra/work/landing' });
-  expect(unreachableLabel(anon)).toBe('landing');
-  expect(unreachableKey(anon)).toBe('cwd-ccfe64bae2f277d7');
-  // unnamed + cwd unresolved: the label falls to the pid and the key is honestly UNKNOWN
-  const blind = ua({ name: null, command: 'claude', cwd: null });
-  expect(unreachableLabel(blind)).toBe('pid 7103');
-  expect(unreachableKey(blind)).toBeNull();
-  // a named agent needs no cwd for its key
-  expect(unreachableKey(ua({ cwd: null }))).toBe('landing');
-});
-
-test('inboxKeyCollisions: distinct names that sanitize alike, or two unnamed sessions in one cwd, share a key', () => {
-  const a = ua({ pid: 1, name: 'a/b', command: 'claude --name a/b' });
-  const b = ua({ pid: 2, name: 'a?b', command: 'claude --name a?b' });
-  const c = ua({ pid: 3, name: 'other', command: 'claude --name other' });
-  expect(inboxKeyCollisions(a, [a, b, c]).map((x) => x.pid)).toEqual([2]);
-  expect(inboxKeyCollisions(c, [a, b, c])).toEqual([]);
-  const u1 = ua({ pid: 4, name: null, command: 'claude', cwd: '/w/x' });
-  const u2 = ua({ pid: 5, name: null, command: 'claude', cwd: '/w/x/' });
-  const blind = ua({ pid: 6, name: null, command: 'claude', cwd: null });
-  expect(inboxKeyCollisions(u1, [u1, u2, blind]).map((x) => x.pid)).toEqual([5]);
-  expect(inboxKeyCollisions(blind, [u1, u2, blind])).toEqual([]);
+  expect(unreachableLabel(ua({ name: null, command: 'claude', cwd: '/Users/ultra/work/landing' }))).toBe('landing');
+  expect(unreachableLabel(ua({ name: null, command: 'claude', cwd: null }))).toBe('pid 7103');
 });
 
 test('matchUnreachable is strict: exact name (case-insensitive), then exact cwd basename', () => {
@@ -316,24 +294,48 @@ test('matchUnreachable is strict: exact name (case-insensitive), then exact cwd 
   expect(matchUnreachable('', [named])).toEqual([]);
 });
 
-test('status/reply texts name the reason, tty, cwd and name', () => {
-  const line = describeUnreachable(ua(), 2);
-  expect(line).toContain('landing · claude — unreachable: not in tmux');
-  expect(line).toContain('tty ttys004');
-  expect(line).toContain('cwd /Users/u/work/landing');
-  expect(line).toContain('name landing');
-  expect(line).toContain('2 queued');
+// --- tmux-only (tg-cli#456): nothing is queued for an agent outside tmux ---
+
+test('status line names the reason, tty, cwd, name and pid — and no inbox queue', () => {
+  const line = describeUnreachable(ua());
+  expect(line).toBe('landing · claude — unreachable: not in tmux (tty ttys004, cwd /Users/u/work/landing, name landing, pid 7103)');
+  expect(describeUnreachable(ua({ tty: null }))).toContain('(tty none,');
+});
+
+test('no-agent listing says the agents outside tmux are tmux-only and how to restart them — never promises a queue', () => {
   expect(noAgentReplyText('legacy', [])).toBe('legacy');
   const listing = noAgentReplyText('legacy', [ua()]);
   expect(listing).toContain('OUTSIDE tmux');
-  expect(listing).toContain('landing · claude');
-  expect(listing).toContain('/agent <name> <text>');
-  expect(queuedReplyText(ua())).toContain('landing is running outside tmux');
-  expect(queuedReplyText(ua())).toContain('Stop-hook inbox');
+  expect(listing).toContain('landing · claude — unreachable: not in tmux');
+  expect(listing).toContain('claude-rotate --tmux <name>');
+  expect(listing).not.toMatch(/queue|inbox|turn end/i);
 });
 
-test('describeUnreachable/queuedReplyText render "tty none" for a headless agent with no tty', () => {
-  const headless = ua({ tty: null });
-  expect(describeUnreachable(headless, 0)).toContain('tty none');
-  expect(queuedReplyText(headless)).toContain('landing is running outside tmux (tty none,');
+test('tmuxStartCommand: claude-rotate for Claude Code, a named tmux window for the other harnesses', () => {
+  expect(tmuxStartCommand(ua())).toBe('claude-rotate --tmux landing');
+  expect(tmuxStartCommand(ua({ agent: 'codex', command: 'codex', name: null, cwd: '/Users/u/work/api' }))).toBe('tmux new-window -n api codex');
+  expect(tmuxStartCommand(ua({ agent: 'opencode', command: 'opencode', name: null, cwd: '/w/web' }))).toBe('tmux new-window -n web opencode');
+  // A label a shell would split or expand is single-quoted, embedded quotes escaped.
+  expect(tmuxStartCommand(ua({ name: null, command: 'claude', cwd: "/w/it's mine" }))).toBe("claude-rotate --tmux 'it'\\''s mine'");
+  // No --name and no cwd: a placeholder, never the synthetic "pid N" label.
+  expect(tmuxStartCommand(ua({ name: null, command: 'claude', cwd: null }))).toBe('claude-rotate --tmux <name>');
+});
+
+test('outsideTmuxRefusalText: ONE line naming the agent, that nothing was sent or queued, and how to start it in tmux', () => {
+  const cc = outsideTmuxRefusalText('landing', [ua()]);
+  expect(cc).not.toContain('\n');
+  expect(cc).toContain('landing · claude runs outside tmux');
+  expect(cc).toContain('nothing was sent or queued');
+  expect(cc.endsWith('Start it in tmux: claude-rotate --tmux landing')).toBe(true);
+
+  const codex = outsideTmuxRefusalText('api', [ua({ pid: 9, agent: 'codex', command: 'codex', name: null, cwd: '/w/api' })]);
+  expect(codex).not.toContain('\n');
+  expect(codex).toContain('api · codex runs outside tmux');
+  expect(codex.endsWith('Start it in tmux: tmux new-window -n api codex')).toBe(true);
+
+  // Several sessions answer to one selector: still one line, every one named, every distinct start command.
+  const both = outsideTmuxRefusalText('landing', [ua(), ua({ pid: 9, agent: 'codex', command: 'codex', name: null })]);
+  expect(both).not.toContain('\n');
+  expect(both).toContain("'landing' matches 2 sessions outside tmux (landing · claude pid 7103, landing · codex pid 9)");
+  expect(both.endsWith('Start it in tmux: claude-rotate --tmux landing or tmux new-window -n landing codex')).toBe(true);
 });
