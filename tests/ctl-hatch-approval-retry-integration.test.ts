@@ -5,8 +5,9 @@
 // behind the same hookId auto-consumed. The late-approval grant protocol v1.1
 // REPLACES that mechanism: a late Approve mints a single-use, operation-bound
 // GRANT (features/tg-ctl/grants.ts) and routes the consume instructions to the
-// ask's origin (the Stop-hook inbox for a paneless ask) — a plain retry
-// WITHOUT a grant-consume now simply posts a FRESH card.
+// ask's origin — which for a paneless Claude Code ask is NOTHING (cc/codex are
+// tmux-only, tg-cli#456: no Stop-hook inbox write); the card names the token
+// path instead — and a plain retry WITHOUT a grant-consume simply posts a FRESH card.
 //
 // These are the RETAINED-ENTRY tap paths (both retire routes: the client
 // process dying, and the raw UNSCOPED_ABANDON_MS backstop timer). The
@@ -203,14 +204,6 @@ function grantStoreOf(cfgDir: string): { grants?: Array<Record<string, unknown>>
   return JSON.parse(readFileSync(p, 'utf8')) as { grants?: Array<Record<string, unknown>>; grace?: Array<Record<string, unknown>> };
 }
 
-// The Stop-hook inbox file the routed grant notice lands in (the default route for
-// a paneless ask): <configDir>/inbox/<key>/pending.jsonl, key = agentInboxKey
-// (origin.subagent when present — 'hatch-worker' here).
-function inboxPending(cfgDir: string): string {
-  const p = join(cfgDir, 'inbox', 'hatch-worker', 'pending.jsonl');
-  return existsSync(p) ? readFileSync(p, 'utf8') : '';
-}
-
 // hatch-<hookId>-<12 lowercase hex> — the EXACT shape agent_tools' request_hatch_approval
 // mints. Two different hex suffixes for the SAME hookId model two attempts of the SAME
 // hatch command — a fresh random suffix every attempt is exactly why a retry can never be
@@ -218,7 +211,6 @@ function inboxPending(cfgDir: string): string {
 const HOOK_ID = 'test-hook';
 const HATCH_REQUEST_ID_1 = `hatch-${HOOK_ID}-aaaaaaaaaaaa`;
 const HATCH_REQUEST_ID_2 = `hatch-${HOOK_ID}-bbbbbbbbbbbb`;
-const HATCH_ENV_VAR = 'RIG_HATCH_REQUEST_TEST_HOOK';
 const SUBAGENT = 'hatch-worker';
 const FINGERPRINT = 'sha256:fp-test-1';
 
@@ -242,8 +234,9 @@ function hatchRequest(requestId: string): Record<string, unknown> {
 }
 
 // The shared core of both retained-tap tests: the ask retires (retention), a late
-// Approve tap mints a grant, and the notice is DELIVERED to the origin's inbox route —
-// never through a permission menu/pane (the production no-menu skip this replaces).
+// Approve tap mints a grant, and — the origin being a paneless Claude Code — nothing
+// is queued anywhere (tg-cli#456); never a permission menu/pane either (the
+// production no-menu skip this replaces).
 async function exerciseRetainedLateTap(cfgDir: string, tg: MockTg): Promise<void> {
   const allowData = tg.allowData()!;
   tg.push([tap(allowData, 701, 1)]);
@@ -259,22 +252,15 @@ async function exerciseRetainedLateTap(cfgDir: string, tg: MockTg): Promise<void
   expect(grant.consumed_at).toBeNull();
   expect((grant.operation as Record<string, unknown>)?.fingerprint).toBe(FINGERPRINT);
 
-  // The card confirms the approval id on the Telegram card.
-  expect(await until(() => tg.edits().some((e) => e.includes(String(grant.approval_id))), 5000)).toBe(true);
+  // The card confirms the approval id AND names the token path, since a paneless
+  // Claude Code origin cannot be told (tmux-only, tg-cli#456).
+  expect(await until(() => tg.edits().some((e) => e.includes('could NOT be delivered') && e.includes(`approved:${String(grant.approval_id)}`)), 5000)).toBe(true);
 
-  // The routed notice reached the ORIGIN ROUTE (the inbox) naming BOTH consume forms —
-  // delivered without any pane or permission menu (the no-menu skip is gone on this path).
-  expect(await until(() => inboxPending(cfgDir).includes(String(grant.approval_id)), 5000)).toBe(true);
-  const notice = inboxPending(cfgDir);
-  expect(notice).toContain(HATCH_REQUEST_ID_1);
-  // The env-var consume form (the inbox line is JSONL, so the notice's inner
-  // quotes are escaped — assert the substance, not the serialization).
-  expect(notice).toContain(`${HATCH_ENV_VAR}=`);
-  expect(notice).toContain(`approved:${String(grant.approval_id)}`);
-  expect(notice).toContain('consumed automatically (pull)');
+  // No Stop-hook inbox write for it.
+  expect(await until(() => daemonLog(cfgDir).includes('hatch-grant-notice-failed'), 5000)).toBe(true);
+  expect(existsSync(join(cfgDir, 'inbox', SUBAGENT))).toBe(false);
   const logText = daemonLog(cfgDir);
   expect(logText).toContain('hatch-grant-minted');
-  expect(logText).toContain('hatch-grant-notice-delivered');
   expect(logText).not.toContain('ask-late-deliver-permission-pane-skip reason=no-menu');
 
   // A plain retry WITHOUT a grant consume is NOT silently auto-allowed any more — it
@@ -287,7 +273,7 @@ async function exerciseRetainedLateTap(cfgDir: string, tg: MockTg): Promise<void
   await ask2.exited;
 }
 
-test('HATCH LATE GRANT (tg-cli#398): a tap after the requesting process exited mints an operation-bound grant and DELIVERS the notice to the origin inbox; a plain retry re-asks, never auto-allows', async () => {
+test('HATCH LATE GRANT (tg-cli#398): a tap after the requesting process exited mints an operation-bound grant — no inbox write for a paneless claude — and a plain retry re-asks, never auto-allows', async () => {
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
@@ -315,7 +301,7 @@ test('HATCH LATE GRANT (tg-cli#398): a tap after the requesting process exited m
 // tg-cli#349 review finding (mirror of the first test): retirement driven purely by the
 // raw UNSCOPED_ABANDON_MS backstop timer (the DEFAULT production scenario — a hatch
 // process's own ~120s budget outlives the 110s abandon window), never by a client death.
-test('HATCH LATE GRANT via the raw abandon timer (default scenario, process never killed): the backstop retire path mints the same grant + inbox delivery', async () => {
+test('HATCH LATE GRANT via the raw abandon timer (default scenario, process never killed): the backstop retire path mints the same grant', async () => {
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
