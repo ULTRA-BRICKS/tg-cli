@@ -16,11 +16,19 @@ export interface Route {
   paneId: string; // tmux pane, or omp:<pid> for an out-of-tmux omp origin
   cwd?: string;
   ts: number; // unix seconds (send time)
+  // The session registry key the origin resolved to (session-registry-and-topics
+  // §2.4). Set by the one-shot migration today; `paneId` stays as a hint.
+  sessionKey?: string;
+  // Unix seconds the migration found this row unresolvable. A legacy row is kept
+  // only for "that session is gone" answers and dropped LEGACY_ROUTE_TTL_SEC later.
+  legacySince?: number;
 }
 
 // Keep the tail only — recency is what matters for both recognition and LRU/MRU,
 // and the file must not grow unbounded across a long-lived session.
 export const MAX_ROUTES = 300;
+
+export const LEGACY_ROUTE_TTL_SEC = 7 * 24 * 60 * 60;
 
 export function parseRoutes(raw: string | null): Route[] {
   if (!raw) return [];
@@ -36,15 +44,25 @@ export function parseRoutes(raw: string | null): Route[] {
     if (!r || typeof r !== 'object') continue;
     const rec = r as Record<string, unknown>;
     if (typeof rec.id !== 'number' || typeof rec.paneId !== 'string' || typeof rec.ts !== 'number') continue;
-    out.push({ id: rec.id, paneId: rec.paneId, cwd: typeof rec.cwd === 'string' ? rec.cwd : undefined, ts: rec.ts });
+    out.push({
+      id: rec.id,
+      paneId: rec.paneId,
+      cwd: typeof rec.cwd === 'string' ? rec.cwd : undefined,
+      ts: rec.ts,
+      ...(typeof rec.sessionKey === 'string' && rec.sessionKey ? { sessionKey: rec.sessionKey } : {}),
+      ...(typeof rec.legacySince === 'number' && Number.isFinite(rec.legacySince) ? { legacySince: rec.legacySince } : {}),
+    });
   }
   return out;
 }
 
-// Append a route, dropping any prior entry for the same message id, capped to the
+// Append a route, dropping any prior entry for the same message id and any legacy
+// row past its TTL (measured against the new route's send time), capped to the
 // last MAX_ROUTES (first-in-first-out by position = chronological by send).
 export function appendRoute(existing: Route[], route: Route): Route[] {
-  const kept = existing.filter((r) => r.id !== route.id);
+  const kept = existing.filter(
+    (r) => r.id !== route.id && (r.legacySince === undefined || route.ts - r.legacySince < LEGACY_ROUTE_TTL_SEC),
+  );
   kept.push(route);
   return kept.length > MAX_ROUTES ? kept.slice(kept.length - MAX_ROUTES) : kept;
 }

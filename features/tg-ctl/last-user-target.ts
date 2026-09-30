@@ -50,6 +50,7 @@ export interface LastUserTarget {
   paneId: string;
   cwd: string;
   ts: number; // unix seconds
+  sessionKey?: string; // session registry key (session-registry-and-topics §2.4)
 }
 
 export function parseLastUserTarget(raw: string | null): LastUserTarget | null {
@@ -77,9 +78,28 @@ export function parseLastUserTarget(raw: string | null): LastUserTarget | null {
   ) {
     return null;
   }
-  return { paneId: rec.paneId, cwd: rec.cwd, ts: rec.ts };
+  return {
+    paneId: rec.paneId,
+    cwd: rec.cwd,
+    ts: rec.ts,
+    ...(typeof rec.sessionKey === 'string' && rec.sessionKey ? { sessionKey: rec.sessionKey } : {}),
+  };
 }
 
 export function serializeLastUserTarget(target: LastUserTarget): string {
   return JSON.stringify(target);
+}
+
+// The anchor a confirmed delivery writes, keeping its session registry key (#487):
+// the registry's fresh answer for this pane+cwd wins; without one, the current
+// anchor's key carries over while it names the same pane and project. `current`
+// is read lazily — only when the registry had no answer.
+export function withSessionKey(
+  next: LastUserTarget,
+  resolved: string | null,
+  current: () => LastUserTarget | null,
+): LastUserTarget {
+  if (resolved) return { ...next, sessionKey: resolved };
+  const cur = current();
+  return cur?.sessionKey && cur.paneId === next.paneId && cur.cwd === next.cwd ? { ...next, sessionKey: cur.sessionKey } : next;
 }

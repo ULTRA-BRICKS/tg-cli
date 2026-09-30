@@ -246,6 +246,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       // Carry the original input so a PreToolUse allow can echo it as updatedInput
       // (docs: ExitPlanMode allow needs updatedInput, not allow alone).
       ...(input ? { toolInput: input } : {}),
+      ...harnessOrigin(p),
       paneId: env.paneId,
       cwd: cwd ?? env.cwd,
       sessionName: env.sessionName,
@@ -263,6 +264,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
     const req = build(env, 'permission', `${session}:${invocationSeed(p)}:${env.invocationNonce}:perm:${toolName}:${detail}`, question, toolName, undefined, cwd, env.invocationNonce);
     req.permissionEvent = permissionEventOf(p);
     if (input) req.toolInput = input;
+    Object.assign(req, harnessOrigin(p));
     return req;
   }
 
@@ -336,12 +338,20 @@ function normalizeAskUserQuestions(p: Record<string, unknown>, env: HookEnv): Bu
     // Carried so the answer envelope can echo the original input (schema-valid
     // wholesale) instead of a lossy rebuild — see buildClaudeQuestionAnswerOutput.
     req.toolInput = input;
+    Object.assign(req, harnessOrigin(p));
     // A set member's lone answer must never late-deliver into the pane
     // (all-or-nothing) — see ButtonRequest.multiQuestion.
     if (questions.length > 1) req.multiQuestion = true;
     out.push(req);
   }
   return out;
+}
+
+// The harness's own session id (`session_id` on every Claude Code / Codex hook)
+// rides the ask as `origin.sessionId`, so the daemon's hook socket can record
+// pane → session for the session registry (session-registry-and-topics §2.1).
+function harnessOrigin(p: Record<string, unknown>): Pick<ButtonRequest, 'origin'> {
+  return typeof p.session_id === 'string' && p.session_id ? { origin: { sessionId: p.session_id } } : {};
 }
 
 // Bound the plan body so the forwarded prompt stays well inside Telegram's

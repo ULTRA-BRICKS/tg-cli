@@ -17,8 +17,11 @@ import {
   liveOmpPaneId,
   matchLiveOmp,
   mergeLiveOmpCandidates,
+  ompSessionFileFromBreadcrumb,
+  ompTerminalId,
   parseLsofJsonlPaths,
   parseOmpSessionMeta,
+  pickPrimaryOmpSessionFile,
   preferOmpApiOverTmux,
   type LiveOmpAgent,
 } from '../features/tg-ctl/omp';
@@ -246,6 +249,48 @@ test('parseLsofJsonlPaths collects n-paths ending in .jsonl', () => {
   const paths = parseLsofJsonlPaths(out);
   expect(paths).toHaveLength(2);
   expect(paths[0]).toContain('01a07d8e');
+});
+
+// tg-cli#487: an omp whose main jsonl is not held open (only subagent transcripts
+// are) must still resolve its session, or the registry keys it omp:pane:… forever.
+const SESSIONS = '/Users/u/.omp/agent/sessions/-xp-cal';
+const MAIN = `${SESSIONS}/2026-09-27T11-50-27-262Z_01a0e2b3-c4be-7358-abce-5cb0666dc692.jsonl`;
+const SUBDIR = `${SESSIONS}/2026-09-27T11-50-27-262Z_01a0e2b3-c4be-7358-abce-5cb0666dc692`;
+
+test('pickPrimaryOmpSessionFile derives the main session from open subagent transcripts', () => {
+  expect(pickPrimaryOmpSessionFile([`${SUBDIR}/FixAboutMe.jsonl`, `${SUBDIR}/Ship745/Ship745.Fix741Findings.jsonl`])).toBe(MAIN);
+});
+
+test('pickPrimaryOmpSessionFile prefers a held-open main jsonl over a derived one', () => {
+  const other = `${SESSIONS}/2026-09-28T01-00-00-000Z_01a0ffff-0000-7000-8000-000000000000.jsonl`;
+  expect(pickPrimaryOmpSessionFile([`${SUBDIR}/FixAboutMe.jsonl`, other])).toBe(other);
+});
+
+test('pickPrimaryOmpSessionFile fails closed when subagent transcripts span two sessions', () => {
+  const otherDir = `${SESSIONS}/2026-09-28T01-00-00-000Z_01a0ffff-0000-7000-8000-000000000000`;
+  expect(pickPrimaryOmpSessionFile([`${SUBDIR}/A.jsonl`, `${otherDir}/B.jsonl`])).toBeNull();
+  expect(pickPrimaryOmpSessionFile(['/tmp/notes.jsonl'])).toBeNull();
+});
+
+test('ompTerminalId mirrors omp getTerminalId: the tty first, tmux pane only without one', () => {
+  expect(ompTerminalId({ tty: 'ttys009', paneId: '%5' })).toBe('ttys009');
+  expect(ompTerminalId({ tty: 'pts/3', paneId: null })).toBe('pts-3');
+  expect(ompTerminalId({ tty: null, paneId: '%5' })).toBe('tmux-%5');
+  expect(ompTerminalId({ tty: null, paneId: null })).toBeNull();
+});
+
+test('ompSessionFileFromBreadcrumb returns the recorded session only for the same cwd', () => {
+  const crumb = `/Users/u/xp/cal\n${MAIN}\ncwdstat 16777230 141596355\n`;
+  expect(ompSessionFileFromBreadcrumb(crumb, '/Users/u/xp/cal')).toBe(MAIN);
+  // Another omp later ran from a different directory on this terminal: not ours.
+  expect(ompSessionFileFromBreadcrumb(crumb, '/Users/u/xp/other')).toBeNull();
+  // Unknown process cwd: the breadcrumb cannot be tied to this process.
+  expect(ompSessionFileFromBreadcrumb(crumb, null)).toBeNull();
+  expect(ompSessionFileFromBreadcrumb('/Users/u/xp/cal\n/tmp/notes.jsonl\n', '/Users/u/xp/cal')).toBeNull();
+  expect(ompSessionFileFromBreadcrumb('', '/Users/u/xp/cal')).toBeNull();
+  // `--session <relative>`: omp records the file relative to the breadcrumb's cwd.
+  const rel = MAIN.slice(MAIN.lastIndexOf('/') + 1);
+  expect(ompSessionFileFromBreadcrumb(`/Users/u/xp/cal\n${rel}\n`, '/Users/u/xp/cal')).toBe(`/Users/u/xp/cal/${rel}`);
 });
 
 test('findLiveOmpAgents lists interactive omp both in and out of tmux; workers and acp are dropped', () => {

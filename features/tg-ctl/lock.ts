@@ -34,6 +34,7 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     pendingBatch: join(configDir, `${base}.pending-batch.json`),
     awarenessNudge: join(configDir, `${base}.awareness-nudge.json`),
     runInfo: join(configDir, `${base}.run.json`),
+    sessions: join(configDir, `${base}.sessions.json`),
   };
 }
 

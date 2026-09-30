@@ -67,6 +67,7 @@ function coerceRegistration(value: unknown): Registration | null {
   if (typeof rec.cwd === 'string') reg.cwd = rec.cwd;
   if (typeof rec.sessionName === 'string') reg.sessionName = rec.sessionName;
   if (typeof rec.registeredAt === 'number') reg.registeredAt = rec.registeredAt;
+  if (typeof rec.sessionKey === 'string' && rec.sessionKey) reg.sessionKey = rec.sessionKey;
   // An entry with NO identifying field at all (no pane, cwd or session) can never
   // match a hook or a route — drop it rather than carry dead weight.
   if (!reg.paneId && !reg.cwd && !reg.sessionName) return null;
@@ -79,13 +80,20 @@ function coerceRegistration(value: unknown): Registration | null {
 // the set. A paneless entry (cwd/session only — the fallback / cwd-only-test
 // path) has no stable key, so it collapses to a single fallback slot: a new
 // paneless registration replaces the prior paneless one (the old single-slot
-// behavior, preserved for the no-pane case).
+// behavior, preserved for the no-pane case). The replaced row's session registry
+// key carries over while pane and cwd are unchanged (#487): the same session is
+// re-registering, and its row must not go keyless until the next registry scan.
 export function upsertRegistration(existing: Registration[], reg: Registration): Registration[] {
   const key = registrationKey(reg);
+  const replaced = key === null ? undefined : existing.find((e) => registrationKey(e) === key);
   const kept = existing.filter((e) =>
     key !== null ? registrationKey(e) !== key : registrationKey(e) !== null,
   );
-  kept.push(reg);
+  kept.push(
+    reg.sessionKey === undefined && replaced?.sessionKey !== undefined && replaced.cwd === reg.cwd
+      ? { ...reg, sessionKey: replaced.sessionKey }
+      : reg,
+  );
   return kept.length > MAX_REGISTRATIONS ? kept.slice(kept.length - MAX_REGISTRATIONS) : kept;
 }
 

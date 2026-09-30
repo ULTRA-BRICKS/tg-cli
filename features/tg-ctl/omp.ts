@@ -4,6 +4,7 @@
  * attach to an already-live TUI: both create another history writer (#450).
  */
 
+import { isAbsolute, join } from 'node:path';
 import { matchAgentCommand, paneIdByPid } from './discover';
 import type { AgentKind, PaneInfo, ProcInfo } from './types';
 import { uniqueProjectSelectorHits, type AgentCandidate } from './agent-match';
@@ -103,8 +104,53 @@ export function parseLsofJsonlPaths(out: string): string[] {
   return paths;
 }
 
+// A subagent transcript lives under its parent session's folder
+// (`…/<ts>_<sessionId>/<Agent>.jsonl`, possibly nested deeper), so the parent
+// session jsonl is that folder + `.jsonl`.
+const SUBAGENT_SESSION_DIR =
+  /^(.*?\/\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-fA-F-]+)\/.+\.jsonl$/;
+
+/**
+ * The omp's own session jsonl among its open files. omp does not keep the main
+ * jsonl open between writes, so an idle session often holds only its subagent
+ * transcripts open (tg-cli#487); their shared parent folder names the session.
+ * Transcripts from two different sessions are ambiguous: null, never a guess.
+ */
 export function pickPrimaryOmpSessionFile(paths: readonly string[]): string | null {
-  return paths.find(isPrimaryOmpSessionFile) ?? null;
+  const primary = paths.find(isPrimaryOmpSessionFile);
+  if (primary) return primary;
+  let derived: string | null = null;
+  for (const p of paths) {
+    const match = SUBAGENT_SESSION_DIR.exec(p);
+    if (!match) continue;
+    const file = `${match[1]}.jsonl`;
+    if (derived !== null && derived !== file) return null;
+    derived = file;
+  }
+  return derived;
+}
+
+/**
+ * The `~/.omp/agent/terminal-sessions/<id>` breadcrumb name omp writes for this
+ * process — the same precedence as omp's getTerminalId: the tty device first
+ * (`/dev/pts/3` → `pts-3`), the tmux pane only when there is no tty.
+ */
+export function ompTerminalId(agent: Pick<LiveOmpAgent, 'tty' | 'paneId'>): string | null {
+  if (agent.tty) return agent.tty.replace(/^\/dev\//, '').replace(/\//g, '-');
+  return agent.paneId ? `tmux-${agent.paneId}` : null;
+}
+
+/**
+ * Session file from an omp terminal breadcrumb (`<cwd>\n<sessionFile>\n…`). The
+ * breadcrumb belongs to whichever omp last wrote it on that terminal, so it is
+ * trusted only when its cwd is this process's cwd. omp records a `--session
+ * <relative>` file relative to that cwd, so it is resolved against it.
+ */
+export function ompSessionFileFromBreadcrumb(content: string, processCwd: string | null): string | null {
+  if (!processCwd) return null;
+  const [cwd, file] = content.split('\n');
+  if (cwd !== processCwd || !file || !isPrimaryOmpSessionFile(file)) return null;
+  return isAbsolute(file) ? file : join(cwd, file);
 }
 
 /**

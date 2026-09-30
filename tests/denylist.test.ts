@@ -47,6 +47,8 @@ const BLOCKED = [
   // a Telegram attach.
   'tg-ctl.123456.history.jsonl',
   'tg-ctl.987.routes.json',
+  'tg-ctl.987.sessions.json',
+  'tg-ctl.987.sessions.json.tmp',
   'tg-ctl.987.last-user-target.json',
   // the anchor's own write-then-rename staging file (review finding): a crash
   // or failed rename can orphan this on disk with the same sensitive content.

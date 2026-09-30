@@ -438,6 +438,7 @@ export interface Registration {
   cwd?: string;
   sessionName?: string;
   registeredAt?: number; // unix seconds
+  sessionKey?: string; // session registry key (session-registry-and-topics §2.4)
 }
 
 export interface TargetPane {
@@ -477,6 +478,7 @@ export interface CtlPaths {
   // finishing the work can never lose it; see runDaemon recovery-on-startup
   awarenessNudge: string; // durable per-agent silence-nudge state (tg-ctl#363)
   runInfo: string; // which commit the running daemon loaded (pid + sha), for stale-code detection (tg-cli#279)
+  sessions: string; // session registry keyed by harness session id; the daemon is its ONLY writer (#487)
 }
 
 // --- forum topics (docs/specs/tg-forum-topics.md) ---

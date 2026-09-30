@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { parseLastUserTarget, serializeLastUserTarget } from '../features/tg-ctl/last-user-target';
+import { parseLastUserTarget, serializeLastUserTarget, withSessionKey } from '../features/tg-ctl/last-user-target';
 
 // tg-cli#78 anchor fix: pure serialization tests for the store's parse/write
 // contract. Integration coverage (the daemon actually recording/resolving
@@ -85,4 +85,17 @@ test('serializeLastUserTarget: produces valid JSON parseable by parseLastUserTar
   const raw = serializeLastUserTarget(target);
   expect(() => JSON.parse(raw)).not.toThrow();
   expect(parseLastUserTarget(raw)).toEqual(target);
+});
+
+// A confirmed delivery rewrites the anchor; its session registry key must survive
+// the rewrite (#487): the registry's fresh answer wins, else the current anchor's
+// key carries over while it names the same pane and project.
+test('withSessionKey: the registry key wins; otherwise a same pane+cwd anchor keeps its key', () => {
+  const next = { paneId: '%2', cwd: '/w/a', ts: 9 };
+  const current = { paneId: '%2', cwd: '/w/a', ts: 1, sessionKey: 'omp:old' };
+  expect(withSessionKey(next, 'omp:fresh', () => current)).toEqual({ ...next, sessionKey: 'omp:fresh' });
+  expect(withSessionKey(next, null, () => current)).toEqual({ ...next, sessionKey: 'omp:old' });
+  expect(withSessionKey(next, null, () => ({ ...current, cwd: '/w/b' }))).toEqual(next);
+  expect(withSessionKey(next, null, () => ({ ...current, paneId: '%3' }))).toEqual(next);
+  expect(withSessionKey(next, null, () => null)).toEqual(next);
 });

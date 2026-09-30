@@ -42,6 +42,8 @@ export const NEVER_ATTACH_PATTERNS: RegExp[] = [
   // coverage as the final filename (review finding), not just the final name.
   /^tg-ctl\..*\.history\.jsonl$/i,
   /^tg-ctl\..*\.routes\.json$/i,
+  // The session registry (#487) maps every session to its pane, cwd and transcript path.
+  /^tg-ctl\..*\.sessions\.json(\.tmp)?$/i,
   /^tg-ctl\..*\.last-user-target\.json(\.tmp\.\d+)?$/i,
   // Legacy name (tg-cli#281 rename): a pre-rename install can still have this
   // file, or a crash-orphaned .tmp.<pid> of it, on disk carrying the same

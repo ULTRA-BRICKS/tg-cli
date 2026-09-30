@@ -474,3 +474,14 @@ test('AskUserQuestion: promptTurnId comes from prompt_id/turn_id, NOT env.invoca
   );
   expect(req!.promptTurnId).toBe('prompt-a');
 });
+
+test('every raw cc/codex ask carries the harness session_id as origin.sessionId (session registry, #487)', () => {
+  const sid = '5d1c7a2e-0000-4000-8000-000000000001';
+  const tool_input = { questions: [{ question: 'Pick', options: [{ label: 'A' }, { label: 'B' }] }] };
+  const permission = normalizeHookPayload({ session_id: sid, hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'ls' } }, env);
+  const plan = normalizeHookPayload({ session_id: sid, hook_event_name: 'PreToolUse', tool_name: 'ExitPlanMode', tool_input: { plan: 'x' } }, env);
+  const questions = normalizeHookRequests({ session_id: sid, hook_event_name: 'PreToolUse', tool_name: 'AskUserQuestion', tool_input }, env);
+  expect(questions).toHaveLength(1);
+  for (const req of [permission, plan, ...(questions ?? [])]) expect(req?.origin).toEqual({ sessionId: sid });
+  expect(normalizeHookPayload({ hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'ls' } }, env)?.origin).toBeUndefined();
+});

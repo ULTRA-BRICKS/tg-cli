@@ -107,6 +107,7 @@ async function makeHarness(routes: unknown[] = []) {
 echo "$*" >> '${tmuxLog}'
 case "$*" in
   *pane_title*) printf '%%0\\tπ > ${TITLE}\\n' ;;
+  *display-message*) printf '4242\\n' ;;
   *list-panes*) printf 'main\\t1\\t%%0\\t2929\\tabduco\\t${WINDOW}\\t\\t${PANE_CWD}\\n' ;;
 esac
 exit 0
@@ -215,4 +216,23 @@ test('the /agent picker names the abduco pane by its tmux window, omp title as t
   await waitFor(() => tg.sends.some((s) => s.buttons.length > 0));
   const picker = tg.sends.find((s) => s.buttons.length > 0)!;
   expect(picker.buttons.map((b) => b.text)).toContain(`${WINDOW} · ${TITLE}`);
+}, 20_000);
+
+test('sessions.json lists the abduco omp once, with its tmux locator AND durable session, and its route migrates (#487)', async () => {
+  const h = await makeHarness([{ id: 50, paneId: '%0', cwd: PANE_CWD, ts: 1 }]);
+  const tg = startFakeTg();
+  await startDaemon(h, tg.port);
+  const sessionsPath = join(h.cfgDir, 'tg-ctl.123.sessions.json');
+  const registry = (): { migrated: Record<string, string>; sessions: unknown[] } => JSON.parse(readFileSync(sessionsPath, 'utf8'));
+  await waitFor(() => existsSync(sessionsPath) && registry().migrated.routes !== undefined);
+  expect(registry().sessions).toEqual([
+    expect.objectContaining({
+      key: `omp:${SESSION_ID}`,
+      state: 'live',
+      locators: { pid: OMP_PID, tmux: { serverPid: 4242, paneId: '%0', panePid: 2929 }, durableSession: 'omp-restored-01a0c5431ac1' },
+    }),
+  ]);
+  expect(JSON.parse(readFileSync(join(h.cfgDir, 'tg-ctl.123.routes.json'), 'utf8'))).toEqual([
+    { id: 50, paneId: '%0', cwd: PANE_CWD, ts: 1, sessionKey: `omp:${SESSION_ID}` },
+  ]);
 }, 20_000);

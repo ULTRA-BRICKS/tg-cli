@@ -149,6 +149,8 @@ import {
   matchLiveOmpOrigin,
   ompReplyOriginMatches,
   mergeLiveOmpCandidates,
+  ompSessionFileFromBreadcrumb,
+  ompTerminalId,
   parseLsofJsonlPaths,
   parseOmpSessionMeta,
   pickPrimaryOmpSessionFile,
@@ -158,6 +160,18 @@ import {
 } from "./features/tg-ctl/omp"
 import { defaultRegistryRoot, listLiveEndpoints, sendLiveMessage } from "./features/tg-ctl/omp-live-runtime.mjs"
 import { selectOriginalEndpoint, originalRequestId, type OriginalOmpEndpoint, type OriginalOmpTarget } from "./features/tg-ctl/omp-live-routing"
+import {
+  bindHookSessions,
+  hookSightingOf,
+  listLiveSessions,
+  migrationLivePanes,
+  scanIsTrustworthy,
+  serverPidAcross,
+  type HookSessionSighting,
+  type PendingHookSighting,
+} from "./features/tg-ctl/harness-sessions"
+import { reconcile, type Registry, type RegistryEvent } from "./features/tg-ctl/session-registry"
+import { parseRegistry, rekeyStores, resolveLocatorToSession, runMigration, serializeRegistry, type MigrationIo, type MigrationStore } from "./features/tg-ctl/session-registry-store"
 import { installOmpLiveExtension, runOmpLiveCommand } from "./tools/omp-live-cli.mjs"
 import {
   DEFAULT_TASK_VIEW,
@@ -289,7 +303,7 @@ import {
   routeMatchesPane,
   withRoutesLock,
 } from "./features/tg-ctl/routes"
-import { parseLastUserTarget, serializeLastUserTarget, type LastUserTarget } from "./features/tg-ctl/last-user-target"
+import { parseLastUserTarget, serializeLastUserTarget, withSessionKey, type LastUserTarget } from "./features/tg-ctl/last-user-target"
 import { appendRecordsToBlob, parseHistory, type HistoryRecord } from "./features/replies/history"
 import { inboundHistoryRecords } from "./features/replies/inbound"
 import { isLikelySlashCommand, parsePendingBatch, serializePendingBatch, stepUpdates } from "./features/tg-ctl/updates"
@@ -1180,18 +1194,42 @@ function jsonlPathsOfPid(pid: number): string[] {
   }
 }
 
-let liveOmpCache: { at: number; agents: LiveOmpAgent[] } | null = null
+// omp's own per-terminal record of the session it is running (tg-cli#487): the
+// fallback for an omp holding no session jsonl open at all.
+function ompBreadcrumbSessionFile(agent: LiveOmpAgent, cwd: string | null): string | null {
+  const id = ompTerminalId(agent)
+  if (!id) return null
+  const home = process.env.HOME
+  const agentDir = process.env.PI_CODING_AGENT_DIR?.trim() || (home ? join(home, ".omp", "agent") : null)
+  if (!agentDir) return null
+  try {
+    const file = ompSessionFileFromBreadcrumb(readFileSync(join(agentDir, "terminal-sessions", id), "utf8"), cwd)
+    return file && existsSync(file) ? file : null
+  } catch {
+    return null
+  }
+}
+
+// `panes`/`procs`: the discovery snapshot the agents were derived from, kept so the
+// session-registry scan reuses it instead of paying for its own ps/lsof pass.
+// `serverPid`: the tmux server of exactly that pane list, read on both sides of it
+// only while a registry scan is wanted (undefined = not read for this snapshot).
+let liveOmpCache: { at: number; agents: LiveOmpAgent[]; panes: PaneInfo[]; procs: ProcInfo[]; serverPid: number | null | undefined } | null = null
 function listLiveOmpAgents(): LiveOmpAgent[] {
   const now = Date.now()
   if (liveOmpCache && now - liveOmpCache.at < UNREACHABLE_SCAN_TTL_MS) return liveOmpCache.agents
   const ttyByPid = readPidTtyMap()
+  const wantServerPid = sessionScanWanted()
+  const serverPidBefore = wantServerPid ? readTmuxServerPid() : null
   const { panes, procs } = snapshot()
+  const serverPid = wantServerPid ? serverPidAcross(serverPidBefore, readTmuxServerPid()) : undefined
   const agents = findLiveOmpAgents(panes, procs, ttyByPid).map((a) => {
     const host = originalHosts.find(h => h.pid === a.pid)
     if (host) return { ...a, ...host }
     const cwd = cwdOfPid(a.pid)
-    const files = jsonlPathsOfPid(a.pid)
-    const sessionFile = pickPrimaryOmpSessionFile(files)
+    // A subagent-derived main file is only a name; like the breadcrumb, trust it only if it exists.
+    const openFile = pickPrimaryOmpSessionFile(jsonlPathsOfPid(a.pid))
+    const sessionFile = (openFile && existsSync(openFile) ? openFile : null) ?? ompBreadcrumbSessionFile(a, cwd)
     let meta = null
     if (sessionFile) {
       try {
@@ -1207,7 +1245,7 @@ function listLiveOmpAgents(): LiveOmpAgent[] {
       agents.push({ ...host, paneId: null, tty: null })
     }
   }
-  liveOmpCache = { at: now, agents }
+  liveOmpCache = { at: now, agents, panes, procs, serverPid }
   return agents
 }
 
@@ -1267,6 +1305,148 @@ async function typeIntoOwnOmpPane(paneId: string, pid: number, text: string): Pr
 function liveOmpForPane(paneId: string, agentPid?: number): LiveOmpAgent | null {
   const agents = listLiveOmpAgents()
   return agents.find((a) => a.paneId === paneId || (agentPid !== undefined && a.pid === agentPid)) ?? null
+}
+
+// --- Session registry (docs/specs/session-registry-and-topics.md §2, tg-cli#487) ---
+// The daemon is the ONLY writer of sessions.json. Off the poll hot path: at most
+// once per SESSION_SCAN_INTERVAL_MS (sooner when a hook sighting needs binding),
+// deferred to run while the long-poll is in flight, one scan at a time. A scan
+// reuses the tick's cached discovery (listLiveOmpAgents' snapshot + omp list) —
+// no ps/lsof of its own — turns it into LiveSessions, reconciles them into the
+// registry, runs any not-yet-done one-shot store migration, and persists only
+// when the serialized registry changed. No consumer reads it yet (S2+); a
+// failure here is logged and never breaks the poll loop.
+const SESSION_SCAN_INTERVAL_MS = 30_000
+let sessionRegistry: Registry | null = null
+let sessionRegistryWritten: string | null = null
+let sessionScanAt = 0
+let sessionScanDue = true
+let sessionScanInFlight = false
+// Set by the daemon's first kick: CLI one-shots that list omp never scan, so they
+// never pay for the server-pid reads.
+let sessionScanEnabled = false
+// cc/codex `session_id`s seen on the hook socket, by pane. The pid is bound at
+// the next scan (bindHookSessions), so a later process in the same pane never
+// inherits the id.
+let pendingHookSessions: PendingHookSighting[] = []
+let hookSessions: HookSessionSighting[] = []
+const MAX_PENDING_HOOK_SESSIONS = 64
+
+function sessionScanWanted(): boolean {
+  return sessionScanEnabled && !sessionScanInFlight && (sessionScanDue || Date.now() - sessionScanAt >= SESSION_SCAN_INTERVAL_MS)
+}
+
+function recordHookSession(req: ButtonRequest): void {
+  const sighting = hookSightingOf(req)
+  if (!sighting) return
+  pendingHookSessions.push(sighting)
+  if (pendingHookSessions.length > MAX_PENDING_HOOK_SESSIONS) pendingHookSessions.shift()
+  sessionScanDue = true // bind it while the asking process is still alive
+}
+
+// tmux `#{pid}` of the server `list-panes` read — part of every pane locator, so a
+// server restart that reuses `%N` ids never looks like the same pane (§2.6).
+function readTmuxServerPid(): number | null {
+  try {
+    const tmux = Bun.spawnSync(["tmux", "display-message", "-p", "#{pid}"], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
+    const pid = Number(tmux.stdout.toString().trim())
+    return tmux.exitCode === 0 && Number.isInteger(pid) && pid > 0 ? pid : null
+  } catch {
+    return null
+  }
+}
+
+function sessionStoreIo(paths: CtlPaths): MigrationIo {
+  const pathOf = (store: MigrationStore): string =>
+    store === "routes" ? paths.routes : store === "registration" ? paths.registration : store === "lastUserTarget" ? paths.lastUserTarget : paths.topics
+  return {
+    read: (store) => readFileOrNull(pathOf(store)),
+    write: (store, content) => {
+      if (content !== null) return atomicWrite(pathOf(store), content)
+      try {
+        unlinkSync(pathOf(store))
+      } catch {
+        // already absent
+      }
+    },
+    locked: (store, body) =>
+      withRoutesLock(fsRoutesLockIo(`${pathOf(store)}.lock`), () => {
+        body()
+        return true
+      }, { onContended: "skip" }) === true,
+  }
+}
+
+function describeRegistryEvent(ev: RegistryEvent): string {
+  switch (ev.kind) {
+    case "promoted":
+      return `promoted ${ev.from} → ${ev.to}`
+    case "paneReused":
+      return `paneReused ${ev.paneId} ${ev.from} → ${ev.to}`
+    case "readopted":
+      return `readopted ${ev.key} thread=${ev.threadId ?? "-"}`
+    default:
+      return `${ev.kind} ${ev.key}`
+  }
+}
+
+// Called once per poll tick, right after the tick refreshed listLiveOmpAgents.
+// Never awaits: the scan is queued behind the getUpdates request it precedes. A
+// snapshot taken while no scan was wanted carries no server pid; the next
+// discovery refresh (UNREACHABLE_SCAN_TTL_MS) reads one.
+function kickSessionRegistryScan(ctx: Ctx): void {
+  sessionScanEnabled = true
+  if (!sessionScanWanted()) return
+  const discovery = liveOmpCache
+  if (!discovery || discovery.serverPid === undefined) return
+  const { serverPid } = discovery
+  sessionScanInFlight = true
+  sessionScanDue = false
+  sessionScanAt = Date.now()
+  setTimeout(() => {
+    try {
+      scanSessionRegistry(ctx, { ...discovery, serverPid })
+    } finally {
+      sessionScanInFlight = false
+    }
+  }, 0)
+}
+
+function scanSessionRegistry(ctx: Ctx, discovery: NonNullable<typeof liveOmpCache> & { serverPid: number | null }): void {
+  const now = Date.now()
+  try {
+    const prev = sessionRegistry ?? parseRegistry(readFileOrNull(ctx.paths.sessions))
+    sessionRegistry = prev
+    const { panes, procs, agents, serverPid } = discovery
+    if (!scanIsTrustworthy(prev, { panes, procs, serverPid })) return
+    hookSessions = bindHookSessions(hookSessions, pendingHookSessions, panes, procs)
+    pendingHookSessions = []
+    const scan = listLiveSessions({ panes, procs, serverPid, paneTitles: readPaneTitles(), omp: agents, hookSessions })
+    const { next, events } = reconcile(prev, scan, now)
+    const io = sessionStoreIo(ctx.paths)
+    for (const ev of events) {
+      log(`session-registry: ${describeRegistryEvent(ev)}`)
+      if (ev.kind === "promoted") for (const line of rekeyStores(io, ev.from, ev.to)) log(`session-registry: ${line}`)
+    }
+    sessionRegistry = next
+    // The one-shot migration drops rows whose pane is dead, so an empty pane list
+    // from a live server (the launchd flake) waits for a later scan — it would read
+    // every registered pane as dead. With no server at all pane liveness is
+    // unknown: the migration runs and drops nothing for a dead pane.
+    const livePaneIds = migrationLivePanes({ panes, serverPid })
+    if (livePaneIds !== "wait") {
+      const migration = runMigration(next, io, { now, livePaneIds })
+      for (const line of migration.log) log(`session-registry: ${line}`)
+      sessionRegistry = migration.registry
+    }
+    const serialized = serializeRegistry(sessionRegistry)
+    if (serialized !== sessionRegistryWritten) {
+      atomicWrite(ctx.paths.sessions, serialized)
+      sessionRegistryWritten = serialized
+    }
+  } catch (err) {
+    log(`session-registry: scan failed: ${err instanceof Error ? err.message : String(err)}`)
+  }
 }
 
 // One `  - …` line per omp, each naming the tmux pane it is shown in (window name +
@@ -3843,6 +4023,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
   }
 
   log(`ask-forward arrived: ${describeAskRequest(req)}`)
+  recordHookSession(req)
 
   // The per-pane registration SET: the question forwards when ITS pane matches
   // ANY registered entry, so EVERY concurrently-registered session forwards
@@ -6689,10 +6870,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // left", asking is the safer failure, so both paths invalidate the same way.
   const recordLastUserTarget = (paneId: string, cwd: string | undefined): void => {
     // "does the anchor already point at THIS pane" is read LAZILY — only inside
-    // the two branches that actually need it (the no-cwd branch, the
-    // write-failure catch) — not unconditionally up front (performance review
-    // finding, raised twice): the overwhelmingly common case (cwd present,
-    // write+rename succeeds) never touches this read at all.
+    // the branches that actually need it (the no-cwd branch, the write-failure
+    // catch, and carrying the session key over when the registry has no answer)
+    // — not unconditionally up front (performance review finding, raised
+    // twice): the common case (cwd present, registry resolves the pane, write+rename
+    // succeeds) never touches this read at all.
     const readCurrent = (): LastUserTarget | null => parseLastUserTarget(readFileOrNull(ctx.paths.lastUserTarget))
     if (!cwd) {
       // A confirmed delivery whose pane has no known cwd can't record a
@@ -6712,7 +6894,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
     const tmp = `${ctx.paths.lastUserTarget}.tmp.${process.pid}`
     try {
-      writeFileSync(tmp, serializeLastUserTarget({ paneId, cwd, ts: Math.floor(Date.now() / 1000) }), { mode: 0o600 })
+      // Keep the anchor's session registry key (#487): the registry's answer for
+      // this pane+cwd, else the key it already carried for the same pane+cwd.
+      const resolved = sessionRegistry ? resolveLocatorToSession(sessionRegistry, paneId, cwd) : null
+      const target = withSessionKey({ paneId, cwd, ts: Math.floor(Date.now() / 1000) }, resolved, readCurrent)
+      writeFileSync(tmp, serializeLastUserTarget(target), { mode: 0o600 })
       renameSync(tmp, ctx.paths.lastUserTarget)
     } catch {
       // A failed renameSync (write succeeded, rename didn't) leaves the tmp file
@@ -10598,6 +10784,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           persistAwarenessNudge()
         }
       }
+
+      kickSessionRegistryScan(ctx)
 
       let json: { ok: boolean; result?: TgUpdate[]; description?: string }
       if (recoveryQueue !== null) {

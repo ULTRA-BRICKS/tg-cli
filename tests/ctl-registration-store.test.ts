@@ -147,3 +147,18 @@ test('registrationSetAllowsHook preserves the paneId-authoritative reject (#per-
 test('registrationSetAllowsHook on an EMPTY set fails closed', () => {
   expect(registrationSetAllowsHook([], { paneId: '%2' })).toBe(false);
 });
+
+// A `tg start` re-run in the same pane and project rewrites that pane's row; the
+// session registry key the migration gave it must survive the rewrite (#487).
+test('upsertRegistration keeps the replaced row\'s sessionKey only while pane and cwd are unchanged', () => {
+  const keyed: Registration = { paneId: '%1', cwd: '/w/a', registeredAt: 1, sessionKey: 'omp:s1' };
+  expect(upsertRegistration([keyed], { paneId: '%1', cwd: '/w/a', registeredAt: 2 })).toEqual([
+    { paneId: '%1', cwd: '/w/a', registeredAt: 2, sessionKey: 'omp:s1' },
+  ]);
+  expect(upsertRegistration([keyed], { paneId: '%1', cwd: '/w/b', registeredAt: 2 })).toEqual([
+    { paneId: '%1', cwd: '/w/b', registeredAt: 2 },
+  ]);
+  expect(upsertRegistration([keyed], { paneId: '%1', cwd: '/w/a', registeredAt: 2, sessionKey: 'omp:s2' })).toEqual([
+    { paneId: '%1', cwd: '/w/a', registeredAt: 2, sessionKey: 'omp:s2' },
+  ]);
+});

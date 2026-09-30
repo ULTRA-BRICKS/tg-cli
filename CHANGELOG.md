@@ -3,6 +3,47 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.6
+
+**Session registry keyed by harness session id, plus the one-shot store migration (#487).**
+
+- The daemon keeps `tg-ctl.<bot>.sessions.json`: one entry per omp/cc/codex session, keyed
+  `<harness>:<sessionId>`. A pid, a tmux pane `(serverPid, paneId, panePid)` and an abduco name
+  are locators, re-resolved on each registry scan; they are never identity. The scan runs off
+  the poll hot path: at most every 30 s (sooner after a cc/codex hook sighting), deferred behind
+  the long-poll, one at a time, reusing the tick's cached discovery instead of its own
+  `ps`/`lsof`. Every tmux omp/cc/codex session and every out-of-tmux omp gets one entry. An
+  abduco-wrapped omp carries both its tmux pane and its `durableSession`. Entries that leave the
+  scan turn `gone`, are re-adopted when
+  the same session resumes, and are pruned after 30 days. An untrusted snapshot (empty `ps`,
+  unreadable tmux server pid, or an empty pane list while a registered process is alive) is
+  skipped, so a launchd flake never marks sessions gone. The tmux server pid is read on both
+  sides of the pane snapshot it belongs to; a server restart in between makes the scan untrusted.
+- cc/codex asks now carry the hook's `session_id` as `origin.sessionId`. The hook socket
+  records pane → session id, so a cc/codex pane's provisional `pane:` key is promoted to its
+  session key in place, and every store row that referenced the provisional key is rewritten.
+- One-shot, idempotent migration after the first trusted scan, with one marker per store:
+  `routes.json`, `registration.json` and `last-user-target.json` rows that resolve to exactly
+  one live entry (with a matching cwd) gain `sessionKey`, and `paneId` stays as a hint.
+  Unresolved routes become `legacy` and are dropped 7 days later. Unresolved registrations and
+  last-user targets are dropped only when their pane is dead; a live pane keeps its row even
+  when its cwd drifted. With no tmux server running the migration still completes, dropping
+  nothing; an empty pane list from a live server (the launchd flake) waits for a later scan.
+  Bound `topics.json` rows set the entry's `threadId`. No consumer reads the keys yet; that
+  starts in S2.
+- `sessionKey` survives the live writers: `tg start` re-registering the same pane and cwd keeps
+  the row's key, and a confirmed delivery writes the anchor with the registry's key for that
+  pane (or keeps the anchor's key for the same pane and cwd). Every later trusted scan
+  re-derives a registration or last-user-target key that is missing or names no live session.
+- An omp is keyed by its session id even when it holds its main session jsonl closed (omp
+  opens it only to write). Its open subagent transcripts (`…/<ts>_<sessionId>/<agent>.jsonl`)
+  name the parent session (used only if that file exists); transcripts of two different
+  sessions resolve nothing. With no jsonl open at all, omp's own terminal breadcrumb
+  (`~/.omp/agent/terminal-sessions/<tty>`, or `tmux-%N` without a tty) supplies the session
+  file when its cwd is the process's cwd, a relative file resolved against that cwd.
+  A provisional `omp:pane:…` entry is promoted in place once the id resolves.
+- `sessions.json` is on the auto-attach never-attach list, like `routes.json`.
+
 ## 1.54.5
 
 **Live Telegram e2e harness (#468): `bun scripts/e2e-telegram.ts`.**

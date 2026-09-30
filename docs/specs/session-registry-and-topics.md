@@ -116,16 +116,23 @@ Stores that key on a locator today switch to `sessionKey`:
 | Store | Today | After | Migration (one-shot, idempotent, `schemaVersion: 2`) |
 |---|---|---|---|
 | `routes.json` | `paneId` (`%N` / `omp:<pid>`) + cwd | `sessionKey` + `paneId` kept as a hint | Resolve `paneId` against the first live scan; if the pane hosts exactly one registry entry and the cwd matches, set `sessionKey`. Otherwise keep the row read-only as `legacy`, used only for "that session is gone" answers, and drop it 7 days after migration. Today the store has no TTL, only the `MAX_ROUTES` FIFO cap in `routes.ts`, so without this a legacy row could live forever. |
-| `registration.json` | `paneId` + cwd | `sessionKey` | Same resolution; unresolved rows are dropped and logged (registrations are re-announced by live sessions). |
-| `last-user-target.json` | `paneId` + cwd | `sessionKey` | Resolve or drop. It is only a hint. |
+| `registration.json` | `paneId` + cwd | `sessionKey` | Same resolution. An unresolved row is dropped and logged only when its pane is dead; a live pane (an untracked harness, or cwd drift) and the paneless slot keep theirs. Registrations are re-announced by live sessions. |
+| `last-user-target.json` | `paneId` + cwd | `sessionKey` | Resolve, else drop when its pane is dead; a live pane keeps it. It is only a hint. |
 | `deferred.json`, `questions.json` | `paneId` | `sessionKey` + `paneId` | Resolve or keep the pane-only form. The §2.6 guard applies at delivery. |
 | `awareness-nudge.json` | `omp:<pid>` | `sessionKey` | Resolve or drop. |
 | `history.jsonl` | `targetAgent` = name | new rows add `sessionKey` + `name` snapshot | Append-only, so no rewrite and no seeding. At read time, an old row joins a key through that key's current `name.primary` or its `aliases` (§3.3). |
 | `topics.json` | `threadId → paneId` (spawn-wizard bindings) | `threadId → sessionKey` inside `sessions.json`; file removed | Bound rows whose pane resolves to an entry become that entry's `threadId`. Others are dropped and logged. The file does not exist on the live machine today. |
 
-The migration runs once at daemon start, after the first scan. It writes the new files first and
+The migration runs once at daemon start, after the first trusted scan. It writes the new files first and
 then deletes the old ones, and logs `migrated N/M` per store. Re-running it on migrated files is a
-no-op.
+no-op. With no tmux server running, pane liveness is unknown: the migration completes but drops
+nothing for a dead pane. An empty pane list from a live server is a flake, so the migration waits
+for a later scan.
+
+Live writers keep `sessionKey`: `tg start` re-registering the same pane and cwd keeps the row's
+key, and a confirmed delivery writes the last-user target with the registry's key for its pane.
+After the migration, every trusted scan re-derives a `registration.json` or
+`last-user-target.json` key that is missing or names no live session. It never drops a row.
 
 ### 2.5 Resume re-adoption
 
