@@ -109,11 +109,14 @@ Goal: every session has one stable identity and one name everywhere. Exit: renam
 `/rename` an omp session → header, picker, status, history and (later) topic follow in place; restart /
 resume keeps the identity; abduco-wrapped omp is a tmux session.
 
+Design: `docs/specs/session-registry-and-topics.md` (registry, naming, topics; slices S0–S9).
+
 - **P0** #454 abduco-wrapped omp treated as not-in-tmux (false "no longer running", "Claude Code not in tmux")
 - **P0** #455 picker/status overwrite the tmux name with the omp title; `[no tmux]` literal
 - **P0** #75 name resolver keeper (tmux window primary · harness title secondary)
+- #487 (new, 2026-09-30) session registry store keyed by harness session id + migration (spec §2)
 - #459 omp routes keyed by pid → key by sessionId/sessionFile
-- #460 `tg replies` history keyed by name → session id; record non-tmux omp sends (+ #136 lock)
+- #460 `tg replies` history keyed by name → session id; tag non-tmux omp sends (recorded today but untagged) (+ #136 lock)
 - #354 pane-id reuse after tmux restart (PR #351); #100 verify pane identity before late delivery
 - #67 registration set → session registry; #263 #264 #265 labels/identity in harness events and limit-continue
 - #446 #448 header follow-ups from PR #447 (verify-live)
@@ -149,6 +152,8 @@ Goal: a tap always does something visible; a pending question stays open until i
 
 Starts after M1 + M2 exit. Goal: every live session has exactly one bot-created topic, named by the M1
 resolver, renamed in place, never duplicated.
+
+Design: `docs/specs/session-registry-and-topics.md` §4.
 
 - **P0** #457 user-created/implicit topics start the spawn wizard and swallow text; unknown topic = black hole
 - #467 one bot-created topic per session; outbound + question cards threaded into it (no env)

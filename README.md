@@ -340,7 +340,9 @@ Caveats while this is experimental:
   pane until it idle-exits. Don't close/reopen a topic whose agent is mid-task; let it finish or
   send `/stop` first.
 
-See `docs/specs/tg-forum-topics.md` (§9 increment plan) for the full design; increments 1–4 have landed.
+See `docs/specs/tg-forum-topics.md` (§9 increment plan) for the design of this shipped behaviour. It
+is superseded by `docs/specs/session-registry-and-topics.md` (one bot-created topic per existing
+session, no spawn wizard; epic #476), which replaces it slice by slice.
 
 ### Recalling messages (`tg replies`, v1.11.0)
 

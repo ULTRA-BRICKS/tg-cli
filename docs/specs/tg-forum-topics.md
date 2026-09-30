@@ -1,8 +1,9 @@
 # tg-ctl — Telegram forum-topics mode (one topic = one agent)
 
-Status: **DRAFT design** (CTO 2026-06-19 "делай"). Implemented incrementally — see
-§9 Increment plan. Supersedes the flat `/agent` phonetic selector as the primary
-addressing model when the bot chat is a **forum** (a supergroup with topics enabled).
+Status: **SUPERSEDED** (2026-09-30) by `docs/specs/session-registry-and-topics.md`: a topic is an
+address for an existing session (one bot-created topic per registry entry), never a spawn request.
+The spawn wizard below is removed by #457; kept for history only. Original status: DRAFT design
+(CTO 2026-06-19 "делай"), for a forum supergroup.
 
 ## 1. Goal
 
