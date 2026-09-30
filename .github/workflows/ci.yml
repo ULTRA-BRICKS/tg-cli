@@ -12,6 +12,8 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Hard backstop above the in-step stall watchdog (a green run takes ~10 min).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -31,4 +33,6 @@ jobs:
             sudo apt-get install -y "$deb"
           }
       - name: Test
-        run: bun test
+        # Plain `bun test` under a stall watchdog: a wedged test process fails the step
+        # naming the file it hung in, instead of idling silently until the job is killed.
+        run: ci/test/bun-test-watchdog.sh

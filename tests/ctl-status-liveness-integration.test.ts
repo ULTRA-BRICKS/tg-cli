@@ -11,6 +11,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
+import { spawnSyncBounded } from './helpers/spawn-sync';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -83,7 +84,7 @@ async function startDaemon(cfgDir: string, port: number): Promise<Subprocess> {
 }
 
 function runStatus(cfgDir: string): { exitCode: number | null; stdout: string; stderr: string } {
-  const proc = Bun.spawnSync([process.execPath, TG_CTL, 'status'], {
+  const proc = spawnSyncBounded([process.execPath, TG_CTL, 'status'], {
     env: {
       PATH: `${join(cfgDir, 'bin')}:${process.env.PATH ?? ''}`,
       HOME: cfgDir,

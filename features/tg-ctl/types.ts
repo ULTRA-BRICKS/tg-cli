@@ -303,6 +303,12 @@ export type Action =
       // than dropping it (codex #187), preserving `/new api /compact first`.
       dirAfterName: boolean;
       from: string;
+      // The `/new` message's own id and its chat. A private-topic spawn records both on the binding
+      // (TopicBinding.sourceChatId/sourceMessageId) so a REPLAY of this same update — the
+      // pending-batch recovery after a crash mid-spawn — is recognized and not run a second time.
+      // The chat is part of the key: message ids are sequential PER CHAT.
+      messageId: number;
+      chatId: number;
       threadId?: number | null;
     }
   // A tap on a flat-/new harness button (tnh:<token>:<harness>) → ask models for that harness.
@@ -494,6 +500,13 @@ export interface TopicBinding {
   // MATCHING token, so a same-slug/same-cwd STRANGER pane (or a crash BEFORE new-window ran, where
   // no window carries the token) is never wrongly adopted (codex r10 P1). Paired with spawnPending.
   spawnToken?: string;
+  // The chat + message_id of the flat-chat `/new` that created this private topic (set on the
+  // preliminary binding, BEFORE new-window). A crash mid-spawn leaves that `/new` in the
+  // pending-batch journal, and the restarted daemon replays it AFTER startup reconcile adopted the
+  // orphan: without this marker the replay would create a second topic and spawn a second agent.
+  // Both halves are compared — a message id alone collides across chats (ids are per-chat).
+  sourceChatId?: number;
+  sourceMessageId?: number;
 }
 
 // One inbound topic message, in the form the entrypoint delivers (and the unknown-topic

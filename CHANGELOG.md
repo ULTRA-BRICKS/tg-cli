@@ -3,6 +3,49 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.22
+
+**CI flakes that blocked every merge (#494), and the double spawn behind one of them.**
+
+- Private-topic `/new` no longer spawns twice after a daemon crash. A crash mid-spawn left the
+  `/new` in the pending-batch journal; after restart, reconcile adopted the orphan agent and the
+  replay then created a second topic and a second agent. The topic binding now records the
+  `/new`'s chat + message id (`sourceChatId` / `sourceMessageId` in `tg-ctl.<bot>.topics.json`,
+  written before `new-window`), and a replay matching both is skipped with a "recovered after a
+  daemon restart" reply where the `/new`'s replies go. Not covered yet (#500): a crash between topic
+  creation and the first binding write, and the flat fallback spawn.
+
+Test fixes:
+
+- `ctl-private-topics-integration`: the crash-after-new-window case waits for the crashed
+  daemon to exit instead of sleeping 150ms and killing it, then for the restarted daemon's
+  adoption log and the pending-batch journal unlink (the end of replay) before asserting. Its
+  `waitFor` throws with the daemon log on timeout instead of falling through. The file's daemon
+  scenarios get a 30s budget — bun's 5s default was shorter than their own 8s lifecycle waits.
+- `ctl-question-durable-integration`: the reconnect case with no `promptTurnId` waits for the
+  restoring edit itself; the reattach log line can land before that edit is sent.
+- `ctl-question-durable-integration` RECONNECT: waits for the pending question to be persisted
+  before SIGKILLing the daemon. The mock records the card when the send arrives; the daemon
+  persists only after the response returns, so a kill in between left nothing to restore and the
+  restart never logged `questions restored` (#506).
+- `ctl-omp-acp-integration`: the name-selector case awaits the original host's input callback
+  and the `ReviewFix` confirmation `sendMessage` as events. The daemon posts that confirmation
+  after delivering, so checking sent messages the moment the input landed read `undefined`.
+- `ctl-daemon-integration` round-trip: `launchctl` is shimmed (the `/status` reply no longer
+  probes every host launchd job) and the event wait is bounded by 45s instead of 10s.
+- `ctl-service-cli`: `status` runs against shimmed `launchctl` / `tmux` / `ps`, not the
+  developer's machine — the host scan made it outlast the 5s test timeout. The file's tests
+  get a 20s budget: a hermetic `status` still takes ~2s per bun process under load.
+- `deploy`, `ctl-service-cli`, `ctl-status-liveness-integration`: every `Bun.spawnSync` has a
+  30s deadline (`tests/helpers/spawn-sync.ts`); a hung child is SIGKILLed and fails its test
+  instead of stalling the CI job until the job limit.
+- Daemons started through `spawnDaemon` lead their own process group; teardown SIGKILLs the
+  group, so children a daemon forked no longer outlive it.
+- CI runs `bun test` through `ci/test/bun-test-watchdog.sh` (#506): when the output stops for
+  180s (`BUN_TEST_STALL_SECS`), the step fails naming the test file it hung in, with the process
+  table, instead of idling silently until the runner kills the job. The job also has a 30-minute
+  `timeout-minutes`.
+
 ## 1.54.16
 
 - **Forum topics: a topic reaches its session through the flat delivery path (#465).** A message in

@@ -53,6 +53,12 @@ export function parseTopics(raw: string | null): TopicBinding[] {
       ...(typeof rec.harness === 'string' && rec.harness.length > 0 ? { harness: rec.harness as AgentKind } : {}),
       ...(rec.spawnPending === true ? { spawnPending: true } : {}),
       ...(typeof rec.spawnToken === 'string' && rec.spawnToken.length > 0 ? { spawnToken: rec.spawnToken } : {}),
+      // The replay marker is a pair: a half (message id without its chat) can't be matched safely,
+      // so it is dropped whole.
+      ...(typeof rec.sourceChatId === 'number' && Number.isFinite(rec.sourceChatId) &&
+        typeof rec.sourceMessageId === 'number' && Number.isFinite(rec.sourceMessageId)
+        ? { sourceChatId: rec.sourceChatId, sourceMessageId: rec.sourceMessageId }
+        : {}),
     });
   }
   return out;
@@ -60,6 +66,13 @@ export function parseTopics(raw: string | null): TopicBinding[] {
 
 function isTopicStatus(s: string): s is TopicStatus {
   return s === 'awaiting-model' || s === 'bound' || s === 'closed';
+}
+
+// The binding a given `/new` (chat + message id) already created, if any — a pending-batch replay of
+// that `/new` after a crash must not create a second topic. Both halves must match: Telegram message
+// ids are sequential per chat, so the id alone collides across chats.
+export function findTopicCreatedBy(topics: TopicBinding[], chatId: number, messageId: number): TopicBinding | undefined {
+  return topics.find((b) => b.sourceChatId === chatId && b.sourceMessageId === messageId);
 }
 
 // Upsert by threadId (one binding per topic), newest kept at the tail, capped to MAX_TOPICS.

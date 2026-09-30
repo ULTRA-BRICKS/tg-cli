@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, setDefaultTimeout, test } from 'bun:test';
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -19,6 +19,11 @@ import { parseTopics } from '../features/tg-ctl/topics';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const SPAWNED_PANE = '%8';
+
+// Every scenario boots at least one real daemon (two for the crash-adoption case) and waits on its
+// lifecycle with 8s `waitFor` bounds; bun's 5s default would cut a slow-but-correct run short on a
+// loaded CI runner before those waits could ever resolve.
+setDefaultTimeout(30_000);
 
 const reg = createDaemonRegistry();
 const servers: Array<{ stop: (c?: boolean) => Promise<void> | void }> = [];
@@ -195,9 +200,17 @@ function forumTopicCreatedMsg(id: number, threadId: number, name: string): unkno
   };
 }
 
-async function waitFor(pred: () => boolean, ms = 8000): Promise<void> {
+// Poll `pred` until it holds; THROW on timeout. A silent return let a timed-out wait fall through to
+// the assertion after it, which reported a misleading "Received: <stale state>" instead of the wait
+// that actually expired. `diag` appends context (e.g. the daemon log) to the timeout error.
+async function waitFor(pred: () => boolean, ms = 8000, diag?: () => string): Promise<void> {
   const t0 = Date.now();
-  while (Date.now() - t0 < ms && !pred()) await Bun.sleep(50);
+  while (!pred()) {
+    if (Date.now() - t0 >= ms) {
+      throw new Error(`waitFor timed out after ${ms}ms: ${pred.toString()}${diag ? `\n${diag()}` : ''}`);
+    }
+    await Bun.sleep(50);
+  }
 }
 
 const sent = (sends: Array<Record<string, unknown>>, needle: string): boolean =>
@@ -371,6 +384,7 @@ test(
     writeFileSync(join(cfgDir, 'bin', 'ps'), fakePsWithOrphan(), { mode: 0o755 });
 
     const queue: unknown[][] = [[textMsg(17, `/new claude-default ${cfgDir} crashpt`)]];
+    const sends: Array<Record<string, unknown>> = [];
     const server = Bun.serve({
       port: 0,
       async fetch(req) {
@@ -387,7 +401,10 @@ test(
         if (url.pathname.endsWith('/createForumTopic')) {
           return Response.json({ ok: true, result: { message_thread_id: 44, name: 'crashpt' } });
         }
-        if (url.pathname.endsWith('/sendMessage')) return Response.json({ ok: true, result: { message_id: 901 } });
+        if (url.pathname.endsWith('/sendMessage')) {
+          sends.push((await req.json()) as Record<string, unknown>);
+          return Response.json({ ok: true, result: { message_id: 900 + sends.length } });
+        }
         if (url.pathname.endsWith('/answerCallbackQuery')) return Response.json({ ok: true, result: true });
         if (url.pathname.endsWith('/editMessageReplyMarkup')) return Response.json({ ok: true, result: true });
         if (url.pathname.endsWith('/setMessageReaction')) return Response.json({ ok: true, result: true });
@@ -411,14 +428,25 @@ test(
     });
     closeSync(logFd);
 
-    await waitFor(() => existsSync(tokenFile));
-    await Bun.sleep(150);
-    crashed.kill();
+    const pendingBatchFile = join(cfgDir, 'tg-ctl.123.pending-batch.json');
+    const readOr = (path: string): string => (existsSync(path) ? readFileSync(path, 'utf8') : '(none)');
+    const diag = (): string =>
+      [`--- daemon.log ---`, readOr(join(cfgDir, 'daemon.log')), `--- spawn.log ---`, readOr(spawnLog), `--- topics ---`, readOr(topicsFile)].join('\n');
+
+    // The fake tmux SIGKILLs the daemon right after stamping the spawn token (a crash between
+    // new-window and the binding write). Wait for that death itself, not a sleep: the topics store
+    // is only final once the crashed daemon is gone.
+    await waitFor(() => crashed.signalCode !== null || crashed.exitCode !== null, 15_000, diag);
+    expect(existsSync(tokenFile)).toBe(true);
+    // The crash landed mid-batch, so the `/new` update is still journaled for replay on restart.
+    expect(existsSync(pendingBatchFile)).toBe(true);
 
     const pending = parseTopics(readFileSync(topicsFile, 'utf8')).find((b) => b.threadId === 44);
     expect(pending?.status).toBe('awaiting-model');
     expect(pending?.spawnPending).toBe(true);
     expect(pending?.spawnToken).toBe(readFileSync(tokenFile, 'utf8'));
+    expect(pending?.sourceChatId).toBe(1);
+    expect(pending?.sourceMessageId).toBe(17);
     expect(pending?.paneId).toBeUndefined();
 
     const restartedLogFd = openSync(join(cfgDir, 'daemon.log'), 'a');
@@ -435,13 +463,22 @@ test(
     });
     closeSync(restartedLogFd);
 
-    await waitFor(
-      () => existsSync(topicsFile) && parseTopics(readFileSync(topicsFile, 'utf8')).some((b) => b.threadId === 44 && b.status === 'bound'),
-    );
+    // Startup reconcile adopts the orphan, THEN the restarted daemon replays the journaled batch —
+    // which still holds the `/new` that crashed. The journal is unlinked only once that replay has
+    // fully run, so its disappearance is the end-of-recovery event. Asserting at the first `bound`
+    // sighting instead raced the replay: a re-run `/new` re-created the topic and spawned again.
+    const restartDiag = (): string => `restarted exitCode=${restarted.exitCode} signal=${restarted.signalCode}\n${diag()}`;
+    await waitFor(() => readOr(join(cfgDir, 'daemon.log')).includes('topic 44: adopting orphan pane %8'), 8000, restartDiag);
+    await waitFor(() => !existsSync(pendingBatchFile), 8000, restartDiag);
+    expect(readOr(join(cfgDir, 'daemon.log'))).toContain('already created topic 44');
+    // The crash beat the first run's "spawned …" reply; the skipped replay still tells the user.
+    await waitFor(() => sends.some((s) => String(s.text).includes('recovered after a daemon restart')), 8000, restartDiag);
+
     const rebound = parseTopics(readFileSync(topicsFile, 'utf8')).find((b) => b.threadId === 44);
     expect(rebound?.status).toBe('bound');
     expect(rebound?.paneId).toBe(SPAWNED_PANE);
     expect(spawnArgvLog(spawnLog)).toHaveLength(1);
+    expect(restarted.signalCode).toBeNull();
 
     restarted.kill();
   },

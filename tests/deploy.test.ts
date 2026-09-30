@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { spawnSyncBounded } from './helpers/spawn-sync';
 
 // HERMETIC PATH for every spawned `deploy.sh`: only the system dirs that `git` /
 // `bash` / coreutils live in — NEVER the host PATH. A `deploy` that could find the
@@ -27,7 +28,7 @@ function git(cwd: string, ...args: string[]) {
   // Deterministic git: identity + signing/default-branch pinned via flags, HOME
   // pointed at the per-test root so the host ~/.gitconfig (signing, hooks) never
   // leaks in. SAFE_PATH keeps git findable without exposing the host `tg`.
-  const proc = Bun.spawnSync(
+  const proc = spawnSyncBounded(
     ['git', '-c', 'commit.gpgsign=false', '-c', 'init.defaultBranch=main', '-C', cwd, ...args],
     {
       env: {
@@ -49,7 +50,7 @@ function git(cwd: string, ...args: string[]) {
 function deploy(...args: string[]) {
   // Always pass --checkout (the test tree) on a hermetic PATH so the host `tg` is
   // unreachable; SAFE_PATH still has git/bash/coreutils.
-  return Bun.spawnSync(['bash', DEPLOY, '--checkout', checkout, ...args], {
+  return spawnSyncBounded(['bash', DEPLOY, '--checkout', checkout, ...args], {
     env: { PATH: SAFE_PATH, HOME: root },
   });
 }
@@ -58,7 +59,7 @@ function deploy(...args: string[]) {
 // PATH-symlink resolution path and the "no tg on PATH" error. Callers pass a
 // hermetic PATH (SAFE_PATH, optionally with a temp bin prefixed).
 function deployEnv(env: Record<string, string>, ...args: string[]) {
-  return Bun.spawnSync(['bash', DEPLOY, ...args], { env });
+  return spawnSyncBounded(['bash', DEPLOY, ...args], { env });
 }
 
 function commitFile(rel: string, body: string, msg: string) {
@@ -74,7 +75,7 @@ function advanceOrigin(file: string, body: string, msg: string) {
   git(root, 'clone', '--quiet', origin, other);
   git(other, 'config', 'user.email', 't@t');
   git(other, 'config', 'user.name', 't');
-  Bun.spawnSync(['mkdir', '-p', join(other, file.slice(0, Math.max(0, file.lastIndexOf('/'))) || '.')]);
+  mkdirSync(join(other, file.slice(0, Math.max(0, file.lastIndexOf('/'))) || '.'), { recursive: true });
   writeFileSync(join(other, file), body);
   git(other, 'add', file);
   git(other, 'commit', '-q', '-m', msg);
@@ -267,7 +268,7 @@ test('resolves the checkout from a `tg` symlink on PATH when no --checkout given
   // host PATH, or it could resolve and `git pull` the real installed checkout).
   advanceOrigin('README.md', 'hello\n', 'docs: add readme');
   const bin = join(root, 'bin');
-  Bun.spawnSync(['mkdir', '-p', bin]);
+  mkdirSync(bin, { recursive: true });
   symlinkSync(join(checkout, 'tg'), join(bin, 'tg'));
   // Sanity: the symlink resolves to THIS test's checkout, not anything on the host.
   expect(realpathSync(join(bin, 'tg'))).toBe(realpathSync(join(checkout, 'tg')));
@@ -289,7 +290,7 @@ test('errors when no `tg` is on PATH and no --checkout is given (exit 1)', () =>
 
 test('errors when --checkout points at a non-git directory (exit 1)', () => {
   const notRepo = join(root, 'not-a-repo');
-  Bun.spawnSync(['mkdir', '-p', notRepo]);
+  mkdirSync(notRepo, { recursive: true });
   const proc = deployEnv({ PATH: SAFE_PATH, HOME: root }, '--checkout', notRepo);
   expect(proc.exitCode).toBe(1);
   expect(proc.stderr.toString()).toContain('not a git checkout');
@@ -360,7 +361,7 @@ test('resolves a multi-hop tg symlink chain to the final checkout', () => {
   // script's hop cap stays a defensive guard, exercised here only as a real chain.
   advanceOrigin('README.md', 'hello\n', 'docs: add readme');
   const bin = join(root, 'bin');
-  Bun.spawnSync(['mkdir', '-p', bin]);
+  mkdirSync(bin, { recursive: true });
   symlinkSync(join(checkout, 'tg'), join(bin, 'mid')); // mid -> checkout/tg
   symlinkSync(join(bin, 'mid'), join(bin, 'tg')); // tg -> mid
   expect(realpathSync(join(bin, 'tg'))).toBe(realpathSync(join(checkout, 'tg')));

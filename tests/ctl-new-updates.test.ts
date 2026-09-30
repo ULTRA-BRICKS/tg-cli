@@ -43,7 +43,7 @@ function cbUpd(id: number, data: string): TgUpdate {
 test('/new <name> parses to a new-command action', () => {
   const r = stepUpdates([upd(10, { text: '/new myproj fix it' })], makeOpts());
   const a = r.actions.find((x) => x.kind === 'new-command');
-  expect(a).toEqual({ kind: 'new-command', harness: null, model: null, dir: null, name: 'myproj', task: 'fix it', dirAfterName: false, from: 'Alex' });
+  expect(a).toEqual({ kind: 'new-command', harness: null, model: null, dir: null, name: 'myproj', task: 'fix it', dirAfterName: false, from: 'Alex', messageId: 10, chatId: CHAT_ID });
 });
 
 test('/new with model + dir parses both', () => {

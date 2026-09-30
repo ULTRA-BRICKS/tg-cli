@@ -193,7 +193,14 @@ mirroring how `routes.cwd` already flows).
      model + spawnPending` bindings are candidates (a normal pre-model or failed-spawn state is not).
      A flaky/empty startup snapshot is skipped (never mass-closes live bindings); a model tap on a
      still-`spawnPending` binding re-probes (the just-in-time adoption) so a missed startup reconcile
-     can't double-spawn. A `bound` binding whose pane is gone is marked `closed`.
+     can't double-spawn. A `bound` binding whose pane is gone is marked `closed`. The crashed private-
+     chat `/new` itself is still in the pending-batch journal and is replayed after reconcile; once its
+     binding exists it records that `/new`'s chat + message id (`sourceChatId` + `sourceMessageId`,
+     written before `new-window`; ids are per-chat, so both are compared), so the replay is skipped
+     instead of creating a second topic + agent, and the skip is acknowledged where the `/new`'s replies go
+     (the crash may have beaten the "spawned …" reply). Not covered: a crash between
+     `createForumTopic` and that first binding write, and the flat fallback spawn (no binding at
+     all) — tracked in #500.
    - **Same-batch races**: a re-spawn tap + a text message in one getUpdates batch routes the text to
      the re-bound pane (not dropped); a second same-batch message to a just-closed topic goes through
      the throttled recovery, never the old "recreate the topic" dead-end.

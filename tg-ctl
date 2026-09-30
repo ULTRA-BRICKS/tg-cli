@@ -344,6 +344,7 @@ import {
   dropHold,
   findHold,
   findTopic,
+  findTopicCreatedBy,
   goneTopicReply,
   holdExpiredReply,
   holdPayload,
@@ -9396,7 +9397,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const out = replyContext(session.threadId)
     const ts = Math.floor(Date.now() / 1000)
     // `harness` makes a later "not running" reply name this harness's resume command.
-    const preliminary = { threadId, name: session.name, status: "awaiting-model" as const, path: session.dir, model: modelId, harness: findModel(modelId)?.kind, ts }
+    const preliminary = { threadId, name: session.name, status: "awaiting-model" as const, path: session.dir, model: modelId, harness: findModel(modelId)?.kind, sourceChatId: session.sourceChatId, sourceMessageId: session.sourceMessageId, ts }
     const spawnToken = `${threadId}-${ts}-${nextSpawnNonce()}`
     updateTopics((topics) => appendTopic(topics, markSpawnPending(preliminary, spawnToken, ts)))
     const spawned = spawnTopicWindow(threadId, slug, session.dir, modelId, session.task)
@@ -9424,7 +9425,22 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // allows dup names).
   const handleNewCommand = async (action: Extract<Action, { kind: "new-command" }>): Promise<boolean> => {
     reapNewSessions()
+    // A crash mid-spawn leaves this `/new` in the pending-batch journal and the restarted daemon
+    // replays it — AFTER startup reconcile already adopted (or can adopt) the orphan its first run
+    // spawned. A private-topic binding carrying this chat + message id proves the first run got as
+    // far as creating the topic, so re-running would create a second topic + a second agent. (The
+    // flat fallback spawn writes no binding, so it has no such guard — #500.) The first run may
+    // have died before its "spawned …" reply, so the skip is acknowledged.
     const out = replyContext(action.threadId)
+    const alreadyCreated = findTopicCreatedBy(loadTopics(), action.chatId, action.messageId)
+    if (alreadyCreated) {
+      log(`new-command: message ${action.chatId}/${action.messageId} already created topic ${alreadyCreated.threadId} (${alreadyCreated.status}) before a restart — replayed /new not re-run`)
+      const state = alreadyCreated.status === "bound"
+        ? `its agent is running there — use \`/agent ${alreadyCreated.name}\` to talk to it`
+        : `topic state \`${alreadyCreated.status}\`, not created again`
+      await sendMessage(ctx, `recovered after a daemon restart: \`/new ${alreadyCreated.name}\` already opened its topic; ${state}`, out)
+      return true
+    }
     if (!action.name) {
       await sendMessage(ctx, "usage: /new [<harness>|<model>] [<dir>] <name> [<task>] — e.g. `/new codex /Users/you/app api fix the build`", out)
       return false
@@ -9476,6 +9492,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       task,
       ts: Math.floor(Date.now() / 1000),
       threadId: action.threadId ?? null,
+      sourceChatId: action.chatId,
+      sourceMessageId: action.messageId,
       ...(dir ? { dir } : {}),
       ...(action.harness ? { harness: action.harness } : {}),
     }

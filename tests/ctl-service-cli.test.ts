@@ -5,7 +5,7 @@
 // launchctl/systemctl commands) and writes nothing, so no live LaunchAgent / systemd unit is ever
 // loaded by the test run. (A real `launchctl load` would register a RunAtLoad agent into the
 // tester's session and actually start the daemon — exactly the side effect this avoids.)
-import { expect, test } from 'bun:test';
+import { expect, setDefaultTimeout, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -16,6 +16,7 @@ import {
   withClaudeHooks,
   withClaudeStatusLineTelemetry,
 } from '../features/tg-ctl/hook-install';
+import { spawnSyncBounded } from './helpers/spawn-sync';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -40,8 +41,24 @@ function reapDaemon(cfg: string, botId: string): void {
   }
 }
 
+// Host probes `status` runs, shimmed so it answers from the temp config dir instead of scanning
+// the developer's machine: launchd (one `launchctl print` per loaded job while looking for an
+// external supervisor), tmux panes and the process table. Unshimmed, `status` took seconds and
+// the status tests hit bun's 5s timeout on a busy host. Per-test shims (`exitCodeShimDir`) are
+// prepended to HOST_PATH, so they still win.
+const HERMETIC_BIN = mkdtempSync(join(tmpdir(), 'tgctl-svc-bin-'));
+writeFileSync(join(HERMETIC_BIN, 'launchctl'), `#!/bin/sh\n[ "$1" = list ] && printf 'PID\\tStatus\\tLabel\\n'\nexit 0\n`, { mode: 0o755 });
+writeFileSync(join(HERMETIC_BIN, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+writeFileSync(join(HERMETIC_BIN, 'ps'), `#!/bin/sh\nprintf '    1     0 /sbin/launchd\\n'\nexit 0\n`, { mode: 0o755 });
+const HOST_PATH = `${HERMETIC_BIN}:${process.env.PATH ?? ''}`;
+
+// Even hermetic, each `tg-ctl status` spends ~2s of wall time in a fresh bun process; a test that
+// runs it twice under parallel suite load outlived bun's 5s default (10x run: 4 of 240 failed).
+// Each child is still hard-bounded by spawnSyncBounded, so a real hang fails, not stalls.
+setDefaultTimeout(20_000);
+
 function run(args: string[], env: Record<string, string>, cwd?: string) {
-  return Bun.spawnSync(['bun', TG_CTL, ...args], { cwd, env: { PATH: process.env.PATH ?? '', ...env } });
+  return spawnSyncBounded(['bun', TG_CTL, ...args], { cwd, env: { PATH: HOST_PATH, ...env } });
 }
 
 function processCwd(pid: number): string | null {
@@ -52,7 +69,7 @@ function processCwd(pid: number): string | null {
       return null;
     }
   }
-  const out = Bun.spawnSync(['lsof', '-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { stdout: 'pipe', stderr: 'pipe' });
+  const out = spawnSyncBounded(['lsof', '-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { stdout: 'pipe', stderr: 'pipe' });
   if (out.exitCode !== 0) return null;
   return out.stdout.toString().split('\n').find((line) => line.startsWith('n'))?.slice(1) ?? null;
 }
@@ -249,7 +266,7 @@ test('status reports when a project-local Claude statusLine shadows the installe
   // not whichever unrelated real OMP happens to be running on the host.
   const bin = exitCodeShimDir('tmux', 0);
   writeFileSync(join(bin, 'ps'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-  const proc = run(['status'], { ...env, PATH: `${bin}:${process.env.PATH ?? ''}` }, project);
+  const proc = run(['status'], { ...env, PATH: `${bin}:${HOST_PATH}` }, project);
   expect(proc.exitCode).toBe(0);
   const out = proc.stdout.toString();
   expect(out).toContain('usage telemetry: shadowed by');
@@ -275,7 +292,7 @@ test('status checks the registered active scope when invoked from another direct
 
   const shimDir = exitCodeShimDir('tmux', 0);
   const otherDir = mkdtempSync(join(tmpdir(), 'tgctl-other-'));
-  const proc = run(['status'], { ...env, PATH: `${shimDir}:${process.env.PATH ?? ''}` }, otherDir);
+  const proc = run(['status'], { ...env, PATH: `${shimDir}:${HOST_PATH}` }, otherDir);
 
   expect(proc.exitCode).toBe(0);
   const out = proc.stdout.toString();
@@ -350,7 +367,7 @@ test.if(process.platform === 'darwin')(
     // bun must still be resolvable for the fallback `start` (it re-spawns this script). Keep the
     // real PATH but PREPEND the shim dir so the failing launchctl wins. Point the API at a dead
     // local port so the fallback daemon's getUpdates fails fast and never hits real Telegram.
-    const fullEnv = { ...env, TG_API_BASE: 'http://127.0.0.1:1', PATH: `${shimDir}:${process.env.PATH ?? ''}` };
+    const fullEnv = { ...env, TG_API_BASE: 'http://127.0.0.1:1', PATH: `${shimDir}:${HOST_PATH}` };
     const proc = run(['enable'], fullEnv);
     expect(proc.exitCode).toBe(4);
     // The plist was written even though activation failed (so a manual launchctl retry works).
@@ -382,7 +399,7 @@ test.if(process.platform === 'darwin')(
   () => {
     const { home, env } = fakeEnv();
     const shimDir = exitCodeShimDir('launchctl', 0); // exit 0 = "succeeded"
-    const path = { PATH: `${shimDir}:${process.env.PATH ?? ''}` };
+    const path = { PATH: `${shimDir}:${HOST_PATH}` };
     const plist = join(home, 'Library', 'LaunchAgents', 'com.agenttools.tg-ctl.tg-ctl.plist');
 
     const enabled = run(['enable'], { ...env, ...path });
@@ -415,12 +432,12 @@ test.if(process.platform === 'darwin')(
     const plist = join(home, 'Library', 'LaunchAgents', 'com.agenttools.tg-ctl.tg-ctl.plist');
 
     // Put a plist on disk via an enable with a passing launchctl shim.
-    const okShim = { PATH: `${exitCodeShimDir('launchctl', 0)}:${process.env.PATH ?? ''}` };
+    const okShim = { PATH: `${exitCodeShimDir('launchctl', 0)}:${HOST_PATH}` };
     expect(run(['enable'], { ...env, ...okShim }).exitCode).toBe(0);
     expect(existsSync(plist)).toBe(true);
 
     // Now disable with a launchctl that fails the unload.
-    const failShim = { PATH: `${exitCodeShimDir('launchctl', 1)}:${process.env.PATH ?? ''}` };
+    const failShim = { PATH: `${exitCodeShimDir('launchctl', 1)}:${HOST_PATH}` };
     const disabled = run(['disable'], { ...env, ...failShim });
     expect(disabled.exitCode).toBe(4);
     // The plist is LEFT in place (the OS may still be running the agent).
@@ -623,7 +640,7 @@ test('start launches the daemon from a stable cwd, not the caller cwd', async ()
       {
         ...env,
         TG_API_BASE: `http://127.0.0.1:${server.port}`,
-        PATH: `${shimDir}:${process.env.PATH ?? ''}`,
+        PATH: `${shimDir}:${HOST_PATH}`,
       },
       launchDir,
     );

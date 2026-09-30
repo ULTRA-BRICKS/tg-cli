@@ -174,7 +174,10 @@ export async function spawnDaemon(
   const botId = opts.botId ?? DEFAULT_BOT_ID;
   const stdio: ['ignore', number | 'ignore', number | 'ignore'] =
     opts.logFd !== undefined ? ['ignore', opts.logFd, opts.logFd] : ['ignore', 'ignore', 'ignore'];
-  const daemon = Bun.spawn([process.execPath, opts.tgCtlPath, 'run'], { env: opts.env, stdio });
+  // `detached` makes the daemon a process-group leader, so teardown can SIGKILL the daemon AND
+  // every child it forked (tmux/ps shims, hook helpers) in one signal — a child that outlived a
+  // pid-only kill was the orphan left behind after a timed-out test.
+  const daemon = Bun.spawn([process.execPath, opts.tgCtlPath, 'run'], { env: opts.env, stdio, detached: true });
   // Track + record the cfgDir BEFORE waiting on the socket — the whole point.
   trackProc(reg, daemon);
   trackCfgDir(reg, opts.cfgDir);
@@ -232,9 +235,16 @@ export async function awaitDetachedStartsSettled(
  * tracked-proc pass missed) so a self-check can assert the sweep actually fires.
  */
 export async function reapDaemons(reg: DaemonRegistry): Promise<number[]> {
-  // 1. Kill tracked procs and wait for each to actually exit.
+  // 1. Kill tracked procs — their whole process group when they lead one (spawnDaemon's are) — and
+  //    wait for each to actually exit. A tracked proc that Bun has not reaped (exitCode null) still
+  //    owns its pid, so the group id cannot have been recycled to an unrelated process.
   for (const p of reg.procs.splice(0)) {
     if (p.exitCode === null) {
+      try {
+        process.kill(-p.pid, 'SIGKILL');
+      } catch {
+        // Not a group leader (a plain trackProc'd child) — kill the pid alone below.
+      }
       try {
         p.kill(9);
       } catch {

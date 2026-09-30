@@ -114,6 +114,10 @@ writeFileSync(join(shimDir, 'tmux'), `#!/bin/sh\necho "$@" >> '${shimLog}'\nexit
 // whatever interactive claude/codex sessions happen to run on the developer's machine,
 // and (a) below would not be hermetic.
 writeFileSync(join(shimDir, 'ps'), `#!/bin/sh\nprintf '    1     0 /sbin/launchd\\n'\nexit 0\n`, { mode: 0o755 });
+// launchctl PATH shim: an empty job list. `/status` probes launchd for an external supervisor
+// (macOS), which otherwise runs `launchctl print` once per loaded host job — hundreds of spawns
+// that made the reply take seconds and the round-trip miss its wait on a busy developer machine.
+writeFileSync(join(shimDir, 'launchctl'), `#!/bin/sh\n[ "$1" = list ] && printf 'PID\\tStatus\\tLabel\\n'\nexit 0\n`, { mode: 0o755 });
 
 const reg = createDaemonRegistry();
 
@@ -163,11 +167,12 @@ test('daemon round-trip: old owner message still delivered, guard replies, /stat
   closeSync(logFd);
 
   // Wait until the whole batch is processed: 4 sends captured AND the next
-  // getUpdates confirmed offset 105 (max update_id + 1).
+  // getUpdates confirmed offset 105 (max update_id + 1). The bound is only a
+  // backstop well inside the test timeout — the loop exits on the events.
   const t0 = Date.now();
-  while (Date.now() - t0 < 10_000) {
+  while (Date.now() - t0 < 45_000) {
     if (sent.length >= 4 && reactions.length >= 1 && offsets.includes(105)) break;
-    await Bun.sleep(100);
+    await Bun.sleep(50);
   }
 
   // (a) prompt from allowed sender → inject attempted → no panes → guard reply.
@@ -223,4 +228,4 @@ test('daemon round-trip: old owner message still delivered, guard replies, /stat
   expect(exited).not.toBe('timeout');
   expect(daemon.exitCode).toBe(0);
   expect(existsSync(pidFile)).toBe(false);
-}, 15_000);
+}, 60_000);

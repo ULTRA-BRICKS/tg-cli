@@ -1072,8 +1072,7 @@ test('RESTORE→TAP→LATE-DELIVER (headline): a SIGKILLed daemon restores a pen
   expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
   const productionData = tg.optionData(1)!;
   // The live pending scoped question is persisted on forward.
-  const statePath = join(cfgDir, 'tg-ctl.123.questions.json');
-  expect(await until(() => existsSync(statePath) && JSON.parse(readFileSync(statePath, 'utf8')).questions.length === 1, 4000)).toBe(true);
+  expect(await until(() => hasPersistedQuestion(cfgDir, 'q_durable'), 4000)).toBe(true);
 
   // SIGKILL the daemon (no close handler runs) AND the hook process (the agent's 120s
   // budget elapsed — it will NOT reconnect). The only record of the question is now the
@@ -1108,6 +1107,10 @@ test('RECONNECT: a daemon bounce mid-block re-attaches the card (no duplicate) a
   expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
   const productionData = tg.optionData(1);
   expect(productionData).not.toBeNull();
+  // The mock records the card when the request ARRIVES; the daemon persists it only after
+  // the response returns. SIGKILL in that gap leaves nothing on disk to restore (no
+  // 'questions restored' line at all) — wait for the persisted record, not the card.
+  expect(await until(() => hasPersistedQuestion(cfgDir, 'q_durable'), 4000)).toBe(true);
 
   // Crash the daemon (SIGKILL — no clean exit). The blocked `tg-ctl ask` socket drops
   // and its reconnect loop begins resending the SAME requestId.
@@ -1676,18 +1679,23 @@ test('PERM QUEUE MISMATCH GUARD (no promptTurnId): a reconnect with the SAME req
   // Byte-identical payload "reconnects" immediately -- exact requestId match,
   // exact payload match -- yet must NOT auto-deliver: there is no proof this is
   // the SAME invocation rather than a routine same-session re-run.
+  const editsBeforeReconnect = tg.edits().length;
   const ask2 = startAsk(cfgDir, tg.port, noTurnId);
   expect(await until(() => daemonLog(cfgDir).includes('no promptTurnId'), 6000)).toBe(true);
   expect(daemonLog(cfgDir)).not.toContain('ask-forward queued-decision-delivered');
 
   // The card must come back LIVE with fresh buttons (buildButtonMessage's own
   // text, no "queued"/"disconnected" wording) -- proving the tap wasn't just
-  // silently thrown away with no visible trace.
+  // silently thrown away with no visible trace. The daemon fires that restoring
+  // editMessageText WITHOUT awaiting it and only then logs "reattached", so the
+  // log line can land before the edit reaches the mock: wait for the edit itself
+  // (the first one after the reconnect), not the log line.
   expect(await until(() => daemonLog(cfgDir).includes('ask-forward reattached'), 4000)).toBe(true);
-  const lastEdit = tg.edits().at(-1);
-  expect(lastEdit).not.toContain('queued');
-  expect(lastEdit).not.toContain('hook disconnected');
-  expect(lastEdit).toContain('Allow bash command: rm -rf /tmp/test?');
+  expect(await until(() => tg.edits().length > editsBeforeReconnect, 4000)).toBe(true);
+  const restoredEdit = tg.edits()[editsBeforeReconnect];
+  expect(restoredEdit).not.toContain('queued');
+  expect(restoredEdit).not.toContain('hook disconnected');
+  expect(restoredEdit).toContain('Allow bash command: rm -rf /tmp/test?');
 
   // And it must be genuinely re-tappable: a fresh Approve on THIS live prompt
   // still resolves the reconnecting hook's own request normally (not stuck,

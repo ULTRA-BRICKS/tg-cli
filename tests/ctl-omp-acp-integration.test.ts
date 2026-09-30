@@ -74,12 +74,20 @@ exit 0
 const acpLog = join(cfgDir, 'acp.log');
 writeFileSync(acpLog, '');
 writeFileSync(join(binDir, 'omp'), `#!/bin/sh\nprintf 'FORBIDDEN\\n' >> '${acpLog}.spawned'\nexit 1\n`, { mode: 0o755 });
+// Both observable effects of the routed message are awaited as events, not polled in a window:
+// the original host's input callback runs in this process, and the daemon posts its confirmation
+// to the fake Bot API only AFTER the delivery, so looking for that confirmation the moment the
+// input lands races the send.
+const originalInput = Promise.withResolvers<void>();
+const confirmSent = Promise.withResolvers<Record<string, unknown>>();
 const endpoint = await startLiveEndpoint({ root: join(cfgDir, 'omp-live'),
   snapshot: () => ({ sessionId: '01a07d8e-c12c-7433-903d-e98726bfda37', cwd: '/Users/u/work/review-cli', sessionFile, title: 'ReviewFix', busy: false }),
-  send: (text: string) => { appendFileSync(acpLog, JSON.stringify({ event: 'original-input', pid: process.pid, sessionId: '01a07d8e-c12c-7433-903d-e98726bfda37', text }) + '\n'); },
+  send: (text: string) => {
+    appendFileSync(acpLog, JSON.stringify({ event: 'original-input', pid: process.pid, sessionId: '01a07d8e-c12c-7433-903d-e98726bfda37', text }) + '\n');
+    originalInput.resolve();
+  },
 });
 
-const sentMessages: Array<Record<string, unknown>> = [];
 let served = 0;
 const server = Bun.serve({
   port: 0,
@@ -109,7 +117,8 @@ const server = Bun.serve({
       return Response.json({ ok: true, result: [] });
     }
     if (url.pathname.endsWith('/sendMessage')) {
-      sentMessages.push((await req.json()) as Record<string, unknown>);
+      const body = (await req.json()) as Record<string, unknown>;
+      if (String(body.text).includes('ReviewFix')) confirmSent.resolve(body);
       return Response.json({ ok: true, result: { message_id: 77 } });
     }
     return Response.json({ ok: true, result: {} });
@@ -140,14 +149,9 @@ test('Telegram name selector reaches original OMP with TMUX unset; never tmux se
   });
   closeSync(logFd);
 
-  const t0 = Date.now();
-  while (Date.now() - t0 < 12_000) {
-    const acp = existsSync(acpLog) ? readFileSync(acpLog, 'utf8') : '';
-    if (acp.includes('original-input')) break;
-    await Bun.sleep(100);
-  }
+  await originalInput.promise;
 
-  const acp = existsSync(acpLog) ? readFileSync(acpLog, 'utf8') : '';
+  const acp = readFileSync(acpLog, 'utf8');
   expect(acp).toContain('"event":"original-input"');
   expect(existsSync(acpLog + '.spawned')).toBe(false);
   expect(acp).toContain('01a07d8e-c12c-7433-903d-e98726bfda37');
@@ -161,9 +165,9 @@ test('Telegram name selector reaches original OMP with TMUX unset; never tmux se
   const tmux = readFileSync(tmuxLog, 'utf8');
   expect(tmux).not.toContain('send-keys');
 
-  const confirm = sentMessages.find((m) => String(m.text).includes('ReviewFix'));
-  expect(confirm?.text).toContain('ReviewFix');
+  const confirm = await confirmSent.promise;
+  expect(String(confirm.text)).toContain('ReviewFix');
   // Ask 108 / tg-cli#342: the stable project token stays on the label so
   // /agent landing and /agent rig-cli remain visible next to the title.
-  expect(String(confirm?.text)).toContain('review-cli');
+  expect(String(confirm.text)).toContain('review-cli');
 }, 20_000);

@@ -18,6 +18,7 @@ import {
   dropHold,
   findHold,
   findTopic,
+  findTopicCreatedBy,
   goneTopicReply,
   holdExpiredReply,
   holdPayload,
@@ -194,6 +195,41 @@ test('spawn markers: markSpawnPending drops a stale pane; markBound / markClosed
   }
 });
 
+test('parseTopics keeps the /new replay marker only as a finite chat + message pair; it survives bind/close', () => {
+  const marked: TopicBinding = { threadId: 1, name: 'a', status: 'awaiting-model', path: '/p', model: 'm', ts: 1, spawnPending: true, spawnToken: 'TOK', sourceChatId: -1001, sourceMessageId: 17 };
+  const [parsed] = parseTopics(serializeTopics([marked]));
+  expect(parsed.sourceChatId).toBe(-1001);
+  expect(parsed.sourceMessageId).toBe(17);
+  // Adoption (markBound) and a later close must not drop it: a replay after either is still a replay.
+  const bound = markBound(parsed, '%5', 3);
+  for (const next of [bound, markClosed(bound, 4)]) {
+    const [again] = parseTopics(serializeTopics([next]));
+    expect([again.sourceChatId, again.sourceMessageId]).toEqual([-1001, 17]);
+  }
+  // A malformed or half marker is dropped whole — a message id without its chat can't be matched.
+  for (const bad of [
+    { sourceChatId: -1001, sourceMessageId: 'nope' },
+    { sourceChatId: null, sourceMessageId: 17 },
+    { sourceMessageId: 17 },
+    { sourceChatId: -1001 },
+  ]) {
+    const [p] = parseTopics(JSON.stringify([{ threadId: 2, name: 'b', status: 'bound', paneId: '%2', ts: 1, ...bad }]));
+    expect(p.sourceChatId).toBeUndefined();
+    expect(p.sourceMessageId).toBeUndefined();
+  }
+});
+
+test('findTopicCreatedBy: a replayed /new matches its own chat + message id, never the same id from another chat', () => {
+  const topics: TopicBinding[] = [
+    { threadId: 44, name: 'api', status: 'bound', paneId: '%8', ts: 1, sourceChatId: 1, sourceMessageId: 17 },
+    { threadId: 45, name: 'web', status: 'bound', paneId: '%9', ts: 2 },
+  ];
+  expect(findTopicCreatedBy(topics, 1, 17)?.threadId).toBe(44);
+  // Message ids are per-chat: id 17 in chat 2 is a different, live /new and must run.
+  expect(findTopicCreatedBy(topics, 2, 17)).toBeUndefined();
+  expect(findTopicCreatedBy(topics, 1, 18)).toBeUndefined();
+});
+
 test('goneTopicReply names the session and the harness resume command', () => {
   expect(goneTopicReply({ name: 'api', harness: 'omp' })).toBe('`api` is not running — resume with `rig omp run --resume …`');
   expect(goneTopicReply({ name: 'web', harness: 'claude' })).toContain('`claude --resume`');
@@ -342,6 +378,12 @@ test('row 1: every daemon verb is answered IN the topic, bound or unknown', () =
       expect(r.actions[1]).toEqual({ kind: 'ack', messageId: 22 });
     }
   }
+});
+
+test('a /new in a topic carries its replay key: its own message id and its chat', () => {
+  const r = stepUpdates([inTopic(24, { text: '/new claude-opus /tmp MyAgent' })], bound);
+  // CHAT_ID ≠ 24, so a swapped chat/message id shows.
+  expect(r.actions[0]).toMatchObject({ kind: 'new-command', threadId: 50, messageId: 24, chatId: CHAT_ID });
 });
 
 test('row 1: /stop, /kill and harness-reserved verbs are NOT daemon verbs — they reach the bound session verbatim', () => {

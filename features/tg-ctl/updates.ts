@@ -401,6 +401,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
                 name,
                 opts,
                 m.message_id,
+                m.chat.id,
                 reply?.message_id ?? null,
                 opts.topicsEnabled && m.is_topic_message ? (m.message_thread_id ?? null) : null,
               );
@@ -471,6 +472,7 @@ function textAction(
   name: string,
   opts: StepOpts,
   messageId: number,
+  chatId: number,
   replyToMessageId: number | null,
   threadId: number | null = null,
 ): Action {
@@ -514,7 +516,7 @@ function textAction(
     }
     if (cmd === '/new') {
       const p = parseNewCommand(text);
-      return { kind: 'new-command', harness: p.harness, model: p.model, dir: p.dir, name: p.name, task: p.task, dirAfterName: p.dirAfterName, from: name, ...topic };
+      return { kind: 'new-command', harness: p.harness, model: p.model, dir: p.dir, name: p.name, task: p.task, dirAfterName: p.dirAfterName, from: name, messageId, chatId, ...topic };
     }
     return { kind: 'inject-text', text, messageId };
   }
@@ -556,7 +558,7 @@ function topicActionFor(updateId: number, m: TgMessage, name: string, opts: Step
   const text = m.text ?? '';
   const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, '');
   if (TOPIC_GLOBAL_CMDS.has(verb)) {
-    return [textAction(text, name, opts, m.message_id, m.reply_to_message?.message_id ?? null, threadId)];
+    return [textAction(text, name, opts, m.message_id, m.chat.id, m.reply_to_message?.message_id ?? null, threadId)];
   }
   const payload = topicPayloadOf(updateId, m, name, opts);
   if (typeof payload === 'string') return [{ kind: 'reply', text: payload, threadId }];
