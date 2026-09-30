@@ -3,6 +3,36 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.10
+
+**Routes, registrations and late answers follow the session, not the pane or pid (#459, #354, #100).**
+
+- `tg` writes the sending session's registry key (`<harness>:<sessionId>`) on each reply route,
+  together with exact locators: the agent pid and, in tmux, the tmux server pid and pane pid. A
+  route written before the daemon scanned the session is stamped by the next registry scan, but
+  only from those exact locators. A tmux origin needs the full pane triple and, when recorded,
+  the same agent pid, so a reused pid in another pane never claims it.
+- A reply follows the route's session through a fresh registry scan to its current pane or pid,
+  so replying to a message sent before `omp --resume` reaches the resumed omp. A gone or unknown
+  session, a legacy route without a key, or an unkeyed route whose exact origin has left the
+  registry gets the agent picker with a named notice; the same-project guess is no longer used
+  for a route that carries a session identity.
+- Pane registrations and the last-user target resolve through the registry the same way: a
+  keyed row follows its session, and a gone session never falls back to its old pane. The
+  last-user anchor skips its cwd check only on a registry the daemon has scanned itself, not the
+  persisted file read before its first scan.
+- Pane-reuse guard: before typing into a pane on a session's behalf, the daemon re-scans and
+  refuses unless the pane still hosts that session, replying "<name> is no longer in pane %N (now
+  <other>)". A scan shared inside the 2 s refresh window is redone when the pane now holds a
+  different process. Queued (deferred) messages persist their target session in
+  `deferred.json`, and a flush into a pane that changed hands posts the refusal and a picker.
+- Each ask is stamped with its session key on arrival (the hook's `session_id`, else the pane's
+  occupant). A late button tap, a permission digit, a reply after the question timed out and the
+  grant-notice pane route all check it before typing.
+- The awareness nudge keys its state by `omp:<sessionId>` when omp has published one, so a resume
+  into another pane keeps its silence clock. Existing pane-keyed rows for the same session carry
+  over.
+
 ## 1.54.6
 
 **Session registry keyed by harness session id, plus the one-shot store migration (#487).**

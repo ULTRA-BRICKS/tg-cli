@@ -368,7 +368,9 @@ export interface StepResult {
 // --- tmux injection plans (spec §16 module 5) ---
 
 export type InjectStep =
-  | { kind: 'verify-pane'; paneId: string } // entrypoint re-checks agent still in pane
+  // The entrypoint re-checks an agent is still in the pane; with `sessionKey`,
+  // that the pane still hosts THAT session (spec §2.6 pane-reuse guard).
+  | { kind: 'verify-pane'; paneId: string; sessionKey?: string }
   | { kind: 'tmux'; argv: string[]; stdin?: string } // tmux command; stdin for load-buffer -
   | { kind: 'sleep'; ms: number };
 

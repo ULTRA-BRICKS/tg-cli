@@ -29,7 +29,7 @@ describe('deferred-store round-trip', () => {
           paneId: '%1',
           items: [
             { text: 'first', sourceMessageId: 11, relatedReactionMessageId: null },
-            { text: 'second', sourceMessageId: 12, relatedReactionMessageId: 99 },
+            { text: 'second', sourceMessageId: 12, relatedReactionMessageId: 99, sessionKey: 'omp:s1' },
           ],
         },
         { paneId: '%2', items: [{ text: 'other', sourceMessageId: null, relatedReactionMessageId: null }] },

@@ -163,6 +163,7 @@ import { selectOriginalEndpoint, originalRequestId, type OriginalOmpEndpoint, ty
 import {
   bindHookSessions,
   hookSightingOf,
+  hookSessionKey,
   listLiveSessions,
   migrationLivePanes,
   scanIsTrustworthy,
@@ -170,8 +171,19 @@ import {
   type HookSessionSighting,
   type PendingHookSighting,
 } from "./features/tg-ctl/harness-sessions"
-import { reconcile, type Registry, type RegistryEvent } from "./features/tg-ctl/session-registry"
+import { reconcile, sessionKey, type Registry, type RegistryEvent } from "./features/tg-ctl/session-registry"
 import { parseRegistry, rekeyStores, resolveLocatorToSession, runMigration, serializeRegistry, type MigrationIo, type MigrationStore } from "./features/tg-ctl/session-registry-store"
+import {
+  checkPaneSession,
+  goneRouteSession,
+  paneRefusalText,
+  registryCurrentForPane,
+  resolveAnchorTarget,
+  resolveRegistrationsBySession,
+  resolveRouteSession,
+  sessionAtPane,
+  sessionDeliveryTarget,
+} from "./features/tg-ctl/session-target"
 import { installOmpLiveExtension, runOmpLiveCommand } from "./tools/omp-live-cli.mjs"
 import {
   DEFAULT_TASK_VIEW,
@@ -957,7 +969,9 @@ function readPaneTitles(): Map<string, string> {
 // registration written by the previous version — see parseRegistrations).
 // `livePaneIds` prunes entries whose pane is gone; pass null to skip pruning
 // (no snapshot available, or a momentarily-empty/flaky one — pruning on empty
-// would wipe every live session at once).
+// would wipe every live session at once). Inside the daemon a keyed row then
+// follows its session through the registry: to the pane it lives in now, or out
+// of the set once it is gone, so a reused pane never inherits it (#354).
 function readRegistrations(paths: CtlPaths, livePaneIds: Set<string> | null = null): Registration[] {
   let raw: string | null
   try {
@@ -965,7 +979,7 @@ function readRegistrations(paths: CtlPaths, livePaneIds: Set<string> | null = nu
   } catch {
     return []
   }
-  return pruneRegistrations(parseRegistrations(raw), livePaneIds)
+  return pruneRegistrations(resolveRegistrationsBySession(parseRegistrations(raw), currentSessionRegistry()), livePaneIds)
 }
 
 // Durably PRUNE dead-pane entries from the on-disk store (review finding): the
@@ -1314,17 +1328,30 @@ function liveOmpForPane(paneId: string, agentPid?: number): LiveOmpAgent | null 
 // reuses the tick's cached discovery (listLiveOmpAgents' snapshot + omp list) —
 // no ps/lsof of its own — turns it into LiveSessions, reconciles them into the
 // registry, runs any not-yet-done one-shot store migration, and persists only
-// when the serialized registry changed. No consumer reads it yet (S2+); a
-// failure here is logged and never breaks the poll loop.
+// when the serialized registry changed. Delivery paths read it through
+// currentSessionRegistry / refreshSessionRegistry (session-target.ts); a failure
+// here is logged and never breaks the poll loop.
 const SESSION_SCAN_INTERVAL_MS = 30_000
 let sessionRegistry: Registry | null = null
 let sessionRegistryWritten: string | null = null
 let sessionScanAt = 0
+// True once this daemon reconciled a scan of its own. Before that the registry
+// is the persisted file, which may predate a tmux restart during downtime.
+let sessionRegistryScanned = false
 let sessionScanDue = true
 let sessionScanInFlight = false
 // Set by the daemon's first kick: CLI one-shots that list omp never scan, so they
 // never pay for the server-pid reads.
 let sessionScanEnabled = false
+// The daemon's ctx, set by its first kick: the delivery-time readers below are
+// module-level (executeInjectSteps, readRegistrations) and CLI one-shots have none.
+let sessionScanCtx: Ctx | null = null
+// Bumped by every scan that ran; a queued tick scan whose discovery is older
+// than a forced delivery-time scan is skipped instead of undoing it.
+let sessionScanGen = 0
+let sessionScanForced = false
+let sessionRefreshAt = 0
+const SESSION_REFRESH_MIN_MS = 2_000
 // cc/codex `session_id`s seen on the hook socket, by pane. The pid is bound at
 // the next scan (bindHookSessions), so a later process in the same pane never
 // inherits the id.
@@ -1333,7 +1360,38 @@ let hookSessions: HookSessionSighting[] = []
 const MAX_PENDING_HOOK_SESSIONS = 64
 
 function sessionScanWanted(): boolean {
-  return sessionScanEnabled && !sessionScanInFlight && (sessionScanDue || Date.now() - sessionScanAt >= SESSION_SCAN_INTERVAL_MS)
+  return sessionScanForced || (sessionScanEnabled && !sessionScanInFlight && (sessionScanDue || Date.now() - sessionScanAt >= SESSION_SCAN_INTERVAL_MS))
+}
+
+// The registry as last scanned (or as persisted, before the first scan of this
+// daemon). Null outside the daemon.
+function currentSessionRegistry(): Registry | null {
+  if (sessionRegistry || !sessionScanCtx) return sessionRegistry
+  sessionRegistry = parseRegistry(readFileOrNull(sessionScanCtx.paths.sessions))
+  return sessionRegistry
+}
+
+// A fresh scan right before a delivery that depends on WHO a pane or pid hosts
+// now (spec §2.5 re-adoption after a resume, §2.6 pane-reuse guard): a fresh
+// ps/lsof/tmux discovery, reconciled synchronously. Rate-limited so a burst of
+// deliveries (a deferred flush) shares one scan; `force` skips the limit.
+function refreshSessionRegistry(force = false): Registry | null {
+  const ctx = sessionScanCtx
+  if (!ctx || (!force && Date.now() - sessionRefreshAt < SESSION_REFRESH_MIN_MS)) return currentSessionRegistry()
+  sessionRefreshAt = Date.now()
+  liveOmpCache = null
+  sessionScanForced = true
+  try {
+    listLiveOmpAgents()
+  } finally {
+    sessionScanForced = false
+  }
+  const discovery = liveOmpCache
+  if (discovery && discovery.serverPid !== undefined) {
+    sessionScanGen++
+    scanSessionRegistry(ctx, { ...discovery, serverPid: discovery.serverPid })
+  }
+  return currentSessionRegistry()
 }
 
 function recordHookSession(req: ButtonRequest): void {
@@ -1396,6 +1454,7 @@ function describeRegistryEvent(ev: RegistryEvent): string {
 // discovery refresh (UNREACHABLE_SCAN_TTL_MS) reads one.
 function kickSessionRegistryScan(ctx: Ctx): void {
   sessionScanEnabled = true
+  sessionScanCtx = ctx
   if (!sessionScanWanted()) return
   const discovery = liveOmpCache
   if (!discovery || discovery.serverPid === undefined) return
@@ -1403,9 +1462,10 @@ function kickSessionRegistryScan(ctx: Ctx): void {
   sessionScanInFlight = true
   sessionScanDue = false
   sessionScanAt = Date.now()
+  const gen = ++sessionScanGen
   setTimeout(() => {
     try {
-      scanSessionRegistry(ctx, { ...discovery, serverPid })
+      if (gen === sessionScanGen) scanSessionRegistry(ctx, { ...discovery, serverPid })
     } finally {
       sessionScanInFlight = false
     }
@@ -1429,6 +1489,7 @@ function scanSessionRegistry(ctx: Ctx, discovery: NonNullable<typeof liveOmpCach
       if (ev.kind === "promoted") for (const line of rekeyStores(io, ev.from, ev.to)) log(`session-registry: ${line}`)
     }
     sessionRegistry = next
+    sessionRegistryScanned = true
     // The one-shot migration drops rows whose pane is dead, so an empty pane list
     // from a live server (the launchd flake) waits for a later scan — it would read
     // every registered pane as dead. With no server at all pane liveness is
@@ -1507,7 +1568,7 @@ async function routeGrantNotice(ctx: Ctx, req: ButtonRequest, text: string, deli
   const ompOrigin = req.origin?.agent === "omp" || req.agent === "omp"
   if (req.paneId && !ompOrigin) {
     try {
-      const res = await executeInjectSteps(buildTextInjectPlan(req.paneId, wrapInbound(ctx.cfg.injectWrap, "tg", text)))
+      const res = await executeInjectSteps(buildTextInjectPlan(req.paneId, wrapInbound(ctx.cfg.injectWrap, "tg", text), { sessionKey: req.sessionKey }))
       return res.ok
     } catch (err) {
       log(`grant-notice pane route failed pane=${req.paneId}: ${err instanceof Error ? err.message : String(err)}`)
@@ -1664,17 +1725,55 @@ function runInboxCommand(ctx: Ctx, argv: string[]): number {
   return 0
 }
 
-// Execute an InjectStep plan. verify-pane re-runs discovery on a CURRENT
-// snapshot — the agent may have exited between picking the target and typing
-// into it, and injecting into a bare shell would EXECUTE the text (spec §5.2).
-async function executeInjectSteps(steps: InjectStep[]): Promise<{ ok: true } | { ok: false; error: string }> {
+// A failed plan; `sessionMismatch`: the §2.6 guard refused (the pane hosts a
+// different session now) and `error` is the named reply for the CTO.
+type InjectFailure = { ok: false; error: string; sessionMismatch?: true }
+
+// The §2.6 guard's named refusal when pane `paneId` no longer hosts session
+// `sessionKey` (re-scanned first), else null. Unkeyed targets (an untracked
+// harness, a pre-registry row) and a daemon without a registry pass. A scan
+// shared with an earlier delivery of the same burst is trusted only while the
+// pane still holds the agent process that scan recorded; otherwise it rescans,
+// so a pane that changed hands inside the rate-limit window is still caught.
+function paneSessionRefusal(sessionKey: string | undefined, paneId: string, observed?: { panes: PaneInfo[]; procs: ProcInfo[] }): string | null {
+  if (sessionKey === undefined) return null
+  const shared = Date.now() - sessionRefreshAt < SESSION_REFRESH_MIN_MS
+  let reg = refreshSessionRegistry()
+  if (!reg) return null
+  if (shared) {
+    const { panes, procs } = observed ?? snapshot()
+    const pane = panes.find((p) => p.paneId === paneId)
+    const agentPid = pane ? findAgentInPane(pane, procs)?.pid : undefined
+    if (!registryCurrentForPane(reg, paneId, pane?.panePid, agentPid)) reg = refreshSessionRegistry(true) ?? reg
+  }
+  const check = checkPaneSession(reg, sessionKey, paneId)
+  if (check.ok) return null
+  log(`pane-guard: refused ${paneId} for ${sessionKey} (now ${check.hostName ?? "no agent"})`)
+  return paneRefusalText(check, paneId)
+}
+
+// The verify-pane step, shared by both executors. It re-runs discovery on a
+// CURRENT snapshot — the agent may have exited between picking the target and
+// typing into it, and injecting into a bare shell would EXECUTE the text (spec
+// §5.2). With a session key it also requires the pane to still host THAT
+// session (spec §2.6, #354/#100): a tmux server restart or a respawned pane
+// reuses `%N`, and a cwd match is never enough.
+function verifyPaneStep(step: Extract<InjectStep, { kind: "verify-pane" }>): InjectFailure | null {
+  const { panes, procs } = snapshot()
+  const pane = panes.find((p) => p.paneId === step.paneId)
+  if (!pane || findAgentInPane(pane, procs) === null) {
+    return { ok: false, error: `pane ${step.paneId} no longer hosts an agent — message not injected` }
+  }
+  const refusal = paneSessionRefusal(step.sessionKey, step.paneId, { panes, procs })
+  return refusal === null ? null : { ok: false, error: refusal, sessionMismatch: true }
+}
+
+// Execute an InjectStep plan (verify-pane: verifyPaneStep).
+async function executeInjectSteps(steps: InjectStep[]): Promise<{ ok: true } | InjectFailure> {
   for (const step of steps) {
     if (step.kind === "verify-pane") {
-      const { panes, procs } = snapshot()
-      const pane = panes.find((p) => p.paneId === step.paneId)
-      if (!pane || findAgentInPane(pane, procs) === null) {
-        return { ok: false, error: `pane ${step.paneId} no longer hosts an agent — message not injected` }
-      }
+      const failed = verifyPaneStep(step)
+      if (failed) return failed
     } else if (step.kind === "tmux") {
       const proc = Bun.spawnSync(step.argv, {
         stdin: step.stdin !== undefined ? new TextEncoder().encode(step.stdin) : undefined,
@@ -1691,14 +1790,11 @@ async function executeInjectSteps(steps: InjectStep[]): Promise<{ ok: true } | {
   return { ok: true }
 }
 
-function executeInjectStepsSync(steps: InjectStep[]): { ok: true } | { ok: false; error: string } {
+function executeInjectStepsSync(steps: InjectStep[]): { ok: true } | InjectFailure {
   for (const step of steps) {
     if (step.kind === "verify-pane") {
-      const { panes, procs } = snapshot()
-      const pane = panes.find((p) => p.paneId === step.paneId)
-      if (!pane || findAgentInPane(pane, procs) === null) {
-        return { ok: false, error: `pane ${step.paneId} no longer hosts an agent — message not injected` }
-      }
+      const failed = verifyPaneStep(step)
+      if (failed) return failed
     } else if (step.kind === "tmux") {
       const proc = Bun.spawnSync(step.argv, {
         stdin: step.stdin !== undefined ? new TextEncoder().encode(step.stdin) : undefined,
@@ -3543,6 +3639,9 @@ export function normalizeButtonRequest(value: unknown): ButtonRequest | null {
       typeof rec.timeoutMs === "number" && Number.isFinite(rec.timeoutMs) && rec.timeoutMs > 0 ? rec.timeoutMs : undefined,
     origin: readAskAdditiveOrigin(rec.origin),
     operation: readAskAdditiveOperation(rec.operation),
+    // Daemon-stamped at arrival (handleHookSocketLine overwrites whatever a
+    // client sent); read back here so it survives the disk restore.
+    sessionKey: typeof rec.sessionKey === "string" && rec.sessionKey ? rec.sessionKey : undefined,
   }
 }
 
@@ -4022,6 +4121,10 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
     return
   }
 
+  // The asking session (spec §2.6): the hook's own session id, else the
+  // registry's occupant of the asking pane. Overwrites any client-sent value.
+  const askReg = currentSessionRegistry()
+  req = { ...req, sessionKey: hookSessionKey(req) ?? (req.paneId && askReg ? sessionAtPane(askReg, req.paneId)?.key : undefined) }
   log(`ask-forward arrived: ${describeAskRequest(req)}`)
   recordHookSession(req)
 
@@ -4834,9 +4937,20 @@ async function readStdinText(): Promise<string> {
 function resolveLastUserTarget(ctx: Ctx, candidates: TargetPane[]): TargetPane | null {
   const anchor = parseLastUserTarget(readFileOrNull(ctx.paths.lastUserTarget))
   if (!anchor) return null
-  const hit = candidates.find((c) => c.pane.paneId === anchor.paneId)
+  // A keyed anchor follows its session (spec §2.4); a gone one never falls back
+  // to its old pane, which may host a different session now.
+  const target = resolveAnchorTarget(anchor, currentSessionRegistry())
+  if (!target) return null
+  const hit = candidates.find((c) => c.pane.paneId === target.paneId)
   if (!hit) return null
-  return routeMatchesPane({ recognizedCwd: anchor.cwd, panePath: hit.pane.panePath }) ? hit : null
+  return anchorProven(target) || routeMatchesPane({ recognizedCwd: anchor.cwd, panePath: hit.pane.panePath }) ? hit : null
+}
+
+// Only a registry this daemon scanned itself may vouch for a pane and skip the
+// cwd guard: the persisted one read before the first scan can predate a tmux
+// restart that reused the pane id.
+function anchorProven(target: { proven: boolean }): boolean {
+  return target.proven && sessionRegistryScanned
 }
 
 // Same anchor lookup as resolveLastUserTarget, but against the merged
@@ -4847,9 +4961,11 @@ function resolveLastUserTarget(ctx: Ctx, candidates: TargetPane[]): TargetPane |
 function resolveLastUserTargetCandidate(ctx: Ctx, candidates: AgentCandidate[]): AgentCandidate | null {
   const anchor = parseLastUserTarget(readFileOrNull(ctx.paths.lastUserTarget))
   if (!anchor) return null
-  const hit = candidates.find((c) => c.paneId === anchor.paneId)
+  const target = resolveAnchorTarget(anchor, currentSessionRegistry())
+  if (!target) return null
+  const hit = candidates.find((c) => c.paneId === target.paneId)
   if (!hit) return null
-  return routeMatchesPane({ recognizedCwd: anchor.cwd, panePath: hit.panePath }) ? hit : null
+  return anchorProven(target) || routeMatchesPane({ recognizedCwd: anchor.cwd, panePath: hit.panePath }) ? hit : null
 }
 
 // Resolve a `/tasks [<agent>]` selector to the relevant project dir. With no
@@ -6458,6 +6574,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     text: string
     sourceMessageId: number | null
     relatedReactionMessageId: number | null
+    // The session the pane hosted when this was queued (spec §2.6): the flush
+    // delivers it only while the pane still hosts that session.
+    sessionKey?: string
     delivered: boolean
   }
   // Inbound queued behind an agent's outstanding question (defer-while-waiting):
@@ -6547,6 +6666,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
               text: i.text,
               sourceMessageId: i.sourceMessageId,
               relatedReactionMessageId: i.relatedReactionMessageId,
+              ...(i.sessionKey ? { sessionKey: i.sessionKey } : {}),
             })),
           })),
         }),
@@ -6571,6 +6691,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
               text: i.text,
               sourceMessageId: i.sourceMessageId,
               relatedReactionMessageId: i.relatedReactionMessageId,
+              ...(i.sessionKey ? { sessionKey: i.sessionKey } : {}),
               delivered: false,
             })),
           ],
@@ -6583,13 +6704,18 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // Enqueue only — the caller queues the source-message ack reaction when this
   // came from a MESSAGE action (which earns a ⏳ ack); a button-callback defer
   // edits its prompt instead and must NOT leak onto the next message's ack.
+  // `sessionKey`: the session the text is for; defaults to the pane's current
+  // occupant in the registry (none for an untracked harness — no guard then).
   const enqueueDeferred = (
     paneId: string,
     wrappedText: string,
     sourceMessageId: number | null,
     relatedReactionMessageId: number | null = null,
+    sessionKey?: string,
   ): DeferredInbound => {
-    const item = { text: wrappedText, sourceMessageId, relatedReactionMessageId, delivered: false }
+    const reg = sessionKey === undefined ? currentSessionRegistry() : null
+    const key = sessionKey ?? (reg ? sessionAtPane(reg, paneId)?.key : undefined)
+    const item: DeferredInbound = { text: wrappedText, sourceMessageId, relatedReactionMessageId, delivered: false, ...(key ? { sessionKey: key } : {}) }
     deferred.enqueue(paneId, item)
     persistDeferred()
     return item
@@ -6604,8 +6730,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // {ok:false} on tmux errors, but a spawn/exception could still escape — treat
     // any throw as a failed paste (drop + log), exactly like {ok:false}.
     try {
-      const res = await executeInjectSteps(buildTextInjectPlan(paneId, item.text))
+      const res = await executeInjectSteps(buildTextInjectPlan(paneId, item.text, { sessionKey: item.sessionKey }))
       if (!res.ok) log(`deferred flush into ${paneId} failed: ${res.error}`)
+      // The pane hosts a different session now (§2.6): nothing was typed. Name
+      // the move and hand the text back through the picker instead of dropping it.
+      if (!res.ok && res.sessionMismatch) {
+        await postRoutePicker(listAgentCandidates(), item.text, `${res.error} — pick where this goes:`, item.sourceMessageId, item.relatedReactionMessageId)
+      }
       if (!res.ok) return false
     } catch (err) {
       log(`deferred flush into ${paneId} threw: ${err}`)
@@ -7770,12 +7901,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   ): Promise<boolean> => {
     const routes = parseRoutes(readFileOrNull(ctx.paths.routes))
     const recognized = recognizeRoute(routes, action.replyToMessageId)
-    const injectVerbatim = async (paneId: string): Promise<boolean> => {
+    // `sessionKey`: the session this reply is for, when known — a deferred copy
+    // carries it, and the pane is re-verified to host it right before typing (§2.6).
+    const injectVerbatim = async (paneId: string, sessionKey?: string): Promise<boolean> => {
       const live = matchLiveOmpOrigin(paneId, listLiveOmpAgents())
       if (live) {
         // Same defer-while-waiting rule as every tmux pane: never type into an open question.
         if (live.paneId && shouldDeferInbound(live.paneId)) {
-          markDeferredForAck(enqueueDeferred(live.paneId, action.injectText, action.messageId, relatedReactionMessageId))
+          markDeferredForAck(enqueueDeferred(live.paneId, action.injectText, action.messageId, relatedReactionMessageId, sessionKey))
           return true
         }
         const res = await deliverOriginalOmp(live, action.injectText, action.messageId, live.paneId)
@@ -7787,10 +7920,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return true
       }
       if (shouldDeferInbound(paneId)) {
-        markDeferredForAck(enqueueDeferred(paneId, action.injectText, action.messageId, relatedReactionMessageId))
+        markDeferredForAck(enqueueDeferred(paneId, action.injectText, action.messageId, relatedReactionMessageId, sessionKey))
         return true
       }
-      const res = await executeInjectSteps(buildTextInjectPlan(paneId, action.injectText))
+      const res = await executeInjectSteps(buildTextInjectPlan(paneId, action.injectText, { sessionKey }))
       if (!res.ok) {
         await sendMessage(ctx, res.error)
         return false
@@ -7845,10 +7978,57 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
       return recognized?.paneId ?? "the agent you replied to"
     }
-    const goneNotice = (): string => `That agent (${goneOriginLabel()}) is no longer running — pick a live one:`
+    const goneNotice = (name: string = goneOriginLabel()): string => `That agent (${name}) is no longer running — pick a live one:`
 
     const msgPreview = action.injectText.slice(0, 60).replace(/\n/g, " ")
+
+    // Session-keyed reply (spec §2.4–§2.5, tg-cli#459): the reply follows the
+    // SESSION that sent the replied-to message to wherever it lives now — a
+    // resumed omp keeps its key under a new pid, a moved one under a new pane —
+    // re-read by a fresh scan. It never falls back to a same-project guess: a gone
+    // session (or a legacy row the migration could not resolve) gets the picker
+    // with a named notice. null: the route carries no session identity at all
+    // (an untracked harness, a pre-registry `tg`) — the pane path below decides.
+    const routeReplyBySession = async (route: NonNullable<typeof recognized>): Promise<boolean | null> => {
+      const replyTo = action.replyToMessageId
+      const toPicker = async (name: string, why: string): Promise<boolean> => {
+        const candidates = listAgentCandidates()
+        log(`reply-route: replyTo=${replyTo} → ${why} → picker (${candidates.length} candidates)`)
+        if (candidates.length > 0) return postReplyPicker(candidates, goneNotice(name))
+        await sendMessage(ctx, noAgentReplyNow())
+        return false
+      }
+      if (route.legacySince !== undefined) return toPicker(goneOriginLabel(), `legacy route ${route.paneId}`)
+      const exactOrigin = route.agentPid !== undefined || route.serverPid !== undefined || route.paneId.startsWith("omp:")
+      if (route.sessionKey === undefined && !exactOrigin) return null
+      // A resumed omp's new process publishes a new endpoint; pick it up before
+      // the scan so an out-of-tmux delivery can reach it.
+      await refreshOriginalHosts()
+      const reg = refreshSessionRegistry()
+      if (!reg) return null
+      const key = route.sessionKey ?? resolveRouteSession(reg, route)
+      if (key === null) {
+        // The origin's exact locators name a session that has since left: the
+        // picker, never the same-project pane guess below.
+        const gone = goneRouteSession(reg, route)
+        if (gone) return toPicker(gone.name.primary, `origin session ${gone.key} gone`)
+        return null
+      }
+      const target = sessionDeliveryTarget(reg, key)
+      if (target.kind !== "live") {
+        return toPicker(target.kind === "gone" ? target.name : goneOriginLabel(), `session ${key} ${target.kind}`)
+      }
+      const paneId = target.paneId ?? (target.pid !== null ? liveOmpPaneId(target.pid) : null)
+      if (paneId === null) return toPicker(target.name, `session ${key} has no locator`)
+      log(`reply-route: replyTo=${replyTo} → session ${key} at ${paneId} (sent from ${route.paneId}) msg="${msgPreview}"`)
+      const delivered = await injectVerbatim(paneId, key)
+      if (delivered) recordLastUserTarget(paneId, target.cwd || undefined)
+      return delivered
+    }
+
     if (recognized) {
+      const bySession = await routeReplyBySession(recognized)
+      if (bySession !== null) return bySession
       const liveHit = matchLiveOmpOrigin(recognized.paneId, listLiveOmpAgents())
       if (liveHit) {
         // omp:<pid> is the live process (pid identity). Do not require cwd match:
@@ -10010,7 +10190,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         if (digit !== null) {
           let deliveryFailure: string | null = null
           try {
-            const res = await executeInjectSteps(buildDigitInjectPlan(paneId, digit))
+            const res = await executeInjectSteps(buildDigitInjectPlan(paneId, digit, retained.req.sessionKey))
             deliveryFailure = res.ok ? null : res.error
           } catch (err) {
             // Bun.spawnSync can throw (missing tmux binary, broken PATH) —
@@ -10148,11 +10328,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // We do NOT enqueue it on the pane's defer queue: if the pane is BUSY we decline
     // and keep the entry retained for a re-tap (the busy guard below) — a queued
     // late-answer could be delivered behind the wrong live question after we'd
-    // already claimed "sent". NOTE (known bound): the pane
-    // is verified to still host an agent, but not that it is the SAME session as when
-    // the question was asked (a repurposed pane within the retention window receives a
-    // clearly-attributed "[TG from …] <label>" message, not a silent wrong action) —
-    // see issue tracker.
+    // already claimed "sent". The pane must also still host the ASKING session
+    // (spec §2.6, tg-cli#100): after a tmux restart or a pane respawn `%N` may host
+    // a different session, which gets nothing typed and the CTO a named refusal.
     const paneId = retained.req.paneId
     // The pane is BUSY (another live question, or a flush in progress) → do NOT
     // deliver now. Injecting would hit the open prompt; ENQUEUING would risk the
@@ -10162,6 +10340,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (shouldDeferInbound(paneId)) {
       log(`ask-late-deliver-busy: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId}`)
       await answerCallbackQuery(ctx, action.callbackQueryId, "agent is busy — tap again shortly")
+      return true
+    }
+    const refusal = paneSessionRefusal(retained.req.sessionKey, paneId)
+    if (refusal !== null) {
+      log(`ask-late-deliver-refused: session left pane ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId}`)
+      await answerCallbackQuery(ctx, action.callbackQueryId, "not delivered — that session left its pane")
+      await sendMessage(ctx, refusal)
       return true
     }
     const wrapped = wrapInbound(ctx.cfg.injectWrap, "tg", answer.label)
@@ -10275,13 +10460,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     answeredButtons.set(action.requestId, { value: answer, label: answer, at: answeredAt, delivery: "pane" })
     persistQuestions()
 
-    const res = await executeInjectSteps(buildTextInjectPlan(paneId, answer))
+    const res = await executeInjectSteps(buildTextInjectPlan(paneId, answer, { sessionKey: retained.req.sessionKey }))
     if (!res.ok) {
       answeredButtons.delete(action.requestId)
       abandonedButtons.set(action.requestId, { req: retained.req, messageId: retained.messageId, at: retained.at })
       persistQuestions()
       log(`ask-post-timeout-reply-failed: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId} err=${res.error}`)
-      await sendMessage(ctx, "could not reach the terminal — reply to the question again")
+      await sendMessage(ctx, res.sessionMismatch ? res.error : "could not reach the terminal — reply to the question again")
       return false
     }
 
@@ -10760,10 +10945,28 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       await refreshOriginalHosts()
       const liveOmpAgentsForNudge = listLiveOmpAgents().filter(a => originalHosts.some(h => h.pid === a.pid))
       if (liveOmpAgentsForNudge.length > 0 || Object.keys(awarenessNudgeStore).length > 0) {
-        const liveOmpAgentByNudgeKey = new Map(liveOmpAgentsForNudge.map((a) => [a.paneId ?? liveOmpPaneId(a.pid), a]))
+        // Nudge state is keyed by the session (`omp:<sessionId>`) when omp has
+        // published one, so a `--resume` into another pane keeps its silence
+        // clock and nudge marker (#459). History rows only carry the pane/pid
+        // locator, so the last-send time is read through the agent's locator.
+        const locatorOf = (a: LiveOmpAgent): string => a.paneId ?? liveOmpPaneId(a.pid)
+        const nudgeKeyOf = (a: LiveOmpAgent): string => (a.sessionId ? sessionKey("omp", a.sessionId) : locatorOf(a))
+        const liveOmpAgentByNudgeKey = new Map(liveOmpAgentsForNudge.map((a) => [nudgeKeyOf(a), a]))
         const nudgeKeys = [...liveOmpAgentByNudgeKey.keys()]
         const sessionIdByNudgeKey = new Map([...liveOmpAgentByNudgeKey].map(([key, a]) => [key, a.sessionId]))
-        const sentAtByKey = lastTgSentAtByKey(parseHistory(readFileOrNull(ctx.paths.history)))
+        const sentAtByLocator = lastTgSentAtByKey(parseHistory(readFileOrNull(ctx.paths.history)))
+        const sentAtByKey = new Map<string, number>()
+        for (const [key, a] of liveOmpAgentByNudgeKey) {
+          const locator = locatorOf(a)
+          const sentAt = sentAtByLocator.get(locator)
+          if (sentAt !== undefined) sentAtByKey.set(key, sentAt)
+          // A pre-#459 row keyed by the locator for this same session carries
+          // over, so the cutover does not restart its silence clock.
+          const legacy = awarenessNudgeStore[locator]
+          if (key !== locator && !awarenessNudgeStore[key] && legacy?.sessionId === a.sessionId) {
+            awarenessNudgeStore = { ...awarenessNudgeStore, [key]: legacy }
+          }
+        }
         const nudgePlan = planAwarenessNudges(nudgeKeys, sentAtByKey, awarenessNudgeStore, Date.now(), sessionIdByNudgeKey)
         awarenessNudgeStore = nudgePlan.store
         if (nudgePlan.keysChanged) persistAwarenessNudge()

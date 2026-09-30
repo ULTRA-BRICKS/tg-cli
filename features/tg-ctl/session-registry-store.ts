@@ -5,15 +5,16 @@
 // first trusted scan and, per store, exactly once (a marker in sessions.json):
 // resolvable rows gain the `sessionKey` of the live entry their locator resolves
 // to, with `paneId` kept as a hint. Later scans only re-derive a key a live writer
-// left missing or dead (registration, last-user target). Consumers switch from pane to key in their own
-// slices (S2 routes/registration/target, S3 deferred/questions), so the rows stay
-// readable by today's parsers. deferred.json, questions.json and
-// awareness-nudge.json are held in daemon memory and rewritten from it, so their
-// migration lands with the consumer that owns that memory.
+// left missing or dead (registration, last-user target) or that `tg` could not
+// stamp on a route (routes). The rows stay readable by older parsers.
+// deferred.json and questions.json carry the key their daemon stamped at enqueue
+// / ask time (S3), and awareness-nudge.json is keyed by session in memory, so
+// neither needs a rewrite here.
 //
 // PURE — reads, writes and writer locks are injected (MigrationIo).
 
 import { parseLastUserTarget, serializeLastUserTarget } from './last-user-target';
+import { resolveRouteSession } from './session-target';
 import { parseRegistrations, serializeRegistrations } from './registration-store';
 import { parseRoutes, serializeRoutes } from './routes';
 import type { MigrationMarkers, Registry, SessionEntry, SessionKey } from './session-registry';
@@ -195,9 +196,23 @@ function rederivedKey(reg: Registry, paneId: string | undefined, cwd: string | u
 // After its one-shot migration, a store's live writers (`tg start`, a confirmed
 // delivery) may still rewrite a row without its key, or keep a key whose session
 // ended while a new one took the pane. Every trusted scan re-derives those keys —
-// never dropping a row. Returns the new content, or null when nothing changed.
-function backfillKeys(store: 'registration' | 'lastUserTarget', raw: string | null, reg: Registry): string | null {
+// never dropping a row. A route row is different: its key is the historic truth
+// of who sent it, so only a row `tg` could not stamp gains one, and only from its
+// exact origin locators (resolveRouteSession) while that session is still live.
+// Returns the new content, or null when nothing changed.
+function backfillKeys(store: 'routes' | 'registration' | 'lastUserTarget', raw: string | null, reg: Registry): string | null {
   if (raw === null) return null;
+  if (store === 'routes') {
+    let changed = false;
+    const rows = parseRoutes(raw).map((r) => {
+      if (r.sessionKey !== undefined || r.legacySince !== undefined) return r;
+      const key = resolveRouteSession(reg, r);
+      if (key === null) return r;
+      changed = true;
+      return { ...r, sessionKey: key };
+    });
+    return changed ? serializeRoutes(rows) : null;
+  }
   if (store === 'registration') {
     let changed = false;
     const rows = parseRegistrations(raw).map((r) => {
@@ -235,10 +250,10 @@ function migrateTopics(raw: string | null, reg: Registry): { registry: Registry;
 }
 
 // Run every not-yet-migrated store's one-shot migration against the registry of
-// a trusted scan; already-migrated registration/lastUserTarget stores get their
-// missing keys re-derived instead (backfillKeys). A store whose lock is contended
-// keeps no marker and is retried by the next call. Returns the same registry
-// object when no migration ran.
+// a trusted scan; already-migrated routes/registration/lastUserTarget stores get
+// their missing keys re-derived instead (backfillKeys). A store whose lock is
+// contended keeps no marker and is retried by the next call. Returns the same
+// registry object when no migration ran.
 export function runMigration(
   reg: Registry,
   io: MigrationIo,
@@ -250,7 +265,7 @@ export function runMigration(
   const log: string[] = [];
   for (const store of STORES) {
     if (reg.migrated[store] !== undefined) {
-      if (store !== 'registration' && store !== 'lastUserTarget') continue;
+      if (store === 'topics') continue;
       // Unlocked peek first: the common case (nothing to re-derive) takes no lock.
       if (backfillKeys(store, io.read(store), registry) === null) continue;
       io.locked(store, () => {

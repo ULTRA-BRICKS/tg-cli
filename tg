@@ -69,6 +69,8 @@ import { agentNameFromDisplayLine } from "./features/tg-ctl/agent-name"
 import { detectAgentViaAncestry, detectAncestorAgent, isProcessRunning } from "./features/branding/detect"
 import { outboundOriginPaneId, parseLsofJsonlPaths, parseOmpSessionMeta, pickPrimaryOmpSessionFile } from "./features/tg-ctl/omp"
 import { parseLsofCwd } from "./features/tg-ctl/unreachable"
+import { parseRegistry } from "./features/tg-ctl/session-registry-store"
+import { resolveRouteSession, type RouteOrigin } from "./features/tg-ctl/session-target"
 import { resolveSessionName, titleFromPaneTitle } from "./features/tg-ctl/session-name"
 import { installSkill } from "./features/install-skill/install"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
@@ -1584,19 +1586,62 @@ if (import.meta.main) {
       return null
     }
     if (!TMUX_PANE) return null
+    return readOriginPane().path
+  }
+  // ONE tmux read of the origin pane: its path (the route cwd, above) and its
+  // exact locator — server pid + pane pid — that names the pane across tmux
+  // restarts (spec §2.6). Cached: every chunk of one send shares it.
+  let originPane: { path: string | null; serverPid?: number; panePid?: number } | undefined
+  const readOriginPane = (): { path: string | null; serverPid?: number; panePid?: number } => {
+    if (originPane) return originPane
+    originPane = { path: null }
+    if (!TMUX_PANE) return originPane
     try {
       const result = Bun.spawnSync(
-        ["tmux", "display-message", "-p", "-t", TMUX_PANE, "#{pane_current_path}"],
+        ["tmux", "display-message", "-p", "-t", TMUX_PANE, "#{pane_current_path}\t#{pid}\t#{pane_pid}"],
         { stdout: "pipe", stderr: "pipe" },
       )
       if (result.exitCode === 0) {
-        const path = new TextDecoder().decode(result.stdout).trim()
-        if (path) return path
+        // The pids are the LAST two fields: a pane path may itself contain a tab.
+        const fields = new TextDecoder().decode(result.stdout).replace(/\r?\n$/, "").split("\t")
+        const panePid = fields.pop()
+        const serverPid = fields.pop()
+        const path = fields.join("\t")
+        originPane = {
+          path: path || null,
+          ...(Number(serverPid) > 0 ? { serverPid: Number(serverPid) } : {}),
+          ...(Number(panePid) > 0 ? { panePid: Number(panePid) } : {}),
+        }
       }
     } catch {
       // tmux missing / pane gone — fall back to process.cwd() in resolveRouteCwd
     }
-    return null
+    return originPane
+  }
+  // The session this send came from (session registry key, spec §2.4), resolved
+  // once per send from the daemon's sessions.json (read-only here) and the exact
+  // origin locators. A reply then follows the SESSION, so it still lands after an
+  // omp restart/resume changed the pid (tg-cli#459). Unresolved (the daemon has
+  // not scanned this session yet) → the route keeps its locators and the
+  // daemon's next scan stamps the key.
+  let originSession: { locators: RouteOrigin; sessionKey: string | null } | undefined
+  const resolveOriginSession = (): { locators: RouteOrigin; sessionKey: string | null } => {
+    if (originSession) return originSession
+    const pane = readOriginPane()
+    const locators: RouteOrigin = {
+      paneId: originPaneId!,
+      ...(ancestor ? { agentPid: ancestor.pid } : {}),
+      ...(pane.serverPid && pane.panePid ? { serverPid: pane.serverPid, panePid: pane.panePid } : {}),
+    }
+    let sessionKey: string | null = null
+    try {
+      const sessionsPath = ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).sessions
+      sessionKey = resolveRouteSession(parseRegistry(readFileSync(sessionsPath, "utf8")), locators)
+    } catch {
+      // no registry yet — the daemon's next scan stamps the route
+    }
+    originSession = { locators, sessionKey }
+    return originSession
   }
   // EVERY outbound message id of THIS send (a multi-chunk >4096 split or a
   // media-group send emits several Telegram message_ids for one logical
@@ -1613,11 +1658,13 @@ if (import.meta.main) {
       // are essentially impossible (the codex #55 scenario was a writer blocked on
       // exactly this lookup WHILE holding the lock). Snapshot ts here too so the
       // locked body is pure file I/O.
+      const origin = resolveOriginSession()
       const newRoute = {
         id: messageId,
-        paneId: originPaneId,
         cwd: resolveRouteCwd({ queryPanePath, fallbackCwd: process.cwd() }),
         ts: Math.floor(Date.now() / 1000),
+        ...origin.locators,
+        ...(origin.sessionKey ? { sessionKey: origin.sessionKey } : {}),
       }
       // Serialize the read-modify-write across concurrent agents: two `tg` sends
       // racing this RMW would last-writer-wins-clobber each other's route entries,

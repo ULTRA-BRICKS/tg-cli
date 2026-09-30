@@ -188,6 +188,28 @@ test('a key a live writer dropped (or that names no live session) is re-derived 
   expect(parseLastUserTarget(io.files.lastUserTarget)?.sessionKey).toBe('cc:pane:7/%3/60');
 });
 
+test('an unkeyed route is stamped on a later scan only from exact origin locators; keyed and legacy rows are never rewritten', () => {
+  const io = new MemIo(FIXTURE);
+  const first = runMigration(REGISTRY, io, { now: NOW, livePaneIds: LIVE_PANES });
+  io.files.routes = JSON.stringify([
+    { id: 20, paneId: 'omp:600', ts: 20, agentPid: 600 }, // headless omp, by pid
+    { id: 21, paneId: '%0', cwd: '/w/gc', ts: 21, serverPid: 7, panePid: 50 }, // exact tmux triple
+    { id: 22, paneId: '%0', cwd: '/w/gc', ts: 22, serverPid: 6, panePid: 50 }, // an older tmux server's %0
+    { id: 23, paneId: '%0', cwd: '/w/gc', ts: 23 }, // a bare pane id is never proof
+    { id: 24, paneId: '%0', ts: 24, agentPid: 100, sessionKey: 'omp:kept' },
+    { id: 25, paneId: '%0', ts: 25, agentPid: 100, legacySince: NOW_SEC },
+  ]);
+  runMigration(first.registry, io, { now: NOW + 60_000, livePaneIds: LIVE_PANES });
+  expect(parseRoutes(io.files.routes!).map((r) => [r.id, r.sessionKey ?? null])).toEqual([
+    [20, 'omp:headless'],
+    [21, `omp:${SID}`],
+    [22, null],
+    [23, null],
+    [24, 'omp:kept'],
+    [25, null],
+  ]);
+});
+
 test('with no tmux server (pane liveness unknown) every store is marked and nothing is dropped', () => {
   const io = new MemIo({ ...FIXTURE, lastUserTarget: JSON.stringify({ paneId: '%8', cwd: '/w/gone', ts: 5 }) });
   const { registry } = runMigration(REGISTRY, io, { now: NOW, livePaneIds: null });

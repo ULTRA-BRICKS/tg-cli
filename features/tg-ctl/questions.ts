@@ -156,6 +156,11 @@ export interface ButtonRequest {
   // OPAQUE: computed by the agent-tools lib; the daemon only compares it when
   // consuming a grant (grants.ts).
   operation?: AskOperation;
+  // The session registry key of the asking session, stamped by the DAEMON when
+  // the ask arrives (never trusted from the client) and persisted with the
+  // question: a late answer is typed into `paneId` only while that pane still
+  // hosts this session (spec §2.6, tg-cli#100).
+  sessionKey?: string;
 }
 
 export interface ButtonMessagePayload {

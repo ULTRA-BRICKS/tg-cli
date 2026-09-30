@@ -43,10 +43,11 @@ export function wrapInbound(template: string, name: string, msg: string, message
 export interface TextInjectOpts {
   escapePrelude?: boolean; // send Escape first (close pickers/menus before typing)
   gapMs?: number; // pre-Enter gap (default 500ms — competitor-source-proven pacing)
+  sessionKey?: string; // refuse unless the pane still hosts this session (§2.6)
 }
 
 export function buildTextInjectPlan(paneId: string, text: string, opts: TextInjectOpts = {}): InjectStep[] {
-  const steps: InjectStep[] = [{ kind: 'verify-pane', paneId }];
+  const steps: InjectStep[] = [opts.sessionKey ? { kind: 'verify-pane', paneId, sessionKey: opts.sessionKey } : { kind: 'verify-pane', paneId }];
 
   if (opts.escapePrelude) {
     steps.push({ kind: 'tmux', argv: ['tmux', 'send-keys', '-t', paneId, 'Escape'] });
@@ -97,9 +98,9 @@ export function buildKeyInjectPlan(paneId: string, key: 'Escape'): InjectStep[] 
 // contract, since it can never be distinguished from a correct single-digit
 // call — a real bug upstream would inject a plausible-looking WRONG answer
 // instead of surfacing loudly).
-export function buildDigitInjectPlan(paneId: string, digit: string): InjectStep[] {
+export function buildDigitInjectPlan(paneId: string, digit: string, sessionKey?: string): InjectStep[] {
   return [
-    { kind: 'verify-pane', paneId },
+    sessionKey ? { kind: 'verify-pane', paneId, sessionKey } : { kind: 'verify-pane', paneId },
     { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', paneId, '-l', digit] },
   ];
 }

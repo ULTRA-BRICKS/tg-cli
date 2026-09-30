@@ -8,7 +8,7 @@
 
 import { abducoSessionName, findAgentInPane } from './discover';
 import type { LiveOmpAgent } from './omp';
-import type { Harness, LiveSession, Registry, TmuxLocator } from './session-registry';
+import { sessionKey, type Harness, type LiveSession, type Registry, type SessionKey, type TmuxLocator } from './session-registry';
 import type { ButtonRequest } from './questions';
 import type { AgentKind, PaneInfo, ProcInfo } from './types';
 
@@ -31,6 +31,13 @@ export function hookSightingOf(req: Pick<ButtonRequest, 'agent' | 'paneId' | 'or
   const sessionId = req.origin?.sessionId;
   if (!harness || !sessionId || !req.paneId) return null;
   return { harness, sessionId, paneId: req.paneId };
+}
+
+// The registry key of the session a cc/codex ask came from — the key the §2.6
+// guard later requires its pane to still host before a late answer is typed.
+export function hookSessionKey(req: Pick<ButtonRequest, 'agent' | 'paneId' | 'origin'>): SessionKey | null {
+  const sighting = hookSightingOf(req);
+  return sighting ? sessionKey(sighting.harness, sighting.sessionId) : null;
 }
 
 // Bind pending sightings to the agent pid their pane hosts in this snapshot (the

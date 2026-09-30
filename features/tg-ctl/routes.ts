@@ -17,8 +17,16 @@ export interface Route {
   cwd?: string;
   ts: number; // unix seconds (send time)
   // The session registry key the origin resolved to (session-registry-and-topics
-  // §2.4). Set by the one-shot migration today; `paneId` stays as a hint.
+  // §2.4): stamped by `tg` at send time, else by the daemon's next scan from the
+  // exact locators below. A reply follows the key to wherever that session lives
+  // now (a resumed omp keeps its key under a new pid); `paneId` stays as a hint.
   sessionKey?: string;
+  // Exact origin locators, recorded so the key can still be derived after the
+  // send: the agent process that ran `tg`, and the origin pane's tmux server pid
+  // and pane pid (a bare `%N` is reused across tmux restarts, §2.6).
+  agentPid?: number;
+  serverPid?: number;
+  panePid?: number;
   // Unix seconds the migration found this row unresolvable. A legacy row is kept
   // only for "that session is gone" answers and dropped LEGACY_ROUTE_TTL_SEC later.
   legacySince?: number;
@@ -50,10 +58,17 @@ export function parseRoutes(raw: string | null): Route[] {
       cwd: typeof rec.cwd === 'string' ? rec.cwd : undefined,
       ts: rec.ts,
       ...(typeof rec.sessionKey === 'string' && rec.sessionKey ? { sessionKey: rec.sessionKey } : {}),
+      ...(posInt(rec.agentPid) ? { agentPid: rec.agentPid } : {}),
+      ...(posInt(rec.serverPid) ? { serverPid: rec.serverPid } : {}),
+      ...(posInt(rec.panePid) ? { panePid: rec.panePid } : {}),
       ...(typeof rec.legacySince === 'number' && Number.isFinite(rec.legacySince) ? { legacySince: rec.legacySince } : {}),
     });
   }
   return out;
+}
+
+function posInt(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v > 0;
 }
 
 // Append a route, dropping any prior entry for the same message id and any legacy

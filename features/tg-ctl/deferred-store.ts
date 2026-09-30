@@ -24,6 +24,10 @@ export interface DeferredStoreItem {
   text: string; // the already-wrapped inbound text to inject
   sourceMessageId: number | null; // Telegram message_id of the queued message (ack target)
   relatedReactionMessageId: number | null; // a related reaction message id, if any
+  // The session the pane hosted when this was queued (session registry key,
+  // spec §2.6). The flush delivers only while the pane still hosts it. Absent for
+  // an untracked harness and for items queued before this field existed.
+  sessionKey?: string;
 }
 
 // One pane's FIFO backlog.
@@ -98,6 +102,7 @@ function parseItems(value: unknown): DeferredStoreItem[] {
       text: ir.text,
       sourceMessageId: numOrNull(ir.sourceMessageId),
       relatedReactionMessageId: numOrNull(ir.relatedReactionMessageId),
+      ...(typeof ir.sessionKey === 'string' && ir.sessionKey ? { sessionKey: ir.sessionKey } : {}),
     });
   }
   return out;
