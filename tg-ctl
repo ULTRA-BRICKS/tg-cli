@@ -183,6 +183,7 @@ import {
   resolveRouteSession,
   sessionAtPane,
   sessionDeliveryTarget,
+  type SessionDeliveryTarget,
 } from "./features/tg-ctl/session-target"
 import {
   createTopicEnsurer,
@@ -196,6 +197,7 @@ import {
   topicTitleFor,
   type SessionLookup,
 } from "./features/tg-ctl/session-topics"
+import { createTopicRenamer, type TopicRenamer } from "./features/tg-ctl/topic-rename"
 import { isThreadRejection, isTopicDeletedError } from "./features/transport/telegram"
 import { installOmpLiveExtension, runOmpLiveCommand } from "./tools/omp-live-cli.mjs"
 import {
@@ -1599,6 +1601,8 @@ function patchSessionEntry(ctx: Ctx, key: SessionKey, patch: Partial<Pick<Sessio
   const reg = currentRegistry(ctx)
   const prev = reg.sessions.find((e) => e.key === key)
   if (!prev) return null
+  // A topic that is replaced or dropped takes its pending retitle with it.
+  if (patch.threadId !== undefined && prev.threadId !== null && prev.threadId !== patch.threadId) topicRenamer?.forget(prev.threadId)
   const next = { ...prev, ...patch }
   sessionRegistry = { ...reg, sessions: reg.sessions.map((e) => (e === prev ? next : e)) }
   try {
@@ -1754,7 +1758,7 @@ async function handleResolveSession(ctx: Ctx, socket: Socket, q: SessionLookup):
 
 // Scan follow-up: a session that moved or came back keeps its topic — the binding follows its
 // new pane locator — and a new process of it (resume, restart) posts "reattached" there. A
-// tmux move of the same process says nothing.
+// tmux move of the same process says nothing. A committed rename retitles the topic.
 function followSessionTopics(ctx: Ctx, prev: Registry, events: RegistryEvent[]): void {
   if (!ctx.cfg.topics && !ctx.cfg.privateTopics) return
   // Forget the recreate cap of entries the registry has dropped.
@@ -1763,6 +1767,15 @@ function followSessionTopics(ctx: Ctx, prev: Registry, events: RegistryEvent[]):
     if (!sessions.some((e) => e.key === key)) topicRecreatedAt.delete(key)
   }
   for (const ev of events) {
+    if (ev.kind === "renamed") {
+      retitleSessionTopic(ctx, ev)
+      continue
+    }
+    if (ev.kind === "pruned") {
+      const threadId = prev.sessions.find((e) => e.key === ev.key)?.threadId
+      if (threadId != null) topicRenamer?.forget(threadId)
+      continue
+    }
     if (ev.kind !== "readopted" && ev.kind !== "relocated") continue
     const entry = liveEntry(ctx, ev.key)
     if (!entry || entry.threadId === null) continue
@@ -1774,6 +1787,37 @@ function followSessionTopics(ctx: Ctx, prev: Registry, events: RegistryEvent[]):
       void sendToSessionTopic(ctx, entry.key, threadId, `📂 ${entry.name.primary || entry.key} — reattached`)
     }
   }
+}
+
+// Rename → editForumTopic (spec §4.7, tg-cli#466): a committed `renamed` event (§3.2, stable for
+// 20 s) retitles the session's topic `primary · secondary`, at most once a minute per topic with
+// the latest name winning (topic-rename.ts). Nothing flows back: a topic renamed in Telegram —
+// including the echo of this very edit — is only logged (§4.4 row 5), never applied to tmux or
+// the registry, so there is no rename loop.
+let topicRenamer: TopicRenamer | null = null
+function retitleSessionTopic(ctx: Ctx, ev: Extract<RegistryEvent, { kind: "renamed" }>): void {
+  const entry = currentRegistry(ctx).sessions.find((e) => e.key === ev.key)
+  if (!entry || entry.threadId === null) return
+  topicRenamer ??= createTopicRenamer({
+    now: Date.now,
+    schedule: (fn, ms) => {
+      const timer = setTimeout(() => void fn(), ms)
+      return () => clearTimeout(timer)
+    },
+    edit: (threadId, title) => editSessionTopic(ctx, threadId, title),
+  })
+  void topicRenamer.rename(entry.threadId, topicTitleFor(entry), topicTitleFor({ key: entry.key, name: ev.from }))
+}
+
+async function editSessionTopic(ctx: Ctx, threadId: number, title: string): Promise<boolean> {
+  const resp = await botPostResult(ctx, "editForumTopic", { chat_id: ctx.chatId, message_thread_id: threadId, name: title })
+  // TOPIC_NOT_MODIFIED: the topic already carries this title.
+  if (!resp.ok && !/TOPIC_NOT_MODIFIED/.test(resp.description)) {
+    log(`session topics: retitling topic ${threadId} failed: ${resp.description}`)
+    return false
+  }
+  log(`session topics: topic ${threadId} retitled "${title}"`)
+  return true
 }
 
 // One `  - …` line per omp, each naming the tmux pane it is shown in (window name +
@@ -1995,23 +2039,27 @@ function runInboxCommand(ctx: Ctx, argv: string[]): number {
 // different session now) and `error` is the named reply for the CTO.
 type InjectFailure = { ok: false; error: string; sessionMismatch?: true }
 
-// The §2.6 guard's named refusal when pane `paneId` no longer hosts session
-// `sessionKey` (re-scanned first), else null. Unkeyed targets (an untracked
-// harness, a pre-registry row) and a daemon without a registry pass. A scan
+// The registry as it describes pane `paneId` NOW (re-scanned first). A scan
 // shared with an earlier delivery of the same burst is trusted only while the
 // pane still holds the agent process that scan recorded; otherwise it rescans,
 // so a pane that changed hands inside the rate-limit window is still caught.
+function registryForPane(paneId: string, observed?: { panes: PaneInfo[]; procs: ProcInfo[] }): Registry | null {
+  const shared = Date.now() - sessionRefreshAt < SESSION_REFRESH_MIN_MS
+  const reg = refreshSessionRegistry()
+  if (!reg || !shared) return reg
+  const { panes, procs } = observed ?? snapshot()
+  const pane = panes.find((p) => p.paneId === paneId)
+  const agentPid = pane ? findAgentInPane(pane, procs)?.pid : undefined
+  return registryCurrentForPane(reg, paneId, pane?.panePid, agentPid) ? reg : (refreshSessionRegistry(true) ?? reg)
+}
+
+// The §2.6 guard's named refusal when pane `paneId` no longer hosts session
+// `sessionKey` (registryForPane), else null. Unkeyed targets (an untracked
+// harness, a pre-registry row) and a daemon without a registry pass.
 function paneSessionRefusal(sessionKey: string | undefined, paneId: string, observed?: { panes: PaneInfo[]; procs: ProcInfo[] }): string | null {
   if (sessionKey === undefined) return null
-  const shared = Date.now() - sessionRefreshAt < SESSION_REFRESH_MIN_MS
-  let reg = refreshSessionRegistry()
+  const reg = registryForPane(paneId, observed)
   if (!reg) return null
-  if (shared) {
-    const { panes, procs } = observed ?? snapshot()
-    const pane = panes.find((p) => p.paneId === paneId)
-    const agentPid = pane ? findAgentInPane(pane, procs)?.pid : undefined
-    if (!registryCurrentForPane(reg, paneId, pane?.panePid, agentPid)) reg = refreshSessionRegistry(true) ?? reg
-  }
   const check = checkPaneSession(reg, sessionKey, paneId)
   if (check.ok) return null
   log(`pane-guard: refused ${paneId} for ${sessionKey} (now ${check.hostName ?? "no agent"})`)
@@ -7741,7 +7789,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // silently wipe the CTO's anchor on every delivery through this path.
     cwd: string,
     // A topic delivery answers errors in its topic and never moves the flat-chat anchor.
-    { out = {}, recordAnchor = true }: { out?: Record<string, unknown>; recordAnchor?: boolean } = {},
+    // `sessionKey`: the registry session this is for — a pane must still host THAT session
+    // (spec §2.6), checked before typing or queueing behind an open question.
+    { out = {}, recordAnchor = true, sessionKey }: { out?: Record<string, unknown>; recordAnchor?: boolean; sessionKey?: string } = {},
   ): Promise<boolean> => {
     if (paneId.startsWith("omp:")) {
       const pid = Number(paneId.slice("omp:".length))
@@ -7760,8 +7810,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (recordAnchor) recordLastUserTarget(paneId, ompCwd)
       return true
     }
+    const refusal = paneSessionRefusal(sessionKey, paneId)
+    if (refusal !== null) {
+      await sendMessage(ctx, refusal, out)
+      return false
+    }
     if (shouldDeferInbound(paneId)) {
-      markDeferredForAck(enqueueDeferred(paneId, prewrappedText, sourceMessageId))
+      markDeferredForAck(enqueueDeferred(paneId, prewrappedText, sourceMessageId, null, sessionKey))
       // A media `/agent` caption is an explicit CTO routing choice, same as its
       // text equivalent — record the tg-cli#78 anchor (review finding: this path
       // was the one remaining explicit-routing gap).
@@ -7782,7 +7837,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (recordAnchor) recordLastUserTarget(paneId, cwd)
       return true
     }
-    const res = await executeInjectSteps(buildTextInjectPlan(paneId, prewrappedText))
+    const res = await executeInjectSteps(buildTextInjectPlan(paneId, prewrappedText, { sessionKey }))
     if (!res.ok) {
       await sendMessage(ctx, res.error, out)
       return false
@@ -8487,8 +8542,33 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     persistTopics(next)
     return next
   }
-  // threadId → current binding status (or null when unknown) for stepUpdates' pure triage.
-  const topicStatusOf = (threadId: number): TopicStatus | null => findTopic(loadTopics(), threadId)?.status ?? null
+  // The registry session that owns topic `threadId` (spec §4.2): the registry, not a topics.json
+  // pane binding, is the truth for a session's topic. A live owner wins over a gone one.
+  const topicOwner = (threadId: number): SessionEntry | null => {
+    const owners = currentSessionRegistry()?.sessions.filter((e) => e.threadId === threadId) ?? []
+    return owners.find((e) => e.state === "live") ?? owners[0] ?? null
+  }
+  // The registry session a topic message addresses (§4.4 rows 2–3): the topic's owner, else — a
+  // binding the attach picker or a pre-registry spawn made — the ONE live session on the bound
+  // pane locator with the binding's cwd. A closed binding is never re-resolved by its pane: that
+  // `%N` may host a stranger now. null: the registry does not know the topic (no scan yet, or an
+  // untracked harness), and the binding's own pane decides.
+  const resolveTopicSession = (threadId: number, binding: TopicBinding | null): SessionEntry | null => {
+    const owner = topicOwner(threadId)
+    if (owner) return owner
+    const reg = currentSessionRegistry()
+    if (!reg || binding?.status !== "bound" || !binding.paneId) return null
+    const key = resolveLocatorToSession(reg, binding.paneId, binding.path)
+    return key === null ? null : (reg.sessions.find((e) => e.key === key) ?? null)
+  }
+  // threadId → current status (or null when unknown) for stepUpdates' pure triage. A topic the
+  // registry gives to a session is known even without a topics.json binding, so a live session's
+  // topic never lands behind the attach picker.
+  const topicStatusOf = (threadId: number): TopicStatus | null => {
+    const owner = topicOwner(threadId)
+    if (owner) return owner.state === "live" ? "bound" : "closed"
+    return findTopic(loadTopics(), threadId)?.status ?? null
+  }
   // sendMessage threaded into a topic — all topic-originated daemon output MUST carry
   // message_thread_id or it lands in General.
   const sendToTopic = (threadId: number, text: string): Promise<number | null> =>
@@ -8544,17 +8624,71 @@ async function runDaemon(ctx: Ctx): Promise<never> {
 
   // Deliver one topic payload to a live session through the flat delivery path (omp endpoint →
   // in-tmux send-keys; deferred behind an open question). Errors answer in the topic, and a topic
-  // delivery never moves the flat-chat last-user-target anchor.
-  const deliverTopicPayload = async (threadId: number, paneId: string, cwd: string, payload: TopicPayload): Promise<boolean> => {
+  // delivery never moves the flat-chat last-user-target anchor. `sessionKey`: the registry session
+  // the pane must still host (§2.6).
+  const deliverTopicPayload = async (threadId: number, paneId: string, cwd: string, payload: TopicPayload, sessionKey?: string): Promise<boolean> => {
     const text = await renderTopicPayload(threadId, payload)
     if (text === null) return false
-    return injectPrewrappedToPane(paneId, text, payload.messageId, cwd, { out: replyContext(threadId), recordAnchor: false })
+    return injectPrewrappedToPane(paneId, text, payload.messageId, cwd, { out: replyContext(threadId), recordAnchor: false, sessionKey })
   }
 
-  // §4.4 rows 2–3: a message in a topic with a binding. A live session gets it; a gone one gets
-  // the "not running — resume with …" reply. Never a spawn, never a fallback to another session.
+  const sessionStillAt = (key: string, target: Extract<SessionDeliveryTarget, { kind: "live" }>): boolean =>
+    target.paneId !== null
+      ? paneSessionRefusal(key, target.paneId) === null
+      : target.pid === null || listLiveOmpAgents().some((a) => a.pid === target.pid)
+
+  // THE delivery to a registry session (§4.4 row 2), shared by the bound-topic route and the
+  // attach picker: a fresh scan says where the session lives NOW (a resumed omp keeps its key
+  // under a new pid; a moved one keeps it in a new pane), then the flat path above delivers it —
+  // the omp-live endpoint, the in-tmux send-keys fallback (#483), cc/codex send-keys, voice STT
+  // and media download. Never a fallback to another session. `gone`: nothing was sent.
+  const deliverToSession = async (
+    key: string,
+    threadId: number,
+    payload: TopicPayload,
+  ): Promise<{ kind: "sent"; ok: boolean } | { kind: "gone"; name: string | null }> => {
+    // A resumed omp's new process publishes a new endpoint; pick it up before the scan.
+    await refreshOriginalHosts()
+    const reg = refreshSessionRegistry()
+    if (!reg) return { kind: "gone", name: null }
+    let target = sessionDeliveryTarget(reg, key)
+    // That scan may be a rate-limited one from moments ago. Before rendering (STT, download),
+    // confirm the session is still where it says — the §2.6 check rescans a pane that changed
+    // hands; an out-of-tmux omp's pid must still be live — else a forced scan says where it went,
+    // or that it is gone.
+    if (target.kind === "live" && !sessionStillAt(key, target)) {
+      target = sessionDeliveryTarget(refreshSessionRegistry(true) ?? reg, key)
+    }
+    if (target.kind !== "live") return { kind: "gone", name: target.kind === "gone" ? target.name : null }
+    // A live cc/codex entry always has a pane and a live omp a pid; the `omp:<pid>` row is the
+    // out-of-tmux omp's endpoint-only locator.
+    const paneId = target.paneId ?? (target.pid !== null ? liveOmpPaneId(target.pid) : null)
+    if (paneId === null) return { kind: "gone", name: target.name }
+    log(`topic ${threadId}: → session ${key} at ${paneId}`)
+    return { kind: "sent", ok: await deliverTopicPayload(threadId, paneId, target.cwd, payload, key) }
+  }
+
+  // §4.4 rows 2–3 for a topic the registry knows: its session gets the message wherever it runs;
+  // a gone one gets the "not running — resume with …" reply in the topic.
+  const routeTopicToSession = async (threadId: number, entry: SessionEntry, payload: TopicPayload): Promise<boolean> => {
+    const res = await deliverToSession(entry.key, threadId, payload)
+    if (res.kind === "sent") return res.ok
+    log(`topic ${threadId}: session ${entry.key} is not running`)
+    await sendToTopic(threadId, goneTopicReply({ name: res.name ?? entry.name.primary, harness: HARNESS_AGENT[entry.harness] }))
+    return false
+  }
+
+  // §4.4 rows 2–3: a message in a known topic. A live session gets it; a gone one gets the "not
+  // running — resume with …" reply. Never a spawn, never a fallback to another session.
   const handleTopicRoute = async (action: Extract<Action, { kind: "topic-route" }>): Promise<boolean> => {
     const binding = findTopic(loadTopics(), action.threadId)
+    const entry = resolveTopicSession(action.threadId, binding)
+    if (entry) {
+      // A topic bound by pane (the attach picker, a pre-registry spawn) becomes its session's
+      // registry topic: it follows the session from now on and is renamed with it (§4.7).
+      if (entry.threadId === null && entry.state === "live") patchSessionEntry(ctx, entry.key, { threadId: action.threadId })
+      return routeTopicToSession(action.threadId, entry, action.payload)
+    }
     // The binding vanished between triage and now (a same-batch store change): the topic is
     // unknown again, so it takes the unknown-topic path rather than dropping the message.
     if (!binding) return handleTopicHold({ kind: "topic-hold", threadId: action.threadId, payload: action.payload })
@@ -8627,7 +8761,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   const handleTopicHold = async (action: Extract<Action, { kind: "topic-hold" }>): Promise<boolean> => {
     // The topic got a binding between triage and now (a same-batch picker tap bound it): route
     // instead of re-holding behind a second picker. Symmetric to handleTopicRoute's fallback.
-    if (findTopic(loadTopics(), action.threadId)) {
+    if (findTopic(loadTopics(), action.threadId) || topicOwner(action.threadId)) {
       return handleTopicRoute({ kind: "topic-route", threadId: action.threadId, payload: action.payload })
     }
     return holdUnknownTopicPayload(action)
@@ -8695,32 +8829,48 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // must still answer for the undelivered tail rather than drop it silently.
     try {
       await answerCallbackQuery(ctx, action.callbackQueryId, "sending…")
-      // Check "does this session already have a topic?" and bind in one store update, so two
-      // topics picking the same session concurrently can never both bind it.
-      const topics = updateTopics((current) => {
-        const own = topicForPane(current, target.paneId)
-        return own && own.threadId !== action.threadId
-          ? null
-          : appendTopic(current, attachTopic(action.threadId, session, Math.floor(Date.now() / 1000)))
-      })
-      const own = topicForPane(topics, target.paneId)
-      if (own && own.threadId !== action.threadId) {
-        const link = topicLink(ctx.chatId, own.threadId)
+      // The registry session behind the picked pane, when the registry knows it: its topic is the
+      // registry's (§4.2), and its queue is delivered by key like any bound topic's. The registry
+      // is re-read as the pane is now: a `%N` that changed hands must not bind the old session.
+      const reg = registryForPane(target.paneId)
+      const pickedKey = reg ? resolveLocatorToSession(reg, target.paneId, undefined) : null
+      const entry = pickedKey ? liveEntry(ctx, pickedKey) : null
+      // "Does this session already have a topic?" and the bind run with no await in between, so
+      // two topics picking the same session concurrently can never both bind it.
+      const own = entry?.threadId ?? topicForPane(loadTopics(), target.paneId)?.threadId ?? null
+      if (own !== null && own !== action.threadId) {
+        const link = topicLink(ctx.chatId, own)
         outcome = `${label} already has its own topic${link ? ` — ${link}` : ""}; this topic stays unlinked`
       } else {
-        await botPost(ctx, "editForumTopic", { chat_id: ctx.chatId, message_thread_id: action.threadId, name: topicTitle(label) })
+        if (entry) patchSessionEntry(ctx, entry.key, { threadId: action.threadId })
+        updateTopics((current) => appendTopic(current, attachTopic(action.threadId, session, Math.floor(Date.now() / 1000))))
+        await editSessionTopic(ctx, action.threadId, entry ? topicTitleFor(entry) : topicTitle(label))
         outcome = `this topic is now ${label}`
       }
-      // Re-verify after the Bot API round-trips above: a pane that died and whose `%N` was reused
-      // meanwhile must never receive this topic's queue (the same guard the route path applies).
-      const state = topicSessionState({ ...attachTopic(action.threadId, session, 0), paneId: target.paneId })
-      if (state.state === "gone") stopped = `${label} stopped before delivery`
-      else if (state.state === "unconfirmed") stopped = state.reply
-      else {
+      if (entry) {
         for (const payload of hold.payloads) {
-          if (!(await deliverTopicPayload(action.threadId, target.paneId, state.cwd, payload))) continue
+          const res = await deliverToSession(entry.key, action.threadId, payload)
+          if (res.kind === "gone") {
+            stopped = `${label} stopped before delivery`
+            break
+          }
+          if (!res.ok) continue
           delivered++
           await settleAckReaction(payload.messageId, true)
+        }
+      } else {
+        // Re-verify after the Bot API round-trips above: a pane that died and whose `%N` was
+        // reused meanwhile must never receive this topic's queue (the same guard the route path
+        // applies).
+        const state = topicSessionState({ ...attachTopic(action.threadId, session, 0), paneId: target.paneId })
+        if (state.state === "gone") stopped = `${label} stopped before delivery`
+        else if (state.state === "unconfirmed") stopped = state.reply
+        else {
+          for (const payload of hold.payloads) {
+            if (!(await deliverTopicPayload(action.threadId, target.paneId, state.cwd, payload))) continue
+            delivered++
+            await settleAckReaction(payload.messageId, true)
+          }
         }
       }
     } catch (err) {

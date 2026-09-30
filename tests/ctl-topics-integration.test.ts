@@ -69,6 +69,9 @@ case "$sub" in
     cat >> '${injectLog}'
     printf '\\n' >> '${injectLog}'
     ;;
+  rename-window)
+    printf 'rename-window\\t%s\\n' "$*" >> '${injectLog}'
+    ;;
 esac
 exit 0
 `;
@@ -599,7 +602,7 @@ test('topics ON: forum topic service messages are recorded only — no spawn, no
     seedTopics: [{ threadId: 50, name: 'api', status: 'bound', paneId: TOPIC_PANE, ts: 1 }],
   });
   const updateQueue: unknown[][] = [];
-  const { server, sends } = makeServer(updateQueue);
+  const { server, sends, calls } = makeServer(updateQueue);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
 
@@ -616,7 +619,10 @@ test('topics ON: forum topic service messages are recorded only — no spawn, no
   ]);
   await waitFor(() => readFileSync(join(cfgDir, 'daemon.log'), 'utf8').includes('topic 50: reopened'));
   expect(sends).toEqual([]);
+  // A topic rename by the user (or the echo of the bot's own editForumTopic) reaches neither tmux
+  // (no rename-window) nor Telegram (no editForumTopic back): no rename loop (#466).
   expect(injected(cfgDir)).toEqual([]);
+  expect(calls.filter((c) => c.method === 'editForumTopic')).toEqual([]);
   expect(topicsStore(cfgDir)).toEqual([{ threadId: 50, name: 'api', status: 'bound', paneId: TOPIC_PANE, ts: 1 }]);
 
   daemon.kill('SIGTERM');

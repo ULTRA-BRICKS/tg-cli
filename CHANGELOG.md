@@ -3,6 +3,23 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.16
+
+- **Forum topics: a topic reaches its session through the flat delivery path (#465).** A message in
+  a session's topic — text, a voice note (transcribed), a photo or a file — goes to the registry
+  session that owns the topic, wherever it runs now (a resumed omp under its new pid, a moved
+  session in its new pane), through the same path as the flat chat: the omp-live bridge, the omp's
+  own tmux pane when it has no bridge, cc/codex send-keys. A pane that hosts a different session
+  now is refused (§2.6). The registry, not a topics.json pane binding, decides: a live session's
+  topic is never held behind the attach picker nor answered "not running" because its binding went
+  stale, and a gone session's topic answers with its harness's resume hint. The attach picker
+  delivers by session too and makes the picked topic the session's registry topic.
+- **Forum topics: renaming a session renames its topic (#466).** A committed rename (tmux window
+  or harness title, stable for 20 s) retitles the session's topic via `editForumTopic`
+  (`<name> · <title>`), at most once a minute per topic with the latest name winning; nothing is
+  sent for an unchanged title. A topic renamed in Telegram — including the echo of this edit — is
+  only logged: it never renames a tmux window or the session, so there is no rename loop.
+
 ## 1.54.14
 
 - **Forum topics: one bot-created topic per session (#467).** With `control.topics` (or

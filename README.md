@@ -336,6 +336,16 @@ Caveats while this is experimental:
   session.
 - **A gone session answers, it does not respawn.** A message in a topic whose session exited gets
   "`<name>` is not running — resume with …"; nothing is delivered elsewhere.
+- **A topic reaches its session wherever it runs.** Text, voice notes (transcribed), photos and
+  files in a session's topic take the same delivery as the flat chat — the omp-live bridge (or,
+  without one, the omp's own tmux pane), cc/codex send-keys — to the pane or process the session
+  lives in now: a resumed or moved session is followed, and a pane that hosts a different session
+  now is refused. A live session's topic is never answered "not running" or held behind the
+  attach picker.
+- **Renaming a session renames its topic.** A tmux window rename or a harness-title change
+  retitles the session's topic (`<name> · <title>`) once the new name has been stable for 20 s, at
+  most once a minute (the latest name wins). Renaming the topic in Telegram changes nothing in tmux
+  or in the session's name.
 - **An agent's own posts go to its session's topic.** Each session gets one bot-created topic on
   its first `tg` send or question/permission card; `tg` finds it by asking the daemon, so no
   `--topic`/`TG_TOPIC` is needed (either one still overrides, and `--reply-to` stays under the
