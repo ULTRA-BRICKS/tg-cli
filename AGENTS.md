@@ -41,11 +41,13 @@ I/O, fetch, signals, `bun:ffi`):
   see "Rich messages" below), `--tag`/`--title` (header badge; compose with rich),
   `--subagent <label>` (a SUBAGENT self-label — renders a second `[label]` bracket right
   after `[window]`; the MAIN/orchestrator agent needs NO flag, its `[window]` bracket
-  already carries the project via `resolveWindowAgentLabel` — the tmux window name, or its
-  cwd basename when the window is auto-renamed to a version/shell; explicit flag wins over
+  already carries the session's PRIMARY name from `resolveSessionName` — the tmux window
+  name, or its cwd basename when the window is auto-renamed to a version/shell/launcher;
+  outside tmux the harness session title; the harness title is the auto `--title` badge in
+  tmux; explicit flag wins over
   `TG_AGENT` env; there is NO env-based auto-detection — `CLAUDE_CODE_CHILD_SESSION` is not
   a reliable main-vs-subagent signal; deprecated alias `--agent`; `--detect-agent` prints
-  the resolved `[window]` label; NOT the same flag as `tg-ctl`'s own `--agent`),
+  the resolved `[window]` label (+ `title: <secondary>`); NOT the same flag as `tg-ctl`'s own `--agent`),
   `--reply-to <message_id>` (thread the message UNDER an inbound one — `reply_to_message_id`
   on sendMessage, `reply_parameters` on sendRichMessage; the `answer` tag requires it),
   `--topic <id>` (post INTO a forum topic — stamps `message_thread_id` on EVERY outbound
@@ -99,8 +101,8 @@ needed by already-running OMP. Cwd/title are not process identity.
   subagent auto-detection (tg#6254). NO LONGER wired into the outbound `[subagent]` label
   (removed because `CLAUDE_CODE_CHILD_SESSION` mislabelled the orchestrator itself); kept
   because open PRs still evolve it. The outbound subagent bracket is explicit-only now
-  (`--subagent`/`TG_AGENT`). The `[window]` label lives in
-  `resolveWindowAgentLabel` (`features/tg-ctl/agent-match.ts`).
+  (`--subagent`/`TG_AGENT`). The `[window]` label is the primary name from
+  `resolveSessionName` (`features/tg-ctl/session-name.ts`).
 - `features/auto-attach/` — path detection → attach files, R1-R4 text rules, line-spec quotes,
   worktree-aware + recursive path resolution, transmitter with Telegram message/caption limits.
   `transmitter.ts` also re-validates every disk attachment right before sending (`file-check.ts`
@@ -143,8 +145,15 @@ needed by already-running OMP. Cwd/title are not process identity.
 - `features/tg-ctl/` — inbound control logic: `control:` config block parser, singleton/pidfile
   helpers, the update→action step function (allowlist, staleness, command split, `/agent`
   routing, reply-quote forwarding), tmux inject plans as data, agent pane discovery (process-tree
-  walk — a Claude Code pane reports its VERSION string as `pane_current_command`, not `claude`),
+  walk — a Claude Code pane reports its VERSION string as `pane_current_command`, not `claude`;
+  an abduco CLIENT in a pane is followed to the same-session abduco SERVER's children, so a rig
+  `omp run` session — omp re-parented under a pid-1 abduco server — is that pane's agent, tg-cli#454),
   `agent-match.ts` (phonetic fuzzy window matching + session-grouped selection buttons),
+  `session-name.ts` (THE session-name resolver, tg-cli#455: `{primary, secondary}` — in tmux the
+  window name leads and the harness title — omp endpoint/jsonl title, else the tmux
+  `#{pane_title}` a harness painted, `π > …`/`✳ …`, marks stripped — is secondary; outside tmux
+  the title leads; cwd basename is the fallback tier. Shared by the `tg` header, the `/agent`
+  picker, `tg-ctl status`, the history label and question cards; never a `no tmux` placeholder),
   `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker),
   `unreachable.ts` + `inbox.ts` (tg-cli#306: agents OUTSIDE tmux — a `ps pid,tty` scan +
   lsof cwd finds interactive agent processes in no pane; they are listed as `unreachable:
@@ -215,7 +224,7 @@ needed by already-running OMP. Cwd/title are not process identity.
   `{ts, message_id, direction, from, text, pane, groupId?, targetAgent?}` object per line. TWO
   writers, both best-effort (a corrupt/unwritable log NEVER breaks a send or an inject, exactly
   like `routes`): the `tg-ctl` poll loop appends every inbound message it processes (stamped with
-  the routed target pane AND `targetAgent` — the routed pane's agent NAME via `agentNameForPane`),
+  the routed target pane AND `targetAgent` — the routed pane's PRIMARY session name via `resolveSessionName`),
   and `tg` appends one `agent` record per OUTBOUND Telegram message_id (stamped with `$TMUX_PANE`
   AND `targetAgent` — the sending session's own agent name, the SAME namespace, so a session's
   inbound and outbound share one label) — a >4096 split or a media-group album emits several ids for one logical
@@ -229,7 +238,7 @@ needed by already-running OMP. Cwd/title are not process identity.
   kept sends uncollapsed (tg-cli#131 follow-up, closes #134).
   The file is trimmed to its last ~5000 lines on each write. `tg replies` is AGENT-SCOPED: it
   defaults to the CURRENT agent (resolved from the current pane's window/project via the SAME
-  `agentNameForPane`) + `user` direction, and MARKS every line with `[→ <agent>]` (`[→ ?]` =
+  resolver primary) + `user` direction, and MARKS every line with `[→ <agent>]` (`[→ ?]` =
   untagged/legacy). `--agent <name>` filters to one agent (case-insensitive), `--all` shows every
   agent, `--untagged` shows only untagged/legacy rows (the three are mutually exclusive; an
   explicit one of them drops the current-pane default so the agent filter is the axis). When the

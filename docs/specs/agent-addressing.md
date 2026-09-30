@@ -89,12 +89,25 @@ numeric window (e.g. window "4", no window names set → all fall back to the
 session name "4") would otherwise render as three identical `4 · claude` buttons,
 impossible to tell apart (the reported bug). `distinctLabels(candidates)`:
 
-- base = `<window> · <agent>`; when the window name is **bare** (empty or purely
-  numeric — the session-name fallback) it leads with the **cwd project dir**
+- base = the session name from `resolveSessionName` (`session-name.ts`, the ONE
+  resolver shared with the `tg` header, `tg-ctl status` and history, tg-cli#455):
+  `<window> · <harness title>` when the pane shows a harness title (a live omp's
+  endpoint/jsonl title, else a harness-painted `#{pane_title}` — omp `π > …`,
+  Claude Code `✳ …`, marks stripped, cut to 40 chars), else `<window> · <agent>`.
+  The tmux window name is NEVER replaced by the title. When the window name is
+  **bare** (empty, numeric, a version string, or a shell/launcher/wrapper such as
+  `zsh`/`node`/`bun`/`abduco`) it leads with the **cwd project dir**
   (`pane_current_path` basename) instead → `<project> · <agent>` (e.g. `rig`,
   `3d-cli`, `hyperide`);
+- an omp shown in NO tmux pane (`omp:<pid>` row) is named by its title, else its
+  cwd project, else `omp · <sid8|pid>`, with the project appended when the title
+  does not contain it;
 - any label still shared by >1 candidate gets the project appended, then — as the
   last-resort, always-unique distinguisher — the pane id (`%N`).
+
+An abduco-wrapped agent (rig `omp run`: the pane shows the abduco CLIENT, omp is the
+child of a pid-1 abduco SERVER of the same session) is discovered as that pane's
+agent, so it gets a normal pane row and `/agent <window>` selects it (tg-cli#454).
 
 `AgentCandidate` therefore carries `panePath` (the pane's cwd). `dedupeCandidates`
 drops any pane id listed twice (a merged/flaky snapshot guard; pane ids are
@@ -166,8 +179,8 @@ treated as non-distinguishing and the label leans on the cwd project dir instead
   piece of length >= 4, or the full basename) may route: `/agent landing` hits
   the sole `conloca-landing` omp. A hyphenated selector with no token hit may
   then use a **unique first segment** (`/agent rig-fable` -> sole `rig-cli`).
-  Ambiguous token/segment sets do not guess. Picker labels for omp append the
-  project dir so those names stay visible next to the session title.
+  Ambiguous token/segment sets do not guess. Picker labels for an omp in no tmux
+  pane append the project dir so those names stay visible next to the session title.
 - Live end-to-end requires an inbound tap from the chat owner (the unit + step
   tests cover the logic; the button round-trip is the same mechanism as
   q→buttons, which has integration coverage).

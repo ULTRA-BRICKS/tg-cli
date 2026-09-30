@@ -316,7 +316,7 @@ test('findLiveOmpAgents discovers omp run from source via bun --preload, no tty,
   expect(agents[0]).toMatchObject({ pid: 73711, paneId: null, tty: null });
 });
 
-test('liveOmpLabel prefers omp session title over cwd basename', () => {
+test('liveOmpLabel (omp in no tmux pane): title, else cwd project, else a short session id/pid (tg-cli#455)', () => {
   const titled: LiveOmpAgent = {
     pid: 7,
     cwd: '/Users/u/xp/review-cli',
@@ -327,9 +327,9 @@ test('liveOmpLabel prefers omp session title over cwd basename', () => {
     tty: 'ttys004',
   };
   expect(liveOmpLabel(titled)).toBe('Fix review-cli from omp');
-  const untitled: LiveOmpAgent = { ...titled, title: null, sessionId: null };
-  expect(liveOmpLabel(untitled)).not.toBe('review-cli'); // must not silently become a cwd guess as THE name source
-  expect(liveOmpLabel(untitled)).toBe('omp · 7');
+  expect(liveOmpLabel({ ...titled, title: null })).toBe('review-cli');
+  expect(liveOmpLabel({ ...titled, title: null, cwd: null })).toBe('omp · 01abc');
+  expect(liveOmpLabel({ ...titled, title: null, cwd: null, sessionId: null })).toBe('omp · 7');
 });
 
 test('matchLiveOmp matches the omp title, not a coincidental other cwd', () => {
@@ -472,9 +472,56 @@ test('mergeLiveOmpCandidates adds out-of-tmux omp to the picker; skips ones alre
   expect(merged.some((c) => c.agent === 'omp' && c.paneId === 'omp:33378')).toBe(true);
   expect(merged.filter((c) => c.agent === 'omp')).toHaveLength(1);
   const untitled = merged.find((c) => c.paneId === 'omp:33378')!;
-  expect(untitled.windowName).toBe('omp · 33378');
+  expect(untitled.windowName).toBe('tg-cli');
   expect(untitled.panePath).toBe('/Users/u/xp/tg-cli');
-  expect(distinctLabels([untitled])).toEqual(['omp · 33378 · tg-cli']);
+  expect(distinctLabels([untitled])).toEqual(['tg-cli · omp']);
+});
+
+test('mergeLiveOmpCandidates: an omp in a tmux pane keeps the tmux window name; its title is the secondary label (tg-cli#455)', () => {
+  const tmux = [
+    {
+      paneId: '%0',
+      sessionName: 'main',
+      windowIndex: 1,
+      windowName: 'gc-sme-backlog',
+      agent: 'omp' as const,
+      panePath: '/Users/u/xp/sme-archiving-gc',
+      paneTitle: 'π ⠹ Stale pane title',
+    },
+  ];
+  const live: LiveOmpAgent[] = [
+    {
+      pid: 57616,
+      cwd: '/Users/u/xp/sme-archiving-gc',
+      sessionFile: null,
+      sessionId: '01a0c543-1ac1-7000-8000-000000000000',
+      title: 'Recover orphaned commits, verify PRs',
+      paneId: '%0',
+      tty: null,
+    },
+  ];
+  const merged = mergeLiveOmpCandidates(tmux, live);
+  expect(merged).toHaveLength(1);
+  expect(merged[0].windowName).toBe('gc-sme-backlog');
+  expect(distinctLabels(merged)).toEqual(['gc-sme-backlog · Recover orphaned commits, verify PRs']);
+});
+
+test('findLiveOmpAgents: an omp under `abduco -A omp-restored-*` gets the pane of its abduco client, not "no tmux" (tg-cli#454)', () => {
+  const panes = [pane('%0', 2929, 'abduco', '/Users/u/xp/sme-archiving-gc')];
+  const rigOmp =
+    'bun --preload /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/omp.ts /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/../src/cli.ts --resume /s.jsonl';
+  const procs = [
+    proc(1, 0, '/sbin/launchd'),
+    proc(2929, 1, '/bin/zsh -l'),
+    proc(57614, 2929, 'abduco -f -A omp-restored-01a0c5431ac1 omp --resume /s.jsonl'),
+    proc(57615, 1, 'abduco -f -A omp-restored-01a0c5431ac1 omp --resume /s.jsonl'),
+    proc(57616, 57615, rigOmp),
+  ];
+  const agents = findLiveOmpAgents(panes, procs, new Map());
+  expect(agents).toHaveLength(1);
+  expect(agents[0]).toMatchObject({ pid: 57616, paneId: '%0' });
+  // The reply-route origin check keyed on the pane now finds it (was null → false "gone" picker).
+  expect(matchLiveOmpOrigin('%0', agents)?.pid).toBe(57616);
 });
 
 test('preferOmpApiOverTmux is true for omp even when a pane exists — never send-keys', () => {

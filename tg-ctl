@@ -20,11 +20,9 @@ import {
   buildAgentSelectMessage,
   dedupeCandidates,
   distinctLabels,
-  isBareWindowName,
   isAgentCommand,
   matchWindows,
   goneAgentFallbackReplyText,
-  resolveWindowAgentLabel,
   suggestSelector,
   type AgentCandidate,
   type ParsedAgentCommand,
@@ -81,9 +79,11 @@ import {
   findAgentInPane,
   panesWithRetry,
   parsePaneList,
+  parsePaneTitles,
   parseProcList,
   pickTargetPaneFromSet,
 } from "./features/tg-ctl/discover"
+import { isBareWindowName, resolveSessionName } from "./features/tg-ctl/session-name"
 import { buildDigitInjectPlan, buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
 import {
   extractPermissionIdentity,
@@ -284,7 +284,6 @@ import {
 import { parseLastUserTarget, serializeLastUserTarget, type LastUserTarget } from "./features/tg-ctl/last-user-target"
 import { appendRecordsToBlob, parseHistory, type HistoryRecord } from "./features/replies/history"
 import { inboundHistoryRecords } from "./features/replies/inbound"
-import { agentNameForPane } from "./features/tg-ctl/agent-name"
 import { isLikelySlashCommand, parsePendingBatch, serializePendingBatch, stepUpdates } from "./features/tg-ctl/updates"
 import {
   appendTopic,
@@ -428,9 +427,10 @@ const CLAUDE_STATUSLINE_TELEMETRY_CMD = "tg-ctl harness-event --agent claude"
 const CODEX_USAGE_HOOK_CMD = "tg-ctl codex-usage-hook"
 const CODEX_TRANSCRIPT_TAIL_BYTES = 500_000
 
-// Spec §5.2 no-tmux guard, verbatim.
+// Spec §5.2 no-agent guard: harness-neutral, one line. Never claims "Claude Code"
+// for whatever was addressed (tg#17036: it was sent for an omp that WAS in tmux).
 export const NO_AGENT_REPLY =
-  "Claude Code not in tmux → feedback won't work. Relaunch: `tmux new -s claude 'claude'`."
+  "No live agent found → not delivered. Run Claude Code / Codex inside tmux (`claude-rotate --tmux <name>`); omp is reachable in or outside tmux."
 
 // --- Pure helpers (exported for tests) ---
 
@@ -905,6 +905,23 @@ function snapshot(): { panes: PaneInfo[]; procs: ProcInfo[] } {
   return { panes, procs }
 }
 
+// Raw `#{pane_title}` per pane id — the harness title omp (`π > title`) and Claude Code
+// (`✳ title`) paint into the terminal (secondary name, tg-cli#455). A separate query, not a
+// PANE_FORMAT field: a title is free text and would break that parser's fixed layout. Only
+// the naming surfaces read it; any failure degrades to "no titles", never to "no panes".
+function readPaneTitles(): Map<string, string> {
+  try {
+    const tmux = Bun.spawnSync(["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_title}"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: SUBPROC_ENV,
+    })
+    return tmux.exitCode === 0 ? parsePaneTitles(tmux.stdout.toString()) : new Map()
+  } catch {
+    return new Map()
+  }
+}
+
 // Read the per-pane registration SET (tg-cli#67). Tolerates the legacy
 // single-object file shape (a daemon upgraded in place keeps the live
 // registration written by the previous version — see parseRegistrations).
@@ -1051,9 +1068,13 @@ function listAgentCandidates(): AgentCandidate[] {
       panePath: pane.panePath,
     })
   }
+  // The harness title each agent pane shows — the picker's SECONDARY name, read only
+  // for panes that host an agent (a pane whose omp exited keeps its stale title).
+  const titles = out.length > 0 ? readPaneTitles() : new Map<string, string>()
+  for (const c of out) c.paneTitle = titles.get(c.paneId) ?? null
   // A pane id is unique per tmux server; dedupe guards a merged/flaky snapshot.
-  // Out-of-tmux omp join as paneId omp:<pid> so /agent can pick them; in-tmux
-  // omp already have a real pane row and are skipped by the merge.
+  // Out-of-tmux omp join as paneId omp:<pid> so /agent can pick them; an omp shown
+  // in a pane keeps that pane's row and adds its title (never renames the row).
   return mergeLiveOmpCandidates(dedupeCandidates(out), listLiveOmpAgents())
 }
 
@@ -1236,11 +1257,23 @@ function liveOmpForPane(paneId: string, agentPid?: number): LiveOmpAgent | null 
   return agents.find((a) => a.paneId === paneId || (agentPid !== undefined && a.pid === agentPid)) ?? null
 }
 
+// One `  - …` line per omp, each naming the tmux pane it is shown in (window name +
+// harness title, falling back to the pane title) — the same resolver name the picker
+// and the outbound header use. One pane snapshot + one title read per listing.
+function describeOmpLines(agents: LiveOmpAgent[]): string[] {
+  const panes = snapshot().panes
+  const titles = agents.some((a) => a.paneId) ? readPaneTitles() : new Map<string, string>()
+  return agents.map((a) => {
+    const pane = a.paneId ? panes.find((p) => p.paneId === a.paneId) : undefined
+    return `  - ${describeLiveOmp(a, pane ? { ...pane, paneTitle: titles.get(pane.paneId) ?? null } : null)}`
+  })
+}
+
 function noAgentReplyNow(): string {
   const live = listLiveOmpAgents()
   const unreachable = listUnreachableAgents()
   if (live.length > 0) {
-    const lines = live.map((a) => `  - ${describeLiveOmp(a)}`)
+    const lines = describeOmpLines(live)
     const ompBlock = `omp (original-process bridge, never session/load):\n${lines.join("\n")}`
     if (unreachable.length === 0) return ompBlock
     return `${ompBlock}\n${noAgentReplyText("", unreachable)}`
@@ -1789,7 +1822,7 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
   const liveOmp = listLiveOmpAgents()
   if (liveOmp.length > 0) {
     lines.push(`omp (original-process): ${liveOmp.length}`)
-    for (const a of liveOmp) lines.push(`  - ${describeLiveOmp(a)}`)
+    lines.push(...describeOmpLines(liveOmp))
     lines.push(...describeUnbridgedOmp(liveOmp))
   }
   const offsetMtime = fileMtimeMs(ctx.paths.offset)
@@ -3279,7 +3312,7 @@ const EXPIRED_TERMINAL_TEXT = "expired — answer in terminal"
 // the answer down the new socket. A multi-question set member additionally can't be
 // late-delivered (the local dialog may be on a DIFFERENT question of the set — see
 // ButtonRequest.multiQuestion), so its text points at the terminal instead. Both are
-// built at the call site with the pane's resolved label (resolveWindowAgentLabel) so
+// built at the call site with the pane's resolved label (resolveSessionName primary) so
 // the card identifies WHICH agent disconnected instead of a bare, unidentifiable
 // message — and phrased as a transient reconnect, not agent death (tg-cli UX fix).
 
@@ -3396,7 +3429,7 @@ function retireAbandonedEntry(ctx: Ctx, rt: QuestionRuntime, entry: PendingButto
       // release path for any paneless retained entry, hatch included.
       if (entry.req.paneId) rt.onRelease(entry.req.paneId)
       else rt.onUnscopedRelease()
-      const label = resolveWindowAgentLabel(entry.req.windowName, entry.req.cwd)
+      const label = resolveSessionName({ tmuxWindow: entry.req.windowName, cwd: entry.req.cwd }).primary
       const hookId = parseHatchHookId(entry.req.requestId)
       const abandonedText =
         entry.req.kind === "permission"
@@ -5672,7 +5705,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // long uncertainty must eventually be reported). Best-effort, like every other
   // card edit in this file: a failed edit just means the card stays as it was.
   const notifyAbandonedLongOutage = (key: string, entry: AbandonedButton): void => {
-    const label = resolveWindowAgentLabel(entry.req.windowName, entry.req.cwd)
+    const label = resolveSessionName({ tmuxWindow: entry.req.windowName, cwd: entry.req.cwd }).primary
     if (entry.messageId !== null) {
       void clearMessageKeyboard(ctx, entry.messageId)
       const hookId = parseHatchHookId(entry.req.requestId)
@@ -5748,7 +5781,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (now - entry.at >= retainMsFor(entry.req.kind, entry.req.critical)) continue
       qd.notifiedAt = now
       changed = true
-      const label = resolveWindowAgentLabel(entry.req.windowName, entry.req.cwd)
+      const label = resolveSessionName({ tmuxWindow: entry.req.windowName, cwd: entry.req.cwd }).primary
       if (entry.messageId !== null) {
         void editMessageText(
           ctx,
@@ -6986,7 +7019,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   ): Promise<boolean | null> => {
     const ompHits = matchLiveOmp(selector, listLiveOmpAgents())
     if (ompHits.length > 1) {
-      const lines = ompHits.map((a) => `  - ${describeLiveOmp(a)}`)
+      const lines = describeOmpLines(ompHits)
       await sendMessage(ctx, `'${selector}' matches several omp sessions:\n${lines.join("\n")}`, out)
       return false
     }
@@ -9558,7 +9591,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         persistQuestions()
         return handleHatchLateTap(action, retained.req, retained.messageId ?? action.messageId, answer, retained.at)
       }
-      const label = resolveWindowAgentLabel(retained.req.windowName, retained.req.cwd)
+      const label = resolveSessionName({ tmuxWindow: retained.req.windowName, cwd: retained.req.cwd }).primary
       const paneId = retained.req.paneId
 
       // QUEUE FIRST, unconditionally, BEFORE any pane-inject attempt below —
@@ -10322,7 +10355,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             return
           }
           const hookId = parseHatchHookId(req.requestId)
-          const label = resolveWindowAgentLabel(req.windowName, req.cwd)
+          const label = resolveSessionName({ tmuxWindow: req.windowName, cwd: req.cwd }).primary
           const pointer = messageId !== null ? " (see the original card above)" : ""
           const text =
             hookId !== null
@@ -10542,14 +10575,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         const histRoutes = parseRoutes(readFileOrNull(ctx.paths.routes))
         // Map a resolved target pane → the human AGENT NAME it belongs to, so
         // each inbound record is attributed (targetAgent) and `tg replies` can
-        // scope to "this agent" (agentNameForPane over the live snapshot — the
+        // scope to "this agent" (the resolveSessionName primary over the live snapshot — the
         // SAME derivation the reader uses for its own pane). One snapshot for
         // the whole batch; a pane that's gone (or none) → null → untagged.
         const agentPanes = snapshot().panes
         const resolveAgent = (pane: string | null): string | null => {
           if (pane === null) return null
           const p = agentPanes.find((x) => x.paneId === pane)
-          return p ? agentNameForPane(p.windowName, p.panePath) : null
+          return p ? resolveSessionName({ tmuxWindow: p.windowName, cwd: p.panePath }).primary || null : null
         }
         const resolvePane = (m: TgMessage): string | null => {
           const replyId = m.reply_to_message?.message_id

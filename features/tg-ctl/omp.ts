@@ -6,10 +6,11 @@
  * reading old question cards, not for starting processes in tg-ctl.
  */
 
-import { matchAgentCommand } from './discover';
+import { matchAgentCommand, paneIdByPid } from './discover';
 import type { AgentKind, PaneInfo, ProcInfo } from './types';
 import type { ButtonOption, ButtonRequest } from './questions';
 import { uniqueProjectSelectorHits, type AgentCandidate } from './agent-match';
+import { resolveSessionName } from './session-name';
 import { normalizeTty, parseAgentNameFromCommand } from './unreachable';
 
 export interface LiveOmpAgent {
@@ -130,28 +131,6 @@ export function pickPrimaryOmpSessionFile(paths: readonly string[]): string | nu
   return paths.find(isPrimaryOmpSessionFile) ?? null;
 }
 
-function pidsUnderPanes(panes: PaneInfo[], procs: ProcInfo[]): Map<number, string> {
-  const byPpid = new Map<number, number[]>();
-  for (const p of procs) {
-    const sib = byPpid.get(p.ppid);
-    if (sib) sib.push(p.pid);
-    else byPpid.set(p.ppid, [p.pid]);
-  }
-  const paneByPid = new Map<number, string>();
-  for (const pane of panes) {
-    const queue = [pane.panePid];
-    const seen = new Set<number>();
-    while (queue.length > 0) {
-      const pid = queue.shift()!;
-      if (seen.has(pid)) continue;
-      seen.add(pid);
-      paneByPid.set(pid, pane.paneId);
-      for (const child of byPpid.get(pid) ?? []) queue.push(child);
-    }
-  }
-  return paneByPid;
-}
-
 /**
  * Interactive omp processes, whether or not they sit in a tmux pane OR have a
  * controlling tty at all. `isOmpLiveSessionCommand` already narrows `procs` to
@@ -175,7 +154,7 @@ export function findLiveOmpAgents(
   procs: ProcInfo[],
   ttyByPid: Map<number, string>,
 ): LiveOmpAgent[] {
-  const paneByPid = pidsUnderPanes(panes, procs);
+  const paneByPid = paneIdByPid(panes, procs);
   const out: LiveOmpAgent[] = [];
   for (const p of procs) {
     if (!isOmpLiveSessionCommand(p.command)) continue;
@@ -194,10 +173,11 @@ export function findLiveOmpAgents(
   return out;
 }
 
+// The name of an omp that is NOT shown in a tmux pane (the resolver's not-in-tmux
+// tier): its own session title, else its cwd project, else a short session id/pid.
 export function liveOmpLabel(a: LiveOmpAgent): string {
-  if (a.title && a.title.trim()) return a.title.trim();
   const short = a.sessionId ? a.sessionId.replace(/-/g, '').slice(0, 8) : String(a.pid);
-  return `omp · ${short}`;
+  return resolveSessionName({ cwd: a.cwd, harnessTitle: a.title, fallback: `omp · ${short}` }).primary;
 }
 
 export function matchLiveOmp(selector: string, agents: LiveOmpAgent[]): LiveOmpAgent[] {
@@ -292,11 +272,17 @@ export function liveOmpToCandidate(a: LiveOmpAgent): AgentCandidate {
     windowName: liveOmpLabel(a),
     agent: 'omp',
     panePath: a.cwd ?? undefined,
+    harnessTitle: a.title,
     ...(name ? { aliases: [name] } : {}),
   };
 }
 
-/** Out-of-tmux omp join the /agent picker; skip any already sitting in a tmux pane. */
+/**
+ * Out-of-tmux omp join the /agent picker as `omp:<pid>` rows. An omp shown in a
+ * tmux pane keeps that pane's row: the tmux window name stays its name, and the
+ * omp title rides along as the harness title (tg-cli#455 — never overwrite the
+ * window name with the title).
+ */
 export function mergeLiveOmpCandidates(
   tmux: AgentCandidate[],
   live: LiveOmpAgent[],
@@ -304,16 +290,15 @@ export function mergeLiveOmpCandidates(
   const out = tmux.map((c) => ({ ...c }));
   const extra: AgentCandidate[] = [];
   for (const a of live) {
-    if (a.paneId) {
-      const existing = out.find((c) => c.paneId === a.paneId);
-      if (existing?.agent === 'omp') {
-        existing.windowName = liveOmpLabel(a);
-        const name = (a.name ?? '').trim();
-        if (name) existing.aliases = [name];
-      }
+    const existing = a.paneId ? out.find((c) => c.paneId === a.paneId) : undefined;
+    if (!existing) {
+      extra.push(liveOmpToCandidate(a));
       continue;
     }
-    extra.push(liveOmpToCandidate(a));
+    if (existing.agent !== 'omp') continue;
+    if (a.title) existing.harnessTitle = a.title;
+    const name = (a.name ?? '').trim();
+    if (name) existing.aliases = [name];
   }
   return extra.length === 0 ? out : [...out, ...extra];
 }
@@ -338,14 +323,24 @@ export function withOmpSession(
   };
 }
 
-export function describeLiveOmp(a: LiveOmpAgent): string {
+// One status line. `pane` is the tmux pane the omp is shown in (when any), so the
+// line leads with the SAME name the picker and the outbound header use.
+export function describeLiveOmp(
+  a: LiveOmpAgent,
+  pane?: { windowName: string; panePath: string; paneTitle?: string | null } | null,
+): string {
+  let label = liveOmpLabel(a);
+  if (pane) {
+    const name = resolveSessionName({ tmuxWindow: pane.windowName, cwd: pane.panePath, harnessTitle: a.title, paneTitle: pane.paneTitle });
+    label = name.secondary ? `${name.primary} · ${name.secondary}` : name.primary;
+  }
   const parts = [
     a.paneId ? `pane ${a.paneId}` : 'no tmux',
     `cwd ${a.cwd ?? '?'}`,
     `title ${a.title ?? '-'}`,
     `pid ${a.pid}`,
   ];
-  return `${liveOmpLabel(a)} · omp — ${a.instanceId ? 'bridge' : 'NO bridge'} (${parts.join(', ')})`;
+  return `${label} · omp — ${a.instanceId ? 'bridge' : 'NO bridge'} (${parts.join(', ')})`;
 }
 
 /**

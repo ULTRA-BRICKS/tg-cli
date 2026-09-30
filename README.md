@@ -197,8 +197,11 @@ With several agents running, `/agent <window> <message>` routes to one of them.
 The window name is fuzzy-matched (phonetic, Cyrillic-aware), so `/agent апи deploy`
 finds the `api-bot` window. Out-of-tmux omp is also addressed by a unique project
 token (`/agent landing` -> cwd `conloca-landing`) or a unique first segment
-(`/agent rig-fable` -> cwd `rig-cli`), and picker buttons show that project next
-to the session title. If the target is ambiguous or omitted, you get inline
+(`/agent rig-fable` -> cwd `rig-cli`). Picker buttons name each session the same way
+the message header does: `<tmux window> · <harness title>` (an omp's own session title,
+or the title Claude Code / omp paints into the tmux pane), and an out-of-tmux omp by its
+title with the project next to it. An omp that rig runs under `abduco` inside a tmux pane
+is that pane's agent. If the target is ambiguous or omitted, you get inline
 buttons grouped by tmux session; tap one to route. Bare `/agent` lists the agents.
 
 ### Agents outside tmux — two delivery channels (v1.46.0)
@@ -484,15 +487,17 @@ See [docs/custom-emoji-system.md](docs/custom-emoji-system.md) for the full spec
 
 The header carries the sender's identity in up to two brackets: `✳️ [window] [subagent]`.
 
-**`[window]` — the project, automatic, no flag.** The first bracket is the pane's tmux
-window name. When that name is a bare auto-rename default — a numeric window index, a
-shell/launcher name (`node`/`zsh`), or Claude Code's version string (`2.1.207`, which
-tmux `automatic-rename` stamps as the window name because the cc process reports its
-version as its command) — it carries no project signal, so `tg` falls back to the pane's
-**cwd project basename**. An orchestrator working in `~/xp/rig-cli` therefore auto-labels
-`[rig-cli]` with no flag, whatever the window is named. This is the MAIN/orchestrator
-agent's identity; it never needs a flag. Check what the current shell resolves to:
-`tg --detect-agent`.
+**`[window]` — the session name, automatic, no flag.** The first bracket is the pane's
+tmux window name. When that name is a bare auto-rename default — a numeric window index,
+a shell/launcher/wrapper name (`node`/`zsh`/`bun`/`abduco`), or Claude Code's version
+string (`2.1.207`, which tmux `automatic-rename` stamps as the window name because the cc
+process reports its version as its command) — it carries no project signal, so `tg`
+falls back to the pane's **cwd project basename**. An orchestrator working in
+`~/xp/rig-cli` therefore auto-labels `[rig-cli]` with no flag, whatever the window is
+named. The harness's own session title (omp's title, or the `✳ <title>` Claude Code paints
+into the pane) follows as the header title. Outside tmux the harness title IS the bracket
+(falling back to the cwd project). This is the MAIN/orchestrator agent's identity; it
+never needs a flag. Check what the current shell resolves to: `tg --detect-agent`.
 
 **`[subagent]` — a subagent self-label, explicit.** Agent branding (above) identifies
 which MODEL is talking; it cannot tell apart the several subagents an orchestrator fans

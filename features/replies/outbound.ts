@@ -67,7 +67,7 @@ export function outboundHistoryText(body: string, attach: OutboundAttachments): 
 // function pure and deterministic for tests. A single-record send gets no
 // groupId — nothing to group it with, so the token is simply unused.
 // `targetAgent` (optional) is the SENDING session's own agent name
-// (agentNameForPane over its tmux pane) — the SAME namespace tg-ctl stamps on
+// (resolveSessionName().primary over its tmux pane) — the SAME namespace tg-ctl stamps on
 // inbound, so a session's outbound and the inbound routed to it share one label
 // and the default agent-scoped `tg replies` view groups them together. Absent
 // (undefined) when the sender's agent name couldn't be resolved → untagged on

@@ -150,9 +150,11 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
   "restart with channels" reply is dropped — media was never channel-only.
   Channel mode's residual advantages are only: works without tmux, and native
   event delivery instead of keystroke fragility.
-- **No-tmux guard:** inbound arrives but `claude` not in tmux / no session → reply
-  in TG: "Claude Code not in tmux → feedback won't work. Relaunch:
-  `tmux new -s claude 'claude'`."
+- **No-agent guard:** inbound arrives but no live agent session is found → reply
+  in TG with ONE harness-neutral line: "No live agent found → not delivered. Run
+  Claude Code / Codex inside tmux (`claude-rotate --tmux <name>`); omp is reachable
+  in or outside tmux." (tg-cli#454: the old "Claude Code not in tmux" text was sent
+  for an omp that was in tmux.)
 
 ## 6. Singleton / idempotency (HARD requirement)
 

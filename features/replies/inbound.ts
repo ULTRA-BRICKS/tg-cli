@@ -28,7 +28,7 @@ export interface InboundOpts {
   // default `pane`. Omitted → every message gets the default `pane`.
   resolvePane?: (m: TgMessage) => string | null;
   // Map the RESOLVED target pane (reply-origin pane, else the default `pane`) to
-  // the human AGENT NAME it belongs to (agentNameForPane over the daemon's live
+  // the human AGENT NAME it belongs to (resolveSessionName().primary over the daemon's live
   // tmux snapshot). Stamped as `targetAgent` so `tg replies` can attribute + scope
   // each message. The daemon injects this; omitted (or a null return) → the record
   // carries no targetAgent (treated as untagged on read). Kept a param, not an

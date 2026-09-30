@@ -66,10 +66,10 @@ import { buildOutboundHistoryRecords, outboundHistoryText } from "./features/rep
 import { runReplies } from "./features/replies/cli"
 import { resolveWindowPanes } from "./features/replies/window"
 import { agentNameFromDisplayLine } from "./features/tg-ctl/agent-name"
-import { detectAgentViaAncestry, detectOmpAncestorPid, isProcessRunning } from "./features/branding/detect"
+import { detectAgentViaAncestry, detectAncestorAgent, isProcessRunning } from "./features/branding/detect"
 import { outboundOriginPaneId, parseLsofJsonlPaths, parseOmpSessionMeta, pickPrimaryOmpSessionFile } from "./features/tg-ctl/omp"
 import { parseLsofCwd } from "./features/tg-ctl/unreachable"
-import { resolveWindowAgentLabel } from "./features/tg-ctl/agent-match"
+import { resolveSessionName, titleFromPaneTitle } from "./features/tg-ctl/session-name"
 import { installSkill } from "./features/install-skill/install"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
 import { planLineSpecs } from "./features/auto-attach/line-spec"
@@ -205,8 +205,9 @@ Options:
                        window → "✳️ [window] [name] <title>", so the recipient can
                        tell WHICH subagent sent the message. The MAIN/orchestrator
                        agent needs NO flag — its [window] bracket already carries
-                       the project (the tmux window name, or its cwd basename when
-                       the window is auto-renamed to a version/shell). There is NO
+                       the session name (the tmux window name, or its cwd basename
+                       when the window is auto-renamed to a version/shell; outside
+                       tmux the harness session title). There is NO
                        env-based subagent auto-detection: pass this flag to
                        identify a subagent. Also: TG_AGENT env (same effect as the
                        flag). Deprecated alias: --agent. Check the auto [window]
@@ -387,7 +388,7 @@ Only those HTML tags are supported. Escape raw <, >, and & outside tags as
 `
 
 // The human AGENT NAME for THIS shell's tmux pane — the SAME derivation the
-// daemon stamps on inbound records (agentNameForPane over #{window_name} +
+// daemon stamps on inbound records (resolveSessionName().primary over #{window_name} +
 // #{pane_current_path}). Used by BOTH the `tg replies` read path (its default
 // `current` scope resolves the reader's own agent) AND the outbound history
 // writer (it stamps `targetAgent` on each record it appends), so a session's
@@ -844,24 +845,22 @@ if (import.meta.main) {
 
   const AI_EMOJI = detectAiEmoji()
 
-  // --- Window label → the `[window]` header bracket ---
-  // ALWAYS the tmux window / cwd-basename label — NEVER the omp/harness
-  // session title. Alex escalation point 5 (2026-09-25): a message sent from
-  // inside a tmux pane under a live omp session used to render with the omp
-  // session's own jsonl title INSTEAD of the tmux window name, so the CTO saw
-  // e.g. "[Fix Missing Provisioned Skills in Rig]" with no tmux window at all
-  // — the two are orthogonal facts (which tmux window vs. what the agent is
-  // working on this turn) and conflating them silently dropped the window
-  // every time an omp ancestor was present. `getHarnessTitle` below surfaces
-  // the session title SEPARATELY (as the auto `--title` default), so both
-  // now always appear: inside tmux, resolveWindowAgentLabel reads the pane's
-  // window name AND cwd (a real user-chosen window name leads; a bare
-  // auto-rename default falls back to the cwd project basename → `rig-cli`,
-  // not `2.1.207`). buildPrefix wraps the result in [] and styles it.
-  const getTmuxWindow = (): string => {
-    if (!process.env.TMUX) return ""
+  // --- Session name → the `[window]` header bracket + the auto `--title` badge ---
+  // ONE resolver (resolveSessionName, tg-cli#455) names the session everywhere —
+  // this header, the /agent picker, `tg-ctl status`, history. In tmux the PRIMARY
+  // name is the tmux window name (a bare auto-rename default falls back to the cwd
+  // project → `rig-cli`, not `2.1.207`) and the harness's own session title is the
+  // SECONDARY name, rendered as the auto `--title` badge — never a substitute for
+  // the window (Alex escalation point 5: "[Fix Missing Provisioned Skills in Rig]"
+  // with no tmux window shown). Outside tmux the harness title IS the primary name.
+  // `null` = not in tmux, or tmux could not resolve this pane (tg-cli#448: that
+  // edge used to print a false literal "no tmux" from inside a real pane). tmux 3.5a
+  // answers `display-message -t <gone pane>` with exit 0 and EMPTY fields, and a live
+  // pane always has a pane_current_path — so an empty answer is "unresolved" too.
+  const getTmuxPane = (): { windowName: string; panePath: string } | null => {
+    const pane = process.env.TMUX_PANE
+    if (!process.env.TMUX || !pane) return null
     try {
-      const pane = process.env.TMUX_PANE
       const result = Bun.spawnSync(
         ["tmux", "display-message", "-p", "-t", pane, "#{window_name}\t#{pane_current_path}"], {
         stdout: "pipe",
@@ -872,32 +871,47 @@ if (import.meta.main) {
         const tab = raw.indexOf("\t")
         const windowName = tab >= 0 ? raw.slice(0, tab) : raw
         const panePath = tab >= 0 ? raw.slice(tab + 1) : ""
-        return resolveWindowAgentLabel(windowName, panePath)
+        if (windowName || panePath) return { windowName, panePath }
       }
     } catch {
       // ignore — tmux not available or not in a pane
     }
-    return ""
+    return null
   }
 
-  // The omp/harness session's own title (jsonl `type:title`/`session.title`).
-  // Surfaced as the auto `--title` default (below), NEVER as a substitute for
-  // the `[window]` bracket above — see the comment on getTmuxWindow.
-  const getHarnessTitle = (ompPid: number | null): string => {
-    if (ompPid === null) return ""
+  // The harness title a non-omp agent (Claude Code: `✳ <title>`) paints into its tmux
+  // pane title; '' when the pane title carries no harness mark (e.g. the host name).
+  const getPaneTitle = (): string => {
+    const pane = process.env.TMUX_PANE
+    if (!process.env.TMUX || !pane) return ""
     try {
-      const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(ompPid), "-Fn"], {
+      const result = Bun.spawnSync(["tmux", "display-message", "-p", "-t", pane, "#{pane_title}"], {
         stdout: "pipe",
         stderr: "pipe",
       })
-      if (lsof.exitCode !== 0) return ""
-      const paths = parseLsofJsonlPaths(new TextDecoder().decode(lsof.stdout))
-      const sessionFile = pickPrimaryOmpSessionFile(paths)
-      if (!sessionFile) return ""
-      const meta = parseOmpSessionMeta(readFileSync(sessionFile, "utf8"))
-      return meta.title ?? ""
+      return result.exitCode === 0 ? titleFromPaneTitle(new TextDecoder().decode(result.stdout)) : ""
     } catch {
       return ""
+    }
+  }
+
+  // The omp session's own title + cwd, from its primary session jsonl (`type:title` /
+  // `session.title`, `session.cwd`) found via lsof on the omp pid.
+  const getOmpSession = (ompPid: number | null): { title: string; cwd: string } => {
+    if (ompPid === null) return { title: "", cwd: "" }
+    try {
+      const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(ompPid), "-Fn", "-n", "-P"], {
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      if (lsof.exitCode !== 0) return { title: "", cwd: "" }
+      const paths = parseLsofJsonlPaths(new TextDecoder().decode(lsof.stdout))
+      const sessionFile = pickPrimaryOmpSessionFile(paths)
+      if (!sessionFile) return { title: "", cwd: "" }
+      const meta = parseOmpSessionMeta(readFileSync(sessionFile, "utf8"))
+      return { title: meta.title ?? "", cwd: meta.cwd ?? "" }
+    } catch {
+      return { title: "", cwd: "" }
     }
   }
 
@@ -935,27 +949,31 @@ if (import.meta.main) {
   // Resolve the window label only from here on: the `--detect-agent` info action
   // and the real send need it, but the emoji/model info flags above must NOT
   // pay for ps/lsof/tmux subprocesses they never read.
-  const ompAncestorPid = detectOmpAncestorPid()
-  const tmuxWindow = getTmuxWindow()
-  const harnessTitle = getHarnessTitle(ompAncestorPid)
-  // ALWAYS the tmux window (never the harness title, see getTmuxWindow above).
-  // A live omp ancestor with NO tmux pane at all is a detached/headless ACP
-  // session — e.g. one orphaned by a tmux crash (Alex escalation point 2/3) —
-  // and gets an explicit "no tmux" marker instead of silently rendering with
-  // no window info whatsoever. A bare, non-agent invocation (no tmux, no
-  // harness ancestor — a cron job, a plain script) keeps the prior empty/no-
-  // bracket behavior: there is no session identity to report.
-  const windowAgentLabel = tmuxWindow || (ompAncestorPid !== null ? "no tmux" : "")
+  const ancestor = detectAncestorAgent()
+  const ompAncestorPid = ancestor?.agent === "omp" ? ancestor.pid : null
+  const tmuxPane = getTmuxPane()
+  const ompSession = getOmpSession(ompAncestorPid)
+  // omp's adapter title wins; any other agent's title comes from its pane title.
+  const harnessTitle = ompSession.title || (ancestor && ancestor.agent !== "omp" ? getPaneTitle() : "")
+  // A session identity exists inside tmux or under an agent ancestor. A bare,
+  // non-agent invocation outside tmux (a cron job, a plain script) gets NO bracket.
+  const hasSessionIdentity = tmuxPane !== null || Boolean(process.env.TMUX) || ancestor !== null
+  const sessionNameFor = (title: string) =>
+    hasSessionIdentity
+      ? resolveSessionName({
+          tmuxWindow: tmuxPane?.windowName ?? null,
+          cwd: tmuxPane?.panePath || ompSession.cwd || process.cwd(),
+          harnessTitle: title,
+        })
+      : { primary: "", secondary: null }
   if (parsed.action === "detectAgent") {
-    // The auto `[window]` label this session's messages get with no flag —
-    // the resolved tmux window name (or its cwd-basename fallback), an
-    // explicit "no tmux" marker for a detached omp ancestor, or "(none)" when
-    // neither applies. The harness/session title (when present) is printed on
-    // a second line — it is now ALWAYS additional to [window], never a
-    // substitute for it. There is NO env-based subagent auto-detection
-    // anymore; a subagent self-labels with `--subagent`.
-    console.log(windowAgentLabel || "(none)")
-    if (harnessTitle) console.log(`title: ${harnessTitle}`)
+    // The auto `[window]` label this session's messages get with no flag (the
+    // resolver's primary name, or "(none)"), and the harness title on a second line
+    // when it is shown as the secondary name. There is NO env-based subagent
+    // auto-detection; a subagent self-labels with `--subagent`.
+    const name = sessionNameFor(harnessTitle)
+    console.log(name.primary || "(none)")
+    if (name.secondary) console.log(`title: ${name.secondary}`)
     process.exit(0)
   }
 
@@ -994,22 +1012,21 @@ if (import.meta.main) {
   const API = `${process.env.TG_API_BASE || "https://api.telegram.org"}/bot${BOT_TOKEN}`
 
   const { items, caption: rawCaption, format, title: explicitTitle, tag, subagent, withOriginal, noPdf, pdfDevice, replyTo, topic, table, dryRun } = parsed
-  // The header title defaults to the omp/harness session's own title when the
-  // caller gave no explicit `--title` (Alex escalation point 5) — but the
-  // content guards below (CJK/mixed-script, screenshot-mention, dictionary)
-  // must enforce ONLY on text the AGENT actually typed, matching their
-  // documented scope. `safeHarnessTitle` starts as the candidate and each
-  // guard DROPS it (never hard-fails) on a hit — the user did not author the
-  // omp session's own auto-generated title and cannot fix it, so it must
-  // never be able to block an otherwise-clean outgoing message (review
-  // finding). The final merge into `title` happens after every guard below.
+  // The harness session title (secondary name in tmux, primary outside it) is
+  // auto content — but the content guards below (CJK/mixed-script,
+  // screenshot-mention, dictionary) must enforce ONLY on text the AGENT actually
+  // typed, matching their documented scope. `safeHarnessTitle` starts as the
+  // candidate and each guard DROPS it (never hard-fails) on a hit — the user did
+  // not author the session's own auto-generated title and cannot fix it, so it
+  // must never be able to block an otherwise-clean outgoing message (review
+  // finding). The session name is resolved from it after every guard below.
   let safeHarnessTitle = harnessTitle
 
   // The optional SECOND `[name]` bracket is a SUBAGENT self-label — explicit
   // only. `--subagent <name>` (parsed to `subagent`) wins; the `TG_AGENT` env is
   // the same-precedence fallback for a subagent that sets it once in its shell.
   // The MAIN/orchestrator agent passes neither and gets NO second bracket — its
-  // identity is the `[window]` label (windowAgentLabel) above. There is deliberately NO
+  // identity is the `[window]` label (the session's primary name) above. There is deliberately NO
   // env-based auto-detection: `CLAUDE_CODE_CHILD_SESSION` is not a reliable
   // main-vs-subagent signal, so a guessed `[subagent]` bracket is never emitted.
   const AGENT_LABEL = subagent || env.TG_AGENT?.trim() || undefined
@@ -1246,9 +1263,15 @@ if (import.meta.main) {
       }
     }
   }
-  // Every content guard above has now either passed the harness-title
-  // candidate or dropped it — merge it into the final header title.
-  const title = explicitTitle ?? (safeHarnessTitle || undefined)
+  // Every content guard above has now either passed the harness-title candidate
+  // or dropped it — resolve the session name from what survived (a dropped title
+  // never leaks into the `[window]` bracket either; the cwd project stands in).
+  // The primary name is the `[window]` bracket; the secondary name (the title,
+  // in tmux) is the default header title. Decision (tg-cli#448): no `--no-title`
+  // opt-out — the CTO asked to see the harness session name (2026-09-29) and the
+  // content guards already drop an unfit title; an explicit `--title` replaces it.
+  const sessionName = sessionNameFor(safeHarnessTitle)
+  const title = explicitTitle ?? (sessionName.secondary || undefined)
 
   // Close the --table bypass: the parse-time gate (features/cli/args.ts) skips a
   // --table send because the rows arrive on stdin, which parseArgs never sees.
@@ -1656,7 +1679,7 @@ if (import.meta.main) {
         originPaneId,
         randomUUID(),
         currentChatId,
-        // This session's own agent name (agentNameForPane over its pane) — the
+        // This session's own agent name (resolveSessionName().primary over its pane) — the
         // SAME label the daemon stamps on inbound, so `tg replies` groups a
         // session's outbound and its inbound under one current-agent scope.
         // Undefined when unresolvable (also always the case for a non-tmux omp
@@ -1713,7 +1736,7 @@ if (import.meta.main) {
   // substituting :helper: markers inside text we're about to remove. Line-spec
   // quotes are inserted AFTER this hook (anchored on the token) so the injected
   // <pre> can't flip the userHtml/escape decision below.
-  const prefix = buildPrefix({ aiEmoji: AI_EMOJI, model: MODEL, tmuxWindow: windowAgentLabel, agentLabel: AGENT_LABEL, tag, title })
+  const prefix = buildPrefix({ aiEmoji: AI_EMOJI, model: MODEL, tmuxWindow: sessionName.primary, agentLabel: AGENT_LABEL, tag, title })
   const renderText = (stripped: string, fmt: Format): { text: string; format: Format } => {
     const parsedCaption = parseEmojiHelpers(stripped)
     // buildPrefix already rendered the prefix to finished html/plain (its emoji

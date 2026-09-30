@@ -17,7 +17,7 @@ export interface RepliesCliDeps {
   // The current tmux pane id for default session scoping, or null when not in
   // tmux / undetectable (then the default scope degrades to all-sessions).
   detectPane: () => string | null;
-  // The reader's OWN agent name — agentNameForPane over the current pane's
+  // The reader's OWN agent name — resolveSessionName().primary over the current pane's
   // window name + cwd (the SAME derivation tg-ctl stamps as targetAgent). null
   // when not in tmux / unresolvable; the default `current` scope then degrades
   // to showing untagged rows plus a note. Optional so existing callers/tests

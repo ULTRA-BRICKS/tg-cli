@@ -321,7 +321,7 @@ function cwdBasename(path: string | null): string {
 }
 
 // The human label — the `--name` when given, else the cwd project dir: the SAME
-// fallback tier `resolveWindowAgentLabel` uses for a tmux pane whose window name is
+// fallback tier `resolveSessionName` uses for a tmux pane whose window name is
 // bare, so an agent is called the same thing whether or not it sits in tmux. An
 // unnamed agent whose cwd could not be resolved is named by its pid (cwdBasename
 // yields '' there, which `??` would NOT fall through — hence the `|| null`).

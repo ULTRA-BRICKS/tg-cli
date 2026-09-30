@@ -21,8 +21,10 @@ export function isProcessRunning(name: string): boolean {
 // reliable signal for agents that — unlike Claude Code's CLAUDECODE — export no
 // env marker: a `codex exec` is the direct parent of the shell command it runs.
 // Crucially it runs BEFORE the pgrep fallbacks so a background `ollama` daemon
-// (a sibling, never an ancestor) can no longer hijack the label.
-function ancestryHit(): { agent: string; pid: number } | null {
+// (a sibling, never an ancestor) can no longer hijack the label. Returns the kind
+// AND pid: `tg` also uses an omp ancestor's pid to stamp routes.json `omp:<pid>`
+// outside tmux and to read that omp session's own title.
+export function detectAncestorAgent(): { agent: string; pid: number } | null {
   try {
     const result = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="], {
       stdout: "pipe",
@@ -37,11 +39,5 @@ function ancestryHit(): { agent: string; pid: number } | null {
 }
 
 export function detectAgentViaAncestry(): string | null {
-  return ancestryHit()?.agent ?? null
-}
-
-/** Pid of the nearest omp ancestor — used to stamp routes.json omp:<pid> outside tmux. */
-export function detectOmpAncestorPid(): number | null {
-  const hit = ancestryHit()
-  return hit?.agent === "omp" ? hit.pid : null
+  return detectAncestorAgent()?.agent ?? null
 }

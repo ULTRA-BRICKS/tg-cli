@@ -8,6 +8,9 @@ import {
   pickTargetPane,
   pickTargetPaneFromSet,
   panesWithRetry,
+  abducoSessionName,
+  paneIdByPid,
+  parsePaneTitles,
 } from '../features/tg-ctl/discover';
 import type { PaneInfo, ProcInfo } from '../features/tg-ctl/types';
 
@@ -557,3 +560,76 @@ test('panesWithRetry: a null run (tmux binary missing) breaks immediately — no
   expect(calls).toBe(1);
 });
 
+// --- abduco-wrapped agents (tg-cli#454) ---
+// Live shape (rig `omp run`, 2026-09-29, re-probed with a real abduco 0.6): the pane
+// shell runs the abduco CLIENT; the abduco SERVER daemonizes (ppid 1) with the SAME
+// argv, and omp is the SERVER's child — never a descendant of pane_pid.
+
+const RIG_OMP =
+  'bun --preload /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/omp.ts /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/../src/cli.ts --resume /s.jsonl';
+
+function abducoPaneFixture(): { pane: PaneInfo; procs: ProcInfo[] } {
+  return {
+    pane: pane('main', 1, '%0', 2929, 'abduco', '/Users/u/xp/sme-archiving-gc', 'gc-sme-backlog'),
+    procs: [
+      proc(1, 0, '/sbin/launchd'),
+      proc(2929, 1, '/bin/zsh -l'),
+      proc(57614, 2929, 'abduco -f -A omp-restored-01a0c5431ac1 omp --resume /s.jsonl'),
+      proc(57615, 1, 'abduco -f -A omp-restored-01a0c5431ac1 omp --resume /s.jsonl'),
+      proc(57616, 57615, RIG_OMP),
+    ],
+  };
+}
+
+test('abducoSessionName reads the session name from getopt-style abduco argv', () => {
+  expect(abducoSessionName('abduco -f -A omp-restored-01a0c5431ac1 omp --resume /s.jsonl')).toBe('omp-restored-01a0c5431ac1');
+  expect(abducoSessionName('/opt/homebrew/bin/abduco -fA omp-restored-x omp')).toBe('omp-restored-x');
+  expect(abducoSessionName('abduco -e ^q -a work')).toBe('work');
+  expect(abducoSessionName('abduco -e^q -n work sleep 9')).toBe('work');
+  expect(abducoSessionName('abduco -r -a -- -dashy')).toBe('-dashy');
+  expect(abducoSessionName('abduco')).toBeNull(); // bare `abduco` lists sessions
+  expect(abducoSessionName('abduco -l')).toBeNull(); // no action flag, no name
+  expect(abducoSessionName('dtach -A /tmp/s omp')).toBeNull();
+  expect(abducoSessionName('omp --resume abduco')).toBeNull();
+});
+
+test('an omp wrapped in abduco resolves to the tmux pane running its abduco client', () => {
+  const { pane: p, procs } = abducoPaneFixture();
+  expect(findAgentInPane(p, procs)).toEqual({ agent: 'omp', pid: 57616 });
+});
+
+test('abduco resolution follows only the SAME session name — a detached session never joins another pane', () => {
+  const p0 = pane('main', 1, '%0', 100, 'abduco', '/a');
+  const p1 = pane('main', 2, '%1', 200, 'zsh', '/b');
+  const procs = [
+    proc(100, 1, '-zsh'),
+    proc(101, 100, 'abduco -A sess-a omp'),
+    proc(102, 1, 'abduco -A sess-a omp'),
+    proc(103, 102, '/opt/homebrew/bin/omp'),
+    proc(200, 1, '-zsh'),
+    proc(202, 1, 'abduco -n sess-b omp'), // created detached, attached from no pane
+    proc(203, 202, '/opt/homebrew/bin/omp'),
+  ];
+  expect(findAgentInPane(p0, procs)).toEqual({ agent: 'omp', pid: 103 });
+  expect(findAgentInPane(p1, procs)).toBeNull();
+  const byPid = paneIdByPid([p0, p1], procs);
+  expect(byPid.get(103)).toBe('%0');
+  expect(byPid.has(203)).toBe(false); // genuinely not shown in any pane
+});
+
+test('paneIdByPid maps an abduco-wrapped omp to its pane and keeps direct children mapped', () => {
+  const { pane: p, procs } = abducoPaneFixture();
+  const direct = pane('main', 7, '%5', 4786, 'bun', '/Users/u/xp/cal', 'cal-fix');
+  const byPid = paneIdByPid([p, direct], [...procs, proc(4786, 1, '/bin/zsh -l'), proc(36698, 4786, RIG_OMP)]);
+  expect(byPid.get(57616)).toBe('%0');
+  expect(byPid.get(36698)).toBe('%5');
+});
+
+test('parsePaneTitles keeps the raw title per pane id (tabs inside a title survive) and skips junk lines', () => {
+  const out = '%0\tπ ⠹ Recover orphaned commits, verify PRs\n%16\t[mosh] ultra@home: ~\n%3\ta\tb\nmain\t0\t%9\t5301\n\n';
+  const titles = parsePaneTitles(out);
+  expect(titles.get('%0')).toBe('π ⠹ Recover orphaned commits, verify PRs');
+  expect(titles.get('%16')).toBe('[mosh] ultra@home: ~');
+  expect(titles.get('%3')).toBe('a\tb');
+  expect(titles.size).toBe(3);
+});

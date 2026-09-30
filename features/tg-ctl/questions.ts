@@ -380,8 +380,8 @@ export function buildPostTimeoutQuestionMessage(chatId: number, req: ButtonReque
 // card restores automatically if a reconnect happens, and a tap right now is
 // QUEUED (see queuedPermissionDecisionText) rather than silently dropped, so the
 // choice is never lost even when reconnect never comes. `label` identifies WHICH
-// pane (the caller resolves it with resolveWindowAgentLabel,
-// features/tg-ctl/agent-match.ts) so a fleet with several agents can tell which one
+// pane (the caller resolves it with resolveSessionName,
+// features/tg-ctl/session-name.ts) so a fleet with several agents can tell which one
 // needs attention instead of a bare, unidentifiable card. The ORIGINAL prompt
 // (buildQuestionText) rides along too — the status line alone would invite a tap
 // on Approve/Reject buttons with no visible clue what they're approving, which is

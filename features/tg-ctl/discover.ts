@@ -151,40 +151,133 @@ export function matchAgentCommand(command: string): AgentKind | null {
   return null;
 }
 
-// CRITICAL repo fact (verified live on CC 2.1.150): a Claude Code pane reports
-// its VERSION string (e.g. '2.1.150') as pane_current_command, NOT 'claude'.
-// Pane-command matching therefore does NOT work for cc — only walking the
-// process tree under pane_pid does. BFS includes pane_pid itself (an agent
-// launched directly by tmux IS the pane process) and stops at the first match,
-// so the shallowest agent wins. A visited set guards against pid-reuse
-// artifacts in the ps snapshot.
-export function findAgentInPane(
-  pane: PaneInfo,
-  procs: ProcInfo[],
-): { agent: AgentKind; pid?: number } | null {
+// abduco (a session detacher rig uses for durable `omp run` sessions) daemonizes a
+// SERVER process that re-parents to pid 1 and keeps the client's exact argv; the
+// agent runs as the SERVER's child. The pane only shows the CLIENT
+// (`abduco -f -A omp-restored-<id> omp --resume …`). Verified live 2026-09-29 with
+// abduco 0.6 (tg-cli#454): without following the client → server hop, every
+// abduco-wrapped omp looked like "no tmux".
+//
+// The session name is abduco's first positional after its getopt flags
+// (`aAclne:fpqrv`; the -a/-A/-c/-n action flag takes no argument, -e takes the
+// detach key). Null for anything that is not an abduco create/attach command.
+export function abducoSessionName(command: string): string | null {
+  if (!command.includes('abduco')) return null; // cheap pre-filter: runs over every ps row
+  const tokens = command.trim().split(/\s+/);
+  if (basename(tokens[0] ?? '') !== 'abduco') return null;
+  let action = false;
+  for (let i = 1; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === '--') return action ? (tokens[i + 1] ?? null) : null;
+    if (t.length > 1 && t.startsWith('-')) {
+      for (let j = 1; j < t.length; j++) {
+        if ('aAcn'.includes(t[j])) action = true;
+        if (t[j] === 'e') {
+          if (j === t.length - 1) i++; // `-e ^q`: the key is the next token
+          break; // `-e^q`: the rest of this token is the key
+        }
+      }
+      continue;
+    }
+    return action ? t : null;
+  }
+  return null;
+}
+
+interface ProcIndex {
+  byPid: Map<number, ProcInfo>;
+  byPpid: Map<number, number[]>;
+  abducoSessionOf: Map<number, string>;
+  abducoBySession: Map<string, number[]>;
+}
+
+function indexProcs(procs: ProcInfo[]): ProcIndex {
   const byPid = new Map<number, ProcInfo>();
-  const byPpid = new Map<number, ProcInfo[]>();
+  const byPpid = new Map<number, number[]>();
+  const abducoSessionOf = new Map<number, string>();
+  const abducoBySession = new Map<string, number[]>();
   for (const p of procs) {
     byPid.set(p.pid, p);
     const siblings = byPpid.get(p.ppid);
-    if (siblings) siblings.push(p);
-    else byPpid.set(p.ppid, [p]);
+    if (siblings) siblings.push(p.pid);
+    else byPpid.set(p.ppid, [p.pid]);
+    const session = abducoSessionName(p.command);
+    if (session === null) continue;
+    abducoSessionOf.set(p.pid, session);
+    const same = abducoBySession.get(session);
+    if (same) same.push(p.pid);
+    else abducoBySession.set(session, [p.pid]);
   }
+  return { byPid, byPpid, abducoSessionOf, abducoBySession };
+}
 
-  const queue: number[] = [pane.panePid];
+// BFS over everything a pane shows: pane_pid, its descendants, and — through an
+// abduco client — the abduco server(s) of the SAME session and their descendants.
+// `visit` returning true stops the walk. A visited set guards pid-reuse cycles.
+function walkPaneTree(panePid: number, index: ProcIndex, visit: (pid: number, proc: ProcInfo | undefined) => boolean): void {
+  const queue: number[] = [panePid];
   const seen = new Set<number>();
   while (queue.length > 0) {
     const pid = queue.shift()!;
     if (seen.has(pid)) continue;
     seen.add(pid);
-    const proc = byPid.get(pid);
-    if (proc) {
-      const agent = matchAgentCommand(proc.command);
-      if (agent) return { agent, pid: proc.pid };
-    }
-    for (const child of byPpid.get(pid) ?? []) queue.push(child.pid);
+    const proc = index.byPid.get(pid);
+    if (visit(pid, proc)) return;
+    for (const child of index.byPpid.get(pid) ?? []) queue.push(child);
+    const session = index.abducoSessionOf.get(pid);
+    if (session !== undefined) for (const peer of index.abducoBySession.get(session) ?? []) queue.push(peer);
   }
-  return null;
+}
+
+// CRITICAL repo fact (verified live on CC 2.1.150): a Claude Code pane reports
+// its VERSION string (e.g. '2.1.150') as pane_current_command, NOT 'claude'.
+// Pane-command matching therefore does NOT work for cc — only walking the
+// process tree under pane_pid does. BFS includes pane_pid itself (an agent
+// launched directly by tmux IS the pane process) and stops at the first match,
+// so the shallowest agent wins. An abduco client in the pane is followed to its
+// server's children (walkPaneTree), so an abduco-wrapped agent is found too.
+export function findAgentInPane(
+  pane: PaneInfo,
+  procs: ProcInfo[],
+): { agent: AgentKind; pid?: number } | null {
+  let found: { agent: AgentKind; pid: number } | null = null;
+  walkPaneTree(pane.panePid, indexProcs(procs), (_pid, proc) => {
+    const agent = proc ? matchAgentCommand(proc.command) : null;
+    if (agent && proc) found = { agent, pid: proc.pid };
+    return found !== null;
+  });
+  return found;
+}
+
+// pid → the pane that shows it, over the same walk as findAgentInPane (so an
+// abduco-wrapped process maps to the pane running its client). When several panes
+// attach one abduco session, the first pane in snapshot order wins.
+export function paneIdByPid(panes: PaneInfo[], procs: ProcInfo[]): Map<number, string> {
+  const index = indexProcs(procs);
+  const out = new Map<number, string>();
+  for (const pane of panes) {
+    walkPaneTree(pane.panePid, index, (pid) => {
+      if (!out.has(pid)) out.set(pid, pane.paneId);
+      return false;
+    });
+  }
+  return out;
+}
+
+// `tmux list-panes -a -F '#{pane_id}\t#{pane_title}'` → raw title per pane id. The
+// title is the greedy tail (a harness may paint a tab into it). Lines whose first
+// field is not a `%N` pane id are skipped, so a tmux that ignored the format (or a
+// test shim answering every list-panes with the pane snapshot) yields no titles.
+export function parsePaneTitles(out: string): Map<string, string> {
+  const titles = new Map<string, string>();
+  for (const rawLine of out.split('\n')) {
+    const line = rawLine.replace(/\r$/, '');
+    const tab = line.indexOf('\t');
+    if (tab < 0) continue;
+    const paneId = line.slice(0, tab);
+    if (/^%\d+$/.test(paneId)) titles.set(paneId, line.slice(tab + 1));
+  }
+  return titles;
 }
 
 // Walk UP the ppid chain from `startPid`, returning the nearest ancestor that

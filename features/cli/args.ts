@@ -65,7 +65,7 @@ export type ParseResult =
       // `--agent` alias still parses). Appears as its own `[name]` bracket right
       // after `[window]`: `✳️ [window] [name] <title>`. The MAIN/orchestrator
       // agent needs NO flag — its `[window]` bracket already carries the project
-      // (resolveWindowAgentLabel derives it from the tmux window / cwd). This
+      // (resolveSessionName derives it from the tmux window / cwd). This
       // flag is for a Task-tool SUBAGENT to identify WHICH subagent sent the
       // message (e.g. `--subagent hyperide-fixer`); there is no reliable env
       // signal to auto-detect that, so it is explicit.

@@ -127,7 +127,8 @@ squares. The tag word is not in the badge (any text after the dots is your
 The header shows the sender as \`✳️ [window] [subagent]\`. The MAIN/orchestrator agent
 needs NO flag: the \`[window]\` bracket already carries the project — it is the tmux window
 name, or the pane's cwd basename when the window is auto-renamed to a version/shell (so a
-session in \`~/xp/rig-cli\` shows \`[rig-cli]\`, never \`[2.1.207]\`).
+session in \`~/xp/rig-cli\` shows \`[rig-cli]\`, never \`[2.1.207]\`); outside tmux it is the
+harness session title. The harness title also follows as the header title inside tmux.
 
 If you are an orchestrator dispatching subagents (Claude Code Task tool or equivalent),
 and a subagent may call \`tg\` itself, ALWAYS pass \`--subagent <descriptive-name>\` from that

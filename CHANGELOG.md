@@ -3,6 +3,36 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.3
+
+**One session name everywhere; abduco-wrapped omp is a tmux session (#454, #455, #75, #448).**
+
+- Discovery follows an abduco CLIENT in a tmux pane to the same-session abduco SERVER's
+  children. A rig `omp run` session (`abduco -f -A omp-restored-<id> omp --resume …`; omp
+  re-parented under a pid-1 abduco server) is now that pane's agent: a reply to its message
+  routes to it instead of the false "That agent … is no longer running" picker,
+  `/agent <window>` selects it, and `tg-ctl status` shows `pane %N` instead of `no tmux`.
+- One pure resolver, `resolveSessionName` (`features/tg-ctl/session-name.ts`), returns
+  `{primary, secondary}` for the `tg` header, the `/agent` picker, `tg-ctl status`, the
+  history label and question cards. In tmux the window name is primary (bare auto-rename
+  names — now also `bun`/`abduco` — fall back to the cwd project) and the harness title is
+  secondary; outside tmux the harness title is primary, then the cwd project. The picker
+  and status no longer overwrite the tmux window name with the omp title.
+- The harness title is the omp endpoint/jsonl title, else a harness-painted tmux
+  `#{pane_title}` (omp `π > …` / `π ⠹ …`, Claude Code `✳ …`), marks and spinner frames
+  stripped; the host-name default and generic names (`Claude Code`) are ignored.
+- `tg` never prints a literal `[no tmux]` (#448): outside tmux — or when tmux cannot
+  resolve the pane — the bracket is the harness title (or the cwd project), and a title
+  dropped by the content guards falls back to the project. Decision: no `--no-title`
+  opt-out; the CTO asked to see the harness session name, the guards already drop an
+  unfit title, and an explicit `--title` replaces it.
+- `tg`'s omp-session lsof now passes `-n -P`: without them lsof reverse-resolved the
+  omp's network sockets and an out-of-tmux send stalled for 20 s+ (measured live;
+  0.15 s with the flags).
+- The no-agent reply is one harness-neutral line ("No live agent found → not delivered.
+  Run Claude Code / Codex inside tmux …; omp is reachable in or outside tmux.") instead
+  of "Claude Code not in tmux", which was sent for an omp that was in tmux (tg#17036).
+
 ## 1.54.1
 
 **OMP subagents no longer withdraw the Telegram bridge; self-heal and tmux fallback (#462, #458).**

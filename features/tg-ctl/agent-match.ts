@@ -8,6 +8,7 @@
 
 import type { AgentKind } from './types';
 import { truncateWithEllipsis } from './text-util';
+import { cwdBasename, resolveSessionName } from './session-name';
 
 export interface AgentCandidate {
   paneId: string; // "%N"
@@ -22,6 +23,12 @@ export interface AgentCandidate {
   // Extra exact /agent selectors (live omp `--name`). Checked BEFORE fuzzy
   // window names so an explicit name is not stolen by another pane's title.
   aliases?: string[];
+  // The harness's own session title from its adapter (live omp endpoint/jsonl).
+  // SECONDARY to the tmux window name — never a replacement (tg-cli#455).
+  harnessTitle?: string | null;
+  // Raw tmux `#{pane_title}` (omp `π > title`, Claude Code `✳ title`); used only
+  // when there is no adapter title.
+  paneTitle?: string | null;
 }
 
 // --- command parse ---
@@ -288,109 +295,39 @@ export function groupBySession(candidates: AgentCandidate[], preserveOrder = fal
 
 // --- distinct candidate labels ---
 
-// The basename of a cwd path (the project dir). Trailing slashes are stripped so
-// `/Users/u/xp/rig/` → `rig`. An empty/root path yields ''.
-function cwdBasename(path: string | null | undefined): string {
-  if (!path) return '';
-  const trimmed = path.replace(/\/+$/, '');
-  if (!trimmed) return '';
-  const idx = trimmed.lastIndexOf('/');
-  return idx === -1 ? trimmed : trimmed.slice(idx + 1);
-}
-
-// Default window names tmux hands back when `automatic-rename` is ON: it sets the
-// window name to the running command, so an un-renamed pane shows the SHELL or the
-// agent's launcher rather than a user-chosen label. The cc pane reports a VERSION
-// string (e.g. "2.1.181") as its command, which surfaces as the window name too.
-// None of these distinguishes a project — the label must lean on the cwd instead.
-//
-// Deliberately ONLY the common shells + the `node` cc-launcher: these are nearly
-// always an auto-rename artifact, never a window a user would deliberately name.
-// `tmux`/`login`/etc. are EXCLUDED — they are far more likely a deliberate user
-// label than an auto-rename default, so treating them as bare would wrongly drop a
-// real name (review tradeoff, tg-cli#75). A user who names a window literally "zsh"
-// loses it to the cwd; that's the accepted edge.
-const DEFAULT_SHELL_NAMES = new Set(['zsh', 'bash', 'sh', 'fish', 'node']);
-
-// A window name that does NOT distinguish a pane and so must not lead the label:
-//   - empty;
-//   - the bare numeric session/window fallback ("4");
-//   - a tmux auto-rename DEFAULT — a shell/launcher command name (zsh, node, …) or
-//     a bare version string ("2.1.181", the cc pane_current_command). The CTO set
-//     real window names ("rig", "3d"); only these un-renamed defaults fall through
-//     to the cwd basename.
-// A genuine user label ("rig", "ext", "api-bot") is NOT bare and leads the label.
-// Exported so the daemon's diagnostic `formatCandidates` reply leads with the same
-// names the picker buttons show (no leading "node"/"4"/version-string mismatch).
-export function isBareWindowName(name: string): boolean {
-  const t = name.trim().toLowerCase();
-  if (t === '') return true;
-  if (/^\d+$/.test(t)) return true; // session/window index fallback
-  if (/^\d+(\.\d+)+$/.test(t)) return true; // dotted version string (cc command)
-  return DEFAULT_SHELL_NAMES.has(t);
-}
-
-// The AGENT LABEL for a pane's `[window]` bracket in an OUTBOUND `tg` header —
-// the tmux window name, EXCEPT when that name is a bare auto-rename default
-// (isBareWindowName: empty, a numeric window index, a dotted version string like
-// Claude Code's "2.1.207" pane_current_command, or a shell/launcher name). In
-// that case the window name carries no project signal, so fall back to the cwd
-// project basename — the SAME tier the `/agent` picker's distinctLabels uses, so
-// a message a session sends is labelled with the project the recipient would see
-// in the picker. Returns '' only when NEITHER signal is usable (empty window in a
-// root/empty cwd).
-//
-// This is the source fix for the `[2.1.207]` header leak: tmux's automatic-rename
-// sets a cc pane's window name to the version string it reports as its command;
-// leaning on the cwd basename here yields `[rig-cli]` regardless of the pane's
-// auto-rename setting. (Overlaps agentNameForPane on the unmerged
-// feat/replies-agent-scope branch — converge the two when that lands.)
-export function resolveWindowAgentLabel(
-  windowName: string | null | undefined,
-  panePath: string | null | undefined,
-): string {
-  const win = (windowName ?? '').trim();
-  if (win && !isBareWindowName(win)) return win;
-  const project = cwdBasename(panePath);
-  if (project) return project;
-  return win;
-}
+// A picker button is one row; a long harness title is cut so the tmux name leads.
+const PICKER_TITLE_MAX = 40;
+// An omp shown in NO tmux pane rides the picker as `omp:<pid>` (omp.ts liveOmpPaneId).
+const NO_PANE_OMP_ROW = /^omp:\d+$/;
 
 // Distinct, human-meaningful labels — one per candidate, SAME index order.
 //
-// The bug this fixes: three `claude` panes in window "4" all rendered as the
-// identical "4 · claude", impossible to tell apart. Strategy per candidate:
-//   - base = `<window> · <agent>` when the window name distinguishes it;
-//   - otherwise (bare/numeric name) or when several candidates would collide on
-//     the same base, append the cwd project dir → `<base> · <project>` (or just
-//     `<project> · <agent>` when the window name carries no signal at all).
-// A genuinely indistinguishable pair (same window, same agent, same cwd) gets
-// the pane id appended so the buttons are never two identical strings.
+// The base label is the session name from resolveSessionName (the ONE resolver
+// shared with the `tg` header, status and history, tg-cli#455):
+//   - a tmux pane → `<window> · <harness title>`, or `<window> · <agent>` with no
+//     title; a bare/numeric window leads with the cwd project instead
+//     (the "4 · claude" ×3 bug);
+//   - an omp in no pane → its title-first name (liveOmpLabel), with the cwd
+//     project kept visible so /agent landing / rig-cli stay discoverable when the
+//     title is an unrelated sentence.
+// Candidates still colliding get the cwd project, then the pane id appended, so
+// the buttons are never two identical strings.
 export function distinctLabels(candidates: AgentCandidate[]): string[] {
   let labels = candidates.map((c) => {
-    // omp: the window is the session title or "omp · <id/pid>". Keep that,
-    // but always show the cwd project token so /agent landing and /agent
-    // rig-cli remain visible when the title is an unrelated sentence.
-    if (c.agent === 'omp' && !isBareWindowName(c.windowName)) {
-      const project = cwdBasename(c.panePath);
-      if (project && !c.windowName.toLowerCase().includes(project.toLowerCase())) {
-        return `${c.windowName} · ${project}`;
-      }
-      return c.windowName;
-    }
-    if (c.agent === 'omp') {
-      const pid = c.paneId.startsWith('omp:') ? c.paneId.slice(4) : '';
-      return pid ? `omp · ${pid}` : 'omp';
-    }
     const project = cwdBasename(c.panePath);
-    if (isBareWindowName(c.windowName)) {
-      // The window name is useless — lead with the project when we have one, else
-      // the (possibly empty) window name. A genuinely empty lead would render a
-      // dangling "· claude", so fall back to the agent alone in that corner case.
-      const lead = project || c.windowName.trim();
-      return lead ? `${lead} · ${c.agent}` : c.agent;
+    if (NO_PANE_OMP_ROW.test(c.paneId)) {
+      const name = c.windowName.trim() || c.agent;
+      if (name === project) return `${name} · ${c.agent}`;
+      return project && !name.toLowerCase().includes(project.toLowerCase()) ? `${name} · ${project}` : name;
     }
-    return `${c.windowName} · ${c.agent}`;
+    const name = resolveSessionName({
+      tmuxWindow: c.windowName,
+      cwd: c.panePath,
+      harnessTitle: c.harnessTitle,
+      paneTitle: c.paneTitle,
+    });
+    if (!name.primary) return c.agent;
+    return `${name.primary} · ${name.secondary ? truncateWithEllipsis(name.secondary, PICKER_TITLE_MAX) : c.agent}`;
   });
   // Resolve collisions in passes: any label still shared by >1 candidate gets the
   // NEXT distinguisher appended (the cwd project dir, then — as the last resort —

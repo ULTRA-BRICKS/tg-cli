@@ -3,15 +3,12 @@ import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-// Integration (tg-cli#358, revised by Alex escalation point 5, 2026-09-25):
-// outbound `tg --detect-agent` resolves the `[window]` bracket ALWAYS from
-// tmux (or an explicit "no tmux" marker for a detached/headless omp ancestor)
-// and the omp session jsonl title as SEPARATE, additional info — never as a
-// substitute for `[window]`. Before this fix, a live omp ancestor's session
-// title silently REPLACED the tmux window name even from inside a real tmux
-// pane, so a message sent from a tmux window showed no tmux window at all —
-// exactly the bug Alex reported ("[Fix Missing Provisioned Skills in Rig]"
-// with no tmux window shown).
+// Integration (tg-cli#358, revised by Alex escalation point 5, 2026-09-25, and
+// by the one session-name resolver, tg-cli#455/#448): inside tmux the `[window]`
+// bracket is ALWAYS the tmux window and the harness session title is SEPARATE,
+// additional info — never a substitute for `[window]` (Alex reported "[Fix
+// Missing Provisioned Skills in Rig]" with no tmux window shown). Outside tmux
+// the harness title IS the name; there is no literal "no tmux" placeholder.
 
 const TG = join(import.meta.dir, '..', 'tg');
 
@@ -78,7 +75,7 @@ function psHeredocLines(binDir: string): string[] {
   ];
 }
 
-test('tg --detect-agent: detached omp session (no tmux) shows an explicit "no tmux" marker PLUS the session title on its own line', () => {
+test('tg --detect-agent: detached omp session (no tmux) is named by its session title — no "no tmux" placeholder (tg-cli#455)', () => {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tg-omp-title-'));
   const { binDir } = setupOmpSession(cfgDir);
 
@@ -96,7 +93,75 @@ test('tg --detect-agent: detached omp session (no tmux) shows an explicit "no tm
   });
   if (proc.exitCode !== 0) console.error(proc.stderr.toString());
   expect(proc.exitCode).toBe(0);
-  expect(proc.stdout.toString().trim()).toBe('no tmux\ntitle: OmpHeaderTitle');
+  expect(proc.stdout.toString().trim()).toBe('OmpHeaderTitle');
+});
+
+// tmux fails the pane query with a non-zero exit, or (tmux 3.5a, verified live for a
+// gone pane id) exit 0 with EMPTY fields.
+for (const [failure, tmuxShim] of [
+  ['non-zero exit', '#!/bin/sh\nexit 1\n'],
+  ['exit 0, empty fields', "#!/bin/sh\nprintf '\\t\\n'\nexit 0\n"],
+]) test(`tg --detect-agent: TMUX set but the pane query fails (${failure}) → the session title, never a false "no tmux" (tg-cli#448)`, () => {
+  const cfgDir = mkdtempSync(join(tmpdir(), 'tg-omp-title-tmuxfail-'));
+  const { binDir } = setupOmpSession(cfgDir);
+  writeFileSync(join(binDir, 'tmux'), tmuxShim, { mode: 0o755 });
+  const launcher = join(cfgDir, 'run-detect-agent.sh');
+  writeFileSync(
+    launcher,
+    ['#!/bin/sh', 'MY_PID=$$', ...psHeredocLines(binDir), `bun "${TG}" --detect-agent`].join('\n') + '\n',
+    { mode: 0o755 },
+  );
+  const proc = Bun.spawnSync([launcher], {
+    env: { PATH: `${binDir}:${process.env.PATH ?? ''}`, HOME: cfgDir, TMUX: '/tmp/tmux-fake,1234,0', TMUX_PANE: '%3' },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  if (proc.exitCode !== 0) console.error(proc.stderr.toString());
+  expect(proc.exitCode).toBe(0);
+  expect(proc.stdout.toString().trim()).toBe('OmpHeaderTitle');
+});
+
+test('tg --detect-agent: a Claude Code pane title (`✳ <title>`) is the secondary name next to the tmux window (tg-cli#455)', () => {
+  const cfgDir = mkdtempSync(join(tmpdir(), 'tg-cc-pane-title-'));
+  const binDir = join(cfgDir, 'bin');
+  mkdirSync(binDir);
+  writeFileSync(
+    join(binDir, 'tmux'),
+    [
+      '#!/bin/sh',
+      'case "$*" in',
+      "  *pane_title*) printf '✳ Fix header labels\\n' ;;",
+      "  *display-message*) printf 'rig-cli\\t/Users/u/xp/rig-cli\\n' ;;",
+      'esac',
+      'exit 0',
+    ].join('\n') + '\n',
+    { mode: 0o755 },
+  );
+  const launcher = join(cfgDir, 'run-detect-agent.sh');
+  writeFileSync(
+    launcher,
+    [
+      '#!/bin/sh',
+      'MY_PID=$$',
+      `cat > "${binDir}/ps" << EOF`,
+      '#!/bin/sh',
+      "printf '    1     0 /sbin/launchd\\n'",
+      "printf ' 7200     1 claude --resume\\n'",
+      "printf ' ${MY_PID}     7200 /bin/zsh\\n'",
+      'EOF',
+      `chmod +x "${binDir}/ps"`,
+      `bun "${TG}" --detect-agent`,
+    ].join('\n') + '\n',
+    { mode: 0o755 },
+  );
+  const proc = Bun.spawnSync([launcher], {
+    env: { PATH: `${binDir}:${process.env.PATH ?? ''}`, HOME: cfgDir, TMUX: '/tmp/tmux-fake,1234,0', TMUX_PANE: '%3' },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  if (proc.exitCode !== 0) console.error(proc.stderr.toString());
+  expect(proc.exitCode).toBe(0);
+  expect(proc.stdout.toString().trim()).toBe('rig-cli\ntitle: Fix header labels');
 });
 
 test('tg --detect-agent: a real tmux window name is NEVER replaced by the omp session title — both show (Alex escalation point 5 regression)', () => {

@@ -22,7 +22,7 @@ export interface HistoryRecord {
   pane: string | null; // tmux pane id this message was routed to / sent from; null outside tmux
   // The human AGENT NAME this message was routed to (inbound) or sent from
   // (outbound) — derived from the target pane's window name / cwd project by
-  // `agentNameForPane`. This is the attribution `tg replies` filters + marks on.
+  // `resolveSessionName().primary`. This is the attribution `tg replies` filters + marks on.
   // ABSENT on a legacy row (written before this field existed) or when no
   // specific target could be resolved (a broadcast / no discovered agent); the
   // reader treats absent as "untagged / unknown" (marked `[→ ?]`), never hiding
