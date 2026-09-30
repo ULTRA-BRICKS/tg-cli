@@ -219,8 +219,7 @@ needed by already-running OMP. Cwd/title are not process identity.
   always works on a feature branch sees the banner on every delivery to that pane, which is
   expected noise from the check's design (it detects "pane busy", not "message off-topic"), not a
   bug. `shell-danger-gate.ts` gates the `!<shell command>` Telegram passthrough (four
-  verbatim-injection surfaces: `textAction`, `topicActionFor`'s bound-topic and closed-topic
-  branches, and the flat entrypoint's `!`-reply path) against a narrow named-shape denylist
+  verbatim-injection surfaces: `textAction`, `topicActionFor`'s topic payload (bound or held), and the flat entrypoint's `!`-reply path) against a narrow named-shape denylist
   (`rm -rf`, `sudo rm`, force-push, a fork bomb, `curl | sh`, …) layered on top of the existing
   identity-only sender-allowlist gate — a match is replied to instead of injected, with a `!!`
   doubled-bang override to confirm and run anyway. Shared shapes in `types.ts`.

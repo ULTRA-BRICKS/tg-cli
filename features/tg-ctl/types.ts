@@ -273,45 +273,24 @@ export type Action =
       replyToMessageId?: number;
       replyAnchor?: string;
     }
-  // --- forum topics (docs/specs/tg-forum-topics.md) ---
-  // A new topic was created → start the per-topic /new flow (ask path, then model).
-  | { kind: 'topic-new'; threadId: number; name: string; from: string }
-  // A user message inside a topic still in the /new flow → feed the path answer (a working
-  // directory) to the state machine. `text` is the raw user text (the path the user typed).
-  | { kind: 'topic-answer'; threadId: number; text: string; from: string; messageId: number }
-  // A tap on a model button (tgm:<threadId>:<modelId>) inside an awaiting-model topic → spawn
-  // the agent with that model. callbackQueryId answers the tap; messageId is the prompt message
-  // (carried for editMessageReplyMarkup that clears the buttons on bind — increment 4).
-  | { kind: 'topic-model'; callbackQueryId: string; threadId: number; modelId: string; messageId: number | null }
-  // A tap on a recent-path button (tgp:<threadId>:<index>:<nonce>) inside an awaiting-path topic →
-  // resolve the index against the binding's persisted pathChoices (only if the nonce matches the
-  // binding's pathChoicesNonce — else a stale button) and advance like a typed path. callbackQueryId
-  // answers the tap; messageId is the prompt (its keyboard is cleared on advance).
-  | { kind: 'topic-path'; callbackQueryId: string; threadId: number; index: number; nonce: number; messageId: number | null }
-  // A tap on a re-spawn button (tgr:<threadId>) for a topic whose pane died → re-launch the
-  // agent with the retained path + model and re-bind. callbackQueryId answers the tap.
-  | { kind: 'topic-respawn'; callbackQueryId: string; threadId: number; messageId: number | null }
-  // A user message inside a BOUND topic → inject into that topic's pane. injectText is already
-  // wrapped for prose, OR verbatim for a `/cmd`/`!shell` passthrough (never re-decorate it); the
-  // entrypoint maps threadId→paneId and threads the ack with threadId.
-  | { kind: 'topic-route'; threadId: number; injectText: string; from: string; messageId: number }
-  // A user message inside a CLOSED topic (its pane died earlier) → the entrypoint offers a
-  // one-tap re-spawn (retained path + model) instead of a silent dead-end (increment 4). Carries
-  // the wrapped text + messageId so that if a SAME-BATCH re-spawn tap already re-bound the topic
-  // before this action runs, the entrypoint routes the message to the now-live pane instead of
-  // dropping it (codex r9 #1). injectText is empty for a media-only message (offer only).
-  | { kind: 'topic-dead'; threadId: number; injectText: string; messageId: number }
-  // Topic closed / reopened service messages → mark the binding (entrypoint persists).
-  | { kind: 'topic-close'; threadId: number }
-  | { kind: 'topic-reopen'; threadId: number }
-  // Topic renamed service message → persist new name + update the tmux-window slug.
-  | { kind: 'topic-rename'; threadId: number; name: string }
+  // --- forum topics: inbound triage (docs/specs/session-registry-and-topics.md §4.4) ---
+  // A message in a topic BOUND to a session → deliver the payload to that session (the
+  // entrypoint answers in the topic when the session is gone). Never spawns, never falls back.
+  | { kind: 'topic-route'; threadId: number; payload: TopicPayload }
+  // A message in an UNKNOWN topic (user-created, implicit, or a lost binding) → queue it for the
+  // topic and post the attach picker there once. Delivered to the picked session, in order.
+  | { kind: 'topic-hold'; threadId: number; payload: TopicPayload }
+  // A tap on an attach-picker button (tgt:<threadId>:<paneId>) → deliver the topic's queue to
+  // that session and bind the topic to it when the session has no topic yet.
+  | { kind: 'topic-attach'; callbackQueryId: string; threadId: number; paneId: string; messageId: number | null }
+  // forum_topic_created / _edited / _closed / _reopened service messages: recorded (logged)
+  // only. They never spawn and never touch tmux.
+  | { kind: 'topic-event'; threadId: number; event: 'created' | 'edited' | 'closed' | 'reopened'; name?: string }
   // --- flat-chat /new command (issue #27; NON-topic) ---
   // A `/new [<harness>|<model>] [<dir>] name [<task>]` slash command in the flat chat → start
   // the interactive new-session flow (ask dir, then harness/model, then spawn). All parts but
-  // `name` are optional; omitted model/dir are picked via inline buttons. Distinct from topic-new
-  // (which is keyed to a forum threadId) — a flat /new carries no thread, so the entrypoint mints
-  // a token.
+  // `name` are optional; omitted model/dir are picked via inline buttons. A flat /new carries no
+  // forum thread, so the entrypoint mints a token.
   | {
       kind: 'new-command';
       harness: SpawnHarness | null;
@@ -465,6 +444,7 @@ export interface CtlPaths {
   routes: string; // message_id→pane map for reply recognition + LRU/MRU picker
   history: string; // append-only JSONL message log for `tg replies` recall
   topics: string; // threadId→agent binding map for forum-topics mode (always allocated)
+  topicHolds: string; // messages held for unknown topics until an attach-picker pick (restored on reload)
   questions: string; // durable forwarded-question state (pending/abandoned + answered-replay)
   grants: string; // late-approval grant + grace store (tg-cli#398; 0600, daemon is the ONLY authority)
   schedules: string; // durable auto-continue schedules (re-armed on restart, #113)
@@ -483,47 +463,31 @@ export interface CtlPaths {
   sessions: string; // session registry keyed by harness session id; the daemon is its ONLY writer (#487)
 }
 
-// --- forum topics (docs/specs/tg-forum-topics.md) ---
+// --- forum topics (docs/specs/session-registry-and-topics.md §4) ---
 
-// Where a topic is in the per-topic /new lifecycle.
-//   awaiting-path  — created; asked for the working directory
-//   awaiting-model — got a path; asked for the model
-//   bound          — agent spawned + pane bound; messages route here
-//   closed         — topic closed or its pane died; re-attaches on reopen/next message
-export type TopicStatus = 'awaiting-path' | 'awaiting-model' | 'bound' | 'closed';
+// Where a topic's binding stands.
+//   awaiting-model — a flat `/new` created this private topic and its spawn is in flight
+//   bound          — the topic addresses a session; messages deliver there
+//   closed         — the bound session is gone; messages get a "not running" reply
+export type TopicStatus = 'awaiting-model' | 'bound' | 'closed';
 
-// One forum topic's binding to an agent. Persisted as a JSON array (CtlPaths.topics),
-// written by the entrypoint on every state transition (same pattern as routes).
+// One forum topic's binding to a session. Persisted as a JSON array (CtlPaths.topics),
+// written by the entrypoint on every transition (same pattern as routes). The session is
+// addressed by its pane locator (`%N`, or `omp:<pid>` for an omp outside tmux).
 export interface TopicBinding {
   threadId: number; // message_thread_id (the topic id)
-  name: string; // the topic name (used for the tmux window slug + display)
+  name: string; // the session's display name (used in replies and the /new tmux window slug)
   status: TopicStatus;
-  path?: string; // chosen working directory (set at awaiting-model)
-  model?: string; // chosen model id from the catalog (set at spawn)
-  paneId?: string; // the spawned tmux pane ("%N"), set at bound
+  path?: string; // the session's working directory (the pane-reuse guard compares it)
+  model?: string; // catalog model id, when a flat /new spawned the session
+  harness?: AgentKind; // the session's harness, for the "resume with …" hint when it is gone
+  paneId?: string; // the session's pane locator, set once bound
   ts: number; // unix seconds of the last transition
-  // The recent-repo paths OFFERED as awaiting-path buttons (increment 4). Persisted so a
-  // `tgp:<threadId>:<idx>` button tap recovers the chosen path by INDEX — callback_data is
-  // capped at 64 bytes, far too small for an absolute path, and recomputing the candidate
-  // list at tap time could drift if a new route was written meanwhile. Cleared once the path
-  // is chosen (it is only meaningful while awaiting-path).
-  pathChoices?: string[];
-  // The nonce embedded in this prompt's path buttons (the offering binding's ts). A `tgp` tap must
-  // carry a matching nonce or it's a STALE button from a superseded prompt (e.g. after a setup
-  // restart replaced pathChoices) — the entrypoint rejects the mismatch rather than resolving the
-  // index against the wrong list (codex r3 P1). Paired with pathChoices; cleared with it.
-  pathChoicesNonce?: number;
-  // True once a re-spawn button has been offered for this (closed) topic (increment 4). Stops a
-  // burst of messages to a dead topic from posting an offer PER message — the offer is sent once,
-  // then further messages are quietly acked until the user taps Re-spawn (which clears the flag by
-  // re-binding) or recreates the topic. Only meaningful while status === 'closed'.
-  respawnOffered?: boolean;
-  // Set on an awaiting-model binding IMMEDIATELY before `tmux new-window`, cleared on spawn
-  // failure, and dropped on bind. It distinguishes the CRASH-GAP state (a crash hit AFTER a
-  // successful new-window but BEFORE the `bound` write — a live orphan pane exists) from a normal
-  // awaiting-model (model chosen, never spawned) or a FAILED spawn (window never created). Only a
-  // spawnPending binding is an orphan-adoption candidate at startup, so a failed spawn + restart
-  // can't bind the topic to an unrelated same-slug/cwd pane (increment 4 / codex r7 P1).
+  // Set on an awaiting-model binding IMMEDIATELY before `tmux new-window` and dropped on bind (a
+  // failed spawn drops the whole binding). It marks the CRASH-GAP state (a crash hit AFTER a
+  // successful new-window but BEFORE the `bound` write — a live orphan pane may exist). Only a
+  // spawnPending binding is an orphan-adoption candidate at startup (codex r7 P1); one reconcile
+  // cannot adopt is dropped by the next message in its topic.
   spawnPending?: boolean;
   // A per-spawn unique token stamped into the new window's env (`TG_SPAWN_TOKEN`) and recorded here
   // BEFORE `tmux new-window`. Startup orphan adoption requires the candidate window to carry the
@@ -531,3 +495,20 @@ export interface TopicBinding {
   // no window carries the token) is never wrongly adopted (codex r10 P1). Paired with spawnPending.
   spawnToken?: string;
 }
+
+// One inbound topic message, in the form the entrypoint delivers (and the unknown-topic
+// hold persists). Text is already wrapped, or verbatim for a `/cmd` / `!shell` passthrough;
+// media and voice carry the Telegram file id and are downloaded/transcribed at delivery.
+export type TopicPayload =
+  | { type: 'text'; text: string; from: string; messageId: number }
+  | {
+      type: 'media';
+      mediaKind: 'photo' | 'document';
+      fileId: string;
+      suggestedName: string; // daemon-chosen: <update_id>.<ext>
+      caption?: string;
+      anchor?: string; // quote anchor when the media itself is a reply
+      from: string;
+      messageId: number;
+    }
+  | { type: 'voice'; fileId: string; suggestedName: string; anchor?: string; from: string; messageId: number };

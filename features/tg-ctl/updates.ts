@@ -15,10 +15,10 @@
 // dropped by age (#183): if Telegram delivered the update after daemon downtime,
 // it is still a real instruction and must reach the agent.
 
-import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatus } from './types';
+import type { Action, ControlConfig, StepResult, TgMessage, TgPhotoSize, TgUpdate, TopicPayload, TopicStatus } from './types';
 import { parseButtonCallback, parseQuestionCloseCallback, parseDecisionReplyToken } from './questions';
 import { isAgentCommand, parseAgentCallback, parseAgentCancelCallback, parseAgentCommand } from './agent-match';
-import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
+import { parseTopicAttachCallback } from './topics';
 import { parseNewCommand, parseNewDirCallback, parseNewHarnessCallback, parseNewModelCallback, parseNewRetryCallback, parseNewPrivateTopicFallbackCallback } from './new-command';
 import { parseTasksCallback, parseTasksCommand } from './tasks-command';
 import { parseContinueCallback } from './limits';
@@ -42,11 +42,11 @@ export interface StepOpts {
   // Format a reply's quote-anchor timestamp (item 3). Injected so the daemon
   // can use local time while tests stay deterministic; defaults to UTC.
   fmtTime?: (unixSec: number) => string;
-  // Forum-topics mode (docs/specs/tg-forum-topics.md). OFF by default: when unset/false a
-  // topic message falls through to the normal flat handling (behaviour unchanged). When on,
-  // the entrypoint injects `topicStatusOf` (threadId → current binding status, or null when
-  // untracked) so stepUpdates can route a topic message purely — bound → inject, awaiting →
-  // /new answer — without owning the binding store (the entrypoint owns it, like routes).
+  // Forum-topics mode (docs/specs/session-registry-and-topics.md §4.4). OFF by default: when
+  // unset/false a topic message falls through to the normal flat handling. When on, the
+  // entrypoint injects `topicStatusOf` (threadId → current binding status, or null when the topic
+  // is unknown) so stepUpdates triages a topic message purely — bound → topic-route, unknown →
+  // topic-hold — without owning the binding store (the entrypoint owns it, like routes).
   topicsEnabled?: boolean;
   topicStatusOf?: (threadId: number) => TopicStatus | null;
   // Flat-chat `/new` command (issue #27). The `/new` slash is ALWAYS recognized (it's a real bot
@@ -115,49 +115,20 @@ export function buildReplyInject(m: TgMessage, name: string, opts: StepOpts): st
   return `${buildReplyAnchor(m, opts)}\n${opts.wrap(name, m.text ?? '', m.message_id)}`;
 }
 
-// A forum LIFECYCLE service message (topic created / renamed / closed / reopened)
-// carries no user instruction — it is Telegram reporting a topic-state change.
-// Unlike owner text/media, a stale TRANSITION (close/reopen/renamed) is ignored
-// by age (see the drop below and the same-batch lifecycle pre-scan); a stale
-// CREATION is the exception and is still processed so the topic gets tracked.
-function isForumServiceMessage(m: TgMessage): boolean {
-  return !!(m.forum_topic_created || m.forum_topic_edited || m.forum_topic_closed || m.forum_topic_reopened);
+// A forum topic service message (created / renamed / closed / reopened) carries no user
+// instruction — it is Telegram reporting a topic-state change, recorded only (§4.4 row 5).
+function forumEventOf(m: TgMessage): 'created' | 'edited' | 'closed' | 'reopened' | null {
+  if (m.forum_topic_created) return 'created';
+  if (m.forum_topic_edited) return 'edited';
+  if (m.forum_topic_closed) return 'closed';
+  if (m.forum_topic_reopened) return 'reopened';
+  return null;
 }
 
 export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
   const callbackActions: Action[] = [];
   const actions: Action[] = [];
   let maxId = -1;
-
-  // PRE-SCAN for threads this batch undergoes a LIFECYCLE TRANSITION (close OR reopen): callbacks
-  // are buffered and executed BEFORE message/service actions, so a same-batch
-  // `[forum_topic_closed/reopened, tgr/tgm/tgp:<thread>]` would otherwise run the spawn tap FIRST and
-  // the lifecycle transition AFTER. For a CLOSE that orphans the just-spawned agent into a closed
-  // topic (codex r21); for a REOPEN, markReopened drops the freshly-bound paneId → orphans it too
-  // (codex r27). So suppress any topic spawn-flow callback (model/path/re-spawn) for a thread the
-  // SAME batch closes OR reopens, letting the lifecycle transition win. Apply the SAME filters the
-  // message loop uses (codex r22): an UNAUTHORIZED service message is ignored there, so it
-  // must NOT suppress a valid same-batch tap here either. Only an allowed, TRACKED-topic one.
-  // Map each such thread to the EARLIEST lifecycle update_id (codex r30): suppression is ORDER-AWARE
-  // for text/media messages — only a message that came AFTER the transition (higher update_id) is
-  // suppressed; one that came BEFORE it is processed normally (it happened before the close/reopen).
-  const lifecycleInBatch = new Map<number, number>();
-  if (opts.topicsEnabled) {
-    for (const u of updates) {
-      const m = u.message;
-      const t = m?.message_thread_id;
-      if (!(m?.forum_topic_closed || m?.forum_topic_reopened) || t === undefined) continue;
-      if (!senderAllowed(m.from?.id, opts)) continue;
-      // A stale-dated close/reopen is ignored HERE (codex r22): an old lifecycle
-      // service message must not suppress a valid same-batch tap. This is about
-      // lifecycle ORDERING within a batch, not owner-message delivery — owner
-      // text/media is never dropped by age (#183, main loop below).
-      if (opts.nowSec - m.date > opts.cfg.stalenessSec) continue;
-      if ((opts.topicStatusOf?.(t) ?? null) === null) continue;
-      const prior = lifecycleInBatch.get(t);
-      if (prior === undefined || u.update_id < prior) lifecycleInBatch.set(t, u.update_id);
-    }
-  }
 
   for (const u of updates) {
     if (u.update_id > maxId) maxId = u.update_id;
@@ -167,57 +138,20 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         callbackActions.push({ kind: 'answer-callback', callbackQueryId: cb.id, text: 'not allowed' });
         continue;
       }
-      // Forum-topic /new-flow taps (tgm: model, tgp: recent-path, tgr: re-spawn) route the spawn
-      // flow — checked first and only when topics mode is on (with the flag off a stray topic tap
-      // falls through to the question/agent parsers, which reject it as expired — never spawns). A
-      // tap whose thread is CLOSED in this SAME batch is answered as expired, NOT routed to the spawn
-      // flow (codex r21: the close wins over a same-batch spawn tap, so no spawn-into-a-closed-topic).
-      if (opts.topicsEnabled) {
-        const modelCb = parseTopicModelCallback(cb.data);
-        if (modelCb) {
-          callbackActions.push(
-            lifecycleInBatch.has(modelCb.threadId)
-              ? { kind: 'answer-callback', callbackQueryId: cb.id, text: 'topic changed — try again' }
-              : {
-                  kind: 'topic-model',
-                  callbackQueryId: cb.id,
-                  threadId: modelCb.threadId,
-                  modelId: modelCb.modelId,
-                  messageId: cb.message?.message_id ?? null,
-                },
-          );
-          continue;
-        }
-        const pathCb = parseTopicPathCallback(cb.data);
-        if (pathCb) {
-          callbackActions.push(
-            lifecycleInBatch.has(pathCb.threadId)
-              ? { kind: 'answer-callback', callbackQueryId: cb.id, text: 'topic changed — try again' }
-              : {
-                  kind: 'topic-path',
-                  callbackQueryId: cb.id,
-                  threadId: pathCb.threadId,
-                  index: pathCb.index,
-                  nonce: pathCb.nonce,
-                  messageId: cb.message?.message_id ?? null,
-                },
-          );
-          continue;
-        }
-        const respawnThreadId = parseTopicRespawnCallback(cb.data);
-        if (respawnThreadId !== null) {
-          callbackActions.push(
-            lifecycleInBatch.has(respawnThreadId)
-              ? { kind: 'answer-callback', callbackQueryId: cb.id, text: 'topic changed — try again' }
-              : {
-                  kind: 'topic-respawn',
-                  callbackQueryId: cb.id,
-                  threadId: respawnThreadId,
-                  messageId: cb.message?.message_id ?? null,
-                },
-          );
-          continue;
-        }
+      // Attach-picker taps (tgt:<thread>:<pane>) deliver a held topic queue. Appended to the
+      // ordered action stream, not callbackActions: a same-batch message to that topic must join
+      // the queue BEFORE the tap drains it. With topics mode off a stray tap falls through to the
+      // question parser, which answers it as expired.
+      const attachCb = opts.topicsEnabled ? parseTopicAttachCallback(cb.data) : null;
+      if (attachCb) {
+        actions.push({
+          kind: 'topic-attach',
+          callbackQueryId: cb.id,
+          threadId: attachCb.threadId,
+          paneId: attachCb.paneId,
+          messageId: cb.message?.message_id ?? null,
+        });
+        continue;
       }
       // Flat-chat /new taps (tnh: harness, tnm: model, tnp: recent-dir) route the new-session flow. NOT gated by
       // topics mode — /new is a flat-chat command. A stale tap whose session expired is rejected by
@@ -367,46 +301,22 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
     // Owner text/media inbound is NOT dropped by age (#183): a message Telegram
     // delivered after daemon downtime or while agents were busy is still a real
     // request and must reach the agent, not vanish behind a "skipped N stale"
-    // notice. A stale forum lifecycle TRANSITION (close/reopen/renamed) IS still
-    // ignored by age — consistent with the same-batch lifecycle pre-scan above
-    // (codex r22): an old topic-state event must not re-drive routing after
-    // downtime, and processing it here while the pre-scan ignores it would let a
-    // same-batch spawn tap orphan into a closing topic. CREATION is the exception
-    // (codex #195): a topic created while the daemon was down > stalenessSec must
-    // STILL reach topicActionFor so it emits topic-new and TRACKS the topic —
-    // else later messages in it are untracked and never bound to an agent.
-    if (isForumServiceMessage(m) && !m.forum_topic_created && opts.nowSec - m.date > opts.cfg.stalenessSec) continue;
-
+    // notice.
     const name = m.from?.first_name || m.from?.username || 'tg';
 
-    // Forum-topics mode: a topic service message or a message inside a TRACKED topic is
-    // handled here and the flat dispatch is skipped. topicActionFor returns null ONLY when
-    // this is not a topic message we own (topics OFF, General, a non-forum reply-thread, or
-    // an untracked topic) → fall through to the normal handling, unchanged. A KNOWN topic
-    // returns a (possibly empty) action list so its messages can NEVER leak to a flat agent
-    // (the media/closed mis-routing the review caught).
+    // Forum-topics mode: a topic service message or ANY message inside a forum topic is
+    // triaged here and the flat dispatch is skipped (§4.4). topicActionFor returns null ONLY
+    // when this is not a topic message (General, or a non-forum reply-thread) → the normal
+    // flat handling, unchanged. Every topic message either delivers or answers in its topic.
     if (opts.topicsEnabled) {
-      // A text/media message in a thread the SAME batch CLOSES or REOPENS, and that arrived AFTER the
-      // transition (higher update_id), must NOT emit a topic-route or a dead-topic recovery (codex r24
-      // P1b / r27): it would route into / offer a re-spawn for a topic the lifecycle transition is
-      // about to change. Ack only — the transition wins. ORDER-AWARE (codex r30): a message BEFORE the
-      // transition (lower update_id) is processed normally. Service messages flow through below.
-      const tid = m.message_thread_id;
-      const lifeId = tid !== undefined ? lifecycleInBatch.get(tid) : undefined;
-      if (
-        lifeId !== undefined &&
-        u.update_id > lifeId &&
-        !m.forum_topic_closed &&
-        !m.forum_topic_reopened &&
-        !m.forum_topic_created
-      ) {
-        actions.push({ kind: 'ack', messageId: m.message_id });
-        continue;
-      }
-      const topicActions = topicActionFor(m, name, opts);
+      const topicActions = topicActionFor(u.update_id, m, name, opts);
       if (topicActions) {
         actions.push(...topicActions);
-        actions.push({ kind: 'ack', messageId: m.message_id });
+        // Delivery receipt, as in the flat path: not for a service message (nothing was sent)
+        // nor for a pure error reply (the reply IS the "did not land" signal).
+        if (topicActions.some((a) => a.kind !== 'reply' && a.kind !== 'topic-event')) {
+          actions.push({ kind: 'ack', messageId: m.message_id });
+        }
         continue;
       }
     }
@@ -620,119 +530,96 @@ export function isLikelySlashCommand(text: string): boolean {
   return /^\/[a-zA-Z][\w-]*(\s|$)/.test(text);
 }
 
-// Forum-topics routing (docs/specs/tg-forum-topics.md §8). Returns the action list for a
-// topic service-message or a message inside a TRACKED topic, else null to fall through to the
-// flat handling. PURE: the bound/awaiting decision uses the injected `topicStatusOf` lookup;
-// the entrypoint owns the binding store and resolves threadId→pane.
-//
-// A KNOWN topic always returns a list (possibly empty) so its messages can NEVER fall through
-// to a flat agent — leaking a topic message to the flat picker injects it into the wrong agent
-// and replies in General (the media/closed mis-routing the review caught). null is reserved for
-// "not ours": General, a non-forum reply-thread (message_thread_id present but is_topic_message
-// absent — a supergroup reply thread, NOT a forum topic), or an untracked topic.
-function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | null {
-  if (m.forum_topic_created) {
-    // The service message's thread id IS the topic id (== its own message_id as a fallback).
+// Daemon verbs answered in ANY forum topic, bound or not (§4.4 row 1). `/stop` and `/kill` are
+// deliberately absent: in a bound topic they reach that topic's session, and in an unknown topic
+// they are held like any other message.
+const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks', '/limit', '/daily', '/spend']);
+
+// Inbound topic triage (docs/specs/session-registry-and-topics.md §4.4). Returns the actions for
+// a topic service message or a message inside a forum topic, else null ("not a topic message":
+// General, or a non-forum supergroup reply-thread) so the flat handling runs unchanged. PURE:
+// the bound/unknown decision uses the injected `topicStatusOf`; whether a bound session is still
+// alive is I/O, so the entrypoint answers "not running" for a gone one. No branch returns an
+// empty list for a user message: each delivers, holds, or replies in the topic.
+function topicActionFor(updateId: number, m: TgMessage, name: string, opts: StepOpts): Action[] | null {
+  const event = forumEventOf(m);
+  if (event) {
+    // The service message's thread id IS the topic id (its own message_id as a fallback).
     const threadId = m.message_thread_id ?? m.message_id;
-    // Guard against a DUPLICATE create for a topic already in-flight or bound: re-emitting
-    // topic-new would let the entrypoint reset it to awaiting-path (createTopic + upsert) and
-    // lose the live pane. Only an untracked or previously-closed topic starts the flow.
-    const created = opts.topicStatusOf?.(threadId) ?? null;
-    if (created === 'bound' || created === 'awaiting-path' || created === 'awaiting-model') return [];
-    return [{ kind: 'topic-new', threadId, name: m.forum_topic_created.name, from: name }];
+    const topicName = m.forum_topic_created?.name ?? m.forum_topic_edited?.name;
+    return [{ kind: 'topic-event', threadId, event, ...(topicName ? { name: topicName } : {}) }];
   }
   const threadId = m.message_thread_id;
-  if (threadId === undefined) return null; // General / non-topic message → flat handling
-  // close/reopen are gated on the topic being TRACKED — an untracked topic (created before the
-  // bot joined / before topics were enabled) closing is not ours, so don't emit an action the
-  // entrypoint has no binding for (keeps the "untracked → not ours" symmetry; review catch).
-  if (m.forum_topic_closed) return (opts.topicStatusOf?.(threadId) ?? null) !== null ? [{ kind: 'topic-close', threadId }] : [];
-  if (m.forum_topic_reopened) return (opts.topicStatusOf?.(threadId) ?? null) !== null ? [{ kind: 'topic-reopen', threadId }] : [];
-  // A topic RENAME (forum_topic_edited) is a recognized service message — never leak to flat.
-  // If the edit carries a new name and the topic is tracked, emit topic-rename so the entrypoint
-  // can persist the new name and rename the live tmux window slug. An icon-only edit (no name
-  // field) or an untracked topic → ack quietly (same "known topic stays ours" invariant).
-  if (m.forum_topic_edited) {
-    const newName = m.forum_topic_edited.name;
-    if (newName && opts.topicStatusOf?.(threadId) != null) {
-      return [{ kind: 'topic-rename', threadId, name: newName }];
-    }
-    return [];
+  // A non-forum supergroup reply-thread also carries message_thread_id; only a real forum topic
+  // message sets is_topic_message.
+  if (threadId === undefined || !m.is_topic_message) return null;
+  const text = m.text ?? '';
+  const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, '');
+  if (TOPIC_GLOBAL_CMDS.has(verb)) {
+    return [textAction(text, name, opts, m.message_id, m.reply_to_message?.message_id ?? null, threadId)];
   }
-  // A non-forum supergroup reply-thread also carries message_thread_id; only a real forum
-  // topic message sets is_topic_message. Without it we'd false-capture a reply thread whose id
-  // happened to match a tracked topic — so require the flag for non-service messages.
-  if (!m.is_topic_message) return null;
-  const status = opts.topicStatusOf?.(threadId) ?? null;
-  // A real forum-topic message (is_topic_message) for a topic the daemon hasn't bound yet is still
-  // OURS — acked, not leaked to a flat agent (which would reply in General, out of the topic). The
-  // increment-2 entrypoint binds it (e.g. spawns on first message); until then it is a no-op ack,
-  // never a mis-route (review: untracked must not reply in General, spec §10).
-  if (status === null) return [];
-  if (status === 'bound') {
-    // A message to the topic's agent. A real slash-command is injected verbatim (so /compact,
-    // /stop, … reach the agent); everything else is PROSE — wrapped so the agent gets the
-    // sender + message_id and can `tg --reply-to <id>` back into the topic. The command test is
-    // narrow (`/word` …, no second slash) so a path-like message — `/etc/hosts is broken`,
-    // `/tmp/foo crashed` — is treated as prose, not mis-read as a command (review catch). A
-    // media-only message (no text) is acked but NOT injected here — routing media into the topic
-    // is increment 2; the point is it must never leak to a flat agent.
-    const text = m.text ?? '';
-    if (!text) return [];
-    // §11 deferral 2: intercept the 3 daemon-global verbs (/status, /agent, /new) even inside
-    // a bound topic — they control the daemon, not the topic agent. /stop and /kill are NOT
-    // intercepted: they must still reach the topic's pane (kill/escape the harness session).
-    // Using an explicit set (not isDaemonSlashCommand) to avoid over-intercepting.
-    const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks', '/limit', '/daily', '/spend']);
-    const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, '');
-    if (TOPIC_GLOBAL_CMDS.has(verb)) return [textAction(text, name, opts, m.message_id, m.reply_to_message?.message_id ?? null, threadId)];
-    // A `!shell` passthrough is VERBATIM into the topic pane (harness `!` convention): no wrap and
-    // no reply quote-anchor, so the `!` stays at column 0 — same rule as the flat path. Checked
-    // before the reply-anchor branch so a `!` reply is verbatim too. A catastrophic shape is
-    // intercepted by shellPassthroughGate and replied to IN THE TOPIC instead of injected.
+  const payload = topicPayloadOf(updateId, m, name, opts);
+  if (typeof payload === 'string') return [{ kind: 'reply', text: payload, threadId }];
+  return (opts.topicStatusOf?.(threadId) ?? null) === null
+    ? [{ kind: 'topic-hold', threadId, payload }]
+    : [{ kind: 'topic-route', threadId, payload }];
+}
+
+// The deliverable form of a topic message, or the reply text when it cannot be delivered.
+function topicPayloadOf(updateId: number, m: TgMessage, name: string, opts: StepOpts): TopicPayload | string {
+  const messageId = m.message_id;
+  if (m.text) {
+    const text = m.text;
+    // A `!shell` passthrough is VERBATIM (harness `!` convention): no wrap and no quote-anchor,
+    // so the `!` stays at column 0 — same rule as the flat path. Checked before the reply-anchor
+    // branch so a `!` reply is verbatim too. A catastrophic shape is answered instead.
     if (text.startsWith('!')) {
       const shellGate = shellPassthroughGate(text);
-      if (shellGate.warning) return [{ kind: 'reply', text: shellGate.warning, threadId }];
-      return [{ kind: 'topic-route', threadId, injectText: shellGate.injectText, from: name, messageId: m.message_id }];
+      return shellGate.warning ?? { type: 'text', text: shellGate.injectText, from: name, messageId };
     }
-    // §11 deferral 1: a prose reply carries the same ↩ «…» quote-anchor as flat-chat replies.
-    // A /command reply still goes verbatim (the startsWith('/') guard above already passed it
-    // through to the injectText path below).
+    // A prose reply carries the same ↩ «…» quote-anchor as a flat-chat reply; a /command reply
+    // stays verbatim.
     if (m.reply_to_message && !text.startsWith('/')) {
-      return [{ kind: 'topic-route', threadId, injectText: buildReplyInject(m, name, opts), from: name, messageId: m.message_id }];
+      return { type: 'text', text: buildReplyInject(m, name, opts), from: name, messageId };
     }
-    const injectText = isLikelySlashCommand(text) ? text : opts.wrap(name, text, m.message_id);
-    return [{ kind: 'topic-route', threadId, injectText, from: name, messageId: m.message_id }];
+    // The command test is narrow (`/word` …, no second slash) so a path-like message —
+    // `/etc/hosts is broken` — is prose and gets wrapped, not injected as a command.
+    return { type: 'text', text: isLikelySlashCommand(text) ? text : opts.wrap(name, text, messageId), from: name, messageId };
   }
-  if (status === 'closed') {
-    // The topic's agent died (pane gone). A message here is not lost: emit topic-dead so the
-    // entrypoint offers a one-tap re-spawn (increment 4) instead of the old silent dead-end.
-    // Carry the wrapped text so a SAME-BATCH re-spawn (which re-binds before this runs) can route
-    // it to the now-live pane rather than dropping it (codex r9 #1). Never leaks to a flat agent.
-    const deadText = m.text ?? '';
-    // A `!` here is the SAME verbatim-passthrough surface as the other three: if a
-    // SAME-BATCH re-spawn re-binds this topic before this action runs, handleTopicDead
-    // replays injectText VERBATIM into the freshly-live pane via handleTopicRoute — so an
-    // ungated dangerous command here would reach a real shell exactly like the bound-topic
-    // path does. Gate it identically; a blocked command becomes a wrapped warning instead
-    // of raw shell text (still carried through on same-batch re-spawn, but as prose, never
-    // executed).
-    const deadBangGate = deadText.startsWith('!') ? shellPassthroughGate(deadText) : null;
-    const deadInject = !deadText
-      ? ''
-      : deadBangGate?.warning
-        ? opts.wrap(name, deadBangGate.warning, m.message_id)
-        : deadBangGate
-          ? deadBangGate.injectText // safe or `!!`-confirmed bang (already peeled)
-          : isLikelySlashCommand(deadText)
-            ? deadText
-            : opts.wrap(name, deadText, m.message_id);
-    return [{ kind: 'topic-dead', threadId, injectText: deadInject, messageId: m.message_id }];
+  const anchor = m.reply_to_message ? { anchor: buildReplyAnchor(m, opts) } : {};
+  const voice = m.voice ?? m.audio;
+  if (voice) {
+    if ((voice.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return TOO_LARGE_REPLY;
+    return { type: 'voice', fileId: voice.file_id, suggestedName: `${updateId}.ogg`, ...anchor, from: name, messageId };
   }
-  // awaiting-path / awaiting-model: a text answer to the /new flow. A path message advances the
-  // flow (the model is picked by the `tgm:` button callback handled in the callback branch above,
-  // NOT as text — an awaiting-model text message just re-shows the buttons in the entrypoint).
-  return [{ kind: 'topic-answer', threadId, text: m.text ?? '', from: name, messageId: m.message_id }];
+  const file = m.photo?.length ? largestPhoto(m.photo) : m.document;
+  if (file) {
+    if ((file.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return TOO_LARGE_REPLY;
+    const isPhoto = !!m.photo?.length;
+    return {
+      type: 'media',
+      mediaKind: isPhoto ? 'photo' : 'document',
+      fileId: file.file_id,
+      suggestedName: `${updateId}.${isPhoto ? 'jpg' : sanitizedExt(m.document?.file_name)}`,
+      ...(m.caption ? { caption: m.caption } : {}),
+      ...anchor,
+      from: name,
+      messageId,
+    };
+  }
+  return UNSUPPORTED_TOPIC_MESSAGE_REPLY;
+}
+
+const UNSUPPORTED_TOPIC_MESSAGE_REPLY = 'not delivered — a session only receives text, voice, photos and files';
+
+// Telegram sends several renditions; take the largest by file_size. Ties and missing sizes
+// resolve to the LATER entry — the array is size-ascending.
+function largestPhoto(photos: TgPhotoSize[]): TgPhotoSize {
+  let best = photos[0];
+  for (const p of photos) {
+    if ((p.file_size ?? 0) >= (best.file_size ?? 0)) best = p;
+  }
+  return best;
 }
 
 function attachMediaReplyRoute(
@@ -754,12 +641,7 @@ function attachMediaReplyRoute(
 }
 
 function photoAction(updateId: number, m: TgMessage, name: string, opts: StepOpts): Action {
-  // Telegram sends several renditions; take the largest by file_size. Ties and
-  // missing sizes resolve to the LATER entry — the array is size-ascending.
-  let best = m.photo![0];
-  for (const p of m.photo!) {
-    if ((p.file_size ?? 0) >= (best.file_size ?? 0)) best = p;
-  }
+  const best = largestPhoto(m.photo!);
   if ((best.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return { kind: 'reply', text: TOO_LARGE_REPLY };
   return attachMediaReplyRoute(
     {

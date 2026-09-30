@@ -1,7 +1,7 @@
 // Content gate for tg-ctl's `!<shell command>` Telegram passthrough.
 //
-// Why this exists: `textAction()`, `topicActionFor()`'s bound-topic branch, its
-// closed-topic (`topic-dead`) branch, and the flat entrypoint's `!`-reply path
+// Why this exists: `textAction()`, `topicPayloadOf()` (bound or held topic
+// messages), and the flat entrypoint's `!`-reply path
 // (all in `updates.ts`) inject a `!`-prefixed message VERBATIM into the attached
 // harness's live tmux pane the instant it arrives. The ONLY check upstream is
 // `senderAllowed` — an IDENTITY check (is this Telegram user on the allowlist?).

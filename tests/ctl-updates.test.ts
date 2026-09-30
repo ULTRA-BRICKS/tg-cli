@@ -483,47 +483,6 @@ test('message from a disallowed sender is dropped regardless of age', () => {
   expect(r.newOffset).toBe(2);
 });
 
-test('a STALE forum lifecycle service message is still ignored by age (#183 excludes service msgs)', () => {
-  // Owner text is delivered regardless of age, but a stale topic-state TRANSITION
-  // (close/reopen/renamed) carries no instruction and must not re-drive routing
-  // after downtime — consistent with the same-batch lifecycle pre-scan. Topic
-  // CREATION is the exception (see the test below): it must still be tracked.
-  const staleClose = upd(1, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false, date: NOW - 9999 });
-  const r = stepUpdates([staleClose], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
-  expect(r.actions.some((a) => a.kind === 'topic-close')).toBe(false);
-  // A FRESH close of the same topic IS processed.
-  const freshClose = upd(2, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false });
-  const r2 = stepUpdates([freshClose], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
-  expect(r2.actions.some((a) => a.kind === 'topic-close')).toBe(true);
-});
-
-test('a STALE forum_topic_created is STILL processed (creation is not age-dropped)', () => {
-  // A topic created while the daemon was down longer than stalenessSec must NOT
-  // be age-dropped: unlike close/reopen, creation is what makes topicActionFor
-  // emit topic-new and TRACK the topic. Dropping it leaves later messages in that
-  // topic untracked (only acked, never bound to an agent). Only close/reopen keep
-  // the age gate. (codex #195)
-  const staleCreate = upd(1, {
-    forum_topic_created: { name: 'api' },
-    message_thread_id: 50,
-    is_topic_message: false,
-    date: NOW - 9999,
-  });
-  const r = stepUpdates([staleCreate], makeOpts({ topicsEnabled: true, topicStatusOf: () => null }));
-  // The exact topic-new action must be emitted (thread id + name), so the
-  // entrypoint tracks the topic — not merely "some action".
-  expect(r.actions.find((a) => a.kind === 'topic-new')).toEqual({
-    kind: 'topic-new',
-    threadId: 50,
-    name: 'api',
-    from: 'Alex',
-  });
-  // Contrast: a stale close of the SAME (untracked) topic is still age-dropped.
-  const staleClose = upd(2, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false, date: NOW - 9999 });
-  const rc = stepUpdates([staleClose], makeOpts({ topicsEnabled: true, topicStatusOf: () => null }));
-  expect(rc.actions.some((a) => a.kind === 'topic-close')).toBe(false);
-});
-
 // --- command split (spec §13) ---
 
 test('/stop → inject-key Escape', () => {

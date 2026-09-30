@@ -3,6 +3,23 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.13
+
+- **Forum topics: inbound triage replaces the spawn wizard (#457).** Creating a topic no longer
+  starts the path → model → spawn flow; `forum_topic_created` / `_edited` / `_closed` /
+  `_reopened` are only logged. A message in an unknown topic (user-created, implicit, or a lost
+  binding) is held and answered with an attach picker of live sessions (most recent first); a pick
+  delivers the held text, photos, files and voice notes in order, exactly once, and binds the topic
+  (renamed via `editForumTopic`) or links the session's existing topic. Holds persist in
+  `tg-ctl.<bot>.topic-holds.json`, survive a restart, and expire after 10 min with an "N messages
+  not delivered" reply. At most 200 topics are held at once: a new one evicts the oldest hold,
+  which gets the same reply. With no session running, the "start one" notice is posted once per
+  hold, not per message. A `/new` topic whose spawn failed or never finished becomes unknown again
+  (its next message gets the attach picker). Daemon verbs (`/status`, `/agent`, …) answer in any
+  topic; a gone session answers "not running — resume with …" (the harness's own resume command;
+  a harness without one gets a generic hint); bound-topic media is delivered instead of silently
+  acked. No topic message is dropped without a reply.
+
 ## 1.54.11
 
 **Debounced rename in place; `tg replies` keyed by session; locked history writes (#460, #136).**

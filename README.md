@@ -325,24 +325,20 @@ inbound topic message routes to its bound pane.
 
 Caveats while this is experimental:
 
-- **Creating a topic spawns an agent.** A `forum_topic_created` starts the per-topic `/new` flow:
-  the daemon asks for the working directory (offering recent project cwds as one-tap buttons, with a
-  free-text fallback), then the model (catalog buttons), then `tmux new-window`s a fresh agent bound
-  to that topic. Messages to the topic route to its pane; the agent's replies thread back.
-- **An agent's own `tg` replies thread into their topic automatically.** A topic-spawned agent's
-  window carries `TG_TOPIC=<id>` (stamped by the daemon at spawn), so a plain `tg "reply"` lands in
-  the topic, not General — no `--topic` needed. (You can still pass `tg --topic <id>` / `TG_TOPIC`
-  explicitly for a non-spawned shell; `TG_TOPIC` is *advisory* for **text / rich** sends — a stale or
-  closed topic id falls back to General rather than hard-failing — whereas an explicit `--topic` is
-  strict. A `--photo`/`--file`/album send with a stale env topic is NOT covered by that fallback.)
-- **A dead topic offers a one-tap re-spawn.** If a topic's agent exits, the next message offers a
-  *Re-spawn* button that re-launches with the retained project + model (or restarts setup if the dir
-  vanished). A daemon restart re-binds a crash-orphaned agent to its topic instead of double-spawning.
-- **Closing then reopening a LIVE topic does NOT re-attach its agent.** `forum_topic_reopened`
-  drops the old pane binding and restarts the `/new` flow (re-pick model → re-spawn) rather than
-  re-attaching the still-running original agent — so that agent keeps running untracked in its old
-  pane until it idle-exits. Don't close/reopen a topic whose agent is mid-task; let it finish or
-  send `/stop` first.
+- **A topic never spawns anything.** Creating, renaming, closing or reopening a topic is only
+  recorded. A message in a topic that is not linked to a session (a topic you created, or an
+  implicit one) is held and the bot posts an **attach picker** there: tap a live session and the
+  held messages reach it in order. If that session has no topic yet, this topic becomes its topic
+  (renamed to the session's name); otherwise the reply links its own topic. Held messages expire
+  after 10 minutes with a "N messages not delivered" reply, and survive a daemon restart.
+- **Daemon verbs work in any topic.** `/status`, `/agent`, `/new`, `/tasks`, `/limit`, `/daily`
+  and `/spend` are answered inside the topic, linked or not. `/stop` and `/kill` reach the topic's
+  session.
+- **A gone session answers, it does not respawn.** A message in a topic whose session exited gets
+  "`<name>` is not running — resume with …"; nothing is delivered elsewhere.
+- **An agent's own `tg` replies** thread into a topic only with `tg --topic <id>` / `TG_TOPIC`
+  (a flat `/new` with `private_topics` stamps it); a `TG_TOPIC` stale id falls back to General for
+  text sends.
 
 See `docs/specs/tg-forum-topics.md` (§9 increment plan) for the design of this shipped behaviour. It
 is superseded by `docs/specs/session-registry-and-topics.md` (one bot-created topic per existing

@@ -223,7 +223,7 @@ export function parseNewCommand(text: string): ParsedNewCommand {
 // --- parents-aware LRU/MRU directory ranker (issue #27 acceptance) ---
 
 // How many recent-dir buttons to offer. A long menu is noise; the free-text fallback always
-// remains. Mirrors the topic flow's MAX_PATH_CHOICES so both menus feel the same.
+// remains.
 export const MAX_NEW_DIR_CHOICES = 8;
 
 // How many `..` parents to expand per recent cwd (review #4): a single deeply-nested recent cwd
@@ -233,7 +233,7 @@ export const MAX_NEW_DIR_CHOICES = 8;
 export const MAX_PARENTS_PER_CWD = 2;
 
 // Build the ranked, deduped recent-directory candidate list for the `/new` dir buttons.
-// Unlike the topic flow's recentPathChoices, this ALSO adds each in-use dir's `..` PARENTS
+// It adds each in-use dir's `..` PARENTS too
 // (issue #27: "the dirs already in use + their `..` parents"), so a user can spawn one level
 // up from where an agent already runs. Ranking is LRU/MRU: the caller passes candidate cwds
 // newest-first (most-recently-used first); a dir keeps the rank of its FIRST (newest) mention,

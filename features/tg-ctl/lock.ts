@@ -21,6 +21,7 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     routes: join(configDir, `${base}.routes.json`),
     history: join(configDir, `${base}.history.jsonl`),
     topics: join(configDir, `${base}.topics.json`),
+    topicHolds: join(configDir, `${base}.topic-holds.json`),
     questions: join(configDir, `${base}.questions.json`),
     grants: join(configDir, `${base}.grants.json`),
     schedules: join(configDir, `${base}.schedules.json`),

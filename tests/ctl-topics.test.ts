@@ -2,38 +2,44 @@ import { expect, test } from 'bun:test';
 import { stepUpdates } from '../features/tg-ctl/updates';
 import {
   DEFAULT_CONTROL,
+  type Action,
   type ControlConfig,
   type TgMessage,
   type TgUpdate,
   type TopicBinding,
+  type TopicPayload,
   type TopicStatus,
 } from '../features/tg-ctl/types';
 import {
   appendTopic,
-  applyModelAnswer,
-  applyPathAnswer,
-  buildModelKeyboard,
-  buildPathKeyboard,
-  buildRespawnKeyboard,
-  createTopic,
+  attachTopic,
+  buildAttachKeyboard,
+  capHolds,
+  dropHold,
+  findHold,
   findTopic,
-  isAwaitingAnswer,
-  clearSpawnPending,
+  goneTopicReply,
+  holdExpiredReply,
+  holdPayload,
   markBound,
   markClosed,
-  markRenamed,
-  markReopened,
-  markRespawnOffered,
+  markNoSessionNotice,
   markSpawnPending,
-  MAX_PATH_CHOICES,
+  MAX_TOPIC_HOLDS,
   MAX_TOPICS,
+  type TopicHold,
+  parseHolds,
+  parseTopicAttachCallback,
   parseTopics,
-  parseTopicModelCallback,
-  parseTopicPathCallback,
-  parseTopicRespawnCallback,
-  recentPathChoices,
+  serializeHolds,
   serializeTopics,
+  setHoldPicker,
   slugifyTopicName,
+  splitExpiredHolds,
+  topicForPane,
+  topicLink,
+  topicTitle,
+  TOPIC_HOLD_TTL_SEC,
 } from '../features/tg-ctl/topics';
 import { DEFAULT_MODEL_ID, findModel, harnessLabel, MODEL_CATALOG, modelsForHarness, spawnArgv, spawnArgvWithTask } from '../features/tg-ctl/models';
 
@@ -66,6 +72,12 @@ function upd(id: number, msg: Partial<TgMessage>): TgUpdate {
   };
 }
 
+const bound = makeOpts({ topicsEnabled: true, topicStatusOf: (t) => (t === 50 ? 'bound' : null) });
+const unknown = makeOpts({ topicsEnabled: true, topicStatusOf: () => null });
+const inTopic = (id: number, msg: Partial<TgMessage>, thread = 50): TgUpdate =>
+  upd(id, { message_thread_id: thread, is_topic_message: true, ...msg });
+const text = (t: string, messageId: number): TopicPayload => ({ type: 'text', text: t, from: 'Alex', messageId });
+
 // --- model catalog ---
 
 test('model catalog: default is first, findModel + spawnArgv resolve', () => {
@@ -78,8 +90,6 @@ test('model catalog: default is first, findModel + spawnArgv resolve', () => {
 });
 
 test('spawnArgv keeps a spaced path as a single argv element (no shell split)', () => {
-  // path is not part of the claude argv today, but the builder must never split it
-  // — assert the builder is called with the path intact and returns a clean argv.
   expect(spawnArgv('claude-default', '/a b/c')).toEqual(['claude']);
 });
 
@@ -106,831 +116,402 @@ test('model catalog helpers: harness labels, harness filters, and task argv', ()
   expect(spawnArgvWithTask('nope', '/x', 'do it')).toBeNull();
 });
 
-// --- store ---
+// --- binding store ---
 
 test('topics store: round-trips and upserts by threadId', () => {
-  const a: TopicBinding = { threadId: 10, name: 'api', status: 'awaiting-path', ts: 1 };
+  const a: TopicBinding = { threadId: 10, name: 'api', status: 'bound', paneId: '%1', harness: 'omp', ts: 1 };
   const b: TopicBinding = { threadId: 20, name: 'web', status: 'bound', paneId: '%3', path: '/w', model: 'claude-opus', ts: 2 };
   let topics = appendTopic(appendTopic([], a), b);
-  expect(findTopic(topics, 10)).toEqual(a);
+  expect(findTopic(topics, 10)?.harness).toBe('omp');
   expect(findTopic(topics, 20)?.paneId).toBe('%3');
-  // upsert: same threadId replaces, not duplicates
-  topics = appendTopic(topics, { ...a, status: 'bound', paneId: '%9', ts: 3 });
+  topics = appendTopic(topics, { ...a, paneId: '%9', ts: 3 });
   expect(topics.filter((t) => t.threadId === 10)).toHaveLength(1);
   expect(findTopic(topics, 10)?.paneId).toBe('%9');
-  // serialize → parse round-trip
   expect(parseTopics(serializeTopics(topics))).toEqual(topics);
 });
 
 test('topics store: parse rejects junk + non-array, keeps valid', () => {
   expect(parseTopics(null)).toEqual([]);
   expect(parseTopics('not json')).toEqual([]);
-  expect(parseTopics('{"threadId":1}')).toEqual([]); // not an array
+  expect(parseTopics('{"threadId":1}')).toEqual([]);
   expect(parseTopics('[{"threadId":"x","status":"bound"},{"threadId":5,"status":"nope"},{"threadId":7,"name":"ok","status":"bound","paneId":"%2","ts":9}]'))
     .toEqual([{ threadId: 7, name: 'ok', status: 'bound', path: undefined, model: undefined, paneId: '%2', ts: 9 }]);
 });
 
+test('topics store: rows left by the deleted spawn wizard are dropped, so the topic is unknown again', () => {
+  const raw = JSON.stringify([
+    { threadId: 1, name: 'mid-path', status: 'awaiting-path', ts: 1, pathChoices: ['/a'] },
+    { threadId: 2, name: 'mid-model', status: 'awaiting-model', path: '/p', ts: 1 },
+    { threadId: 3, name: 'spawning', status: 'awaiting-model', path: '/p', model: 'claude-opus', spawnPending: true, spawnToken: 't', ts: 1 },
+    { threadId: 4, name: 'dead', status: 'closed', paneId: '%4', respawnOffered: true, ts: 1 },
+  ]);
+  const topics = parseTopics(raw);
+  expect(findTopic(topics, 1)).toBeNull();
+  expect(findTopic(topics, 2)).toBeNull();
+  // a flat /new private-topic spawn in flight is kept for startup orphan reconcile
+  expect(findTopic(topics, 3)?.spawnToken).toBe('t');
+  // a gone session keeps its binding (it answers "not running"); wizard-only fields are gone
+  expect(findTopic(topics, 4)).toEqual({ threadId: 4, name: 'dead', status: 'closed', path: undefined, model: undefined, paneId: '%4', ts: 1 });
+});
+
 test('topics store: parse drops a bound binding with no paneId, and a NaN ts → 0', () => {
-  // bound-without-pane would route into nothing → dropped (re-binds on next message)
   expect(parseTopics('[{"threadId":7,"name":"x","status":"bound","ts":1}]')).toEqual([]);
-  // a NaN ts (typeof NaN === 'number') must not slip through — normalized to 0
-  expect(parseTopics('[{"threadId":7,"name":"x","status":"awaiting-path","ts":null}]')[0]?.ts).toBe(0);
+  expect(parseTopics('[{"threadId":7,"name":"x","status":"closed","paneId":"%1","ts":null}]')[0]?.ts).toBe(0);
 });
 
 test('topics store: caps at MAX_TOPICS keeping the newest', () => {
   let topics: TopicBinding[] = [];
-  for (let i = 0; i < MAX_TOPICS + 5; i++) topics = appendTopic(topics, { threadId: i, name: `t${i}`, status: 'bound', ts: i });
+  for (let i = 0; i < MAX_TOPICS + 5; i++) topics = appendTopic(topics, { threadId: i, name: `t${i}`, status: 'bound', paneId: '%1', ts: i });
   expect(topics).toHaveLength(MAX_TOPICS);
-  expect(findTopic(topics, 0)).toBeNull(); // oldest dropped
+  expect(findTopic(topics, 0)).toBeNull();
   expect(findTopic(topics, MAX_TOPICS + 4)?.name).toBe(`t${MAX_TOPICS + 4}`);
 });
 
-// --- lifecycle transitions ---
-
-test('lifecycle: create → path → model → bound', () => {
-  const created = createTopic(42, 'My Repo', 100);
-  expect(created).toEqual({ threadId: 42, name: 'My Repo', status: 'awaiting-path', ts: 100 });
-  expect(isAwaitingAnswer(created)).toBe(true);
-
-  const withPath = applyPathAnswer(created, '/Users/me/repo', 101);
-  expect(withPath.status).toBe('awaiting-model');
-  expect(withPath.path).toBe('/Users/me/repo');
-
-  const withModel = applyModelAnswer(withPath, 'claude-opus', 102);
-  expect(withModel?.model).toBe('claude-opus');
-  expect(withModel?.status).toBe('awaiting-model'); // stays until spawn succeeds
-
-  const bound = markBound(withModel!, '%7', 103);
-  expect(bound.status).toBe('bound');
-  expect(bound.paneId).toBe('%7');
-  expect(isAwaitingAnswer(bound)).toBe(false);
+test('topicForPane: only a BOUND binding makes a session "already have a topic"', () => {
+  const topics = [
+    { threadId: 1, name: 'a', status: 'closed' as const, paneId: '%1', ts: 1 },
+    { threadId: 2, name: 'b', status: 'bound' as const, paneId: '%2', ts: 1 },
+  ];
+  expect(topicForPane(topics, '%1')).toBeNull();
+  expect(topicForPane(topics, '%2')?.threadId).toBe(2);
+  expect(topicForPane(topics, 'omp:9')).toBeNull();
 });
 
-test('lifecycle: an invalid model id is rejected (re-ask), valid keeps the path', () => {
-  const withPath = applyPathAnswer(createTopic(1, 'x', 1), '/p', 2);
-  expect(applyModelAnswer(withPath, 'bogus', 3)).toBeNull();
-  expect(applyModelAnswer(withPath, 'claude-sonnet', 3)?.path).toBe('/p'); // path preserved
+test('attachTopic binds the topic to the picked session; markClosed keeps the pane for display', () => {
+  const b = attachTopic(77, { paneId: 'omp:42', name: 'api · omp', path: '/repo', harness: 'omp' }, 5);
+  expect(b).toEqual({ threadId: 77, name: 'api · omp', status: 'bound', paneId: 'omp:42', path: '/repo', harness: 'omp', ts: 5 });
+  expect(markClosed(b, 6)).toMatchObject({ status: 'closed', paneId: 'omp:42', ts: 6 });
 });
 
-test('lifecycle: close, then reopen resumes at awaiting-model when a path is known', () => {
-  const bound = markBound(applyModelAnswer(applyPathAnswer(createTopic(1, 'x', 1), '/p', 2), 'claude-opus', 3)!, '%2', 4);
-  const closed = markClosed(bound, 5);
-  expect(closed.status).toBe('closed');
-  const reopened = markReopened(closed, 6);
-  expect(reopened.status).toBe('awaiting-model'); // path known → re-pick model
-  expect(reopened.paneId).toBeUndefined(); // old pane dropped
-  // a topic reopened with no path restarts at awaiting-path
-  expect(markReopened(createTopic(2, 'y', 1), 7).status).toBe('awaiting-path');
+test('spawn markers: markSpawnPending drops a stale pane; markBound / markClosed clear both', () => {
+  const b: TopicBinding = { threadId: 1, name: 'x', status: 'awaiting-model', paneId: '%old', ts: 1 };
+  const pending = markSpawnPending(b, 'tok', 2);
+  expect(pending).toMatchObject({ spawnPending: true, spawnToken: 'tok' });
+  expect(pending.paneId).toBeUndefined();
+  for (const next of [markBound(pending, '%5', 3), markClosed(pending, 3)]) {
+    expect(next.spawnPending).toBeUndefined();
+    expect(next.spawnToken).toBeUndefined();
+  }
+});
+
+test('goneTopicReply names the session and the harness resume command', () => {
+  expect(goneTopicReply({ name: 'api', harness: 'omp' })).toBe('`api` is not running — resume with `rig omp run --resume …`');
+  expect(goneTopicReply({ name: 'web', harness: 'claude' })).toContain('`claude --resume`');
+  expect(goneTopicReply({ name: 'cx', harness: 'codex' })).toContain('`codex resume`');
+  // A harness with no known resume command gets a generic hint — never another harness's command.
+  for (const harness of [undefined, 'unknown', 'aider'] as const) {
+    expect(goneTopicReply({ name: 'old', harness })).toBe('`old` is not running — resume it, then send again');
+  }
 });
 
 test('slugifyTopicName: safe tmux window name, fallback to threadId', () => {
   expect(slugifyTopicName('My API Bot!', 5)).toBe('my-api-bot');
-  expect(slugifyTopicName('Апи Бот', 5)).toBe('api-bot'); // Cyrillic transliterated, not collapsed to topic-5
+  expect(slugifyTopicName('Апи Бот', 5)).toBe('api-bot');
   expect(slugifyTopicName('Ревью', 7)).toBe('revyu');
-  expect(slugifyTopicName('🔥🔥', 9)).toBe('topic-9'); // emoji-only → fallback (unmapped)
+  expect(slugifyTopicName('🔥🔥', 9)).toBe('topic-9');
   expect(slugifyTopicName('  ---  ', 5)).toBe('topic-5');
   expect(slugifyTopicName('a'.repeat(40), 5)).toHaveLength(24);
-  // the length cap must not re-expose a trailing dash (trim runs AFTER slice)
   expect(slugifyTopicName(`${'a'.repeat(23)} b`, 5)).toBe('a'.repeat(23));
 });
 
-// --- stepUpdates topic routing ---
+test('topicTitle caps at Telegram\'s 128 characters; topicLink only for supergroups', () => {
+  expect(topicTitle('short')).toBe('short');
+  const long = topicTitle('я'.repeat(200));
+  expect([...long]).toHaveLength(128);
+  expect(long.endsWith('…')).toBe(true);
+  expect(topicLink(-1001234567890, 42)).toBe('https://t.me/c/1234567890/42');
+  expect(topicLink(1000, 42)).toBeNull();
+});
+
+// --- unknown-topic hold ---
+
+test('hold: FIFO per topic, the expiry clock runs from the FIRST item', () => {
+  let holds = holdPayload([], 50, text('one', 1), NOW);
+  holds = holdPayload(holds, 60, text('other', 2), NOW + 5);
+  holds = holdPayload(holds, 50, text('two', 3), NOW + 590);
+  expect(findHold(holds, 50)?.payloads.map((p) => p.messageId)).toEqual([1, 3]);
+  expect(findHold(holds, 50)?.firstAt).toBe(NOW);
+  const { expired, open } = splitExpiredHolds(holds, NOW + TOPIC_HOLD_TTL_SEC);
+  expect(expired.map((h) => h.threadId)).toEqual([50]);
+  expect(open.map((h) => h.threadId)).toEqual([60]);
+  expect(dropHold(holds, 50).map((h) => h.threadId)).toEqual([60]);
+});
+
+test('hold store: survives a restart — round-trips payloads, picker id and first-item time', () => {
+  let holds = holdPayload([], 50, text('hi', 1), NOW);
+  holds = holdPayload(holds, 50, { type: 'media', mediaKind: 'photo', fileId: 'F', suggestedName: '9.jpg', caption: 'c', from: 'Alex', messageId: 2 }, NOW);
+  holds = holdPayload(holds, 50, { type: 'voice', fileId: 'V', suggestedName: '10.ogg', anchor: '↩ tg#1 «…»', from: 'Alex', messageId: 3 }, NOW);
+  holds = setHoldPicker(holds, 50, 900);
+  expect(parseHolds(serializeHolds(holds))).toEqual(holds);
+});
+
+test('hold store: corrupt input degrades to no holds; an invalid payload is skipped, not the hold', () => {
+  expect(parseHolds(null)).toEqual([]);
+  expect(parseHolds('garbage')).toEqual([]);
+  expect(parseHolds('{"version":99,"holds":[]}')).toEqual([]);
+  const raw = JSON.stringify({
+    version: 1,
+    holds: [
+      { threadId: 5, firstAt: NOW, pickerMessageId: 'x', payloads: [{ type: 'text', text: 'ok', from: 'A', messageId: 1 }, { type: 'sticker' }] },
+      { threadId: 6, firstAt: NOW, payloads: [{ type: 'text' }] },
+    ],
+  });
+  expect(parseHolds(raw)).toEqual([{ threadId: 5, firstAt: NOW, pickerMessageId: null, payloads: [{ type: 'text', text: 'ok', from: 'A', messageId: 1 }] }]);
+});
+
+test('hold cap: a new topic past MAX_TOPIC_HOLDS evicts the OLDEST hold, never the newest', () => {
+  let holds: TopicHold[] = [];
+  for (let t = 1; t <= MAX_TOPIC_HOLDS; t++) holds = holdPayload(holds, t, text(`m${t}`, t), NOW + t);
+  // A message joining an existing hold never evicts anything.
+  expect(capHolds(holdPayload(holds, 5, text('more', 999), NOW + 999)).evicted).toEqual([]);
+  const { kept, evicted } = capHolds(holdPayload(holds, 10_000, text('newest', 10_000), NOW + 10_000));
+  expect(kept).toHaveLength(MAX_TOPIC_HOLDS);
+  expect(findHold(kept, 10_000)?.payloads.map((p) => p.messageId)).toEqual([10_000]);
+  expect(evicted.map((h) => h.threadId)).toEqual([1]);
+  expect(findHold(kept, 1)).toBeNull();
+});
+
+test('hold cap: evicts by firstAt, not array position (a restored store may be out of order)', () => {
+  const holds: TopicHold[] = [];
+  for (let t = 1; t <= MAX_TOPIC_HOLDS; t++) holds.push({ threadId: t, firstAt: NOW + t, payloads: [text(`m${t}`, t)], pickerMessageId: null });
+  // The oldest hold sits in the middle of the array.
+  holds.splice(100, 0, { threadId: 9_999, firstAt: NOW - 500, payloads: [text('old', 9_999)], pickerMessageId: null });
+  const { kept, evicted } = capHolds(holds);
+  expect(evicted.map((h) => h.threadId)).toEqual([9_999]);
+  expect(kept.map((h) => h.threadId)).toEqual(holds.filter((h) => h.threadId !== 9_999).map((h) => h.threadId));
+});
+
+test('a dead picker resets the no-session notice, so the next message is answered again', () => {
+  let holds = markNoSessionNotice(holdPayload([], 7, text('a', 1), NOW), 7);
+  holds = setHoldPicker(holds, 7, 900); // a session started; a real picker was posted
+  holds = setHoldPicker(holds, 7, null); // its session exited
+  expect(findHold(holds, 7)?.noSessionNoticeSent).toBeUndefined();
+});
+
+test('holdExpiredReply counts the undelivered messages', () => {
+  expect(holdExpiredReply(1)).toBe('1 message not delivered — send again to reach a session');
+  expect(holdExpiredReply(3)).toBe('3 messages not delivered — send again to reach a session');
+});
+
+// --- attach picker ---
+
+test('attach picker: one button per session carrying tgt:<thread>:<pane>, parsed back exactly', () => {
+  const kb = buildAttachKeyboard(50, [
+    { paneId: '%3', label: 'api · omp' },
+    { paneId: 'omp:4242', label: 'web · omp' },
+  ]);
+  expect(kb).toEqual([[{ text: 'api · omp', callback_data: 'tgt:50:%3' }], [{ text: 'web · omp', callback_data: 'tgt:50:omp:4242' }]]);
+  for (const row of kb) expect(Buffer.byteLength(row[0].callback_data)).toBeLessThanOrEqual(64);
+  expect(parseTopicAttachCallback('tgt:50:%3')).toEqual({ threadId: 50, paneId: '%3' });
+  expect(parseTopicAttachCallback('tgt:50:omp:4242')).toEqual({ threadId: 50, paneId: 'omp:4242' });
+  for (const bad of [undefined, 'tgt:0:%3', 'tgt:50:', 'tgt:50:%x', 'tgt:-1:%3', 'tga:50:%3', 'tgt:50:%3:extra']) {
+    expect(parseTopicAttachCallback(bad)).toBeNull();
+  }
+});
+
+// --- stepUpdates: §4.4 decision table ---
 
 test('topics OFF: a topic message falls through to normal flat injection (unchanged behaviour)', () => {
-  const r = stepUpdates([upd(1, { text: 'hi', message_thread_id: 99 })], makeOpts({ topicsEnabled: false }));
+  const r = stepUpdates([upd(1, { text: 'hi', message_thread_id: 99, is_topic_message: true })], makeOpts({ topicsEnabled: false }));
   expect(r.actions).toEqual([
     { kind: 'inject-text', text: '[TG from Alex #1] hi', messageId: 1 },
     { kind: 'ack', messageId: 1 },
   ]);
 });
 
-test('topics ON: forum_topic_created → topic-new + ack', () => {
-  const r = stepUpdates(
-    [upd(50, { message_thread_id: 50, forum_topic_created: { name: 'feature-x' } })],
-    makeOpts({ topicsEnabled: true }),
-  );
-  expect(r.actions).toEqual([
-    { kind: 'topic-new', threadId: 50, name: 'feature-x', from: 'Alex' },
-    { kind: 'ack', messageId: 50 },
-  ]);
+test('topics ON: General (no message_thread_id) and a non-forum reply-thread stay flat', () => {
+  expect(stepUpdates([upd(1, { text: 'hi' })], bound).actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #1] hi', messageId: 1 });
+  // a supergroup reply thread carries a thread id but no is_topic_message — even one colliding with a bound topic
+  expect(stepUpdates([upd(2, { text: 'x', message_thread_id: 50 })], bound).actions[0]).toMatchObject({ kind: 'inject-text' });
 });
 
-test('topics ON: prose in a BOUND topic → topic-route with wrapped text', () => {
-  const r = stepUpdates(
-    [upd(7, { text: 'deploy now', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: (t) => (t === 50 ? 'bound' : null) }),
-  );
+test('row 1: every daemon verb is answered IN the topic, bound or unknown', () => {
+  const verbs: Array<[string, Partial<Action>]> = [
+    ['/status', { kind: 'status' }],
+    ['/agent @mybot pane1', { kind: 'agent-route' }],
+    ['/new claude-opus /tmp MyAgent', { kind: 'new-command' }],
+    ['/tasks', { kind: 'tasks' }],
+    ['/limit codex', { kind: 'limit-status', agent: 'codex' }],
+    ['/daily', { kind: 'daily-report' }],
+    ['/spend week', { kind: 'usage-report', period: 'week' }],
+  ];
+  for (const opts of [bound, unknown]) {
+    for (const [cmd, expected] of verbs) {
+      const r = stepUpdates([inTopic(22, { text: cmd })], opts);
+      expect(r.actions[0]).toMatchObject({ ...expected, threadId: 50 });
+      expect(r.actions[1]).toEqual({ kind: 'ack', messageId: 22 });
+    }
+  }
+});
+
+test('row 1: /stop, /kill and harness-reserved verbs are NOT daemon verbs — they reach the bound session verbatim', () => {
+  for (const cmd of ['/stop', '/kill', '/usage', '/cost', '/stats', '/compact']) {
+    expect(stepUpdates([inTopic(20, { text: cmd })], bound).actions[0]).toEqual({ kind: 'topic-route', threadId: 50, payload: text(cmd, 20) });
+  }
+});
+
+test('row 2: prose in a BOUND topic → topic-route with the wrapped text', () => {
+  const r = stepUpdates([inTopic(7, { text: 'deploy now' })], bound);
   expect(r.actions).toEqual([
-    { kind: 'topic-route', threadId: 50, injectText: '[TG from Alex #7] deploy now', from: 'Alex', messageId: 7 },
+    { kind: 'topic-route', threadId: 50, payload: text('[TG from Alex #7] deploy now', 7) },
     { kind: 'ack', messageId: 7 },
   ]);
 });
 
-test('topics ON: a slash-command in a BOUND topic injects VERBATIM (reaches the agent)', () => {
-  const r = stepUpdates(
-    [upd(11, { text: '/compact', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '/compact', from: 'Alex', messageId: 11 });
+test('row 2: a path-like prose message is wrapped, not injected as a command', () => {
+  const r = stepUpdates([inTopic(14, { text: '/etc/hosts is broken' })], bound);
+  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, payload: text('[TG from Alex #14] /etc/hosts is broken', 14) });
 });
 
-test('topics ON: a `!shell` command in a BOUND topic injects VERBATIM (no wrap, `!` at column 0)', () => {
-  const r = stepUpdates(
-    [upd(15, { text: '!git status', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '!git status', from: 'Alex', messageId: 15 });
-});
-
-test('topics ON: `!rm -rf /` in a BOUND topic is BLOCKED — reply in the topic, not topic-route', () => {
-  const r = stepUpdates(
-    [upd(17, { text: '!rm -rf /', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions).toHaveLength(2);
-  expect(r.actions[0].kind).toBe('reply');
-  expect((r.actions[0] as { kind: 'reply'; text: string; threadId?: number | null }).threadId).toBe(50);
-  expect((r.actions[0] as { kind: 'reply'; text: string }).text).toContain('rm-rf');
-  expect(r.actions[1]).toEqual({ kind: 'ack', messageId: 17 });
-});
-
-test('topics ON: a `!shell` REPLY in a BOUND topic is VERBATIM — no quote-anchor prepended', () => {
-  const r = stepUpdates(
-    [
-      upd(16, {
-        text: '!ls',
-        message_thread_id: 50,
-        is_topic_message: true,
-        reply_to_message: { message_id: 90, chat: { id: CHAT_ID }, date: NOW, text: 'earlier' },
-      }),
-    ],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '!ls', from: 'Alex', messageId: 16 });
-});
-
-test('topics ON: a dangerous `!rm -rf /` REPLY in a BOUND topic is BLOCKED — reply, not a verbatim topic-route', () => {
-  // Pins that the danger gate fires BEFORE the reply-anchor branch (updates.ts: the `!` check
-  // runs first regardless of reply_to_message) — a dangerous bang reply must not slip through
-  // via the reply-routing path.
-  const r = stepUpdates(
-    [
-      upd(20, {
-        text: '!rm -rf /',
-        message_thread_id: 50,
-        is_topic_message: true,
-        reply_to_message: { message_id: 91, chat: { id: CHAT_ID }, date: NOW, text: 'earlier' },
-      }),
-    ],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions[0].kind).toBe('reply');
-  expect((r.actions[0] as { kind: 'reply'; text: string; threadId?: number | null }).threadId).toBe(50);
-  expect((r.actions[0] as { kind: 'reply'; text: string }).text).toContain('rm-rf');
-});
-
-test('topics ON: `!!rm -rf /` (doubled bang) in a BOUND topic is confirmed and injected VERBATIM, one `!` peeled', () => {
-  const r = stepUpdates(
-    [upd(21, { text: '!!rm -rf /', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '!rm -rf /', from: 'Alex', messageId: 21 });
-});
-
-test('topics ON: media (no text) in a BOUND topic is ACKED only — never leaks to a flat agent', () => {
-  const r = stepUpdates(
-    [upd(12, { photo: [{ file_id: 'f' }], message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  // no inject-text / no download-media to a flat agent — just the ack (increment 2 routes topic media)
-  expect(r.actions).toEqual([{ kind: 'ack', messageId: 12 }]);
-});
-
-test('topics ON: a message in a CLOSED topic → topic-dead (offer re-spawn) — never leaks to a flat agent', () => {
-  // increment 4: a message to a topic whose agent died emits topic-dead so the entrypoint offers
-  // a one-tap re-spawn (the old behaviour was a silent ack-only dead-end). Still never leaks flat.
-  const r = stepUpdates(
-    [upd(13, { text: 'still here?', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' }),
-  );
-  expect(r.actions).toEqual([
-    { kind: 'topic-dead', threadId: 50, injectText: wrap('Alex', 'still here?', 13), messageId: 13 },
-    { kind: 'ack', messageId: 13 },
-  ]);
-});
-
-test('topics ON: `!rm -rf /` in a CLOSED topic is BLOCKED — topic-dead carries a warning, not raw shell (tg-cli shell-danger-gate)', () => {
-  // A same-batch re-spawn tap replays topic-dead's injectText VERBATIM into the freshly-live
-  // pane (handleTopicDead -> handleTopicRoute). A dangerous `!` here must not carry raw shell
-  // text through that path — it must be wrapped as a warning instead.
-  const r = stepUpdates(
-    [upd(18, { text: '!rm -rf /', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' }),
-  );
-  expect(r.actions[0].kind).toBe('topic-dead');
-  const injectText = (r.actions[0] as { kind: 'topic-dead'; injectText: string }).injectText;
-  expect(injectText).not.toBe('!rm -rf /');
-  expect(injectText).toContain('rm-rf');
-  expect(r.actions[1]).toEqual({ kind: 'ack', messageId: 18 });
-});
-
-test('topics ON: `!!rm -rf /` (confirmed) in a CLOSED topic still carries the peeled command verbatim', () => {
-  const r = stepUpdates(
-    [upd(19, { text: '!!rm -rf /', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' }),
-  );
-  expect(r.actions[0]).toEqual({ kind: 'topic-dead', threadId: 50, injectText: '!rm -rf /', messageId: 19 });
-});
-
-test('topics ON: a media-only message in a CLOSED topic → topic-dead with empty injectText', () => {
-  const r = stepUpdates(
-    [upd(14, { photo: [{ file_id: 'f' }], message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' }),
-  );
-  expect(r.actions).toEqual([
-    { kind: 'topic-dead', threadId: 50, injectText: '', messageId: 14 },
-    { kind: 'ack', messageId: 14 },
-  ]);
-});
-
-test('topics ON: a message in an AWAITING topic → topic-answer (raw text)', () => {
-  const r = stepUpdates(
-    [upd(8, { text: '/Users/me/api', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'awaiting-path' }),
-  );
-  expect(r.actions).toEqual([
-    { kind: 'topic-answer', threadId: 50, text: '/Users/me/api', from: 'Alex', messageId: 8 },
-    { kind: 'ack', messageId: 8 },
-  ]);
-});
-
-test('topics ON: an UNTRACKED forum-topic message is ACKED only — never leaks to a flat agent / General', () => {
-  const r = stepUpdates(
-    [upd(9, { text: 'hello', message_thread_id: 77, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => null }),
-  );
-  expect(r.actions).toEqual([{ kind: 'ack', messageId: 9 }]);
-});
-
-test('topics ON: prose starting with / (a path) in a BOUND topic is WRAPPED, not a verbatim command', () => {
-  const r = stepUpdates(
-    [upd(14, { text: '/etc/hosts is broken', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  // wrapped (carries sender + #id for tg --reply-to), NOT injected verbatim as a command
-  expect(r.actions[0]).toEqual({
+test('row 2: a prose reply carries the quote anchor; a /command or `!` reply stays verbatim', () => {
+  const replyTo = { message_id: 42, date: 1_749_000_000, text: 'quoted text', chat: { id: CHAT_ID } };
+  const prose = stepUpdates([inTopic(25, { text: 'yes, do it', reply_to_message: replyTo })], bound).actions[0];
+  expect(prose.kind === 'topic-route' && prose.payload.type === 'text' && prose.payload.text).toMatch(/^↩ tg#42 «/);
+  expect(stepUpdates([inTopic(26, { text: '/stop', reply_to_message: replyTo })], bound).actions[0]).toEqual({
     kind: 'topic-route',
     threadId: 50,
-    injectText: '[TG from Alex #14] /etc/hosts is broken',
-    from: 'Alex',
-    messageId: 14,
+    payload: text('/stop', 26),
+  });
+  expect(stepUpdates([inTopic(16, { text: '!ls', reply_to_message: replyTo })], bound).actions[0]).toEqual({
+    kind: 'topic-route',
+    threadId: 50,
+    payload: text('!ls', 16),
   });
 });
 
-test('topics ON: a DUPLICATE forum_topic_created for an in-flight/bound topic does NOT reset it', () => {
-  for (const st of ['bound', 'awaiting-path', 'awaiting-model'] as const) {
-    const r = stepUpdates(
-      [upd(50, { message_thread_id: 50, forum_topic_created: { name: 'dup' } })],
-      makeOpts({ topicsEnabled: true, topicStatusOf: () => st }),
-    );
-    // no topic-new (would clobber the live binding) — just the ack
-    expect(r.actions).toEqual([{ kind: 'ack', messageId: 50 }]);
+test('`!shell`: a safe or confirmed command passes verbatim; a catastrophic one is answered in the topic, bound or unknown', () => {
+  expect(stepUpdates([inTopic(15, { text: '!git status' })], bound).actions[0]).toEqual({ kind: 'topic-route', threadId: 50, payload: text('!git status', 15) });
+  expect(stepUpdates([inTopic(21, { text: '!!rm -rf /' })], bound).actions[0]).toEqual({ kind: 'topic-route', threadId: 50, payload: text('!rm -rf /', 21) });
+  for (const opts of [bound, unknown]) {
+    const r = stepUpdates([inTopic(17, { text: '!rm -rf /' })], opts);
+    expect(r.actions).toHaveLength(1);
+    const reply = r.actions[0];
+    expect(reply).toMatchObject({ kind: 'reply', threadId: 50 });
+    expect(reply.kind === 'reply' && reply.text).toContain('rm-rf');
   }
-  // but a create for an untracked/closed topic DOES start the flow
-  const fresh = stepUpdates(
-    [upd(51, { message_thread_id: 51, forum_topic_created: { name: 'new' } })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => null }),
+});
+
+test('row 2: photo, document and voice in a bound topic are delivered, not silently acked', () => {
+  const photo = stepUpdates([inTopic(12, { photo: [{ file_id: 'small', file_size: 10 }, { file_id: 'big', file_size: 99 }], caption: 'look' })], bound);
+  expect(photo.actions).toEqual([
+    {
+      kind: 'topic-route',
+      threadId: 50,
+      payload: { type: 'media', mediaKind: 'photo', fileId: 'big', suggestedName: '12.jpg', caption: 'look', from: 'Alex', messageId: 12 },
+    },
+    { kind: 'ack', messageId: 12 },
+  ]);
+  const doc = stepUpdates([inTopic(13, { document: { file_id: 'D', file_name: 'report.PDF' } })], bound).actions[0];
+  expect(doc).toEqual({
+    kind: 'topic-route',
+    threadId: 50,
+    payload: { type: 'media', mediaKind: 'document', fileId: 'D', suggestedName: '13.pdf', from: 'Alex', messageId: 13 },
+  });
+  const voice = stepUpdates([inTopic(14, { voice: { file_id: 'V' } })], bound).actions[0];
+  expect(voice).toEqual({ kind: 'topic-route', threadId: 50, payload: { type: 'voice', fileId: 'V', suggestedName: '14.ogg', from: 'Alex', messageId: 14 } });
+});
+
+test('row 2/3: a topic whose session is gone or whose spawn never finished is routed — the entrypoint decides', () => {
+  for (const st of ['closed', 'awaiting-model'] as const) {
+    const r = stepUpdates([inTopic(9, { text: 'hello' })], makeOpts({ topicsEnabled: true, topicStatusOf: () => st }));
+    expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, payload: text('[TG from Alex #9] hello', 9) });
+  }
+});
+
+test('row 4: an UNKNOWN topic holds the payload — text, album parts and voice join in order', () => {
+  const r = stepUpdates(
+    [
+      inTopic(1, { text: 'first' }, 77),
+      inTopic(2, { photo: [{ file_id: 'p1' }] }, 77),
+      inTopic(3, { photo: [{ file_id: 'p2' }] }, 77),
+      inTopic(4, { voice: { file_id: 'v' } }, 77),
+      inTopic(5, { text: '/stop' }, 77),
+    ],
+    unknown,
   );
-  expect(fresh.actions[0]).toEqual({ kind: 'topic-new', threadId: 51, name: 'new', from: 'Alex' });
+  const holds = r.actions.filter((a) => a.kind === 'topic-hold');
+  expect(holds.map((a) => a.kind === 'topic-hold' && a.threadId)).toEqual([77, 77, 77, 77, 77]);
+  expect(holds.map((a) => a.kind === 'topic-hold' && a.payload.messageId)).toEqual([1, 2, 3, 4, 5]);
+  expect(holds[4]).toEqual({ kind: 'topic-hold', threadId: 77, payload: text('/stop', 5) });
+  // every held message still gets its receipt
+  expect(r.actions.filter((a) => a.kind === 'ack')).toHaveLength(5);
 });
 
-test('topics ON: an OLD topic message in a bound topic is still routed to its agent (#183)', () => {
-  // Owner inbound is no longer dropped by age: a message Telegram delivered
-  // after downtime still reaches the agent, topic-routed like any other.
-  const old: TgUpdate = {
-    update_id: 20,
-    message: { message_id: 20, from: { id: CHAT_ID, first_name: 'Alex' }, chat: { id: CHAT_ID }, date: NOW - 9999, text: 'old', message_thread_id: 50, is_topic_message: true },
+test('row 4: with no topicStatusOf lookup a topic message is held, never leaked to a flat agent', () => {
+  const r = stepUpdates([inTopic(31, { text: 'hi' }, 30)], { ...makeOpts({ topicsEnabled: true }), topicStatusOf: undefined });
+  expect(r.actions[0]).toEqual({ kind: 'topic-hold', threadId: 30, payload: text('[TG from Alex #31] hi', 31) });
+});
+
+test('nothing is silently dropped: an oversized file and an unsupported message are answered in the topic', () => {
+  const big = stepUpdates([inTopic(40, { document: { file_id: 'D', file_size: 30 * 1024 * 1024 } })], unknown);
+  expect(big.actions).toEqual([{ kind: 'reply', text: 'file too large for Bot API (>20 MB)', threadId: 50 }]);
+  const sticker = stepUpdates([inTopic(41, {})], bound);
+  expect(sticker.actions).toHaveLength(1);
+  expect(sticker.actions[0]).toMatchObject({ kind: 'reply', threadId: 50 });
+});
+
+test('every user message in a topic, in every binding state, yields a visible action — never a bare ack', () => {
+  const messages: Array<Partial<TgMessage>> = [
+    { text: 'hi' },
+    { text: '/status' },
+    { text: '!rm -rf /' },
+    { photo: [{ file_id: 'p' }] },
+    { voice: { file_id: 'v' } },
+    { document: { file_id: 'd', file_size: 99 * 1024 * 1024 } },
+    {},
+  ];
+  for (const st of [null, 'bound', 'closed', 'awaiting-model'] as const) {
+    for (const [i, msg] of messages.entries()) {
+      const r = stepUpdates([inTopic(100 + i, msg)], makeOpts({ topicsEnabled: true, topicStatusOf: () => st }));
+      expect(r.actions.some((a) => a.kind !== 'ack')).toBe(true);
+    }
+  }
+});
+
+test('row 5: forum topic service messages are recorded only — no spawn, no ack', () => {
+  const r = stepUpdates(
+    [
+      upd(50, { message_thread_id: 50, forum_topic_created: { name: 'feature-x' } }),
+      upd(51, { message_thread_id: 50, forum_topic_edited: { name: 'renamed' } }),
+      upd(52, { message_thread_id: 50, forum_topic_edited: {} }),
+      upd(53, { message_thread_id: 50, forum_topic_closed: {}, date: NOW - 9999 }),
+      upd(54, { message_thread_id: 50, forum_topic_reopened: {} }),
+    ],
+    bound,
+  );
+  expect(r.actions).toEqual([
+    { kind: 'topic-event', threadId: 50, event: 'created', name: 'feature-x' },
+    { kind: 'topic-event', threadId: 50, event: 'edited', name: 'renamed' },
+    { kind: 'topic-event', threadId: 50, event: 'edited' },
+    { kind: 'topic-event', threadId: 50, event: 'closed' },
+    { kind: 'topic-event', threadId: 50, event: 'reopened' },
+  ]);
+});
+
+test('an attach tap → topic-attach in message order (after same-batch held messages); OFF → expired', () => {
+  const tap: TgUpdate = {
+    update_id: 9,
+    callback_query: { id: 'cb1', from: { id: CHAT_ID }, data: 'tgt:77:%3', message: { message_id: 500, chat: { id: CHAT_ID }, date: NOW } },
   };
-  const r = stepUpdates([old], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
-  expect(r.actions.length).toBeGreaterThan(0);
-  expect(r.actions.some((a) => a.kind === 'ack' && a.messageId === 20)).toBe(true);
-  expect(r.skippedStale).toBe(0);
+  const r = stepUpdates([inTopic(8, { text: 'queued' }, 77), tap], unknown);
+  expect(r.actions.map((a) => a.kind)).toEqual(['topic-hold', 'ack', 'topic-attach']);
+  expect(r.actions[2]).toEqual({ kind: 'topic-attach', callbackQueryId: 'cb1', threadId: 77, paneId: '%3', messageId: 500 });
+  const off = stepUpdates([tap], makeOpts({ topicsEnabled: false }));
+  expect(off.actions).toEqual([{ kind: 'answer-callback', callbackQueryId: 'cb1', text: 'expired' }]);
 });
 
-test('topics ON: a topic message from a NON-allowed sender yields NO topic action', () => {
+test('a topic message or tap from a NON-allowed sender yields no topic action', () => {
   const intruder: TgUpdate = {
     update_id: 21,
-    message: { message_id: 21, from: { id: 999, first_name: 'Mallory' }, chat: { id: CHAT_ID }, date: NOW, text: 'pwn', message_thread_id: 50, is_topic_message: true },
+    message: { message_id: 21, from: { id: 999 }, chat: { id: CHAT_ID }, date: NOW, text: 'pwn', message_thread_id: 50, is_topic_message: true },
   };
-  const r = stepUpdates([intruder], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
-  expect(r.actions).toEqual([]);
+  expect(stepUpdates([intruder], bound).actions).toEqual([]);
+  const tap: TgUpdate = { update_id: 22, callback_query: { id: 'cb', from: { id: 999 }, data: 'tgt:50:%3' } };
+  expect(stepUpdates([tap], bound).actions).toEqual([{ kind: 'answer-callback', callbackQueryId: 'cb', text: 'not allowed' }]);
 });
 
-test('topics ON but topicStatusOf undefined: service messages still route; a topic message falls to flat', () => {
-  const opts = { ...makeOpts({ topicsEnabled: true }), topicStatusOf: undefined };
-  const created = stepUpdates([upd(30, { message_thread_id: 30, forum_topic_created: { name: 'x' } })], opts);
-  expect(created.actions[0]).toEqual({ kind: 'topic-new', threadId: 30, name: 'x', from: 'Alex' });
-  // a regular forum-topic message with no lookup → status null → acked only (not leaked to flat)
-  const msg = stepUpdates([upd(31, { text: 'hi', message_thread_id: 30, is_topic_message: true })], opts);
-  expect(msg.actions).toEqual([{ kind: 'ack', messageId: 31 }]);
-});
-
-test('topics ON: forum_topic_created with no from → name defaults to "tg"', () => {
-  const r = stepUpdates(
-    [{ update_id: 40, message: { message_id: 40, chat: { id: CHAT_ID }, date: NOW, from: { id: CHAT_ID }, message_thread_id: 40, forum_topic_created: { name: 'z' } } }],
-    makeOpts({ topicsEnabled: true }),
-  );
-  expect(r.actions[0]).toEqual({ kind: 'topic-new', threadId: 40, name: 'z', from: 'tg' });
-});
-
-test('topics ON: a non-forum reply-thread (thread id but NOT is_topic_message) falls through to flat', () => {
-  // A supergroup reply thread carries message_thread_id but no is_topic_message; even if its id
-  // collides with a tracked topic it must NOT be captured as a topic message.
-  const r = stepUpdates(
-    [upd(10, { text: 'reply thread msg', message_thread_id: 50 })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions).toEqual([
-    { kind: 'inject-text', text: '[TG from Alex #10] reply thread msg', messageId: 10 },
-    { kind: 'ack', messageId: 10 },
-  ]);
-});
-
-test('topics ON: forum_topic_closed / reopened on a TRACKED topic → topic-close / topic-reopen + ack', () => {
-  const tracked = makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' });
-  const closed = stepUpdates([upd(1, { message_thread_id: 50, forum_topic_closed: {} })], tracked);
-  expect(closed.actions).toEqual([{ kind: 'topic-close', threadId: 50 }, { kind: 'ack', messageId: 1 }]);
-  const reopened = stepUpdates([upd(2, { message_thread_id: 50, forum_topic_reopened: {} })], tracked);
-  expect(reopened.actions).toEqual([{ kind: 'topic-reopen', threadId: 50 }, { kind: 'ack', messageId: 2 }]);
-});
-
-test('topics ON: close/reopen on an UNTRACKED topic emits no topic action (just ack) — not ours', () => {
-  const untracked = makeOpts({ topicsEnabled: true, topicStatusOf: () => null });
-  const closed = stepUpdates([upd(3, { message_thread_id: 99, forum_topic_closed: {} })], untracked);
-  expect(closed.actions).toEqual([{ kind: 'ack', messageId: 3 }]);
-});
-
-test('topics ON: forum_topic_edited (rename) with name → topic-rename + ack for a tracked topic — never leaks to flat', () => {
-  // §11 deferral 3: a rename of a tracked topic emits topic-rename so the entrypoint can
-  // persist the new name and update the tmux window slug.
-  const r = stepUpdates(
-    [upd(4, { message_thread_id: 50, forum_topic_edited: { name: 'renamed' } })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions).toEqual([{ kind: 'topic-rename', threadId: 50, name: 'renamed' }, { kind: 'ack', messageId: 4 }]);
-});
-
-test('topics ON: forum_topic_edited with no name (icon-only) is silently acked — never leaks to flat', () => {
-  // An icon-only edit carries no name; nothing to persist, just ack.
-  const r = stepUpdates(
-    [upd(4, { message_thread_id: 50, forum_topic_edited: {} })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions).toEqual([{ kind: 'ack', messageId: 4 }]);
-});
-
-test('topics ON: General (no message_thread_id) is unaffected', () => {
-  const r = stepUpdates([upd(3, { text: 'plain' })], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
-  expect(r.actions).toEqual([
-    { kind: 'inject-text', text: '[TG from Alex #3] plain', messageId: 3 },
-    { kind: 'ack', messageId: 3 },
-  ]);
-});
-
-// --- model-pick button (the awaiting-model spawn step) ---
-
-function cbUpd(id: number, data: string): TgUpdate {
-  return {
-    update_id: id,
-    callback_query: {
-      id: `cb${id}`,
-      from: { id: CHAT_ID, first_name: 'Alex' },
-      message: { message_id: id, chat: { id: CHAT_ID }, date: NOW },
-      data,
-    },
-  };
-}
-
-test('parseTopicModelCallback: parses tgm:<threadId>:<modelId>, rejects malformed', () => {
-  expect(parseTopicModelCallback('tgm:50:claude-opus')).toEqual({ threadId: 50, modelId: 'claude-opus' });
-  expect(parseTopicModelCallback('tgm:1:claude-default')).toEqual({ threadId: 1, modelId: 'claude-default' });
-  expect(parseTopicModelCallback('tgm:0:claude-default')).toBeNull(); // a thread id is always >= 1
-  expect(parseTopicModelCallback('tga:50:0')).toBeNull(); // wrong prefix (/agent picker)
-  expect(parseTopicModelCallback('tgq:abc:o0')).toBeNull(); // wrong prefix (question)
-  expect(parseTopicModelCallback('tgm:notanum:m')).toBeNull();
-  expect(parseTopicModelCallback('tgm:50:')).toBeNull();
-  expect(parseTopicModelCallback('tgm:50')).toBeNull();
-  expect(parseTopicModelCallback('tgm::claude-opus')).toBeNull(); // empty threadId must NOT coerce to 0
-  expect(parseTopicModelCallback('tgm:1e2:m')).toBeNull(); // Number() exotica rejected
-  expect(parseTopicModelCallback('tgm:0x10:m')).toBeNull();
-  expect(parseTopicModelCallback('tgm:-5:m')).toBeNull(); // a thread id is always positive
-  expect(parseTopicModelCallback(undefined)).toBeNull();
-});
-
-test('buildModelKeyboard: one button per catalog model, callback carries threadId + id', () => {
-  const kb = buildModelKeyboard(50, MODEL_CATALOG);
-  expect(kb).toHaveLength(MODEL_CATALOG.length);
-  expect(kb[0][0]).toEqual({ text: MODEL_CATALOG[0].label, callback_data: `tgm:50:${MODEL_CATALOG[0].id}` });
-  // every row is a single button whose callback round-trips through the parser
-  for (const row of kb) {
-    expect(row).toHaveLength(1);
-    expect(parseTopicModelCallback(row[0].callback_data)?.threadId).toBe(50);
-  }
-});
-
-test('topics ON: a tgm: model tap emits a topic-model action (routed to the spawn flow)', () => {
-  const r = stepUpdates([cbUpd(7, 'tgm:50:claude-opus')], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'awaiting-model' }));
-  expect(r.actions).toEqual([
-    {
-      kind: 'topic-model',
-      callbackQueryId: 'cb7',
-      threadId: 50,
-      modelId: 'claude-opus',
-      messageId: 7,
-    },
-  ]);
-});
-
-test('topics OFF: a tgm: tap does NOT emit topic-model — falls through to the question parser (expired)', () => {
-  const r = stepUpdates([cbUpd(8, 'tgm:50:claude-opus')], makeOpts({ topicsEnabled: false }));
-  // With topics off the model tap is not recognized as a spawn action; it falls to the
-  // button-callback parser which rejects the non-tgq data as an expired callback.
-  expect(r.actions).toEqual([{ kind: 'answer-callback', callbackQueryId: 'cb8', text: 'expired' }]);
-});
-
-// --- increment 4: recent-path buttons, path/respawn callbacks, pathChoices persistence ---
-
-test('recentPathChoices: dedupes, keeps absolute existing dirs, preserves newest-first order', () => {
-  const existing = new Set(['/a', '/b', '/c']);
-  const isAbsDir = (p: string) => p.startsWith('/') && existing.has(p);
-  // '/a' repeated, 'rel' relative, '/gone' not a dir → only /a,/b,/c survive, in first-seen order.
-  const out = recentPathChoices(['/a', '/a', 'rel', '/gone', '/b', undefined, '', '/c'], isAbsDir);
-  expect(out).toEqual(['/a', '/b', '/c']);
-});
-
-test('recentPathChoices: caps at MAX_PATH_CHOICES', () => {
-  const candidates = Array.from({ length: MAX_PATH_CHOICES + 5 }, (_, i) => `/p${i}`);
-  const out = recentPathChoices(candidates, () => true);
-  expect(out).toHaveLength(MAX_PATH_CHOICES);
-  expect(out[0]).toBe('/p0');
-});
-
-test('buildPathKeyboard: one button per choice, callback tgp:<threadId>:<index>:<nonce>', () => {
-  expect(buildPathKeyboard(42, ['/x', '/y'], 7)).toEqual([
-    [{ text: '/x', callback_data: 'tgp:42:0:7' }],
-    [{ text: '/y', callback_data: 'tgp:42:1:7' }],
-  ]);
-});
-
-test('buildPathKeyboard: empty choices → empty keyboard (free-text only)', () => {
-  expect(buildPathKeyboard(42, [], 7)).toEqual([]);
-});
-
-test('parseTopicPathCallback: valid tgp:<thread>:<index>:<nonce> (index may be 0)', () => {
-  expect(parseTopicPathCallback('tgp:42:0:99')).toEqual({ threadId: 42, index: 0, nonce: 99 });
-  expect(parseTopicPathCallback('tgp:7:3:5')).toEqual({ threadId: 7, index: 3, nonce: 5 });
-});
-
-test('parseTopicPathCallback: rejects malformed / wrong-prefix / leading-zero index / negative / missing nonce', () => {
-  expect(parseTopicPathCallback(undefined)).toBeNull();
-  expect(parseTopicPathCallback('tgp:42')).toBeNull();
-  expect(parseTopicPathCallback('tgp:42:0')).toBeNull(); // missing nonce (old 3-part shape)
-  expect(parseTopicPathCallback('tgm:42:0:1')).toBeNull(); // model prefix
-  expect(parseTopicPathCallback('tgp:0:1:1')).toBeNull(); // threadId must be >=1
-  expect(parseTopicPathCallback('tgp:42:00:1')).toBeNull(); // leading-zero index
-  expect(parseTopicPathCallback('tgp:42:-1:1')).toBeNull();
-  expect(parseTopicPathCallback('tgp:42:x:1')).toBeNull();
-  expect(parseTopicPathCallback('tgp:42:0:0')).toBeNull(); // nonce must be >=1
-});
-
-test('parseTopicRespawnCallback: valid tgr:<thread>, rejects malformed', () => {
-  expect(parseTopicRespawnCallback('tgr:42')).toBe(42);
-  expect(parseTopicRespawnCallback(undefined)).toBeNull();
-  expect(parseTopicRespawnCallback('tgr:0')).toBeNull();
-  expect(parseTopicRespawnCallback('tgr:42:extra')).toBeNull();
-  expect(parseTopicRespawnCallback('tgm:42')).toBeNull();
-});
-
-test('buildRespawnKeyboard: one Re-spawn button carrying tgr:<threadId>', () => {
-  expect(buildRespawnKeyboard(42)).toEqual([[{ text: 'Re-spawn the agent', callback_data: 'tgr:42' }]]);
-});
-
-test('parseTopics: preserves a clean pathChoices array; drops a malformed one', () => {
-  const good = serializeTopics([
-    { threadId: 1, name: 'a', status: 'awaiting-path', ts: 1, pathChoices: ['/p', '/q'] },
-  ]);
-  expect(parseTopics(good)[0].pathChoices).toEqual(['/p', '/q']);
-  const bad = JSON.stringify([
-    { threadId: 2, name: 'b', status: 'awaiting-path', ts: 1, pathChoices: ['/p', 5] },
-  ]);
-  expect(parseTopics(bad)[0].pathChoices).toBeUndefined();
-});
-
-test('applyPathAnswer: drops the now-stale pathChoices when advancing to awaiting-model', () => {
-  const b: TopicBinding = { threadId: 1, name: 'a', status: 'awaiting-path', ts: 1, pathChoices: ['/p'] };
-  const next = applyPathAnswer(b, '/chosen', 2);
-  expect(next.status).toBe('awaiting-model');
-  expect(next.path).toBe('/chosen');
-  expect(next.pathChoices).toBeUndefined();
-});
-
-test('topics ON: a tgp: tap → topic-path action (recent-path button, carries the nonce)', () => {
-  expect(stepUpdates([cbUpd(9, 'tgp:50:1:77')], makeOpts({ topicsEnabled: true })).actions).toEqual([
-    { kind: 'topic-path', callbackQueryId: 'cb9', threadId: 50, index: 1, nonce: 77, messageId: 9 },
-  ]);
-});
-
-test('topics ON: a tgr: tap → topic-respawn action', () => {
-  expect(stepUpdates([cbUpd(10, 'tgr:50')], makeOpts({ topicsEnabled: true })).actions).toEqual([
-    { kind: 'topic-respawn', callbackQueryId: 'cb10', threadId: 50, messageId: 10 },
-  ]);
-});
-
-test('topics OFF: a tgp:/tgr: tap does NOT emit a topic action — falls through (expired)', () => {
-  expect(stepUpdates([cbUpd(9, 'tgp:50:0:1')], makeOpts({ topicsEnabled: false })).actions).toEqual([
-    { kind: 'answer-callback', callbackQueryId: 'cb9', text: 'expired' },
-  ]);
-  expect(stepUpdates([cbUpd(10, 'tgr:50')], makeOpts({ topicsEnabled: false })).actions).toEqual([
-    { kind: 'answer-callback', callbackQueryId: 'cb10', text: 'expired' },
-  ]);
-});
-
-test('topics ON: a SAME-BATCH forum_topic_closed wins over a tgr/tgm/tgp tap — no spawn into a closed topic (codex r21)', () => {
-  // The close + a stale spawn tap arrive in one batch. Callbacks run before service messages, so
-  // without the pre-scan the tap would spawn into the just-closed topic. The pre-scan suppresses the
-  // tap (answered "topic closed") so the close wins. topicStatusOf must see the topic as TRACKED.
-  const closedMsg = upd(20, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false });
-  const opts = makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' });
-
-  const r1 = stepUpdates([closedMsg, cbUpd(21, 'tgr:50')], opts);
-  expect(r1.actions).toContainEqual({ kind: 'answer-callback', callbackQueryId: 'cb21', text: 'topic changed — try again' });
-  expect(r1.actions.some((a) => a.kind === 'topic-respawn')).toBe(false);
-  expect(r1.actions.some((a) => a.kind === 'topic-close')).toBe(true);
-
-  const r2 = stepUpdates([closedMsg, cbUpd(22, 'tgm:50:claude-opus')], opts);
-  expect(r2.actions).toContainEqual({ kind: 'answer-callback', callbackQueryId: 'cb22', text: 'topic changed — try again' });
-  expect(r2.actions.some((a) => a.kind === 'topic-model')).toBe(false);
-
-  const r3 = stepUpdates([closedMsg, cbUpd(23, 'tgp:50:0:7')], opts);
-  expect(r3.actions).toContainEqual({ kind: 'answer-callback', callbackQueryId: 'cb23', text: 'topic changed — try again' });
-  expect(r3.actions.some((a) => a.kind === 'topic-path')).toBe(false);
-});
-
-test('topics ON: a SAME-BATCH forum_topic_reopened also suppresses a stale spawn tap (codex r27)', () => {
-  // The reopen + a stale tgr tap in one batch: the tap would re-bind a pane that the reopen
-  // (markReopened) then drops → orphan. The pre-scan suppresses the tap so the reopen wins.
-  const reopenMsg = upd(26, { forum_topic_reopened: {}, message_thread_id: 50, is_topic_message: false });
-  const opts = makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' });
-
-  const r = stepUpdates([reopenMsg, cbUpd(27, 'tgr:50')], opts);
-  expect(r.actions).toContainEqual({ kind: 'answer-callback', callbackQueryId: 'cb27', text: 'topic changed — try again' });
-  expect(r.actions.some((a) => a.kind === 'topic-respawn')).toBe(false);
-  expect(r.actions.some((a) => a.kind === 'topic-reopen')).toBe(true);
-
-  // A same-batch reopen (id 26) + a LATER TEXT (id 28 > 26) → suppressed (ack only).
-  const textAfter = upd(28, { text: 'hi', message_thread_id: 50, is_topic_message: true });
-  const r2 = stepUpdates([reopenMsg, textAfter], opts);
-  expect(r2.actions.some((a) => a.kind === 'topic-route' || a.kind === 'topic-dead')).toBe(false);
-  expect(r2.actions).toContainEqual({ kind: 'ack', messageId: 28 });
-});
-
-test('topics ON: a text BEFORE a same-batch close (lower update_id) is PROCESSED, not dropped (codex r30 order-aware)', () => {
-  // The text (id 20) arrived BEFORE the close (id 21), so it happened before the topic was closed →
-  // it must route to the (still-bound) agent, NOT be silently acked/dropped.
-  const textBefore = upd(20, { text: 'last thing', message_thread_id: 50, is_topic_message: true });
-  const closeAfter = upd(21, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false });
-  const r = stepUpdates([textBefore, closeAfter], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
-  expect(r.actions.some((a) => a.kind === 'topic-route' && (a as { threadId: number }).threadId === 50)).toBe(true);
-  expect(r.actions.some((a) => a.kind === 'topic-close')).toBe(true);
-
-  // The SYMMETRIC reopen order: a text (id 30) BEFORE a reopen (id 31) on a closed topic still routes
-  // its dead-topic recovery (topic-dead) — it happened before the reopen.
-  const textBefore2 = upd(30, { text: 'hi', message_thread_id: 50, is_topic_message: true });
-  const reopenAfter = upd(31, { forum_topic_reopened: {}, message_thread_id: 50, is_topic_message: false });
-  const r2 = stepUpdates([textBefore2, reopenAfter], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' }));
-  expect(r2.actions.some((a) => a.kind === 'topic-dead')).toBe(true);
-});
-
-test('topics ON: a tgr tap is NOT suppressed when the same-batch close is for a DIFFERENT thread', () => {
-  // The pre-scan is per-thread: a close of thread 99 must not block a tap on thread 50.
-  const closedOther = upd(24, { forum_topic_closed: {}, message_thread_id: 99, is_topic_message: false });
-  const r = stepUpdates([closedOther, cbUpd(25, 'tgr:50')], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' }));
-  expect(r.actions.some((a) => a.kind === 'topic-respawn' && (a as { threadId: number }).threadId === 50)).toBe(true);
-});
-
-test('topics ON: a same-batch close + a TEXT message to that thread → ack only, NO topic-route/recovery (codex r24 P1b)', () => {
-  // A [forum_topic_closed, <text>] batch on a bound topic: the text must NOT emit a topic-route (which
-  // would route into / offer a re-spawn for the just-closed topic). Ack only; the close action wins.
-  const closeMsg = upd(40, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false });
-  const textMsg = upd(41, { text: 'still there?', message_thread_id: 50, is_topic_message: true });
-  const r = stepUpdates([closeMsg, textMsg], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
-  expect(r.actions.some((a) => a.kind === 'topic-route')).toBe(false);
-  expect(r.actions.some((a) => a.kind === 'topic-dead')).toBe(false);
-  expect(r.actions.some((a) => a.kind === 'topic-close')).toBe(true);
-  expect(r.actions).toContainEqual({ kind: 'ack', messageId: 41 }); // the text is acked, not routed
-});
-
-test('topics ON: a STALE or UNAUTHORIZED same-batch close does NOT suppress a valid tap (codex r22)', () => {
-  const opts = makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' });
-  // STALE close (date far in the past, beyond stalenessSec): it's ignored by the loop, so it must
-  // NOT suppress the fresh tgr tap on the same thread.
-  const staleClose = upd(30, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false, date: NOW - 10 * 3600 });
-  const rStale = stepUpdates([staleClose, cbUpd(31, 'tgr:50')], opts);
-  expect(rStale.actions.some((a) => a.kind === 'topic-respawn')).toBe(true);
-
-  // UNAUTHORIZED close (from a non-allowlisted user id): same — must not suppress the valid tap.
-  const unauthClose = upd(32, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false, from: { id: 999_999, first_name: 'Mallory' } });
-  const rUnauth = stepUpdates([unauthClose, cbUpd(33, 'tgr:50')], opts);
-  expect(rUnauth.actions.some((a) => a.kind === 'topic-respawn')).toBe(true);
-});
-
-test('markRespawnOffered sets the flag; markClosed/markBound/markReopened clear it', () => {
-  const closed: TopicBinding = { threadId: 1, name: 'a', status: 'closed', path: '/p', model: 'claude-opus', ts: 1 };
-  const offered = markRespawnOffered(closed, 2);
-  expect(offered.respawnOffered).toBe(true);
-  // A fresh close drops a stale flag (so the first message after re-close re-offers).
-  expect(markClosed(offered, 3).respawnOffered).toBeUndefined();
-  // Re-binding (re-spawn succeeded) clears it — the topic is no longer dead.
-  expect(markBound(offered, '%5', 4).respawnOffered).toBeUndefined();
-  // Reopen restarts the flow → clears it too.
-  expect(markReopened(offered, 5).respawnOffered).toBeUndefined();
-});
-
-test('parseTopics preserves respawnOffered:true, ignores a non-true value', () => {
-  const on = serializeTopics([{ threadId: 1, name: 'a', status: 'closed', ts: 1, respawnOffered: true }]);
-  expect(parseTopics(on)[0].respawnOffered).toBe(true);
-  const off = JSON.stringify([{ threadId: 2, name: 'b', status: 'closed', ts: 1, respawnOffered: 'yes' }]);
-  expect(parseTopics(off)[0].respawnOffered).toBeUndefined();
-});
-
-test('markSpawnPending sets the flag + token; clearSpawnPending / markBound / markClosed / markReopened clear both', () => {
-  const am: TopicBinding = { threadId: 1, name: 'a', status: 'awaiting-model', path: '/p', model: 'claude-opus', ts: 1 };
-  const pending = markSpawnPending(am, 'TOK1', 2);
-  expect(pending.spawnPending).toBe(true);
-  expect(pending.spawnToken).toBe('TOK1');
-  for (const next of [clearSpawnPending(pending, 3), markBound(pending, '%5', 4), markClosed(pending, 5), markReopened(pending, 6)]) {
-    expect(next.spawnPending).toBeUndefined();
-    expect(next.spawnToken).toBeUndefined();
-  }
-});
-
-test('parseTopics preserves spawnPending:true + spawnToken, ignores non-true / non-string values', () => {
-  const on = serializeTopics([
-    { threadId: 1, name: 'a', status: 'awaiting-model', path: '/p', model: 'm', ts: 1, spawnPending: true, spawnToken: 'TOK' },
-  ]);
-  expect(parseTopics(on)[0].spawnPending).toBe(true);
-  expect(parseTopics(on)[0].spawnToken).toBe('TOK');
-  const off = JSON.stringify([{ threadId: 2, name: 'b', status: 'awaiting-model', ts: 1, spawnPending: 1, spawnToken: 42 }]);
-  expect(parseTopics(off)[0].spawnPending).toBeUndefined();
-  expect(parseTopics(off)[0].spawnToken).toBeUndefined();
-});
-
-// --- §11 deferrals: reply anchor, daemon-global slash intercept, topic-rename ---
-
-// Deferral 2 adversarial boundary: /stop and /kill must NOT be intercepted (they
-// belong to the topic's own harness session, not the daemon).
-test('§11 d2: /stop in a bound topic → topic-route with verbatim /stop (not daemon-intercepted)', () => {
-  const r = stepUpdates(
-    [upd(20, { text: '/stop', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '/stop', from: 'Alex', messageId: 20 });
-});
-
-test('§11 d2: /kill in a bound topic → topic-route with verbatim /kill (not daemon-intercepted)', () => {
-  const r = stepUpdates(
-    [upd(21, { text: '/kill', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '/kill', from: 'Alex', messageId: 21 });
-});
-
-test('§11 d2: /status in a bound topic → daemon-intercepted (kind: status)', () => {
-  const r = stepUpdates(
-    [upd(22, { text: '/status', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions[0]).toMatchObject({ kind: 'status', threadId: 50 });
-});
-
-test('§11 d2: /agent @bot in a bound topic → daemon-intercepted (kind: agent-route, NOT topic-route)', () => {
-  const r = stepUpdates(
-    [upd(23, { text: '/agent @mybot pane1', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions[0]?.kind).not.toBe('topic-route');
-  expect(r.actions[0]?.kind).toBe('agent-route');
-  expect(r.actions[0]).toMatchObject({ threadId: 50 });
-});
-
-test('§11 d2: /new model dir Name in a bound topic → daemon-intercepted (NOT topic-route)', () => {
-  const r = stepUpdates(
-    [upd(24, { text: '/new claude-opus /tmp MyAgent', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions[0]?.kind).not.toBe('topic-route');
-  expect(r.actions[0]?.kind).toBe('new-command');
-  expect(r.actions[0]).toMatchObject({ threadId: 50 });
-});
-
-test('§11 d2: /limit in a bound topic → daemon-intercepted with source thread id', () => {
-  const r = stepUpdates(
-    [upd(27, { text: '/limit codex', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions[0]).toMatchObject({ kind: 'limit-status', agent: 'codex', threadId: 50 });
-});
-
-test('§11 d2: /daily in a bound topic → daemon-intercepted with source thread id', () => {
-  const r = stepUpdates(
-    [upd(28, { text: '/daily', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions[0]).toMatchObject({ kind: 'daily-report', threadId: 50 });
-});
-
-// Named /spend, NOT /usage/cost/stats — see ctl-updates.test.ts for the full reserved-set
-// rationale (tg-cli#290 review finding).
-test('§11 d2: /spend in a bound topic → daemon-intercepted with source thread id', () => {
-  const r = stepUpdates(
-    [upd(29, { text: '/spend week', message_thread_id: 50, is_topic_message: true })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions[0]).toMatchObject({ kind: 'usage-report', period: 'week', threadId: 50 });
-});
-
-// The whole reserved set (/usage, /cost, /stats — see ctl-updates.test.ts) must reach the
-// topic's agent pane VERBATIM, not be daemon-intercepted.
-for (const [idx, reserved] of ['/usage', '/cost', '/stats'].entries()) {
-  test(`§11 d2: ${reserved} in a bound topic passes through to the agent (NOT intercepted)`, () => {
-    const r = stepUpdates(
-      [upd(30 + idx, { text: reserved, message_thread_id: 50, is_topic_message: true })],
-      makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-    );
-    expect(r.actions[0]).toMatchObject({ kind: 'topic-route', injectText: reserved, threadId: 50 });
-  });
-}
-
-// Deferral 1: prose reply in a bound topic gets the ↩ tg#<id> «…» quote-anchor.
-test('§11 d1: prose reply in a bound topic → topic-route with ↩ tg#<id> «…» quote-anchor', () => {
-  const replyTo = { message_id: 42, date: 1_749_000_000, text: 'quoted text', chat: { id: CHAT_ID, type: 'supergroup' as const } };
-  const r = stepUpdates(
-    [upd(25, { text: 'yes, do it', message_thread_id: 50, is_topic_message: true, reply_to_message: replyTo })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  const a = r.actions[0];
-  expect(a?.kind).toBe('topic-route');
-  if (a?.kind === 'topic-route') {
-    expect(a.injectText).toMatch(/^↩ tg#42 «/);
-  }
-});
-
-test('§11 d1: /stop reply in a bound topic → verbatim /stop (no anchor, /stop is a command)', () => {
-  const replyTo = { message_id: 42, date: 1_749_000_000, text: 'whatever', chat: { id: CHAT_ID, type: 'supergroup' as const } };
-  const r = stepUpdates(
-    [upd(26, { text: '/stop', message_thread_id: 50, is_topic_message: true, reply_to_message: replyTo })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  // /stop must go verbatim to the topic agent, no anchor
-  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '/stop', from: 'Alex', messageId: 26 });
-});
-
-// Deferral 3: topic-rename action from forum_topic_edited.
-test('§11 d3: forum_topic_edited with name → topic-rename for a tracked topic', () => {
-  const r = stepUpdates(
-    [upd(30, { message_thread_id: 50, forum_topic_edited: { name: 'New Name' } })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: (t) => (t === 50 ? 'bound' : null) }),
-  );
-  expect(r.actions).toContainEqual({ kind: 'topic-rename', threadId: 50, name: 'New Name' });
-});
-
-test('§11 d3: forum_topic_edited with no name (icon-only edit) → [] for a tracked topic', () => {
-  const r = stepUpdates(
-    [upd(31, { message_thread_id: 50, forum_topic_edited: {} })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
-  );
-  expect(r.actions.some((a) => a.kind === 'topic-rename')).toBe(false);
-  expect(r.actions).toContainEqual({ kind: 'ack', messageId: 31 });
-});
-
-test('§11 d3: forum_topic_edited with name for an UNTRACKED topic → [] (not topic-rename)', () => {
-  const r = stepUpdates(
-    [upd(32, { message_thread_id: 77, forum_topic_edited: { name: 'Whatever' } })],
-    makeOpts({ topicsEnabled: true, topicStatusOf: () => null }),
-  );
-  expect(r.actions.some((a) => a.kind === 'topic-rename')).toBe(false);
-});
-
-// markRenamed lifecycle: keeps all fields except name + ts.
-test('markRenamed updates name + ts, preserves all other fields', () => {
-  const binding: TopicBinding = {
-    threadId: 50, name: 'old-name', status: 'bound', paneId: '%3', path: '/p', model: 'claude-opus', ts: 100,
-  };
-  const renamed = markRenamed(binding, 'new-name', 200);
-  expect(renamed.name).toBe('new-name');
-  expect(renamed.ts).toBe(200);
-  expect(renamed.status).toBe('bound');
-  expect(renamed.paneId).toBe('%3');
-  expect(renamed.path).toBe('/p');
-  expect(renamed.model).toBe('claude-opus');
+test('an OLD topic message is still triaged, never age-dropped (#183)', () => {
+  const r = stepUpdates([inTopic(20, { text: 'old', date: NOW - 9999 })], bound);
+  expect(r.actions[0]).toMatchObject({ kind: 'topic-route' });
+  expect(r.skippedStale).toBe(0);
 });

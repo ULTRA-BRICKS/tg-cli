@@ -5,8 +5,8 @@ import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 
-// End-to-end forum-topics ROUTING (docs/specs/tg-forum-topics.md §8, increment 3 minus
-// spawn): the real daemon, a fake Telegram server, and a fake tmux/ps reporting TWO claude
+// End-to-end forum-topic inbound triage (docs/specs/session-registry-and-topics.md §4.4): the
+// real daemon, a fake Telegram server, and a fake tmux/ps reporting TWO claude
 // panes — %1 (the flat/1:1 default target, pinned via registration) and %2 (a pre-seeded
 // BOUND topic's pane). Every injected payload is logged as `<paneId>\t<text>` so a test can
 // assert WHICH pane each message reached.
@@ -18,8 +18,10 @@ import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon
 //      into the flat pane %1 — turning topics on does not change non-topic routing.
 //   3. With control.topics ON, a message inside a BOUND topic injects into THAT topic's pane
 //      (%2), never the flat target.
-//   4. A topic whose bound pane is DEAD does NOT leak into the flat agent: the daemon posts an
-//      error sendMessage carrying message_thread_id = T (outbound threading) and injects nothing.
+//   4. A topic whose bound session is GONE does NOT leak into the flat agent: the daemon answers
+//      "not running — resume with …" in the topic (message_thread_id = T) and injects nothing.
+//   5. An UNKNOWN topic holds its messages and posts the attach picker there; a pick delivers
+//      the queue to the chosen session in order, exactly once, and binds the topic.
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -40,13 +42,16 @@ const TOPIC_PID = 4242;
 // `<paneId>\t<text>` to $injectLog. The pane id is captured from the `-t %N` flag in the same
 // invocation. load-buffer/paste-buffer (multi-line) is unused here (all test texts are single
 // line) so it is logged verbatim without a pane prefix — never hit in these cases.
-function fakeTmux(cwd: string, injectLog: string): string {
+function fakeTmux(cwd: string, injectLog: string, fleet = true): string {
+  const panes = fleet
+    ? `printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '${FLAT_PANE}' '${FLAT_PID}' 'claude' 'main' '${cwd}'
+    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '1' '${TOPIC_PANE}' '${TOPIC_PID}' 'claude' 'main' '${cwd}'`
+    : ':';
   return `#!/bin/sh
 sub="$1"; shift
 case "$sub" in
   list-panes)
-    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '${FLAT_PANE}' '${FLAT_PID}' 'claude' 'main' '${cwd}'
-    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '1' '${TOPIC_PANE}' '${TOPIC_PID}' 'claude' 'main' '${cwd}'
+    ${panes}
     ;;
   display-message)
     printf 'main\\n'
@@ -78,7 +83,11 @@ exit 0
 `;
 }
 
-function makeCfgDir(opts: { topics: boolean; seedTopics?: unknown[] | ((cfgDir: string) => unknown[]) }): string {
+function makeCfgDir(opts: {
+  topics: boolean;
+  seedTopics?: unknown[] | ((cfgDir: string) => unknown[]);
+  fleet?: boolean; // false → tmux lists no panes: no session is running
+}): string {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-topics-'));
   const injectLog = join(cfgDir, 'inject.log');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
@@ -93,7 +102,7 @@ function makeCfgDir(opts: { topics: boolean; seedTopics?: unknown[] | ((cfgDir: 
     writeFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), JSON.stringify(seeds));
   }
   mkdirSync(join(cfgDir, 'bin'));
-  writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmux(cfgDir, injectLog), { mode: 0o755 });
+  writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmux(cfgDir, injectLog, opts.fleet ?? true), { mode: 0o755 });
   writeFileSync(join(cfgDir, 'bin', 'ps'), fakePs(), { mode: 0o755 });
   return cfgDir;
 }
@@ -142,13 +151,18 @@ async function startDaemon(cfgDir: string, apiPort: number): Promise<Subprocess>
 // A scripted Telegram server: getUpdates drains updateQueue one batch at a time; sendMessage
 // and setMessageReaction bodies are captured so the test can assert message_thread_id threading
 // and delivery receipts.
+// Callback answers and message/topic edits are captured in `calls` as `{ method, ...body }`.
+const CAPTURED_METHODS = ['answerCallbackQuery', 'editMessageText', 'editMessageReplyMarkup', 'editForumTopic'];
+
 function makeServer(updateQueue: unknown[][]): {
   server: ReturnType<typeof Bun.serve>;
   sends: Array<Record<string, unknown>>;
   reactions: Array<Record<string, unknown>>;
+  calls: Array<Record<string, unknown>>;
 } {
   const sends: Array<Record<string, unknown>> = [];
   const reactions: Array<Record<string, unknown>> = [];
+  const calls: Array<Record<string, unknown>> = [];
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -167,10 +181,32 @@ function makeServer(updateQueue: unknown[][]): {
         reactions.push((await req.json()) as Record<string, unknown>);
         return Response.json({ ok: true, result: true });
       }
+      const method = url.pathname.split('/').at(-1) ?? '';
+      if (CAPTURED_METHODS.includes(method)) {
+        calls.push({ method, ...((await req.json()) as Record<string, unknown>) });
+        return Response.json({ ok: true, result: true });
+      }
       return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
     },
   });
-  return { server, sends, reactions };
+  return { server, sends, reactions, calls };
+}
+
+function attachTap(updateId: number, threadId: number, paneId: string, pickerMessageId: number): unknown {
+  return {
+    update_id: updateId,
+    callback_query: {
+      id: `cb${updateId}`,
+      from: { id: 1, first_name: 'Alex' },
+      data: `tgt:${threadId}:${paneId}`,
+      message: { message_id: pickerMessageId, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), message_thread_id: threadId },
+    },
+  };
+}
+
+function holdsStore(cfgDir: string): { holds: Array<Record<string, unknown>> } {
+  const p = join(cfgDir, 'tg-ctl.123.topic-holds.json');
+  return existsSync(p) ? (JSON.parse(readFileSync(p, 'utf8')) as { holds: Array<Record<string, unknown>> }) : { holds: [] };
 }
 
 function plainMsg(messageId: number, text: string, nowSec: number): unknown {
@@ -344,11 +380,11 @@ test('topics ON: a REUSED pane (binding path != live pane path) does NOT leak �
   await daemon.exited;
 }, 30_000);
 
-test('topics ON: a BOUND topic whose pane is DEAD does NOT leak to the flat agent — error posted with message_thread_id, binding closed', async () => {
-  // %9 is not in the fake tmux pane list → the bound pane is gone.
+test('topics ON: a BOUND topic whose session is GONE answers "not running" in the topic — no leak, no spawn, binding closed', async () => {
+  // %9 is not in the fake tmux pane list → the bound session is gone.
   const cfgDir = makeCfgDir({
     topics: true,
-    seedTopics: [{ threadId: 50, name: 'api', status: 'bound', paneId: '%9', ts: 1 }],
+    seedTopics: [{ threadId: 50, name: 'api', status: 'bound', paneId: '%9', harness: 'omp', ts: 1 }],
   });
   const updateQueue: unknown[][] = [];
   const { server, sends, reactions } = makeServer(updateQueue);
@@ -358,26 +394,16 @@ test('topics ON: a BOUND topic whose pane is DEAD does NOT leak to the flat agen
   const nowSec = Math.floor(Date.now() / 1000);
   updateQueue.push([topicMsg(13, 50, 'are you there?', nowSec)]);
 
-  // The daemon posts an error into the topic — wait for that sendMessage.
-  await waitFor(() => sends.length >= 1);
-  // CRITICAL safety: nothing was injected anywhere (no leak into the flat %1 agent).
-  expect(injected(cfgDir)).toEqual([]);
-  // The replies are threaded into the topic (message_thread_id = T), not General. The restart flow
-  // (no path/model seed) posts the path prompt AND an "exited — set it up again" notice into T.
-  await waitFor(() => sends.some((s) => s.message_thread_id === 50 && String(s.text).includes('exited')));
-  const exitedReplies = sends.filter((s) => String(s.text).includes('exited'));
-  expect(exitedReplies.length).toBeGreaterThan(0);
-  expect(exitedReplies.every((s) => s.message_thread_id === 50)).toBe(true);
-  // The dead binding flips to closed, then increment 4 recovers: this seed has NO path/model, so
-  // the entrypoint restarts the /new flow (back to awaiting-path) rather than a one-tap re-spawn —
-  // the human is never left at a dead-end. (A seed WITH path+model would offer a Re-spawn button;
-  // see the dedicated re-spawn test below.)
-  await waitFor(() => topicsStore(cfgDir).some((t) => t.threadId === 50 && t.status === 'awaiting-path'));
-  const binding = topicsStore(cfgDir).find((t) => t.threadId === 50);
-  expect(binding?.status).toBe('awaiting-path');
-  // A FAILED route earns NO 👀 receipt — the trailing ack reads the route's false verdict
-  // (lastActionOk), so a dead-pane message must not also be marked "seen by the agent". Give
-  // the ack a beat to run after the error sendMessage, then assert no reaction was set.
+  await waitFor(() => sends.some((s) => String(s.text).includes('not running')));
+  const reply = sends.find((s) => String(s.text).includes('not running'));
+  expect(reply).toMatchObject({ message_thread_id: 50, text: '`api` is not running — resume with `rig omp run --resume …`' });
+  expect(injected(cfgDir)).toEqual([]); // nothing reached the flat %1 agent (or anywhere)
+  expect(topicsStore(cfgDir).find((t) => t.threadId === 50)?.status).toBe('closed');
+  // A second message to the gone topic gets the same answer — never silence, never a picker.
+  updateQueue.push([topicMsg(14, 50, 'hello?', nowSec)]);
+  await waitFor(() => sends.filter((s) => String(s.text).includes('not running')).length >= 2);
+  expect(sends.some((s) => s.reply_markup !== undefined)).toBe(false);
+  // An undelivered message earns no 👀 receipt.
   await Bun.sleep(300);
   expect(reactions).toEqual([]);
 
@@ -385,95 +411,213 @@ test('topics ON: a BOUND topic whose pane is DEAD does NOT leak to the flat agen
   await daemon.exited;
 }, 30_000);
 
-test('topics ON: a message in an UNTRACKED topic (no binding) is ACK-only — never leaks to the flat agent', async () => {
-  // The COMMON case at topics:true before the spawn executor lands: a topic with no binding
-  // (topic-new is a logged no-op, so topicStatusOf → null). stepUpdates ACKs it and emits NO
-  // route, so nothing reaches the flat %1 agent. This is the headline safety guarantee.
-  const cfgDir = makeCfgDir({ topics: true }); // no seeded bindings
+test('topics ON: an UNKNOWN topic holds messages + posts the attach picker once; a pick delivers them in order, once, and binds the topic', async () => {
+  const cfgDir = makeCfgDir({ topics: true }); // no bindings: topic 77 is unknown (user-created / implicit)
   const updateQueue: unknown[][] = [];
-  const { server, reactions } = makeServer(updateQueue);
+  const { server, sends, reactions, calls } = makeServer(updateQueue);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
 
   const nowSec = Math.floor(Date.now() / 1000);
-  updateQueue.push([topicMsg(15, 77, 'hello untracked topic', nowSec)]);
+  updateQueue.push([topicMsg(15, 77, 'first held', nowSec), topicMsg(16, 77, 'second held', nowSec)]);
 
-  // It gets a 👀 (ack-only) — wait for that, then assert nothing was injected anywhere.
-  await waitFor(() => reactions.length >= 1);
-  expect(reactions.at(-1)).toMatchObject({ message_id: 15 });
-  await Bun.sleep(200);
-  expect(injected(cfgDir)).toEqual([]); // NOT in %1, NOT in %2 — nowhere
+  await waitFor(() => holdsStore(cfgDir).holds.some((h) => (h.payloads as unknown[]).length === 2 && h.pickerMessageId !== null));
+  const pickers = sends.filter((s) => s.reply_markup !== undefined);
+  expect(pickers).toHaveLength(1); // posted once per hold, not per message
+  expect(pickers[0].message_thread_id).toBe(77);
+  const buttons = (pickers[0].reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> }).inline_keyboard.flat();
+  expect(buttons.map((b) => b.callback_data).sort()).toEqual(['tgt:77:%1', 'tgt:77:%2']);
+  expect(injected(cfgDir)).toEqual([]); // held, not delivered anywhere yet
+  await waitFor(() => reactions.length >= 2);
+  expect(reactions.map((r) => (r.reaction as Array<{ emoji: string }>)[0].emoji)).toEqual(['✍️', '✍️']);
 
-  daemon.kill('SIGTERM');
-  await daemon.exited;
-}, 30_000);
-
-test('topics ON: forum_topic_reopened on a tracked closed topic resumes the /new flow (markReopened)', async () => {
-  // A closed topic that already knows its path → reopen drops to awaiting-model (re-pick model
-  // → increment 2 re-spawns), and the old pane is dropped. Mirrors the close test for symmetry.
-  const cfgDir = makeCfgDir({
-    topics: true,
-    seedTopics: [{ threadId: 50, name: 'api', status: 'closed', path: '/w', model: 'claude-opus', paneId: TOPIC_PANE, ts: 1 }],
-  });
-  const updateQueue: unknown[][] = [];
-  const { server } = makeServer(updateQueue);
-  servers.push(server);
-  const daemon = await startDaemon(cfgDir, server.port);
-
-  const nowSec = Math.floor(Date.now() / 1000);
-  updateQueue.push([
-    {
-      update_id: 16,
-      message: {
-        message_id: 16,
-        from: { id: 1, first_name: 'Alex' },
-        chat: { id: 1 },
-        date: nowSec,
-        message_thread_id: 50,
-        forum_topic_reopened: {},
-      },
-    },
+  // Pick %2 — twice (a double tap). The queue is delivered exactly once, in order.
+  const pickerId = holdsStore(cfgDir).holds[0].pickerMessageId as number;
+  updateQueue.push([attachTap(17, 77, TOPIC_PANE, pickerId), attachTap(18, 77, TOPIC_PANE, pickerId)]);
+  await waitFor(() => injected(cfgDir).length >= 2 && calls.filter((c) => c.method === 'answerCallbackQuery').length >= 2);
+  await Bun.sleep(300);
+  expect(injected(cfgDir)).toEqual([
+    { pane: TOPIC_PANE, text: '[TG from Alex tg#15] first held' },
+    { pane: TOPIC_PANE, text: '[TG from Alex tg#16] second held' },
   ]);
+  expect(calls.some((c) => c.method === 'answerCallbackQuery' && String(c.text).startsWith('expired'))).toBe(true);
+  expect(holdsStore(cfgDir).holds).toEqual([]);
+  // %2 had no topic → topic 77 becomes its topic, renamed to the session's title.
+  expect(topicsStore(cfgDir).find((t) => t.threadId === 77)).toMatchObject({ status: 'bound', paneId: TOPIC_PANE, harness: 'claude' });
+  expect(calls.find((c) => c.method === 'editForumTopic')).toMatchObject({ message_thread_id: 77 });
+  expect(sends.some((s) => s.message_thread_id === 77 && String(s.text).startsWith('this topic is now'))).toBe(true);
 
-  await waitFor(() => topicsStore(cfgDir).some((t) => t.threadId === 50 && t.status === 'awaiting-model'));
-  const binding = topicsStore(cfgDir).find((t) => t.threadId === 50);
-  expect(binding?.status).toBe('awaiting-model'); // path known → re-pick model
-  expect(binding?.paneId).toBeUndefined(); // old pane dropped on reopen
-  expect(injected(cfgDir)).toEqual([]); // a service message never reaches an agent
+  // A later message in the now-bound topic routes straight to %2 — no second picker.
+  updateQueue.push([topicMsg(19, 77, 'direct now', nowSec)]);
+  await waitFor(() => injected(cfgDir).length >= 3);
+  expect(injected(cfgDir)[2]).toEqual({ pane: TOPIC_PANE, text: '[TG from Alex tg#19] direct now' });
+  expect(sends.filter((s) => s.reply_markup !== undefined)).toHaveLength(1);
 
   daemon.kill('SIGTERM');
   await daemon.exited;
 }, 30_000);
 
-test('topics ON: forum_topic_closed on a tracked topic persists status=closed (lifecycle wiring)', async () => {
+test('topics ON: a message right after a pick in the SAME batch routes to the just-bound session — no second picker', async () => {
+  const cfgDir = makeCfgDir({ topics: true });
+  const updateQueue: unknown[][] = [];
+  const { server, sends } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([topicMsg(15, 77, 'held', nowSec)]);
+  await waitFor(() => holdsStore(cfgDir).holds.some((h) => h.pickerMessageId !== null));
+  const pickerId = holdsStore(cfgDir).holds[0].pickerMessageId as number;
+
+  // Tap, then type before the next poll: both land in one getUpdates batch, triaged up front
+  // while topic 77 was still unknown.
+  updateQueue.push([attachTap(16, 77, TOPIC_PANE, pickerId), topicMsg(17, 77, 'typed after tap', nowSec)]);
+  await waitFor(() => injected(cfgDir).length >= 2);
+  expect(injected(cfgDir)).toEqual([
+    { pane: TOPIC_PANE, text: '[TG from Alex tg#15] held' },
+    { pane: TOPIC_PANE, text: '[TG from Alex tg#17] typed after tap' },
+  ]);
+  expect(sends.filter((s) => s.reply_markup !== undefined)).toHaveLength(1);
+  expect(holdsStore(cfgDir).holds).toEqual([]);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('topics ON: a tap on a session that has since exited retires that picker — the next message posts a fresh one', async () => {
+  const cfgDir = makeCfgDir({ topics: true });
+  const updateQueue: unknown[][] = [];
+  const { server, sends, calls } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([topicMsg(15, 77, 'held', nowSec)]);
+  await waitFor(() => holdsStore(cfgDir).holds.some((h) => h.pickerMessageId !== null));
+  const pickerId = holdsStore(cfgDir).holds[0].pickerMessageId as number;
+
+  // %9 is not in the fake tmux fleet: the button's session exited after the picker was posted.
+  updateQueue.push([attachTap(16, 77, '%9', pickerId)]);
+  await waitFor(() => holdsStore(cfgDir).holds.some((h) => h.pickerMessageId === null));
+  expect(calls.some((c) => c.method === 'answerCallbackQuery' && String(c.text).includes('no longer running'))).toBe(true);
+
+  updateQueue.push([topicMsg(17, 77, 'still waiting', nowSec)]);
+  await waitFor(() => sends.filter((s) => s.reply_markup !== undefined).length >= 2);
+  expect(sends.filter((s) => s.reply_markup !== undefined)).toHaveLength(2);
+  expect(holdsStore(cfgDir).holds[0].payloads as unknown[]).toHaveLength(2);
+  expect(injected(cfgDir)).toEqual([]);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('topics ON: a pick onto a session that ALREADY has a topic delivers there but leaves this topic unbound', async () => {
   const cfgDir = makeCfgDir({
     topics: true,
     seedTopics: [{ threadId: 50, name: 'api', status: 'bound', paneId: TOPIC_PANE, ts: 1 }],
   });
   const updateQueue: unknown[][] = [];
-  const { server } = makeServer(updateQueue);
+  const { server, sends, calls } = makeServer(updateQueue);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
 
   const nowSec = Math.floor(Date.now() / 1000);
-  updateQueue.push([
-    {
-      update_id: 14,
-      message: {
-        message_id: 14,
-        from: { id: 1, first_name: 'Alex' },
-        chat: { id: 1 },
-        date: nowSec,
-        message_thread_id: 50,
-        forum_topic_closed: {},
-      },
-    },
-  ]);
+  updateQueue.push([topicMsg(20, 77, 'for api', nowSec)]);
+  await waitFor(() => holdsStore(cfgDir).holds.some((h) => h.pickerMessageId !== null));
+  updateQueue.push([attachTap(21, 77, TOPIC_PANE, holdsStore(cfgDir).holds[0].pickerMessageId as number)]);
 
-  await waitFor(() => topicsStore(cfgDir).some((t) => t.threadId === 50 && t.status === 'closed'));
-  expect(topicsStore(cfgDir).find((t) => t.threadId === 50)?.status).toBe('closed');
-  // Nothing injected — a service message never reaches an agent.
+  await waitFor(() => sends.some((s) => String(s.text).includes('already has its own topic')));
+  expect(injected(cfgDir)).toEqual([{ pane: TOPIC_PANE, text: '[TG from Alex tg#20] for api' }]);
+  expect(topicsStore(cfgDir).find((t) => t.threadId === 77)).toBeUndefined();
+  expect(topicsStore(cfgDir).find((t) => t.threadId === 50)?.paneId).toBe(TOPIC_PANE);
+  expect(calls.some((c) => c.method === 'editForumTopic')).toBe(false);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('topics ON: held messages survive a daemon restart — a restored hold is delivered on a pick, an expired one answered', async () => {
+  const cfgDir = makeCfgDir({ topics: true });
+  const nowSec = Math.floor(Date.now() / 1000);
+  writeFileSync(
+    join(cfgDir, 'tg-ctl.123.topic-holds.json'),
+    JSON.stringify({
+      version: 1,
+      holds: [
+        { threadId: 77, firstAt: nowSec - 60, pickerMessageId: 500, payloads: [{ type: 'text', text: '[TG from Alex #30] kept', from: 'Alex', messageId: 30 }] },
+        {
+          threadId: 88,
+          firstAt: nowSec - 700,
+          pickerMessageId: 501,
+          payloads: [
+            { type: 'text', text: 'a', from: 'Alex', messageId: 31 },
+            { type: 'text', text: 'b', from: 'Alex', messageId: 32 },
+          ],
+        },
+      ],
+    }),
+  );
+  const updateQueue: unknown[][] = [];
+  const { server, sends, calls } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  // The hold that expired while the daemon was down still gets its reply, in its topic.
+  await waitFor(() => sends.some((s) => s.message_thread_id === 88));
+  expect(sends.find((s) => s.message_thread_id === 88)?.text).toBe('2 messages not delivered — send again to reach a session');
+  expect(calls.some((c) => c.method === 'editMessageReplyMarkup' && c.message_id === 501)).toBe(true);
+  expect(holdsStore(cfgDir).holds.map((h) => h.threadId)).toEqual([77]);
+
+  updateQueue.push([attachTap(40, 77, FLAT_PANE, 500)]);
+  await waitFor(() => injected(cfgDir).length >= 1);
+  expect(injected(cfgDir)).toEqual([{ pane: FLAT_PANE, text: '[TG from Alex #30] kept' }]);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('topics ON: /status in an UNKNOWN topic is answered in that topic (daemon verbs work in any topic)', async () => {
+  const cfgDir = makeCfgDir({ topics: true });
+  const updateQueue: unknown[][] = [];
+  const { server, sends } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  updateQueue.push([topicMsg(50, 77, '/status', Math.floor(Date.now() / 1000))]);
+  await waitFor(() => sends.length >= 1);
+  expect(sends[0].message_thread_id).toBe(77);
+  expect(sends.some((s) => s.reply_markup !== undefined)).toBe(false); // a verb is not held
+  expect(holdsStore(cfgDir).holds).toEqual([]);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('topics ON: forum topic service messages are recorded only — no spawn, no binding change, nothing sent', async () => {
+  const cfgDir = makeCfgDir({
+    topics: true,
+    seedTopics: [{ threadId: 50, name: 'api', status: 'bound', paneId: TOPIC_PANE, ts: 1 }],
+  });
+  const updateQueue: unknown[][] = [];
+  const { server, sends } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const service = (id: number, thread: number, extra: Record<string, unknown>): unknown => ({
+    update_id: id,
+    message: { message_id: id, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, message_thread_id: thread, ...extra },
+  });
+  updateQueue.push([
+    service(60, 90, { forum_topic_created: { name: 'New Topic' } }),
+    service(61, 50, { forum_topic_edited: { name: 'renamed by user' } }),
+    service(62, 50, { forum_topic_closed: {} }),
+    service(63, 50, { forum_topic_reopened: {} }),
+  ]);
+  await waitFor(() => readFileSync(join(cfgDir, 'daemon.log'), 'utf8').includes('topic 50: reopened'));
+  expect(sends).toEqual([]);
   expect(injected(cfgDir)).toEqual([]);
+  expect(topicsStore(cfgDir)).toEqual([{ threadId: 50, name: 'api', status: 'bound', paneId: TOPIC_PANE, ts: 1 }]);
 
   daemon.kill('SIGTERM');
   await daemon.exited;
@@ -506,6 +650,108 @@ test('topics ON: `/agent <gone>` inside a BOUND topic does NOT fall back to the 
   expect(injected(cfgDir)).toEqual([]);
   const errorReplies = sends.filter((s) => String(s.text ?? '').includes("no agent matching 'ghost'"));
   expect(errorReplies.every((s) => s.message_thread_id === 50)).toBe(true);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('topics ON: two topics picking the SAME session concurrently — one binds, the other stays unlinked, nothing is lost', async () => {
+  const cfgDir = makeCfgDir({ topics: true });
+  const updateQueue: unknown[][] = [];
+  const { server, sends } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([topicMsg(15, 77, 'from 77', nowSec), topicMsg(16, 78, 'from 78', nowSec)]);
+  await waitFor(() => holdsStore(cfgDir).holds.filter((h) => h.pickerMessageId !== null).length === 2);
+  const pickerOf = (t: number) => holdsStore(cfgDir).holds.find((h) => h.threadId === t)?.pickerMessageId as number;
+  // Both taps land in one batch: different threads, so the dispatcher runs them concurrently.
+  updateQueue.push([attachTap(17, 77, TOPIC_PANE, pickerOf(77)), attachTap(18, 78, TOPIC_PANE, pickerOf(78))]);
+
+  await waitFor(() => injected(cfgDir).length >= 2 && sends.some((s) => String(s.text).includes('already has its own topic')));
+  expect(injected(cfgDir).map((l) => l.text).sort()).toEqual(['[TG from Alex tg#15] from 77', '[TG from Alex tg#16] from 78']);
+  const bindings = topicsStore(cfgDir).filter((t) => t.paneId === TOPIC_PANE);
+  expect(bindings).toHaveLength(1); // a session has at most one topic
+  expect(bindings[0].status).toBe('bound');
+  const loser = bindings[0].threadId === 77 ? 78 : 77;
+  expect(sends.some((s) => s.message_thread_id === loser && String(s.text).includes('already has its own topic'))).toBe(true);
+  expect(holdsStore(cfgDir).holds).toEqual([]);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('topics ON: a leftover awaiting-model binding (spawn never finished) drops on the next message — the attach picker appears, not "still starting"', async () => {
+  // A crash-gap row reconcile could not adopt: no `web` window exists.
+  const cfgDir = makeCfgDir({
+    topics: true,
+    seedTopics: (dir) => [
+      { threadId: 60, name: 'web', status: 'awaiting-model', path: dir, model: 'claude-opus', harness: 'claude', spawnPending: true, spawnToken: '60-1-1', ts: 1 },
+    ],
+  });
+  const updateQueue: unknown[][] = [];
+  const { server, sends } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([topicMsg(15, 60, 'hello?', nowSec)]);
+  await waitFor(() => sends.some((s) => s.reply_markup !== undefined));
+  expect(sends.some((s) => String(s.text).includes('still starting'))).toBe(false);
+  expect(sends.find((s) => s.reply_markup !== undefined)?.message_thread_id).toBe(60);
+  expect(holdsStore(cfgDir).holds.map((h) => h.threadId)).toEqual([60]);
+  expect(topicsStore(cfgDir).find((t) => t.threadId === 60)).toBeUndefined();
+  expect(injected(cfgDir)).toEqual([]);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('topics ON: with no session running, the "no session" notice is posted once per hold, not once per message', async () => {
+  const cfgDir = makeCfgDir({ topics: true, fleet: false });
+  const updateQueue: unknown[][] = [];
+  const { server, sends } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([topicMsg(15, 77, 'one', nowSec)]);
+  await waitFor(() => sends.some((s) => String(s.text).includes('no session is running')));
+  updateQueue.push([topicMsg(16, 77, 'two', nowSec), topicMsg(17, 77, 'three', nowSec)]);
+  await waitFor(() => (holdsStore(cfgDir).holds[0]?.payloads as unknown[] | undefined)?.length === 3);
+  // An ABSENT second notice has no event to await; give a stray send time to land.
+  await Bun.sleep(300);
+  expect(sends.filter((s) => String(s.text).includes('no session is running'))).toHaveLength(1);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('topics ON: past the hold cap a new topic evicts the OLDEST hold and answers there — the newest is kept', async () => {
+  const cfgDir = makeCfgDir({ topics: true });
+  const nowSec = Math.floor(Date.now() / 1000);
+  const seeded = Array.from({ length: 200 }, (_, i) => ({
+    threadId: 1000 + i,
+    firstAt: nowSec - 60 + i,
+    pickerMessageId: 5000 + i,
+    payloads: [{ type: 'text', text: `held ${i}`, from: 'Alex', messageId: 3000 + i }],
+  }));
+  writeFileSync(join(cfgDir, 'tg-ctl.123.topic-holds.json'), JSON.stringify({ version: 1, holds: seeded }));
+  const updateQueue: unknown[][] = [];
+  const { server, sends, calls } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  updateQueue.push([topicMsg(15, 77, 'newest', nowSec)]);
+  await waitFor(() => sends.some((s) => s.message_thread_id === 1000));
+  expect(sends.find((s) => s.message_thread_id === 1000)?.text).toBe('1 message not delivered — send again to reach a session');
+  expect(calls.some((c) => c.method === 'editMessageReplyMarkup' && c.message_id === 5000)).toBe(true);
+  await waitFor(() => holdsStore(cfgDir).holds.some((h) => h.threadId === 77));
+  const threads = holdsStore(cfgDir).holds.map((h) => h.threadId);
+  expect(threads).toHaveLength(200);
+  expect(threads).toContain(77);
+  expect(threads).not.toContain(1000);
 
   daemon.kill('SIGTERM');
   await daemon.exited;

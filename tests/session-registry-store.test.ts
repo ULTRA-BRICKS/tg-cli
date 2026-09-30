@@ -87,7 +87,7 @@ const FIXTURE: Partial<Record<MigrationStore, string>> = {
   topics: JSON.stringify([
     { threadId: 70, name: 'gc', status: 'bound', paneId: '%0', ts: 1 },
     { threadId: 71, name: 'x', status: 'bound', paneId: '%8', ts: 1 },
-    { threadId: 72, name: 'y', status: 'awaiting-path', ts: 1 },
+    { threadId: 72, name: 'y', status: 'closed', ts: 1 },
   ]),
 };
 const LIVE_PANES = new Set(['%0', '%3', '%5']);
