@@ -3,6 +3,18 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.23
+
+**`tg-ctl status` says why an omp has no bridge: started before the bridge code, or a real failure (#458).**
+
+- Each omp in the "omp without bridge" block now compares its process start with when the
+  installed bridge last changed: the managed `~/.omp/agent/extensions/tg-omp-live.ts` loader and
+  the files it imports. OMP binds an extension once per process and reuses it for every
+  in-process subagent, and 18.3 cannot reload JS extensions, so an omp started before a bridge
+  fix (or before the loader was installed) keeps what it loaded (before #483 the bridge dropped
+  its endpoint at the first subagent spawn) until it is saved/stopped and resumed once. An omp
+  started after that and still unbridged is flagged as a bridge failure with its log path.
+
 ## 1.54.22
 
 **CI flakes that blocked every merge (#494), and the double spawn behind one of them.**

@@ -23,7 +23,10 @@ still listed, from its private metadata, with `busy: true`; it is never reported
 send to such a host that times out says the text may still arrive once it frees up; it is
 never retried through another path.
 `tg-ctl status` lists every live OMP with its bridge state and names each one WITHOUT a
-bridge (`omp without bridge: N`) together with how it is reached meanwhile.
+bridge (`omp without bridge: N`) together with how it is reached meanwhile. When it can read
+the process start (`ps -o etime=`), each such line also says whether the OMP started before
+the installed bridge code last changed (it still runs the older bridge: save/stop + resume
+once) or after it (a real bridge failure: check `~/.omp/logs/omp.<date>.<pid>.log`).
 
 For a local verified delivery use:
 

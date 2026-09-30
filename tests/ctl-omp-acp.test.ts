@@ -5,6 +5,9 @@ import { findAgentInPane, matchAgentCommand } from '../features/tg-ctl/discover'
 import type { PaneInfo, ProcInfo } from '../features/tg-ctl/types';
 import {
   describeLiveOmp,
+  describeUnbridgedOmp,
+  ompLiveLoaderSources,
+  parsePidStartList,
   isLiveOmpOriginId,
   liveOmpPidFromOriginId,
   matchLiveOmpOrigin,
@@ -637,3 +640,58 @@ test('ompReplyOriginMatches trusts omp:<pid> even when recorded cwd is /tmp', ()
   expect(ompReplyOriginMatches({ paneId: '%1', cwd: '/tmp' }, { ...live, paneId: '%1' })).toBe(false);
 });
 
+// --- #458: an unbridged omp that predates the installed bridge code ---
+
+test('parsePidStartList turns ps etime ([[dd-]hh:]mm:ss) into start epochs', () => {
+  const now = Date.UTC(2026, 8, 30, 12, 0, 0);
+  const out = [' 101    01:05', ' 102 02:00:00', ' 103 1-00:00:10', 'junk', ' 104 9:99:99:99', ' 105 12:99', ' 106 61:00', ' 107 1-24:00:00'].join('\n');
+  const starts = parsePidStartList(out, now);
+  expect(starts.get(101)).toBe(now - 65_000);
+  expect(starts.get(102)).toBe(now - 7_200_000);
+  expect(starts.get(103)).toBe(now - 86_410_000);
+  for (const pid of [104, 105, 106, 107]) expect(starts.has(pid)).toBe(false);
+});
+
+test('describeUnbridgedOmp tells a pre-bridge-code omp (resume once) from a post-deploy failure', () => {
+  const base = { cwd: '/w', sessionFile: null, sessionId: null, tty: null };
+  const codeAt = Date.UTC(2026, 8, 29, 23, 42);
+  const agents: LiveOmpAgent[] = [
+    { ...base, pid: 1, title: 'Old', paneId: '%1' },
+    { ...base, pid: 2, title: 'New', paneId: null },
+    { ...base, pid: 3, title: 'Unknown', paneId: null },
+    { ...base, pid: 4, title: 'Bridged', paneId: null, instanceId: 'a'.repeat(32) },
+  ];
+  const asked: number[][] = [];
+  const lines = describeUnbridgedOmp(agents, (pids) => {
+    asked.push(pids);
+    return { codeChangedAtMs: codeAt, startedAtMs: new Map([[1, codeAt - 60_000], [2, codeAt + 60_000], [4, codeAt - 60_000]]) };
+  });
+  expect(asked).toEqual([[1, 2, 3]]);
+  expect(lines[0]).toBe('omp without bridge: 3');
+  const old = lines.find((l) => l.includes('pid 1')) ?? '';
+  expect(old).toContain('started before the installed bridge code changed');
+  expect(old).toContain('resume once');
+  const fresh = lines.find((l) => l.includes('pid 2')) ?? '';
+  expect(fresh).toContain('started after the installed bridge code');
+  expect(fresh).not.toContain('resume once');
+  const unknown = lines.find((l) => l.includes('pid 3')) ?? '';
+  expect(unknown).toContain('pid 3');
+  expect(unknown).not.toContain('bridge code');
+  expect(lines.some((l) => l.includes('pid 4'))).toBe(false);
+});
+
+test('ompLiveLoaderSources reads the file URLs the managed loader imports', () => {
+  const loader = [
+    '// Managed by tg-cli omp-live (v1).',
+    'const source = new URL("file:///Users/u/.files/repos/tg-cli/features/tg-ctl/omp-live-extension.mjs");',
+    'const runtime = new URL("file:///Users/u/.files/repos/tg-cli/features/tg-ctl/omp-live-runtime.mjs");',
+    'const other = new URL("https://example.com/x.mjs");',
+    'const spaced = new URL("file:///Users/u/my%20repo/omp-live-extension.mjs");',
+  ].join('\n');
+  expect(ompLiveLoaderSources(loader)).toEqual([
+    '/Users/u/.files/repos/tg-cli/features/tg-ctl/omp-live-extension.mjs',
+    '/Users/u/.files/repos/tg-cli/features/tg-ctl/omp-live-runtime.mjs',
+    '/Users/u/my repo/omp-live-extension.mjs',
+  ]);
+  expect(ompLiveLoaderSources('export default () => {};')).toEqual([]);
+});

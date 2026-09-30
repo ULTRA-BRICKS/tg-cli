@@ -156,6 +156,9 @@ import {
   pickPrimaryOmpSessionFile,
   preferOmpApiOverTmux,
   withOmpSession,
+  ompLiveLoaderSources,
+  parsePidStartList,
+  type BridgeCodeAge,
   type LiveOmpAgent,
 } from "./features/tg-ctl/omp"
 import { defaultRegistryRoot, listLiveEndpoints, sendLiveMessage } from "./features/tg-ctl/omp-live-runtime.mjs"
@@ -1178,6 +1181,33 @@ function readPidTtyMap(): Map<number, string> {
     return parsePidTtyList(ps.stdout.toString())
   } catch {
     return new Map()
+  }
+}
+
+// #458: when the installed bridge last changed — the managed loader (same agent root
+// ensureOmpLiveExtensionOnStartup installs into) and the files it names (the extension and
+// runtime; the runtime imports only node builtins) — vs when each unbridged omp started:
+// tells "resume once to load it" from a real bridge failure. No loader, a loader with no
+// file URL, any missing file or a `ps` failure degrades to no verdict, never a crash.
+function readBridgeCodeAge(home: string, pids: number[]): BridgeCodeAge | undefined {
+  const loaderPath = join(home, ".omp", "agent", "extensions", "tg-omp-live.ts")
+  const loader = readFileOrNull(loaderPath)
+  const sources = loader === null ? [] : ompLiveLoaderSources(loader)
+  let codeChangedAtMs: number | null = null
+  if (sources.length > 0) {
+    let latest = 0
+    for (const path of [loaderPath, ...sources]) {
+      const mtime = fileMtimeMs(path)
+      if (mtime === null) { latest = -1; break }
+      latest = Math.max(latest, mtime)
+    }
+    codeChangedAtMs = latest < 0 ? null : latest
+  }
+  try {
+    const ps = Bun.spawnSync(["ps", "-o", "pid=,etime=", "-p", pids.join(",")], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
+    return { codeChangedAtMs, startedAtMs: parsePidStartList(ps.stdout.toString(), Date.now()) }
+  } catch {
+    return undefined
   }
 }
 
@@ -2426,7 +2456,7 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
   if (liveOmp.length > 0) {
     lines.push(`omp (original-process): ${liveOmp.length}`)
     lines.push(...describeOmpLines(liveOmp))
-    lines.push(...describeUnbridgedOmp(liveOmp))
+    lines.push(...describeUnbridgedOmp(liveOmp, (pids) => readBridgeCodeAge(ctx.home, pids)))
   }
   const offsetMtime = fileMtimeMs(ctx.paths.offset)
   lines.push(

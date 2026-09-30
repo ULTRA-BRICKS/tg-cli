@@ -5,6 +5,7 @@
  */
 
 import { isAbsolute, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { matchAgentCommand, paneIdByPid } from './discover';
 import type { AgentKind, PaneInfo, ProcInfo } from './types';
 import { uniqueProjectSelectorHits, type AgentCandidate } from './agent-match';
@@ -358,20 +359,73 @@ export function describeLiveOmp(
   return `${label} · omp — ${a.instanceId ? 'bridge' : 'NO bridge'} (${parts.join(', ')})`;
 }
 
+// `ps -o pid=,etime= -p …` → pid → process start (ms epoch). etime is
+// [[dd-]hh:]mm:ss, locale-independent unlike lstart; malformed rows are dropped.
+export function parsePidStartList(out: string, nowMs: number): Map<number, number> {
+  const starts = new Map<number, number>();
+  for (const line of out.split('\n')) {
+    const m = /^\s*(\d+)\s+(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s*$/.exec(line);
+    if (!m) continue;
+    const [days, hours, minutes, seconds] = [m[2], m[3], m[4], m[5]].map((v) => Number(v ?? 0));
+    if (minutes >= 60 || seconds >= 60 || hours >= 24) continue;
+    starts.set(Number(m[1]), nowMs - (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000);
+  }
+  return starts;
+}
+
+/** When the installed bridge (loader + the code it imports) last changed, and when each live omp started. */
+export interface BridgeCodeAge {
+  codeChangedAtMs: number | null;
+  startedAtMs: ReadonlyMap<number, number>;
+}
+
+/**
+ * Absolute file paths the managed `tg-omp-live.ts` loader imports (its `new URL("file://…")`
+ * literals) — the code a NEW omp actually loads, which need not be this tg-ctl's checkout.
+ */
+export function ompLiveLoaderSources(loader: string): string[] {
+  const paths: string[] = [];
+  for (const m of loader.matchAll(/new URL\(("file:\/\/[^"\n]+")\)/g)) {
+    try { paths.push(fileURLToPath(JSON.parse(m[1]))); } catch { /* not a file URL literal */ }
+  }
+  return paths;
+}
+
+// OMP binds an extension once per process and reuses that module for every in-process
+// subagent, and 18.3 cannot reload JS extensions. An omp started before the installed
+// bridge changed (or was first installed) keeps what it loaded — pre-#483 code dropped its
+// endpoint at the first subagent spawn — until it is resumed; one started after it and
+// still unbridged is a real failure.
+function bridgeCodeVerdict(a: LiveOmpAgent, age: BridgeCodeAge | undefined): string | null {
+  const started = age?.startedAtMs.get(a.pid);
+  const changed = age?.codeChangedAtMs;
+  if (started === undefined || changed === undefined || changed === null) return null;
+  const at = (ms: number) => new Date(ms).toISOString().slice(0, 16).replace('T', ' ');
+  return started < changed
+    ? `started before the installed bridge code changed (${at(started)} < ${at(changed)} UTC) → runs an older or no bridge; save/stop + resume once`
+    : `started after the installed bridge code (${at(changed)} UTC) yet unbridged → bridge failure, see ~/.omp/logs/omp.*.${a.pid}.log`;
+}
+
 /**
  * `tg-ctl status` block naming every live omp WITHOUT an original-process endpoint
- * (#458), and how each is reached meanwhile. Empty when every omp is bridged.
+ * (#458), how each is reached meanwhile, and whether it predates the bridge code.
+ * `readAge` is asked only for the unbridged pids. Empty when every omp is bridged.
  */
-export function describeUnbridgedOmp(agents: readonly LiveOmpAgent[]): string[] {
+export function describeUnbridgedOmp(
+  agents: readonly LiveOmpAgent[],
+  readAge?: (pids: number[]) => BridgeCodeAge | undefined,
+): string[] {
   const missing = agents.filter((a) => !a.instanceId);
   if (missing.length === 0) return [];
+  const age = readAge?.(missing.map((a) => a.pid));
   return [
     `omp without bridge: ${missing.length}`,
     ...missing.map((a) => {
       const name = (a.name ?? '').trim();
       const label = name && name !== liveOmpLabel(a) ? `${liveOmpLabel(a)} (--name ${name})` : liveOmpLabel(a);
       const reach = a.paneId ? `pane ${a.paneId} → tmux send-keys into its own TUI` : 'no tmux → unreachable until it loads the bridge';
-      return `  - ${label} · pid ${a.pid} · ${reach}`;
+      const verdict = bridgeCodeVerdict(a, age);
+      return `  - ${[label, `pid ${a.pid}`, reach, ...(verdict ? [verdict] : [])].join(' · ')}`;
     }),
     '  fix: tg-ctl omp-live install, then save/stop + resume each once (never a second copy)',
   ];
