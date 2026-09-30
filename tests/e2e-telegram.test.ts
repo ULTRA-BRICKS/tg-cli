@@ -406,7 +406,7 @@ describe('statusNames', () => {
       '  - pane %0, cwd /private/tmp',
       `  - ${describeLiveOmp(omp)}`,
       `  - ${describeLiveOmp({ ...omp, instanceId: 'i1', title: 'Ship it', cwd: '/w/beta', paneId: '%4' })}`,
-      `  - ${describeUnreachable({ pid: 9, agent: 'claude', tty: 'ttys004', command: 'claude', name: null, cwd: '/w/gamma' }, 0)}`,
+      `  - ${describeUnreachable({ pid: 9, agent: 'claude', tty: 'ttys004', command: 'claude', name: null, cwd: '/w/gamma' })}`,
     ].join('\n');
     expect(statusNames(status)).toEqual([
       { windowName: 'Fix login', panePath: '/w/alpha' },

@@ -3,6 +3,32 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.31
+
+- **Claude Code and Codex are tmux-only (#456).** `/agent <name> <text>` (or a bare
+  `/agent <name>`) to a Claude Code / Codex session running outside tmux gets a one-line
+  refusal naming how to start it in tmux — `claude-rotate --tmux <name>`, or
+  `tmux new-window -n <name> codex` — and nothing is queued. The Stop-hook inbox that used to
+  take such messages delivered only at the agent's next turn end, so an idle session never
+  got them. A belated hatch approval for a Claude Code / Codex ask with no tmux pane is not
+  queued either; the card names the token path. omp outside tmux is unchanged (omp-live, with
+  its grant-notice inbox fallback). `tg-ctl status` and the no-agent reply list agents outside
+  tmux with the restart hint instead of a queue count; `tg-ctl inbox queue` is gone and
+  `tg-ctl inbox` shows omp's pending grant notices and the archive.
+- **The stranded inbox is reported once and archived.** On its first poll the daemon moves
+  every leftover `inbox/<key>/pending.jsonl` entry to `stranded-<stamp>.jsonl` — except an
+  omp grant notice whose grant is still live, which stays pending for the omp hook — lists
+  those messages in one Telegram message (oldest first, key and preview each; unreadable lines
+  are counted, not dropped), and writes `inbox-stranded-report.json` so a restart does not
+  repeat it (only a kill between the send and that write lists them again — a duplicate,
+  never a loss). A transient send failure (network, 429, 5xx) keeps the built report and the
+  next poll retries only the send; the inbox is not swept again. Telegram rejecting the
+  report (4xx) is final and logged; the archive keeps every message. A key whose backlog could not be claimed or archived keeps
+  it (`pending.jsonl` or `claim-sweep-*.jsonl`) and the marker records an incomplete sweep
+  and the archives already reported, so the next start sweeps again and reports only what
+  was not listed yet — without duplicating what a crashed sweep had already archived or put
+  back.
+
 ## 1.54.28
 
 - **Inbound Telegram messages reach an agent exactly once (#517, #299).** Root cause of the 7x copy of

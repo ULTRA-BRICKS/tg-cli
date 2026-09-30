@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, openSync, closeSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, openSync, closeSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
@@ -84,7 +84,7 @@ afterAll(async () => {
   server.stop(true);
 });
 
-test('a fully headless claude session (no tty anywhere, parented under launchd) is queued to and listed as unreachable', async () => {
+test('a fully headless claude session (no tty anywhere, parented under launchd) is found: /agent names it in a refusal, and it is listed as unreachable', async () => {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'w');
   await spawnDaemon(reg, {
     tgCtlPath: TG_CTL,
@@ -101,18 +101,11 @@ test('a fully headless claude session (no tty anywhere, parented under launchd) 
   // agent-naming reply replaced it, exactly as it does when a tty IS available.
   expect(sentMessages.some((m) => String(m.text).startsWith('Claude Code not in tmux'))).toBe(false);
 
-  // The no-agent listing for tg#11 explains the inbox too; both replies race, so match the
-  // reply to tg#10 by its own wording, not by list order.
-  const queuedReply = sentMessages.find((m) => String(m.text).includes('— queued to its Stop-hook inbox'));
-  expect(queuedReply?.text).toContain('landing is running outside tmux (tty none, cwd /Users/u/work/landing)');
+  // Found, so `/agent landing …` is refused by name (tmux-only, tg-cli#456) — not "no agent matching".
 
-  const pending = join(cfgDir, 'inbox', 'landing', 'pending.jsonl');
-  expect(existsSync(pending)).toBe(true);
-  const entries = readFileSync(pending, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
-  expect(entries).toHaveLength(1);
-  expect(entries[0]).toMatchObject({ id: 10, from: 'Alex', text: 'deploy now' });
-  expect(entries[0].wrapped).toContain('tg#10');
-  expect(entries[0].wrapped).toContain('deploy now');
+  const refusal = sentMessages.find((m) => String(m.text).includes('landing · claude runs outside tmux'));
+  expect(String(refusal?.text).endsWith('Start it in tmux: claude-rotate --tmux landing')).toBe(true);
+  expect(existsSync(join(cfgDir, 'inbox', 'landing'))).toBe(false);
 
   const listing = sentMessages.find((m) => String(m.text).includes('OUTSIDE tmux'));
   expect(listing?.text).toContain('landing · claude — unreachable: not in tmux (tty none, cwd /Users/u/work/landing, name landing, pid 7103)');

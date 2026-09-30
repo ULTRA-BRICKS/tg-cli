@@ -2,7 +2,7 @@
 
 The best way to monitor several coding agents at once: they push only what matters — status updates, blockers, a question — and you reply from your phone. Agent questions and permission prompts arrive as **tappable inline buttons**; no terminal round-trip needed.
 
-Works with any agent in tmux: Claude Code, Codex, opencode, aider, and more. An agent started outside tmux is listed as unreachable and reached through its Stop-hook inbox (Claude Code, Codex).
+Works with any agent in tmux: Claude Code, Codex, opencode, aider, and more. omp also works outside tmux (omp-live); every other agent started outside tmux is listed as unreachable, with how to restart it inside tmux.
 
 ## What it looks like
 
@@ -211,23 +211,23 @@ title with the project next to it. An omp that rig runs under `abduco` inside a 
 is that pane's agent. If the target is ambiguous or omitted, you get inline
 buttons grouped by tmux session; tap one to route. Bare `/agent` lists the agents.
 
-### Agents outside tmux — two delivery channels (v1.46.0)
+### Agents outside tmux — tmux-only, except omp (v1.46.0, v1.54.31)
 tg-ctl types replies into an agent's **tmux pane** (`send-keys`). An interactive agent
 started from a plain terminal tab (no `$TMUX`) has no pane, so it used to be invisible:
 not in `tg-ctl status`, messages silently dropped. Now such an agent is **listed as
-unreachable with the reason** — `tg-ctl status`, `/status` and the bare `/agent` picker
-show `landing · claude — unreachable: not in tmux (tty ttys004, cwd …, name landing)` —
-and gets a **second channel**: `/agent landing <text>` queues the message to its
-**Stop-hook inbox** (`~/.config/tg-cli/inbox/<key>/pending.jsonl`; key = the agent's
-`--name`, else a hash of its cwd). The Claude Code / Codex Stop hook installed by
-[agent-tools](https://git.hyperide.ai/ultrabricks/agent-tools) (`cc_hook_bridge`) reads the
-inbox at every turn end and hands the text to the agent as its next instruction; you get an
-explicit reply when it is queued and a 👌 reaction on your message once it is delivered.
+unreachable with the reason** — `tg-ctl status`, `/status` and the no-agent reply show
+`landing · claude — unreachable: not in tmux (tty ttys004, cwd …, name landing, pid …)`.
 
-**Limit, honestly:** the inbox is read at a *turn end*. An agent that is already idle
-receives the message only when it next finishes a turn — delivery is deferred until the
-agent is active. For full reach start agents inside tmux (`claude-rotate --tmux <name>`
-does that and passes `--name <name>`). `tg-ctl inbox` shows what is queued.
+Claude Code and Codex are **tmux-only** (tg-cli#456): `/agent landing <text>` to one
+running outside tmux gets a one-line refusal that says how to start it in tmux —
+`claude-rotate --tmux landing` (it opens the tmux window and passes `--name landing`),
+`tmux new-window -n <name> codex` for Codex — and nothing is queued. The Stop-hook inbox
+that used to take such messages delivered only at the agent's next turn end, so an idle
+session never got them; its leftover messages were listed to you once and archived under
+`~/.config/tg-cli/inbox/*/stranded-*.jsonl`. omp is the exception: it is reached outside
+tmux through its original-process bridge (`tg-ctl omp-live`, see
+`docs/omp-original-process.md`). `tg-ctl inbox` shows what the inbox still holds (an omp
+grant notice waiting for that omp's next turn, and the archive).
 
 ### Q→buttons (v1.5.0, seamless setup in v1.6.0)
 Agent questions and permission prompts are forwarded to Telegram as inline buttons — no need to touch the terminal. Tap to answer; the answer is injected back into the pane immediately. Supports Claude Code question/permission shapes, Codex `PermissionRequest`, and opencode `question.asked`/`permission.asked` events.
@@ -293,7 +293,7 @@ plain text to send the answer into the agent pane post-factum.
 | `/status` | Report daemon state |
 | `/limit [<agent>]` | Show the latest saved 5-hour/weekly/context usage telemetry for all agents or one agent |
 | `/tasks [<agent>] [<status>]` | Show the task board; defaults to work that needs attention, with filters and pages |
-| `/agent [<window>] <msg>` | Route a message to a specific agent (fuzzy window match, else selection buttons); an agent outside tmux (exact `--name` / cwd basename) gets it queued to its Stop-hook inbox |
+| `/agent [<window>] <msg>` | Route a message to a specific agent (fuzzy window match, else selection buttons); a Claude Code / Codex outside tmux (exact `--name` / cwd basename) gets a one-line refusal naming how to start it in tmux |
 | `/daily` | What-shipped report: merged PRs since the last run (`rig daily`) |
 | `/spend [day\|week\|month]` | Token/cost usage report (`rig usage`) — also pushed automatically weekly/monthly, see `tg-ctl usage-schedule enable` |
 

@@ -49,7 +49,7 @@ metadata:
 
 # tg — Telegram bridge for agents
 
-Push reports and files to Telegram; the user can reply back (tmux pane, or the Stop-hook inbox for an agent outside tmux).
+Push reports and files to Telegram; the user can reply back (typed into your tmux pane — Claude Code and Codex must run inside tmux).
 
 ## Invocation
 \`\`\`
@@ -243,11 +243,12 @@ reply keeps the quote anchor and reaches the replied-to origin pane).
   transient network blip (3 attempts, jittered ~300ms→2.7s) before giving up,
   so a momentary hiccup no longer silently drops the message.
 
-## Two inbound channels — run inside tmux
-Replies are typed into your tmux pane. An agent started OUTSIDE tmux (no \`$TMUX\`)
-is listed by \`tg-ctl status\` as \`unreachable: not in tmux\` and only reachable via
-its Stop-hook inbox: a \`/agent <name> <text>\` is queued and delivered at your NEXT
-turn end (never while idle). Prefer starting inside tmux (\`claude-rotate --tmux <name>\`).
+## Replies need tmux (Claude Code, Codex)
+Replies are typed into your tmux pane. Claude Code and Codex are tmux-only: one started
+OUTSIDE tmux (no \`$TMUX\`) is listed by \`tg-ctl status\` as \`unreachable: not in tmux\`,
+and a \`/agent <name> <text>\` to it is refused — nothing reaches you and nothing is
+queued. Start inside tmux (\`claude-rotate --tmux <name>\`). omp is the exception: it is
+reached outside tmux through its original-process bridge (\`tg-ctl omp-live\`).
 
 Always use \`tg\`, never direct curl to the Telegram API.
 `;
