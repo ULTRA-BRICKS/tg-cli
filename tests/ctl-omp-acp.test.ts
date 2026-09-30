@@ -1,25 +1,15 @@
 import { expect, test } from 'bun:test';
 import { distinctLabels } from '../features/tg-ctl/agent-match';
-import { wrapInbound } from '../features/tg-ctl/inject';
 import { questionCapability } from '../features/tg-ctl/questions';
 import { findAgentInPane, matchAgentCommand } from '../features/tg-ctl/discover';
 import type { PaneInfo, ProcInfo } from '../features/tg-ctl/types';
 import {
-  acpPermissionReply,
-  acpPermissionToButtonRequest,
-  acpSessionTitleFromUpdate,
-  buildAcpInitialize,
-  buildAcpSessionLoad,
-  buildAcpSessionNew,
-  buildAcpSessionPrompt,
+  describeLiveOmp,
   isLiveOmpOriginId,
   liveOmpPidFromOriginId,
   matchLiveOmpOrigin,
   ompReplyOriginMatches,
-  ompAcpSpawnArgv,
   outboundOriginPaneId,
-  decodeAcpFrames,
-  encodeAcpFrame,
   findLiveOmpAgents,
   isPrimaryOmpSessionFile,
   isOmpLiveSessionCommand,
@@ -530,182 +520,18 @@ test('preferOmpApiOverTmux is true for omp even when a pane exists — never sen
   expect(preferOmpApiOverTmux('opencode')).toBe(false);
 });
 
-test('questionCapability(omp) is buttons — ACP request_permission, not the tmux floor', () => {
+test('questionCapability(omp) is buttons — native hook forwarding, not the tmux floor', () => {
   expect(questionCapability('omp')).toBe('buttons');
 });
 
-// --- ACP JSON-RPC (omp 18.1.14 speaks NDJSON, not LSP Content-Length) ---
-
-async function acpInitializeOnce(
-  proc: {
-    stdin: { write: (chunk: string) => unknown };
-    stdout: ReadableStream<Uint8Array>;
-  },
-): Promise<unknown> {
-  proc.stdin.write(encodeAcpFrame(buildAcpInitialize(1)));
-  const reader = proc.stdout.getReader();
-  const decoder = new TextDecoder();
-  let buf = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (value) buf += decoder.decode(value, { stream: true });
-    const { messages, rest } = decodeAcpFrames(buf);
-    buf = rest;
-    for (const raw of messages) {
-      if (!raw || typeof raw !== 'object') continue;
-      const rec = raw as { id?: unknown; result?: unknown };
-      if (rec.id === 1 && rec.result) return raw;
-    }
-    if (done) throw new Error('ACP initialize timed out');
-  }
-}
-
-test('encodeAcpFrame / decodeAcpFrames round-trip NDJSON JSON-RPC', () => {
-  const req = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1 } };
-  const framed = encodeAcpFrame(req);
-  expect(framed.startsWith('{')).toBe(true);
-  expect(framed.endsWith('\n')).toBe(true);
-  expect(framed).not.toContain('Content-Length');
-  const { messages, rest } = decodeAcpFrames(framed);
-  expect(rest).toBe('');
-  expect(messages).toEqual([req]);
+test('describeLiveOmp names the real transport: bridge only with a verified original-process endpoint (tg-cli#469)', () => {
+  const base: LiveOmpAgent = { pid: 7103, cwd: '/p', sessionFile: null, sessionId: null, title: 'Fix', paneId: null, tty: null };
+  expect(describeLiveOmp({ ...base, instanceId: 'gen-1' })).toContain('omp — bridge (');
+  expect(describeLiveOmp(base)).toContain('omp — NO bridge (');
+  expect(describeLiveOmp(base)).not.toContain('ACP');
 });
 
-test('decodeAcpFrames parses a single NDJSON line without a blank line', () => {
-  const line = '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}\n';
-  const { messages, rest } = decodeAcpFrames(line);
-  expect(rest).toBe('');
-  expect(messages).toEqual([{ jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } }]);
-});
-
-test(
-  'client helper completes initialize against an NDJSON ACP child with TMUX unset',
-  async () => {
-    const fake = `
-let buf = "";
-process.stdin.on("data", (chunk) => {
-  buf += chunk.toString("utf8");
-  for (;;) {
-    const nl = buf.indexOf("\\n");
-    if (nl < 0) break;
-    const line = buf.slice(0, nl).trim();
-    buf = buf.slice(nl + 1);
-    if (!line.startsWith("{")) continue;
-    let msg;
-    try { msg = JSON.parse(line); } catch { continue; }
-    if (msg.method === "initialize") {
-      process.stdout.write(JSON.stringify({
-        jsonrpc: "2.0",
-        id: msg.id,
-        result: { protocolVersion: 1, agentInfo: { name: "oh-my-pi" } },
-      }) + "\\n");
-    }
-  }
-});
-process.stdin.resume();
-`;
-    const proc = Bun.spawn([process.execPath, '-e', fake], {
-      stdin: 'pipe',
-      stdout: 'pipe',
-      stderr: 'pipe',
-      env: { ...process.env, TMUX: '' },
-    });
-    try {
-      const result = await acpInitializeOnce(proc);
-      expect(result).toEqual({
-        jsonrpc: '2.0',
-        id: 1,
-        result: { protocolVersion: 1, agentInfo: { name: 'oh-my-pi' } },
-      });
-    } finally {
-      proc.kill();
-    }
-  },
-  1000,
-);
-
-test('buildAcpSessionPrompt is session/prompt with text parts — never a tmux argv', () => {
-  const wrapped = wrapInbound('[TG from {name} {id}] {msg}', 'Alex', 'deploy now', 10);
-  const req = buildAcpSessionPrompt(2, '01sess', wrapped);
-  expect(req.method).toBe('session/prompt');
-  expect(JSON.stringify(req)).not.toContain('send-keys');
-  expect(JSON.stringify(req)).not.toContain('tmux');
-  expect(req.params).toEqual({
-    sessionId: '01sess',
-    prompt: [{ type: 'text', text: wrapped }],
-  });
-  expect(wrapped).toContain('[TG from Alex tg#10]');
-  expect(wrapped).toContain('deploy now');
-});
-
-test('buildAcpInitialize and buildAcpSessionNew match the live omp 18.1.14 handshake', () => {
-  expect(buildAcpInitialize(1).method).toBe('initialize');
-  expect(buildAcpSessionNew(2, '/tmp/proj').method).toBe('session/new');
-  expect(buildAcpSessionNew(2, '/tmp/proj').params).toEqual({ cwd: '/tmp/proj', mcpServers: [] });
-});
-
-test('acpSessionTitleFromUpdate reads session_info_update title from omp itself', () => {
-  expect(
-    acpSessionTitleFromUpdate({
-      jsonrpc: '2.0',
-      method: 'session/update',
-      params: {
-        sessionId: '01s',
-        update: { sessionUpdate: 'session_info_update', title: 'Fix review-cli from omp' },
-      },
-    }),
-  ).toBe('Fix review-cli from omp');
-  expect(acpSessionTitleFromUpdate({ jsonrpc: '2.0', method: 'session/prompt' })).toBeNull();
-});
-
-test('acpPermissionToButtonRequest maps session/request_permission to Telegram buttons', () => {
-  const req = acpPermissionToButtonRequest({
-    jsonrpc: '2.0',
-    id: 9,
-    method: 'session/request_permission',
-    params: {
-      sessionId: '01s',
-      toolCall: { toolCallId: 'call-1', title: 'Run tests?', kind: 'execute' },
-      options: [
-        { optionId: 'allow-once', name: 'Allow', kind: 'allow_once' },
-        { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
-      ],
-    },
-  });
-  expect(req).not.toBeNull();
-  expect(req!.agent).toBe('omp');
-  expect(req!.kind).toBe('permission');
-  expect(req!.question).toContain('Run tests?');
-  expect(req!.options?.map((o) => o.label)).toEqual(['Allow', 'Reject']);
-  expect(req!.omp).toEqual({ sessionId: '01s', rpcId: 9 });
-  const reply = acpPermissionReply(req!, 'allow-once');
-  expect(reply).toEqual({
-    jsonrpc: '2.0',
-    id: 9,
-    result: { outcome: { outcome: 'selected', optionId: 'allow-once' } },
-  });
-  expect(JSON.stringify(reply)).not.toContain('send-keys');
-});
-
-test('acpPermissionToButtonRequest maps a question-shaped option list (ask tool)', () => {
-  const req = acpPermissionToButtonRequest({
-    jsonrpc: '2.0',
-    id: 'q1',
-    method: 'session/request_permission',
-    params: {
-      sessionId: '01s',
-      toolCall: { toolCallId: 'ask-1', title: 'Which target?', kind: 'other' },
-      options: [
-        { optionId: 'a', name: 'staging', kind: 'allow_once' },
-        { optionId: 'b', name: 'prod', kind: 'allow_once' },
-      ],
-    },
-  });
-  expect(req!.kind).toBe('question');
-  expect(req!.options?.map((o) => o.label)).toEqual(['staging', 'prod']);
-});
-
-// --- out-of-tmux reply origin (tg-cli#339): routes must stamp omp:<pid>, ACP session/load ---
+// --- out-of-tmux reply origin (tg-cli#339): routes must stamp omp:<pid> ---
 
 test('outboundOriginPaneId stamps omp:<pid> when there is no tmux pane', () => {
   expect(outboundOriginPaneId({ tmuxPane: null, ompAncestorPid: 7103 })).toBe('omp:7103');
@@ -748,33 +574,6 @@ test('matchLiveOmpOrigin finds the live process for an omp:<pid> reply origin', 
   expect(matchLiveOmpOrigin('omp:7103', live)?.title).toBe('ReviewFix');
   expect(matchLiveOmpOrigin('%1', live)?.pid).toBe(9000);
   expect(matchLiveOmpOrigin('omp:1', live)).toBeNull();
-});
-
-test('buildAcpSessionLoad addresses the live session id, not session/new', () => {
-  const req = buildAcpSessionLoad(3, '/Users/u/work/review-cli', '01a07d8e-c12c-7433-903d-e98726bfda37');
-  expect(req.method).toBe('session/load');
-  expect(req.params).toEqual({
-    cwd: '/Users/u/work/review-cli',
-    mcpServers: [],
-    sessionId: '01a07d8e-c12c-7433-903d-e98726bfda37',
-  });
-  expect(JSON.stringify(req)).not.toContain('session/new');
-  expect(JSON.stringify(req)).not.toContain('send-keys');
-});
-
-test('ompAcpSpawnArgv drops --no-session when loading a live session', () => {
-  expect(ompAcpSpawnArgv({ cwd: '/proj', loadSession: true })).toEqual([
-    'acp',
-    '--allow-home',
-    '--cwd=/proj',
-  ]);
-  expect(ompAcpSpawnArgv({ cwd: '/proj', loadSession: false })).toEqual([
-    'acp',
-    '--no-session',
-    '--allow-home',
-    '--cwd=/proj',
-  ]);
-  expect(ompAcpSpawnArgv({ cwd: '/proj', loadSession: true }).includes('--no-session')).toBe(false);
 });
 
 test('ompReplyOriginMatches trusts omp:<pid> even when recorded cwd is /tmp', () => {

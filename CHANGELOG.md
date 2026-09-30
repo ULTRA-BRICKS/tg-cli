@@ -3,6 +3,37 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.4
+
+**Merged means running: stale-daemon detection, verified restarts, auto-restart on deploy
+(#279, #438); docs/status drift and dead ACP code (#469).**
+
+- The daemon records which commit it loaded (`tg-ctl.<botid>.run.json`). `tg-ctl status`
+  prints a `code:` line — `current`, `checkout at … — no daemon code changed`, or
+  `STALE — daemon runs X but <checkout> is at Y` with the fix — so a merged-but-not-restarted
+  fix is visible (it sat inert for weeks before).
+- `tg-ctl stop` / `restart` find the daemon through the same launchd → flock holder → pidfile
+  chain as `status`: a vanished pidfile no longer makes them no-op against a live daemon, and
+  a live pidfile pid that does not hold the flock (a reused pid — including one whose daemon
+  died and freed the lock) is never signalled. `stop` exits 1 when the process outlives the
+  SIGTERM drain; `enable` / `disable` then fail too instead of reporting success over it.
+- `tg-ctl restart` is verified: exit 0 only once the old process is dead AND a successor
+  holds the lock (a successor that died right after writing its pidfile does not count); it
+  never launches a replacement over a still-alive daemon. A
+  launchd-owned daemon comes back under its job (`launchctl kickstart`) instead of as a
+  detached stray. New `--if-stale`: restart only when a daemon runs whose loaded code is not
+  current (docs/tests-only merges don't bounce it).
+- `scripts/deploy.sh` ends every run — including an already-up-to-date one — with
+  `tg-ctl restart --if-stale`, instead of a warning; `--no-restart-ctl` opts out (the old
+  `--restart-ctl` is gone), exit 3 when the restart fails. Restarts keep queued messages,
+  questions and registrations (all on disk); the old "restart drops registration" warning
+  was stale.
+- AGENTS.md names the live launchd job (`ai.hyperide.tg-ctl`, installed by rig) next to the
+  `com.agenttools.tg-ctl.tg-ctl` label `tg-ctl enable` would install, and documents deploy /
+  restart. Removed the dead ACP helpers (frame codec, `session/*` builders, permission
+  mapping, `omp acp` argv), the `replyOmpAcpPermission` stub and the unreachable
+  `ButtonRequest.omp` branches.
+
 ## 1.54.3
 
 **One session name everywhere; abduco-wrapped omp is a tmux session (#454, #455, #75, #448).**

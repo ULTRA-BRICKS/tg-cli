@@ -3,7 +3,6 @@ import {
   ctlPaths,
   botIdFromToken,
   readPidFile,
-  pidStatus,
   ownsPidFile,
   shouldAutoStart,
   planLegacyLastUserTargetMigration,
@@ -69,30 +68,6 @@ test('readPidFile rejects missing/empty/garbage content', () => {
   expect(readPidFile('-5')).toBeNull();
 });
 
-// --- pidStatus: kill0 is injected, no real signals here ---
-test('pidStatus is absent when there is no pid at all', () => {
-  expect(
-    pidStatus(null, () => {
-      throw new Error('kill0 must not be called for a null pid');
-    }),
-  ).toBe('absent');
-});
-
-test('pidStatus is running when kill0 confirms the pid', () => {
-  const seen: number[] = [];
-  expect(
-    pidStatus(4242, (pid) => {
-      seen.push(pid);
-      return true;
-    }),
-  ).toBe('running');
-  expect(seen).toEqual([4242]);
-});
-
-test('pidStatus is stale when the pidfile exists but the process is gone', () => {
-  expect(pidStatus(4242, () => false)).toBe('stale');
-});
-
 // --- ownsPidFile: cleanExit may unlink the pidfile ONLY when it is ours (tg#93) ---
 test('ownsPidFile is true only when the pidfile content equals our pid', () => {
   expect(ownsPidFile('4242\n', 4242)).toBe(true);
@@ -141,7 +116,7 @@ test('shouldAutoStart ignores everything except TMUX (no TTY gate)', () => {
 });
 
 // --- planLegacyLastUserTargetMigration (tg-cli#281): plan only, `exists` is
-// injected so this never touches real disk, same as pidStatus's kill0 ---
+// injected so this never touches real disk ---
 test('plans a migration when only the legacy file exists', () => {
   const present = new Set(['/cfg/tg-ctl.123.last-alex-target.json']);
   const plan = planLegacyLastUserTargetMigration('/cfg', '123', (p) => present.has(p));

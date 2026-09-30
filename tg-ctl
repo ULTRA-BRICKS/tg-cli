@@ -12,7 +12,8 @@
 // (`run`) takes the flock as its FIRST action and exits 0 when another
 // instance already owns the bot.
 
-import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs"
+import { dlopen, FFIType } from "bun:ffi"
+import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs"
 import { createConnection, createServer, type Server, type Socket } from "net"
 import { basename, dirname, isAbsolute, join, resolve } from "path"
 import { detectAgentLabel } from "./features/agent-detect/detect"
@@ -148,7 +149,6 @@ import {
   matchLiveOmpOrigin,
   ompReplyOriginMatches,
   mergeLiveOmpCandidates,
-  optionIdForAnswer,
   parseLsofJsonlPaths,
   parseOmpSessionMeta,
   pickPrimaryOmpSessionFile,
@@ -196,7 +196,15 @@ import {
 } from "./features/tg-ctl/tg-awareness-nudge"
 import { normalizeRichHtml, validateRichHtml } from "./features/render/rich"
 import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
-import { botIdFromToken, ctlPaths, daemonRunState, daemonStatusLine, ownsPidFile, pidStatus, planLegacyLastUserTargetMigration, readPidFile } from "./features/tg-ctl/lock"
+import { botIdFromToken, ctlPaths, daemonRunState, daemonStatusLine, ownsPidFile, planLegacyLastUserTargetMigration, readPidFile, type DaemonRunState } from "./features/tg-ctl/lock"
+import {
+  assessCodeFreshness,
+  codeFreshnessLine,
+  parseRunInfo,
+  serializeRunInfo,
+  shouldRestartForFreshness,
+  type CodeFreshness,
+} from "./features/tg-ctl/code-freshness"
 import {
   abandonedLongOutageText,
   abandonedMultiText,
@@ -362,12 +370,20 @@ export const USAGE = `Usage:
                          # background (detached) daemon, returns immediately
   tg-ctl run             # foreground (blocking) daemon — the process itself
   tg-ctl status          # is it running? pid / bot / target pane / autostart;
+                         # \`code:\` names the commit the daemon loaded — STALE when its
+                         # checkout has newer daemon code (merged but not restarted);
                          # also lists agents running OUTSIDE tmux as unreachable (tg-cli#306)
   tg-ctl inbox           # pending Stop-hook inbox entries per agent (the tmux-free channel)
   tg-ctl inbox queue <name|dir> <text…>
                          # queue text to a non-tmux agent's Stop-hook inbox by hand
-  tg-ctl stop            # stop the background daemon
-  tg-ctl restart         # graceful reload — drains in-flight, keeps queued messages + questions
+  tg-ctl stop            # stop the daemon (found via pidfile, flock holder or launchd job);
+                         # exits 1 if it is still alive after the SIGTERM drain
+  tg-ctl restart [--if-stale]
+                         # graceful reload — drains in-flight, keeps queued messages + questions;
+                         # exits 0 only once the old process is gone AND a successor holds the
+                         # lock (a launchd-owned daemon comes back under launchd).
+                         # --if-stale: only when a daemon runs whose loaded code differs from its
+                         # checkout's HEAD (what scripts/deploy.sh runs after a pull)
   tg-ctl enable [--dry-run]
                          # install OS autostart (launchd / systemd --user) AND start now
                          # (--dry-run prints the plan and touches nothing)
@@ -1247,10 +1263,6 @@ async function typeIntoOwnOmpPane(paneId: string, pid: number, text: string): Pr
   log(`omp-live: no endpoint for pid=${pid} — tmux send-keys into its own pane ${paneId} (original process, no spawn)`)
   return executeInjectSteps(buildTextInjectPlan(paneId, text))
 }
-async function replyOmpAcpPermission(_req: ButtonRequest, _optionId: string): Promise<{ ok: false; error: string }> {
-  // Retained old ACP cards cannot be approved against a newly spawned process.
-  return { ok: false, error: 'Legacy ACP session is closed. Answer the question in the original OMP; native hook forwarding remains available.' }
-}
 
 function liveOmpForPane(paneId: string, agentPid?: number): LiveOmpAgent | null {
   const agents = listLiveOmpAgents()
@@ -1774,13 +1786,13 @@ function singleRegisteredCwd(regs: Registration[]): string | null {
 
 function composeStatus(ctx: Ctx, statusCwd: string | null): string {
   const env = autostartEnv(ctx)
-  const pid = readPidFile(readFileOrNull(ctx.paths.pid))
-  const pidAlive = pid !== null && kill0(pid)
-  const lockPid = pidAlive ? null : lockHolderPid(ctx.paths.lock)
-  const hintPid = pidAlive ? pid : lockPid
-  const launchd = detectLaunchdDaemon(env, hintPid)
-  const lines: string[] = [daemonStatusLine(daemonRunState(pid, pidAlive, launchd, lockPid), ctx.botId)]
-
+  const runState = probeDaemonRunState(ctx, false)
+  const lines: string[] = [daemonStatusLine(runState, ctx.botId)]
+  // Merged ≠ deployed until the resident process restarts (tg-cli#279): name the commit it loaded.
+  if (runState.kind === "running") {
+    const freshness = assessRunningCode(ctx, runState.pid)
+    lines.push(codeFreshnessLine(freshness) + (shouldRestartForFreshness(freshness) ? " — run `tg-ctl restart`" : ""))
+  }
 
   // Show every LIVE registered session (the per-pane set), not just one — a
   // multi-session operator must SEE that all their panes are registered to
@@ -2169,6 +2181,34 @@ function installHooks(home: string): number {
 // --- start: registration snapshot + detached daemon spawn, then exit ---
 
 function startLauncher(ctx: Ctx, flags: StartFlags): void {
+  recordStartRegistration(ctx, flags)
+
+  // No lock, no pipes (see header). The daemon flocks first and exits 0 if
+  // another instance holds the bot, so double-starts are a cheap no-op.
+  const logFd = openSync(ctx.paths.log, "a")
+  const runBin = resolveDeployedBin(ctx.home)
+  const runCwd = dirname(runBin)
+  // Pin cwd + PWD to the deployed bin dir so a caller's worktree can be removed
+  // after `start` without leaving the long-lived daemon on a deleted cwd.
+  const proc = Bun.spawn([process.execPath, runBin, "run"], {
+    detached: true,
+    stdio: ["ignore", logFd, logFd],
+    cwd: runCwd,
+    env: { ...process.env, PWD: runCwd, TG_CTL_CONFIG_DIR: ctx.configDir },
+  })
+  proc.unref()
+  closeSync(logFd) // the child holds its own dup
+  console.log(`tg-ctl: daemon launch requested (bot ${ctx.botId}) — log: ${ctx.paths.log}`)
+  // Hint at autostart unless it's already installed, so a one-shot `start` doesn't silently die
+  // at the next reboot (the shared service-management contract: start HINTS at enable). Skipped
+  // on the no-op fallback OS, where there's nothing to enable.
+  const env = autostartEnv(ctx)
+  if (autostartKind(env) !== "none" && !autostartUnitInstalled(env)) {
+    console.log("tg-ctl: not set to start at login — run `tg-ctl enable` to survive reboots.")
+  }
+}
+
+function recordStartRegistration(ctx: Ctx, flags: StartFlags): void {
   mkdirSync(ctx.configDir, { recursive: true })
   // UPSERT this session's entry into the per-pane registration SET (tg-cli#67),
   // keyed by paneId — instead of OVERWRITING one global slot. A `tg` send from
@@ -2206,76 +2246,172 @@ function startLauncher(ctx: Ctx, flags: StartFlags): void {
   } catch {
     // best-effort registration bookkeeping — never block the daemon launch
   }
+}
 
-  // No lock, no pipes (see header). The daemon flocks first and exits 0 if
-  // another instance holds the bot, so double-starts are a cheap no-op.
-  const logFd = openSync(ctx.paths.log, "a")
-  const runBin = resolveDeployedBin(ctx.home)
-  const runCwd = dirname(runBin)
-  // Pin cwd + PWD to the deployed bin dir so a caller's worktree can be removed
-  // after `start` without leaving the long-lived daemon on a deleted cwd.
-  const proc = Bun.spawn([process.execPath, runBin, "run"], {
-    detached: true,
-    stdio: ["ignore", logFd, logFd],
-    cwd: runCwd,
-    env: { ...process.env, PWD: runCwd, TG_CTL_CONFIG_DIR: ctx.configDir },
-  })
-  proc.unref()
-  closeSync(logFd) // the child holds its own dup
-  console.log(`tg-ctl: daemon launch requested (bot ${ctx.botId}) — log: ${ctx.paths.log}`)
-  // Hint at autostart unless it's already installed, so a one-shot `start` doesn't silently die
-  // at the next reboot (the shared service-management contract: start HINTS at enable). Skipped
-  // on the no-op fallback OS, where there's nothing to enable.
-  const env = autostartEnv(ctx)
-  if (autostartKind(env) !== "none" && !autostartUnitInstalled(env)) {
-    console.log("tg-ctl: not set to start at login — run `tg-ctl enable` to survive reboots.")
+// --- stop / restart / status ---
+
+// Locate the daemon through the pidfile → flock holder → launchd chain `status` reports
+// (tg-cli#316). `authoritativeLock`: stop/restart always ask the flock — its holder IS the daemon
+// (spec §6), so a vanished pidfile can't make them no-op against a live daemon, and a live pidfile
+// pid that does not hold the flock (a reused pid) is never signalled (tg-cli#438): with no lock
+// holder and no launchd job, a free flock turns that pid into a stale pidfile. `status` probes
+// the flock only when the pidfile pid is dead, keeping its cheap path.
+function probeDaemonRunState(ctx: Ctx, authoritativeLock: boolean): DaemonRunState {
+  const pid = readPidFile(readFileOrNull(ctx.paths.pid))
+  const pidAlive = pid !== null && kill0(pid)
+  const lockPid = authoritativeLock || !pidAlive ? lockHolderPid(ctx.paths.lock) : null
+  const hintPid = lockPid ?? (pidAlive ? pid : null)
+  const launchd = detectLaunchdDaemon(autostartEnv(ctx), hintPid)
+  const reusedPid = authoritativeLock && pidAlive && lockPid === null && !launchd && daemonLockFree(ctx.paths.lock)
+  return daemonRunState(pid, pidAlive && !reusedPid, launchd, lockPid)
+}
+
+// How long `restart` waits for a successor (a launchd relaunch or the detached spawn) to take the
+// flock and write its pidfile.
+const SUCCESSOR_WAIT_MS = 15_000
+
+// Re-run `probe` every 100ms until it yields a value or `ms` elapses (then null). Sync on purpose:
+// the lifecycle subcommands are one-shot CLI calls with nothing else to run meanwhile.
+function pollSync<T>(probe: () => T | null, ms: number): T | null {
+  for (let waited = 0; ; waited += 100) {
+    const value = probe()
+    if (value !== null || waited >= ms) return value
+    Bun.sleepSync(100)
   }
 }
 
-// --- stop / status ---
+type StopOutcome =
+  | { kind: "not-running" }
+  | { kind: "stopped"; pid: number; launchdLabel?: string }
+  | { kind: "still-alive"; pid: number }
 
-function stopDaemon(ctx: Ctx): void {
-  const pid = readPidFile(readFileOrNull(ctx.paths.pid))
-  const alive = pidStatus(pid, kill0)
-  if (alive === "absent") {
+// SIGTERM the located daemon and wait out its drain. "still-alive" means the process outlived the
+// ceiling (or could not be signalled): it is NOT stopped, and `restart` must not launch over it.
+function stopDaemon(ctx: Ctx): StopOutcome {
+  const state = probeDaemonRunState(ctx, true)
+  if (state.kind === "not-running") {
     console.log("tg-ctl: not running")
-    return
+    return { kind: "not-running" }
   }
-  if (alive === "stale") {
+  if (state.kind === "stale-pidfile") {
     try {
       unlinkSync(ctx.paths.pid)
     } catch {}
-    console.log(`tg-ctl: not running (cleaned stale pidfile, pid ${pid})`)
-    return
+    console.log(`tg-ctl: not running (cleaned stale pidfile, pid ${state.pid})`)
+    return { kind: "not-running" }
   }
+  const pid = state.pid
   try {
-    process.kill(pid!, "SIGTERM")
+    process.kill(pid, "SIGTERM")
   } catch (err) {
-    console.error(`tg-ctl: SIGTERM failed for pid ${pid}: ${err}`)
-    process.exit(1)
+    // ESRCH: it exited between the probe and the signal — that IS stopped. Anything else (EPERM:
+    // another user's process) leaves it running.
+    if (!(err instanceof Error && "code" in err && err.code === "ESRCH")) {
+      console.error(`tg-ctl: SIGTERM failed for pid ${pid}: ${err}`)
+      return { kind: "still-alive", pid }
+    }
   }
-  // Wait for the daemon to actually exit — up to the cooperative-drain ceiling
-  // plus a margin, NOT a flat 2s. The SIGTERM drain can legitimately hold the
-  // flock for up to GRACEFUL_SHUTDOWN_MS while it finishes the in-flight batch;
-  // `restart` calls this then immediately startLauncher(), so returning early
-  // (while the old daemon still owns the flock) makes the successor no-op-exit on
-  // the contended flock and, once the old finally drains, leaves NOTHING running
-  // (review: restart can leave no daemon). Poll until the pid is gone or the
-  // ceiling elapses.
-  const deadlineMs = GRACEFUL_SHUTDOWN_MS + 2000
-  for (let waited = 0; waited < deadlineMs && kill0(pid!); waited += 100) Bun.sleepSync(100)
-  const stillAlive = kill0(pid!)
-  // Only unlink the pidfile when the process is truly gone. The daemon's own
-  // cleanExit removes its pidfile (ownsPidFile-guarded); unlinking here while it
-  // is STILL ALIVE would strip a live daemon's pidfile — `status` would then read
-  // no pid and falsely report "not running" (tg#93 in reverse). Fall back to the
-  // unlink only for a daemon that died without cleaning up.
-  if (!stillAlive) {
-    try {
-      unlinkSync(ctx.paths.pid)
-    } catch {}
+  // Poll until the pid is gone, NOT a flat sleep: returning while the old daemon still owns the
+  // flock would make `restart`'s successor no-op-exit on it and, once the old one drains, leave
+  // NOTHING running (review: restart can leave no daemon). Ceiling: the cooperative drain may hold
+  // the flock for GRACEFUL_SHUTDOWN_MS while it finishes the in-flight batch, plus a margin.
+  const waitMs = GRACEFUL_SHUTDOWN_MS + 2000
+  if (pollSync(() => (kill0(pid) ? null : pid), waitMs) === null) {
+    console.error(`tg-ctl: pid ${pid} is still alive ${waitMs / 1000}s after SIGTERM — NOT stopped (\`kill -9 ${pid}\` if it is wedged)`)
+    return { kind: "still-alive", pid }
   }
-  console.log(stillAlive ? `tg-ctl: SIGTERM sent (pid ${pid}, still exiting)` : `tg-ctl: stopped (pid ${pid})`)
+  // The daemon's cleanExit removes its own pidfile; this covers one that died without cleaning up.
+  // Ownership-guarded: a launchd KeepAlive relaunch may already have written the successor's pid.
+  try {
+    if (ownsPidFile(readFileOrNull(ctx.paths.pid), pid)) unlinkSync(ctx.paths.pid)
+  } catch {}
+  console.log(`tg-ctl: stopped (pid ${pid})`)
+  return { kind: "stopped", pid, launchdLabel: state.owner === "launchd" ? state.label : undefined }
+}
+
+// `tg-ctl restart [--if-stale]`: a graceful, VERIFIED reload. Exit 0 only when the old process is
+// confirmed dead AND a successor holds the flock (its pidfile names a new live pid) — never
+// "restarted" over a still-running old daemon or over nothing (tg-cli#438). A launchd-owned daemon
+// comes back under launchd (`launchctl kickstart`; a no-op when a KeepAlive job already relaunched
+// it), never as a detached stray fighting launchd for the flock. `--if-stale` is the deploy path
+// (tg-cli#279): act only when a daemon runs whose loaded code is not proven current.
+function restartDaemon(ctx: Ctx, flags: StartFlags, ifStale: boolean): number {
+  if (ifStale) {
+    const running = probeDaemonRunState(ctx, true)
+    if (running.kind !== "running") {
+      console.log("tg-ctl: not running — nothing to restart")
+      return 0
+    }
+    const freshness = assessRunningCode(ctx, running.pid)
+    if (!shouldRestartForFreshness(freshness)) {
+      console.log(`tg-ctl: ${codeFreshnessLine(freshness)} — no restart needed`)
+      return 0
+    }
+    console.log(`tg-ctl: ${codeFreshnessLine(freshness)} — restarting`)
+  }
+  const stopped = stopDaemon(ctx)
+  if (stopped.kind === "still-alive") {
+    console.error(`tg-ctl: restart aborted — pid ${stopped.pid} is still running; did NOT start a replacement.`)
+    return 1
+  }
+  const oldPid = stopped.kind === "stopped" ? stopped.pid : null
+  const launchdLabel = stopped.kind === "stopped" ? stopped.launchdLabel : undefined
+  if (launchdLabel) {
+    recordStartRegistration(ctx, flags)
+    if (!runAutostartCommand({ argv: ["launchctl", "kickstart", `${launchdDomain()}/${launchdLabel}`], describe: `kickstart of launchd job ${launchdLabel}` })) {
+      return 1
+    }
+  } else {
+    startLauncher(ctx, flags)
+  }
+  // The daemon writes its pidfile only after taking the flock; still requiring the flock held
+  // rejects a detached successor that died right after writing it — our own unreaped child keeps
+  // answering kill(0) as a zombie, but the kernel has already released its lock.
+  const successor = pollSync(() => {
+    const pid = readPidFile(readFileOrNull(ctx.paths.pid))
+    return pid !== null && pid !== oldPid && kill0(pid) && !daemonLockFree(ctx.paths.lock) ? pid : null
+  }, SUCCESSOR_WAIT_MS)
+  if (successor === null) {
+    const where = launchdLabel ? `launchd job ${launchdLabel}` : `the daemon log ${ctx.paths.log}`
+    console.error(`tg-ctl: restart FAILED — no new daemon took the lock within ${SUCCESSOR_WAIT_MS / 1000}s; check ${where}.`)
+    return 1
+  }
+  console.log(oldPid === null ? `tg-ctl: started (pid ${successor})` : `tg-ctl: restarted (pid ${oldPid} → ${successor})`)
+  return 0
+}
+
+// Run `git -C dir …`; trimmed stdout, or null when git fails / is missing.
+function gitOutput(dir: string, args: string[]): string | null {
+  try {
+    const r = Bun.spawnSync(["git", "-C", dir, ...args], { stdout: "pipe", stderr: "ignore" })
+    return r.exitCode === 0 ? r.stdout.toString().trim() : null
+  } catch {
+    return null
+  }
+}
+
+// Record which commit this daemon process loaded (tg-cli#279) so `status` and `restart --if-stale`
+// can compare it with the checkout's HEAD. Best-effort: outside a git checkout nothing is recorded
+// and the code identity reads as unknown.
+function recordRunInfo(ctx: Ctx): void {
+  try {
+    const codeDir = dirname(realpathSync(import.meta.path))
+    const commit = gitOutput(codeDir, ["rev-parse", "HEAD"])
+    if (commit) atomicWrite(ctx.paths.runInfo, serializeRunInfo({ pid: process.pid, commit, codeDir, startedAt: Date.now() }))
+  } catch {}
+}
+
+// Is the running daemon executing the code its checkout holds now? (tg-cli#279)
+function assessRunningCode(ctx: Ctx, daemonPid: number): CodeFreshness {
+  const info = parseRunInfo(readFileOrNull(ctx.paths.runInfo))
+  if (info === null || info.pid !== daemonPid) return assessCodeFreshness(info, daemonPid, null, null)
+  const head = gitOutput(info.codeDir, ["rev-parse", "HEAD"])
+  let changed: string[] | null = []
+  if (head !== null && head !== info.commit) {
+    const out = gitOutput(info.codeDir, ["diff", "--name-only", info.commit, head])
+    changed = out === null ? null : out.split("\n").filter(Boolean)
+  }
+  return assessCodeFreshness(info, daemonPid, head, changed)
 }
 
 // --- enable / disable: OS autostart self-registration (the agenttools_service contract) ---
@@ -2346,12 +2482,16 @@ interface LaunchctlProbe {
   printDump(label: string): string | undefined
 }
 
-// The real probe: `launchctl list` for labels, `launchctl print <domain>/<label>` per label. A
-// LaunchAgent lives in the per-user `gui/<uid>` domain; under root (uid 0) daemons live in `system`
-// instead (`gui/0/<label>` just errors), so pick the domain by uid.
-function realLaunchctlProbe(): LaunchctlProbe {
+// A LaunchAgent lives in the per-user `gui/<uid>` domain; under root (uid 0) daemons live in
+// `system` instead (`gui/0/<label>` just errors), so pick the domain by uid.
+function launchdDomain(): string {
   const uid = process.getuid?.() ?? 0
-  const domain = uid === 0 ? "system" : `gui/${uid}`
+  return uid === 0 ? "system" : `gui/${uid}`
+}
+
+// The real probe: `launchctl list` for labels, `launchctl print <domain>/<label>` per label.
+function realLaunchctlProbe(): LaunchctlProbe {
+  const domain = launchdDomain()
   const listStdout = (): string | undefined => {
     const r = Bun.spawnSync(["launchctl", "list"], { stdout: "pipe", stderr: "ignore" })
     if (r.exitCode !== 0 || !r.stdout) return undefined
@@ -2461,6 +2601,43 @@ function lockHolderPid(lockPath: string): number | null {
   }
 }
 
+// flock(2) through bun:ffi — neither Bun nor Node expose it and macOS has no flock(1). The
+// library is opened on first use, so CLI subcommands that never touch the lock never dlopen it.
+const LOCK_EX_NB = 6 // LOCK_EX (2) | LOCK_NB (4)
+const LOCK_UN = 8
+let flockSymbol: ((fd: number, op: number) => number) | undefined
+function flock(fd: number, op: number): number {
+  if (!flockSymbol) {
+    const lib = process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6"
+    flockSymbol = dlopen(lib, { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } }).symbols.flock
+  }
+  return flockSymbol(fd, op)
+}
+
+// Is THIS config dir's flock free — provably no daemon holds it? Taking it for an instant is the
+// only exact test: lsof lists any process with the file open, and an exited-but-unreaped child
+// keeps answering kill(0) while the kernel has already dropped its lock. A daemon starting in
+// that instant loses the race and exits 0 (the spec §6 idempotent no-op). Read-only open: never
+// creates or truncates the lock file; no file means no daemon ever took it. Any other failure
+// (EACCES, fd exhaustion, flock unavailable via FFI) is NOT proof of "free" — it answers false,
+// so callers fall back to trusting the live pid.
+function daemonLockFree(lockPath: string): boolean {
+  let fd: number
+  try {
+    fd = openSync(lockPath, "r")
+  } catch (err) {
+    return err instanceof Error && "code" in err && err.code === "ENOENT"
+  }
+  try {
+    if (flock(fd, LOCK_EX_NB) !== 0) return false
+    flock(fd, LOCK_UN)
+    return true
+  } catch {
+    return false
+  } finally {
+    closeSync(fd)
+  }
+}
 
 
 // The `autostart:` status line. Gathers the impure facts — own-unit file existence and (only when
@@ -2526,7 +2703,10 @@ function enableAutostart(ctx: Ctx, dryRun: boolean): number {
 
   // The OS is about to launch its own copy. Stop any background (pidfile) instance first so we
   // don't end up with two processes on the same bot — the no-double-start invariant.
-  stopDaemon(ctx)
+  if (stopDaemon(ctx).kind === "still-alive") {
+    console.error("tg-ctl: enable aborted — the running daemon did not stop; autostart NOT installed over it.")
+    return EXIT_AUTOSTART_FAILED
+  }
 
   if (plan.file) {
     try {
@@ -2589,7 +2769,11 @@ function disableAutostart(ctx: Ctx): number {
   }
   // disable also stops the manager-spawned (background) instance. On launchd/systemd the unload/
   // disable above already stopped the OS-owned copy; this is the catch-all for a pidfile instance.
-  stopDaemon(ctx)
+  const stopped = stopDaemon(ctx)
+  if (stopped.kind === "still-alive") {
+    console.error(`tg-ctl: disable incomplete — pid ${stopped.pid} is still running.`)
+    return EXIT_AUTOSTART_FAILED
+  }
   if (removeFailed) return EXIT_AUTOSTART_FAILED
   // On the 'none' fallback there was never an OS unit — say what actually happened (stopped the
   // background instance) rather than the misleading "autostart disabled (none)".
@@ -5645,20 +5829,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   mkdirSync(ctx.configDir, { recursive: true })
 
   // flock FIRST (spec §6): bound to the open file description, released by the
-  // kernel on ANY exit including SIGKILL. Neither Bun nor Node expose flock
-  // and macOS has no flock(1), hence bun:ffi. The fd stays open for the
-  // daemon's lifetime.
-  const { dlopen, FFIType } = await import("bun:ffi")
-  const lib = process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6"
-  const ffi = dlopen(lib, { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } })
-  const LOCK_EX_NB = 6 // LOCK_EX (2) | LOCK_NB (4)
+  // kernel on ANY exit including SIGKILL. The fd stays open for the daemon's lifetime.
   const lockFd = openSync(ctx.paths.lock, "w")
-  if (ffi.symbols.flock(lockFd, LOCK_EX_NB) !== 0) {
+  if (flock(lockFd, LOCK_EX_NB) !== 0) {
     // Another daemon owns this bot — idempotent no-op (spec §6).
     process.exit(0)
   }
 
   writeFileSync(ctx.paths.pid, `${process.pid}\n`)
+  recordRunInfo(ctx)
 
   // One-time migration (tg-cli#281): best-effort rename a pre-existing
   // last-alex-target.json forward so the CTO's routing anchor survives the
@@ -9492,33 +9671,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // specifically so a late tap here CAN still be recorded as a queuedDecision
     // — this early "nothing to inject into" bail-out must not reject it before
     // the permission branch below ever runs.
-    if (!retained.req.omp && !retained.req.paneId && !(retained.req.kind === "permission" && isHatchRequest(retained.req))) return false
-    if (retained.req.omp) {
-      const answer = resolveButtonCallback(retained.req, { requestId: action.requestId, value: action.value })
-      if (answer.status !== "answered") return false
-      const optionId = optionIdForAnswer(retained.req, answer.value, answer.label)
-      const answeredAt = Date.now()
-      abandonedButtons.delete(action.requestId)
-      pruneAnsweredButtons(answeredButtons, answeredAt)
-      answeredButtons.set(action.requestId, { value: answer.value, label: answer.label, decision: answer.decision, at: answeredAt, delivery: "socket" })
-      persistQuestions()
-      const res = await replyOmpAcpPermission(retained.req, optionId)
-      if (!res.ok) {
-        answeredButtons.delete(action.requestId)
-        abandonedButtons.set(action.requestId, { req: retained.req, messageId: retained.messageId, at: retained.at })
-        persistQuestions()
-        await answerCallbackQueryOrNotify(ctx, action, "could not reach omp ACP — tap again")
-        return true
-      }
-      await answerCallbackQuery(ctx, action.callbackQueryId, "✓ sent to the agent")
-      const cardId = retained.messageId ?? action.messageId
-      if (cardId !== null) {
-        void clearMessageKeyboard(ctx, cardId)
-        void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label), undefined, hatchParseMode(retained.req))
-      }
-      log(`omp-acp: tap delivered via session/request_permission reply optionId=${optionId}`)
-      return true
-    }
+    if (!retained.req.paneId && !(retained.req.kind === "permission" && isHatchRequest(retained.req))) return false
     // A tap must come from THIS retained entry's OWN Telegram message — mirrors the
     // live-prompt path's same guard (case "answer-question" below). Without it, a
     // stale card reusing a deterministic callback key (callbackRequestId is a
@@ -9849,11 +10002,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     pruneAnsweredButtons(answeredButtons, answeredAt)
     answeredButtons.set(action.requestId, { value: answer.value, label: answer.label, decision: answer.decision, at: answeredAt, delivery: "pane" })
     persistQuestions()
-    const res = retained.req.omp
-      ? await replyOmpAcpPermission(retained.req, optionIdForAnswer(retained.req, answer.value, answer.label))
-      : retained.req.agent === "omp"
-        ? await deliverOriginalOmp(liveOmpForPane(paneId) ?? { cwd: retained.req.cwd ?? "/" }, wrapInbound(ctx.cfg.injectWrap, "tg", answer.label), `answer:${action.requestId}`, paneId)
-        : await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
+    const res = retained.req.agent === "omp"
+      ? await deliverOriginalOmp(liveOmpForPane(paneId) ?? { cwd: retained.req.cwd ?? "/" }, wrapInbound(ctx.cfg.injectWrap, "tg", answer.label), `answer:${action.requestId}`, paneId)
+      : await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
     if (!res.ok) {
       // The pane is unreachable (gone / no longer an agent). ROLL BACK the claim:
       // restore the retained entry (with its ORIGINAL `at`, so a failed attempt doesn't
@@ -10767,13 +10918,18 @@ if (import.meta.main) {
     process.exit(0)
   }
   if (cmd === "stop") {
-    stopDaemon(ctx)
-    process.exit(0)
+    const stopped = stopDaemon(ctx)
+    if (stopped.kind === "stopped" && stopped.launchdLabel) {
+      console.log(
+        `tg-ctl: note — launchd job ${stopped.launchdLabel} supervises the daemon and may relaunch it; ` +
+          `\`tg-ctl disable\` (or \`launchctl bootout ${launchdDomain()}/${stopped.launchdLabel}\`) keeps it down.`,
+      )
+    }
+    process.exit(stopped.kind === "still-alive" ? 1 : 0)
   }
   if (cmd === "restart") {
-    stopDaemon(ctx)
-    startLauncher(ctx, parseStartFlags(process.argv.slice(3)))
-    process.exit(0)
+    const args = process.argv.slice(3)
+    process.exit(restartDaemon(ctx, parseStartFlags(args), args.includes("--if-stale")))
   }
   if (cmd === "enable") {
     process.exit(enableAutostart(ctx, process.argv.includes("--dry-run")))

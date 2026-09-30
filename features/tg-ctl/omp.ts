@@ -1,14 +1,11 @@
 /**
- * OMP process/session discovery and legacy ACP frame compatibility helpers.
- * Live delivery uses omp-live-runtime + the extension in the ORIGINAL process.
- * Never use ACP session/load or --resume -p to attach to an already-live TUI:
- * both create another history writer. Legacy framing exports remain for callers
- * reading old question cards, not for starting processes in tg-ctl.
+ * OMP process/session discovery. Live delivery uses omp-live-runtime + the
+ * extension in the ORIGINAL process. Never use ACP session/load or --resume -p to
+ * attach to an already-live TUI: both create another history writer (#450).
  */
 
 import { matchAgentCommand, paneIdByPid } from './discover';
 import type { AgentKind, PaneInfo, ProcInfo } from './types';
-import type { ButtonOption, ButtonRequest } from './questions';
 import { uniqueProjectSelectorHits, type AgentCandidate } from './agent-match';
 import { resolveSessionName } from './session-name';
 import { normalizeTty, parseAgentNameFromCommand } from './unreachable';
@@ -32,27 +29,6 @@ export interface OmpSessionMeta {
   title: string | null;
   sessionId: string | null;
   cwd: string | null;
-}
-
-export interface OmpRequestRef {
-  sessionId: string;
-  rpcId: string | number;
-}
-
-export interface AcpRequest {
-  jsonrpc: '2.0';
-  id: string | number;
-  method: string;
-  params?: unknown;
-}
-
-export interface AcpResponse {
-  jsonrpc: '2.0';
-  id?: string | number;
-  result?: unknown;
-  error?: unknown;
-  method?: string;
-  params?: unknown;
 }
 
 const PRIMARY_SESSION_FILE =
@@ -256,13 +232,6 @@ export function ompReplyOriginMatches(
   return Boolean(recognized.cwd && live.cwd && recognized.cwd === live.cwd);
 }
 
-/** argv after `omp`. Loading a live session must NOT pass --no-session (ephemeral sibling). */
-export function ompAcpSpawnArgv(opts: { cwd: string; loadSession: boolean }): string[] {
-  const args = ['acp', '--allow-home', `--cwd=${opts.cwd}`];
-  if (!opts.loadSession) args.splice(1, 0, '--no-session');
-  return args;
-}
-
 export function liveOmpToCandidate(a: LiveOmpAgent): AgentCandidate {
   const name = (a.name ?? '').trim();
   return {
@@ -360,156 +329,4 @@ export function describeUnbridgedOmp(agents: readonly LiveOmpAgent[]): string[] 
     }),
     '  fix: tg-ctl omp-live install, then save/stop + resume each once (never a second copy)',
   ];
-}
-
-// --- ACP framing (NDJSON JSON-RPC over stdio; omp 18.1.14) ---
-
-export function encodeAcpFrame(message: object): string {
-  return `${JSON.stringify(message)}\n`;
-}
-
-export function decodeAcpFrames(chunk: string): { messages: unknown[]; rest: string } {
-  const messages: unknown[] = [];
-  let rest = chunk;
-  while (rest.length > 0) {
-    const nl = rest.indexOf('\n');
-    if (nl < 0) break;
-    const line = rest.slice(0, nl).replace(/\r$/, '').trim();
-    rest = rest.slice(nl + 1);
-    if (!line.startsWith('{')) continue;
-    try {
-      messages.push(JSON.parse(line));
-    } catch {
-      /* drop malformed */
-    }
-  }
-  return { messages, rest };
-}
-
-export function buildAcpInitialize(id: string | number): AcpRequest {
-  return {
-    jsonrpc: '2.0',
-    id,
-    method: 'initialize',
-    params: {
-      protocolVersion: 1,
-      clientInfo: { name: 'tg-ctl', version: '1.49.1' },
-      clientCapabilities: {},
-    },
-  };
-}
-
-export function buildAcpSessionNew(id: string | number, cwd: string): AcpRequest {
-  return {
-    jsonrpc: '2.0',
-    id,
-    method: 'session/new',
-    params: { cwd, mcpServers: [] },
-  };
-}
-
-export function buildAcpSessionLoad(id: string | number, cwd: string, sessionId: string): AcpRequest {
-  return {
-    jsonrpc: '2.0',
-    id,
-    method: 'session/load',
-    params: { cwd, mcpServers: [], sessionId },
-  };
-}
-
-export function buildAcpSessionPrompt(id: string | number, sessionId: string, text: string): AcpRequest {
-  return {
-    jsonrpc: '2.0',
-    id,
-    method: 'session/prompt',
-    params: {
-      sessionId,
-      prompt: [{ type: 'text', text }],
-    },
-  };
-}
-
-export function acpSessionIdFromResult(message: unknown): string | null {
-  if (!message || typeof message !== 'object') return null;
-  const rec = message as Record<string, unknown>;
-  const result = rec.result;
-  if (!result || typeof result !== 'object') return null;
-  const id = (result as Record<string, unknown>).sessionId;
-  return typeof id === 'string' && id ? id : null;
-}
-
-export function acpSessionTitleFromUpdate(message: unknown): string | null {
-  if (!message || typeof message !== 'object') return null;
-  const rec = message as Record<string, unknown>;
-  if (rec.method !== 'session/update') return null;
-  const params = rec.params;
-  if (!params || typeof params !== 'object') return null;
-  const update = (params as Record<string, unknown>).update;
-  if (!update || typeof update !== 'object') return null;
-  const u = update as Record<string, unknown>;
-  if (u.sessionUpdate !== 'session_info_update') return null;
-  return typeof u.title === 'string' && u.title ? u.title : null;
-}
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
-
-export function acpPermissionToButtonRequest(message: unknown): ButtonRequest | null {
-  if (!isRecord(message) || message.method !== 'session/request_permission') return null;
-  if (message.id === undefined || message.id === null) return null;
-  const params = message.params;
-  if (!isRecord(params)) return null;
-  const sessionId = typeof params.sessionId === 'string' ? params.sessionId : '';
-  if (!sessionId) return null;
-  const toolCall = isRecord(params.toolCall) ? params.toolCall : {};
-  const title = typeof toolCall.title === 'string' ? toolCall.title : 'omp permission';
-  const rawOpts = Array.isArray(params.options) ? params.options : [];
-  const options: ButtonOption[] = [];
-  for (const item of rawOpts) {
-    if (!isRecord(item)) continue;
-    const optionId = typeof item.optionId === 'string' ? item.optionId : '';
-    const name = typeof item.name === 'string' ? item.name : optionId;
-    if (!optionId || !name) continue;
-    options.push({ label: name, description: optionId });
-  }
-  if (options.length === 0) return null;
-  const kinds = rawOpts.map((item) => (isRecord(item) ? item.kind : null));
-  const hasReject = kinds.some((k) => k === 'reject_once' || k === 'reject_always');
-  const kind = hasReject && options.length <= 2 ? 'permission' : 'question';
-  const rpcId = message.id as string | number;
-  return {
-    requestId: `omp_${sessionId}_${String(rpcId)}`.replace(/[^A-Za-z0-9_-]/g, '_'),
-    agent: 'omp',
-    kind,
-    question: title,
-    options,
-    omp: { sessionId, rpcId },
-  };
-}
-
-export function acpPermissionReply(req: ButtonRequest, optionId: string): AcpResponse | null {
-  if (!req.omp) return null;
-  return {
-    jsonrpc: '2.0',
-    id: req.omp.rpcId,
-    result: { outcome: { outcome: 'selected', optionId } },
-  };
-}
-
-export function optionIdForAnswer(req: ButtonRequest, value: string, label: string): string {
-  if (req.options) {
-    const byDesc = req.options.find((o) => o.description === value);
-    if (byDesc?.description) return byDesc.description;
-    const byLabel = req.options.find((o) => o.label === label || o.label === value);
-    if (byLabel?.description) return byLabel.description;
-  }
-  if (req.kind === 'permission') {
-    if (value === 'allow' || value === 'deny') {
-      const want = value === 'deny' ? 'reject' : 'allow';
-      const hit = req.options?.find((o) => (o.description ?? '').includes(want));
-      if (hit?.description) return hit.description;
-    }
-  }
-  return value;
 }

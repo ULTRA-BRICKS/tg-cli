@@ -1,8 +1,8 @@
 // Singleton/lifecycle helpers for tg-ctl (spec §6, §7).
 //
 // Everything here is PURE — the actual flock(2) (bun:ffi), kill(2) and file
-// reads live in the tg-ctl entrypoint, which feeds these helpers plain data.
-// `kill0` is injected so pidStatus is testable without sending real signals.
+// reads live in the tg-ctl entrypoint, which feeds these helpers plain data
+// (liveness arrives as booleans / pids already probed by the caller).
 
 import { join } from 'path';
 import type { ControlConfig, CtlPaths } from './types';
@@ -33,14 +33,14 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     dailyPending: join(configDir, `${base}.daily-pending.txt`),
     pendingBatch: join(configDir, `${base}.pending-batch.json`),
     awarenessNudge: join(configDir, `${base}.awareness-nudge.json`),
+    runInfo: join(configDir, `${base}.run.json`),
   };
 }
 
 // One-time migration plan (tg-cli#281): last-user-target.json replaces the
 // last-alex-target.json filename PR #278 shipped hours earlier. A live daemon
 // may already hold state under the old name — this only returns a plan
-// (never touches disk) so it stays testable with an injected `exists`, same
-// as `pidStatus`'s injected `kill0`.
+// (never touches disk) so it stays testable with an injected `exists`.
 //
 // 'migrate': the new file is absent — rename the legacy one forward so the
 // CTO's anchor survives the upgrade.
@@ -85,13 +85,6 @@ export function readPidFile(content: string | null): number | null {
   return pid > 0 ? pid : null;
 }
 
-// The pidfile is purely informational (spec §6) — the flock is the real
-// singleton. 'stale' means the file exists but kill -0 says the process died.
-export function pidStatus(pid: number | null, kill0: (pid: number) => boolean): 'running' | 'stale' | 'absent' {
-  if (pid === null) return 'absent';
-  return kill0(pid) ? 'running' : 'stale';
-}
-
 // The launchd job found running this daemon, as the caller probed it (see autostart.ts's
 // selectLaunchdDaemonJob). undefined when launchd runs no such job — or on a host without launchd.
 export interface LaunchdDaemon {
@@ -116,10 +109,14 @@ export type DaemonRunState =
 // Decide the daemon's run state from independent sources of truth. The pidfile is informational
 // (spec §6); launchd and the flock holder are not. Precedence:
 //   1. a live launchd job that supervises this binary (owns the process across relaunches)
-//   2. a live pidfile pid
-//   3. a live lock-holder pid (socket and pidfile may both be gone; the flock is the singleton)
+//   2. a live lock-holder pid (socket and pidfile may both be gone; the flock is the singleton)
+//   3. a live pidfile pid
 //   4. a dead pidfile → stale
 //   5. nothing → not-running
+// The lock holder outranks a live pidfile pid because a pidfile naming a live pid that does NOT
+// hold the flock is a reused pid, not the daemon — `stop`/`restart` must never signal it
+// (tg-cli#438). `status` skips the lsof probe while the pidfile pid is alive (lockHolderPid null),
+// so it keeps its cheap path.
 // Pure: the caller injects kill(0) as `pidAlive`, the launchd probe, and the lock-holder pid.
 export function daemonRunState(
   pidfilePid: number | null,
@@ -132,8 +129,8 @@ export function daemonRunState(
     if (pidfilePid === null || pidfilePid === launchd.pid) return base;
     return { ...base, note: pidAlive ? { kind: 'other-live', pid: pidfilePid } : { kind: 'stale', pid: pidfilePid } };
   }
-  if (pidfilePid !== null && pidAlive) return { kind: 'running', owner: 'process', pid: pidfilePid };
   if (lockHolderPid !== null && lockHolderPid > 0) return { kind: 'running', owner: 'process', pid: lockHolderPid };
+  if (pidfilePid !== null && pidAlive) return { kind: 'running', owner: 'process', pid: pidfilePid };
   if (pidfilePid !== null) return { kind: 'stale-pidfile', pid: pidfilePid };
   return { kind: 'not-running' };
 }

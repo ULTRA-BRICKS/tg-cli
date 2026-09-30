@@ -21,6 +21,19 @@ Credentials: `~/.config/tg-cli/.env` — must contain `TG_BOT_TOKEN` and `TG_CHA
 - Keep `main` checked out here at all times.
 - Never leave the checkout on a half-done feature branch.
 - Do all feature work in git worktrees on separate branches.
+- **After every merge to main, deploy with `scripts/deploy.sh`** (from any checkout — it
+  resolves this live one through the `tg` symlink): fast-forward, then
+  `tg-ctl restart --if-stale`. `tg` needs no restart, but the resident `tg-ctl run`
+  daemon keeps the code it loaded until it restarts — merged ≠ running (tg-cli#279).
+  `tg-ctl status` prints a `code:` line: the commit the daemon loaded, `STALE` when the
+  checkout has newer daemon code. `tg-ctl restart` is graceful (SIGTERM drain; queued
+  messages, questions and registrations persist on disk) and verified: it exits non-zero
+  unless the old process is gone and a successor holds the lock. On this machine the live
+  daemon is supervised by rig's launchd job **`ai.hyperide.tg-ctl`**
+  (`~/Library/LaunchAgents/ai.hyperide.tg-ctl.plist`, `KeepAlive`, stderr →
+  `~/.config/tg-cli/launchd.tg-ctl.err.log`); `tg-ctl restart` brings it back under that
+  job (`launchctl kickstart`). Never `launchctl bootout` it to "restart" — that unloads
+  autostart.
 
 ## Hook Caller Discipline
 
@@ -61,11 +74,14 @@ I/O, fetch, signals, `bun:ffi`):
   singleton via real `flock(2)` over `bun:ffi`, Telegram `getUpdates` long-poll, tmux pane
   injection. The lifecycle subcommands follow the shared agent-tools service-management
   contract (`agenttools_service`): `run` = foreground/blocking; `start` = background detached
-  daemon; `status` = running?/pid/bot/target/autostart; `stop` = stop the background daemon;
+  daemon; `status` = running?/pid/bot/target/code/autostart; `stop` = stop the daemon (found
+  via pidfile, flock holder or launchd job); `restart` = verified graceful reload;
   `enable` = install OS autostart AND start now; `disable` = remove autostart AND stop. A bare
   `tg-ctl` (no subcommand) prints HELP and never launches. OS-autostart matrix lives in
   `features/tg-ctl/autostart.ts`, mirroring the lib's SEMANTICS: macOS → launchd LaunchAgent
-  (label `com.agenttools.tg-ctl.tg-ctl`, `RunAtLoad` + `KeepAlive{SuccessfulExit:false}`,
+  (`tg-ctl enable` installs label `com.agenttools.tg-ctl.tg-ctl` — the live machine instead
+  runs rig's external `ai.hyperide.tg-ctl` job, which `status` names as the supervisor;
+  `RunAtLoad` + `KeepAlive{SuccessfulExit:false}`,
   legacy `launchctl load`/`unload`); Linux with a usable `systemctl --user` → systemd `--user`
   unit (`agenttools-tg-ctl-tg-ctl.service`, `Restart=on-failure`, `enable --now`); any other host
   (Linux with no `systemctl --user` — containers, no D-Bus session — or an unsupported OS) → a

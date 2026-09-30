@@ -12,38 +12,37 @@
 #
 #   `tg` itself needs NO restart — the next `tg` invocation reads the new file.
 #   `tg-ctl run` is a resident Bun process that loaded its code (tg-ctl +
-#   features/tg-ctl/*) into memory at start; if the pull changes any file the
-#   daemon imports, the running daemon keeps the OLD code until it is
-#   restarted. Restarting it DROPS the daemon's pane/cwd/session registration,
-#   so this script never blind-restarts a running daemon: it detects whether
-#   the deploy touched daemon code and, if so, STOPS at a clear warning telling
-#   you to restart it yourself (re-registering the same pane). Pass
-#   --restart-ctl to opt in to an automatic stop/start (registration is NOT
-#   preserved — only do this when no agent pane is registered, or you will
-#   re-register it after).
+#   features/ + tools/) into memory at start; the running daemon keeps the OLD
+#   code until it is restarted — merged fixes sat inert for weeks (tg-cli#279).
+#   So every deploy ends with `tg-ctl restart --if-stale`: the daemon records
+#   which commit it loaded, and is gracefully restarted (SIGTERM drain; queued
+#   messages, questions and pane registrations are on disk and survive) exactly
+#   when that commit differs from the checkout's HEAD in daemon code. It runs
+#   on the already-up-to-date path too, so re-running this script converges a
+#   checkout that was pulled by hand without a restart.
 #
 # PAST BUG THIS GUARDS
 #   ROADMAP "tg-cli #36 merged but NOT deployed": a merged `--tag`/help change
 #   sat un-deployed because the live `~/.files/bin/tg` checkout was never
 #   pulled. This script is the documented, scripted deploy step that closes
-#   that gap.
+#   that gap; `gh ship`'s post-merge step is expected to run it.
 #
 # USAGE
-#   scripts/deploy.sh [--checkout DIR] [--restart-ctl] [--dry-run]
+#   scripts/deploy.sh [--checkout DIR] [--no-restart-ctl] [--dry-run]
 #
-#   --checkout DIR   The git checkout to update. Default: resolve the `tg` on
-#                    PATH through its symlink to its containing repo. Override
-#                    when deploying a checkout other than the one on PATH.
-#   --restart-ctl    If a `tg-ctl` daemon is running AND the deploy touched its
-#                    code, stop+start it automatically. WITHOUT this flag the
-#                    script warns and leaves the daemon alone (default: safe).
-#   --dry-run        Show what would happen (fetch + report divergence) without
-#                    pulling or touching the daemon. Always FF-safe to run.
+#   --checkout DIR     The git checkout to update. Default: resolve the `tg` on
+#                      PATH through its symlink to its containing repo. Override
+#                      when deploying a checkout other than the one on PATH.
+#   --no-restart-ctl   Leave a stale tg-ctl daemon running (report only).
+#   --dry-run          Show what would land (fetch + report divergence) without
+#                      pulling or touching the daemon. Always FF-safe to run.
 #
 # EXIT CODES
-#   0  up to date, or deployed successfully
+#   0  deployed (or already up to date) and the daemon, if running, runs it
 #   1  usage / environment error (no checkout, not a git repo, dirty tree)
 #   2  cannot fast-forward (checkout diverged from origin/main) — needs a human
+#   3  checkout up to date (pulled or already current), but the tg-ctl restart failed
+#      (old daemon still alive, or no successor came up) — see the tg-ctl message above it
 set -euo pipefail
 
 usage() {
@@ -55,22 +54,22 @@ means the checked-out FILE is the running binary, so "deploying" a merged change
 is a guarded fast-forward `git pull` in that checkout.
 
 Usage:
-  scripts/deploy.sh [--checkout DIR] [--restart-ctl] [--dry-run]
+  scripts/deploy.sh [--checkout DIR] [--no-restart-ctl] [--dry-run]
 
-  --checkout DIR   The git checkout to update. Default: resolve the `tg` on PATH
-                   through its symlink to its containing repo.
-  --restart-ctl    If a tg-ctl daemon is running AND the deploy touched its code,
-                   stop+start it automatically (drops the pane/cwd/session
-                   registration — re-register afterwards). Default: warn only.
-  --dry-run        Show what would land (fetch + report) without pulling or
-                   touching the daemon. Always safe to run.
+  --checkout DIR     The git checkout to update. Default: resolve the `tg` on PATH
+                     through its symlink to its containing repo.
+  --no-restart-ctl   Do not restart a tg-ctl daemon running stale code (report
+                     only). Default: `tg-ctl restart --if-stale` — a graceful
+                     reload only when the daemon's loaded code is not current.
+  --dry-run          Show what would land (fetch + report) without pulling or
+                     touching the daemon. Always safe to run.
 
-Exit codes: 0 up-to-date/deployed · 1 usage/env error · 2 non-fast-forward.
+Exit codes: 0 deployed · 1 usage/env error · 2 non-fast-forward · 3 tg-ctl restart failed.
 EOF
 }
 
 CHECKOUT=""
-RESTART_CTL=0
+RESTART_CTL=1
 DRY_RUN=0
 
 while [ $# -gt 0 ]; do
@@ -80,7 +79,7 @@ while [ $# -gt 0 ]; do
         echo "deploy: --checkout requires a directory argument." >&2; exit 1
       fi
       CHECKOUT="$2"; shift 2 ;;
-    --restart-ctl) RESTART_CTL=1; shift ;;
+    --no-restart-ctl) RESTART_CTL=0; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "deploy: unknown argument '$1' (try --help)" >&2; exit 1 ;;
@@ -164,114 +163,90 @@ fi
 local_sha="$(git_c rev-parse HEAD)"
 remote_sha="$(git_c rev-parse "$upstream")"
 
-if [ "$local_sha" = "$remote_sha" ]; then
-  echo "deploy: already up to date ($(git_c rev-parse --short HEAD)) — nothing to do."
-  exit 0
-fi
-
-# Fast-forward only: refuse if the checkout has commits the remote lacks.
-if ! git_c merge-base --is-ancestor HEAD "$upstream"; then
-  echo "deploy: cannot fast-forward — '$branch' has diverged from '$upstream'." >&2
-  echo "        A human must reconcile (rebase/merge). Aborting." >&2
-  exit 2
-fi
-
-echo "deploy: $(git_c rev-parse --short HEAD) -> $(git_c rev-parse --short "$upstream"), commits to land:"
-git_c log --oneline "HEAD..$upstream" | sed 's/^/  /'
-
-# Does the deploy touch the tg-ctl daemon's runtime code? The `tg-ctl run`
-# process imports the `tg-ctl` entry AND shared modules under `features/` (the
-# inbound-inject wrap, cli/version, render helpers, …) — not just
-# features/tg-ctl/. So treat a change to `tg-ctl` OR anything under `features/`
-# as "the running daemon may be stale". This only drives a WARNING (never a blind
-# restart), so erring toward over-warning is the safe bias — a missed warning
-# silently ships stale daemon behavior (e.g. this PR's VERSION bump in
-# features/cli/version.ts, which a features/tg-ctl-only matcher would not catch).
-ctl_changed=0
-if git_c diff --name-only "HEAD..$upstream" | grep -qE '^(tg-ctl(/|$)|features/)'; then
-  ctl_changed=1
-fi
-
-if [ "$DRY_RUN" = "1" ]; then
-  echo "deploy: --dry-run — not pulling."
-  [ "$ctl_changed" = "1" ] && echo "deploy: (dry-run) would require a tg-ctl restart (daemon code changed)."
-  exit 0
-fi
-
-# ── fast-forward to the already-validated upstream ─────────────────────────────
-# Use `merge --ff-only "$upstream"` (not `pull`, which would re-fetch): we already
-# fetched and validated `$upstream` is a strict descendant of HEAD, so this updates
-# against the SAME object state the ctl_changed decision was computed from — no
-# second fetch, no race window where a new push slips in unwarned.
-git_c merge --ff-only --quiet "$upstream"
-new_sha="$(git_c rev-parse --short HEAD)"
-echo "deploy: pulled — now at $new_sha"
-
 # Run the deployed checkout's OWN tg/tg-ctl (NOT whatever is first on PATH — when
 # --checkout names a tree other than the PATH one, the PATH binary is unrelated).
 tg_checkout="$CHECKOUT/tg"
 ctl_checkout="$CHECKOUT/tg-ctl"
 
-# Bound every post-deploy invocation of the freshly-pulled binaries with `timeout`
-# when available, so a wedged binary (startup lock, blocking on stdin, network on
-# launch) can't hang the deploy. `bounded CMD ARGS…` runs CMD under that bound (or
-# bare where no timeout(1)/gtimeout is on the box).
+# Bound every invocation of the checkout's binaries with `timeout` when available,
+# so a wedged binary (startup lock, blocking on stdin, network on launch) can't
+# hang the deploy. `bounded SECS CMD ARGS…` runs CMD under that bound (or bare
+# where no timeout(1)/gtimeout is on the box).
 timeout_bin="$(command -v timeout || command -v gtimeout || true)"
-[ -z "$timeout_bin" ] && echo "deploy: NOTE — no timeout(1)/gtimeout; post-deploy tg/tg-ctl calls run unbounded." >&2
 bounded() {
-  if [ -n "$timeout_bin" ]; then "$timeout_bin" 30 "$@"; else "$@"; fi
+  secs="$1"; shift
+  if [ -n "$timeout_bin" ]; then "$timeout_bin" "$secs" "$@"; else "$@"; fi
 }
 
-# `tg` is a committed script: the symlink already points at the new file. Verify
-# the deployed `tg` reports the new commit (sanity check the script is runnable).
-# The `|| true` keeps a failing/empty version probe (e.g. bun missing → exit 127,
-# which `set -o pipefail` would otherwise surface) from aborting the whole deploy.
-if [ -x "$tg_checkout" ]; then
-  tg_version="$(bounded "$tg_checkout" --version 2>/dev/null | head -1)" || true
-  if [ -n "$tg_version" ]; then
-    echo "deploy: tg --version -> $tg_version"
-  else
-    echo "deploy: WARNING — deployed tg produced no --version output (is bun on PATH?)." >&2
+if [ "$local_sha" = "$remote_sha" ]; then
+  echo "deploy: already up to date ($(git_c rev-parse --short HEAD)) — nothing to pull."
+  [ "$DRY_RUN" = "1" ] && exit 0
+else
+  # Fast-forward only: refuse if the checkout has commits the remote lacks.
+  if ! git_c merge-base --is-ancestor HEAD "$upstream"; then
+    echo "deploy: cannot fast-forward — '$branch' has diverged from '$upstream'." >&2
+    echo "        A human must reconcile (rebase/merge). Aborting." >&2
+    exit 2
   fi
-fi
 
-# Re-register the agent skill (idempotent; keeps the skill file current).
-if [ -x "$tg_checkout" ]; then
-  bounded "$tg_checkout" install-skill >/dev/null 2>&1 \
-    && echo "deploy: refreshed tg skill (install-skill)" \
-    || echo "deploy: WARNING — 'tg install-skill' failed/timed out; re-run it manually." >&2
+  echo "deploy: $(git_c rev-parse --short HEAD) -> $(git_c rev-parse --short "$upstream"), commits to land:"
+  git_c log --oneline "HEAD..$upstream" | sed 's/^/  /'
+
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "deploy: --dry-run — not pulling (a real run then restarts tg-ctl if its loaded code is stale)."
+    exit 0
+  fi
+
+  # ── fast-forward to the already-validated upstream ───────────────────────────
+  # Use `merge --ff-only "$upstream"` (not `pull`, which would re-fetch): we already
+  # fetched and validated `$upstream` is a strict descendant of HEAD, so this lands
+  # exactly the commits listed above — no race window where a new push slips in.
+  git_c merge --ff-only --quiet "$upstream"
+  echo "deploy: pulled — now at $(git_c rev-parse --short HEAD)"
+
+  [ -z "$timeout_bin" ] && echo "deploy: NOTE — no timeout(1)/gtimeout; post-deploy tg/tg-ctl calls run unbounded." >&2
+
+  # `tg` is a committed script: the symlink already points at the new file. Verify
+  # the deployed `tg` reports the new commit (sanity check the script is runnable).
+  # The `|| true` keeps a failing/empty version probe (e.g. bun missing → exit 127,
+  # which `set -o pipefail` would otherwise surface) from aborting the whole deploy.
+  if [ -x "$tg_checkout" ]; then
+    tg_version="$(bounded 30 "$tg_checkout" --version 2>/dev/null | head -1)" || true
+    if [ -n "$tg_version" ]; then
+      echo "deploy: tg --version -> $tg_version"
+    else
+      echo "deploy: WARNING — deployed tg produced no --version output (is bun on PATH?)." >&2
+    fi
+  fi
+
+  # Re-register the agent skill (idempotent; keeps the skill file current).
+  if [ -x "$tg_checkout" ]; then
+    bounded 30 "$tg_checkout" install-skill >/dev/null 2>&1 \
+      && echo "deploy: refreshed tg skill (install-skill)" \
+      || echo "deploy: WARNING — 'tg install-skill' failed/timed out; re-run it manually." >&2
+  fi
 fi
 
 # ── tg-ctl daemon ──────────────────────────────────────────────────────────────
-# Manage the deployed checkout's own tg-ctl. The daemon is a host singleton, so a
-# running one may belong to a DIFFERENT checkout; only restart when this deploy's
-# binary reports the daemon as running (its status reads the shared pid/lock).
-ctl_bin="$ctl_checkout"
-ctl_running=0
-if [ -x "$ctl_bin" ] && bounded "$ctl_bin" status >/dev/null 2>&1; then
-  ctl_running=1
-fi
-
-if [ "$ctl_running" = "1" ] && [ "$ctl_changed" = "1" ]; then
+# `tg-ctl restart --if-stale` owns the whole decision (tg-cli#279): no daemon → no-op
+# (a deploy never starts one); loaded code current → no-op; otherwise a graceful,
+# verified reload — under launchd when launchd owns the daemon — that exits non-zero
+# unless the old process is gone AND a successor holds the lock (tg-cli#438). Bound:
+# the SIGTERM drain (≤10s) plus the successor wait (≤15s), with margin.
+if [ -x "$ctl_checkout" ]; then
   if [ "$RESTART_CTL" = "1" ]; then
-    echo "deploy: restarting tg-ctl (daemon code changed; --restart-ctl given)..."
-    echo "deploy: NOTE — restart drops the daemon's pane/cwd/session registration." >&2
-    # Surface a stop failure on its own — otherwise a still-alive daemon makes the
-    # subsequent start fail and wrongly blames `start`.
-    bounded "$ctl_bin" stop  || { echo "deploy: tg-ctl stop FAILED — daemon may still be running; fix it and retry." >&2; exit 1; }
-    bounded "$ctl_bin" start || { echo "deploy: tg-ctl start FAILED — start it manually." >&2; exit 1; }
-    echo "deploy: tg-ctl restarted. Re-register the agent pane if one was bound."
+    if ! bounded 60 "$ctl_checkout" restart --if-stale; then
+      echo "deploy: ====================================================================" >&2
+      echo "deploy: tg-ctl restart FAILED — the checkout is up to date, but the daemon may" >&2
+      echo "deploy: still run the OLD code (or not run at all). See the tg-ctl message" >&2
+      echo "deploy: above; \`tg-ctl status\` shows the running pid and its code line." >&2
+      echo "deploy: ====================================================================" >&2
+      exit 3
+    fi
   else
-    echo "deploy: ====================================================================" >&2
-    echo "deploy: ACTION NEEDED — tg-ctl is running and this deploy changed its code." >&2
-    echo "deploy: The running daemon still holds the OLD code. Restart it to apply:" >&2
-    echo "deploy:     tg-ctl status   # note the registered pane/cwd/session" >&2
-    echo "deploy:     tg-ctl stop && tg-ctl start [--pane %N] [--cwd ...] [--session ...]" >&2
-    echo "deploy: (or re-run this deploy with --restart-ctl to stop/start automatically)" >&2
-    echo "deploy: ====================================================================" >&2
+    echo "deploy: --no-restart-ctl — tg-ctl left as is:"
+    bounded 30 "$ctl_checkout" status 2>/dev/null | grep -E '^(tg-ctl:|code:)' | sed 's/^/  /' || true
   fi
-elif [ "$ctl_running" = "1" ]; then
-  echo "deploy: tg-ctl running; deploy did not touch its code — no restart needed."
 fi
 
-echo "deploy: done — deployed $new_sha."
+echo "deploy: done — $CHECKOUT at $(git_c rev-parse --short HEAD)."

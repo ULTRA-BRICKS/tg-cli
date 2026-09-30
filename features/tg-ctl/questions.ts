@@ -65,11 +65,6 @@ export interface OpencodeRequestRef {
   replyKind: 'question' | 'question-v2' | 'permission' | 'permission-v2';
 }
 
-export interface OmpRequestRef {
-  sessionId: string;
-  rpcId: string | number;
-}
-
 export interface ButtonRequest {
   requestId: string;
   buttonId?: string; // short Telegram callback id; requestId may be long/opaque
@@ -109,9 +104,6 @@ export interface ButtonRequest {
   // is unchanged, only the pane-injection fallback is refused.
   multiQuestion?: boolean;
   opencode?: OpencodeRequestRef;
-  // ACP session/request_permission (omp 18.1.14). A tap replies via the JSON-RPC
-  // result on this connection — never a tmux digit inject.
-  omp?: OmpRequestRef;
   // The identity proof tg-ctl requires before AUTOMATICALLY delivering a QUEUED
   // permission decision to a reconnecting hook within its retention window
   // (tg-cli#182: ABANDONED_PERMISSION_RETAIN_MS): without this proof,
@@ -323,8 +315,8 @@ function hatchSafeStatus(req: ButtonRequest, status: string): string {
 
 // Exhaustive over AgentKind on purpose: adding a new kind forces a deliberate
 // capability decision here (the compiler flags a missing case) instead of a
-// silent default — omp is ACP buttons (session/request_permission), not the
-// tmux floor.
+// silent default — omp asks arrive as buttons through its native hook forwarding
+// (`tg-ctl ask`), not the tmux floor.
 // The default branch is the RUNTIME fail-safe: the kind crosses a JS boundary
 // (JSON on the hook socket), so an out-of-union value must still get the safe
 // capability rather than `undefined`.

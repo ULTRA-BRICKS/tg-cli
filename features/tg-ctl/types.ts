@@ -476,6 +476,7 @@ export interface CtlPaths {
   // written BEFORE the offset advances so a crash between telling Telegram we have it and
   // finishing the work can never lose it; see runDaemon recovery-on-startup
   awarenessNudge: string; // durable per-agent silence-nudge state (tg-ctl#363)
+  runInfo: string; // which commit the running daemon loaded (pid + sha), for stale-code detection (tg-cli#279)
 }
 
 // --- forum topics (docs/specs/tg-forum-topics.md) ---

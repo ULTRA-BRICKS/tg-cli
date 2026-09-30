@@ -3,13 +3,14 @@
 // tg-ctl runs as ONE daemon process shared by the whole agent fleet. Before this module, the
 // poll loop ran every batch's actions through a single strict `for (const action of
 // step.actions) { await executeAction(action) }` loop — one action fully finished (including
-// any network/IPC call inside it) before the next one even started. `executeAction` reaches
-// omp agents over ACP (`promptOmpAcp` -> `acpCall(..., "session/prompt", timeoutMs)`); a wedged
-// omp process (stdin/stdout backed up, deadlocked, etc.) held that await for up to the call's
-// full timeout. Because the daemon is single-threaded and shared, that one hung delivery froze
-// delivery to EVERY other agent in the same batch -- including perfectly healthy ones (e.g. a
-// Claude Code session receiving messages fine) -- for as long as the stuck target took to time
-// out. This is classic head-of-line blocking: one shared serial queue, no per-target isolation.
+// any network/IPC call inside it) before the next one even started. `executeAction` then reached
+// omp agents over ACP (`promptOmpAcp` -> `acpCall(..., "session/prompt", timeoutMs)`, since
+// removed — tg-cli#450/#469); a wedged omp process (stdin/stdout backed up, deadlocked, etc.)
+// held that await for up to the call's full timeout. Because the daemon is single-threaded and
+// shared, that one hung delivery froze delivery to EVERY other agent in the same batch --
+// including perfectly healthy ones (e.g. a Claude Code session receiving messages fine) -- for
+// as long as the stuck target took to time out. This is classic head-of-line blocking: one
+// shared serial queue, no per-target isolation.
 //
 // The fix is a "serialization key" per unit of work. Work sharing a key (the same topic
 // thread, the same pending-selection token, the same question requestId -- i.e. anything that

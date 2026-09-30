@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -13,9 +13,9 @@ const SAFE_PATH = '/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin';
 // Exercise the REAL scripts/deploy.sh against throwaway local git repos: a bare
 // "origin" + a checkout cloned from it. No network, no mocks — the script runs
 // its actual fetch / merge-base / pull --ff-only logic against real git. The
-// tg-ctl daemon branches are driven by a STUB `tg-ctl` planted in the checkout
-// (the script runs `$CHECKOUT/tg-ctl`, never a host daemon), so the warn path and
-// the --restart-ctl stop/start path are covered without touching a real daemon.
+// tg-ctl daemon step is driven by a STUB `tg-ctl` planted in the checkout (the
+// script runs `$CHECKOUT/tg-ctl`, never a host daemon), so the restart hand-off,
+// its failure exit, and --no-restart-ctl are covered without touching a real daemon.
 
 const DEPLOY = join(import.meta.dir, '..', 'scripts', 'deploy.sh');
 
@@ -81,17 +81,18 @@ function advanceOrigin(file: string, body: string, msg: string) {
   git(other, 'push', '-q', 'origin', 'main');
 }
 
-// Plant a stub `tg-ctl` in the checkout that records each subcommand to a log and
-// returns the given exit codes (status defaults to 0 = "running"; stop/start to 0).
-// The deploy script runs `$CHECKOUT/tg-ctl`, so this is the exact binary it calls.
-function plantStubCtl(opts: { statusCode?: number; stopCode?: number; startCode?: number } = {}) {
+// Plant a stub `tg-ctl` in the checkout that records each invocation's argv to a log
+// and exits with `restartCode` for `restart` (0 = the verified reload succeeded or
+// was not needed). The deploy script runs `$CHECKOUT/tg-ctl`, so this is the exact
+// binary it calls; the restart DECISION itself lives in tg-ctl and is covered by
+// tests/ctl-daemon-lifecycle-integration.test.ts.
+function plantStubCtl(opts: { restartCode?: number } = {}) {
   const log = join(root, 'ctl-calls.log');
   const script = [
     '#!/usr/bin/env bash',
-    `echo "$1" >> "${log}"`,
-    `[ "$1" = status ] && exit ${opts.statusCode ?? 0}`,
-    `[ "$1" = stop ] && exit ${opts.stopCode ?? 0}`,
-    `[ "$1" = start ] && exit ${opts.startCode ?? 0}`,
+    `echo "$*" >> "${log}"`,
+    `[ "$1" = restart ] && exit ${opts.restartCode ?? 0}`,
+    '[ "$1" = status ] && { echo "tg-ctl: running (pid 4242) — bot 1"; echo "code: 1234567 (current)"; echo "registrations: none"; }',
     'exit 0',
   ].join('\n');
   writeFileSync(join(checkout, 'tg-ctl'), `${script}\n`, { mode: 0o755 });
@@ -200,27 +201,10 @@ test('--dry-run reports the pending commits without pulling', () => {
   expect(git(checkout, 'rev-parse', 'HEAD')).toBe(before);
 });
 
-test('flags a tg-ctl restart when the deploy changes daemon code', () => {
-  advanceOrigin('features/tg-ctl/inject.ts', '// daemon code\n', 'feat(tg-ctl): change inject');
-
-  // --dry-run surfaces the restart-needed note without touching the daemon.
-  const proc = deploy('--dry-run');
-  expect(proc.exitCode).toBe(0);
-  expect(proc.stdout.toString()).toContain('would require a tg-ctl restart');
-});
-
-test('does NOT flag a restart for a docs-only deploy', () => {
-  advanceOrigin('README.md', 'docs only\n', 'docs: tweak');
-
-  const proc = deploy('--dry-run');
-  expect(proc.exitCode).toBe(0);
-  expect(proc.stdout.toString()).not.toContain('would require a tg-ctl restart');
-});
-
 // Plant + commit the stub tg-ctl, push it as the shared base, THEN advance origin
 // with a daemon-code change so the checkout is exactly one fast-forward behind and
 // has a clean tree. Returns the stub's call log path.
-function setupDaemonDeploy(stub: { statusCode?: number; stopCode?: number; startCode?: number }) {
+function setupDaemonDeploy(stub: { restartCode?: number } = {}) {
   const log = plantStubCtl(stub);
   git(checkout, 'add', 'tg-ctl');
   git(checkout, 'commit', '-q', '-m', 'test: stub tg-ctl');
@@ -229,66 +213,52 @@ function setupDaemonDeploy(stub: { statusCode?: number; stopCode?: number; start
   return log;
 }
 
-test('real deploy with daemon code change + running daemon prints the ACTION-NEEDED banner (no restart without the flag)', () => {
-  const log = setupDaemonDeploy({ statusCode: 0 }); // status 0 = "running"
+test('after the pull, the daemon decision goes to the deployed `tg-ctl restart --if-stale`', () => {
+  const log = setupDaemonDeploy();
 
-  const proc = deploy(); // no --restart-ctl
+  const proc = deploy();
   expect(proc.exitCode).toBe(0);
-  expect(proc.stderr.toString()).toContain('ACTION NEEDED');
-  // Only `status` was queried; the daemon was NOT stopped/started.
-  const calls = readFileSync(log, 'utf8');
-  expect(calls).toContain('status');
-  expect(calls).not.toContain('stop');
-  expect(calls).not.toContain('start');
+  expect(proc.stdout.toString()).toContain('pulled');
+  expect(readFileSync(log, 'utf8').trim()).toBe('restart --if-stale');
 });
 
-test('--restart-ctl stops then starts the daemon when its code changed', () => {
-  const log = setupDaemonDeploy({ statusCode: 0, startCode: 0 });
+test('an up-to-date checkout still converges the daemon (a pull done by hand left it stale)', () => {
+  const log = plantStubCtl();
+  git(checkout, 'add', 'tg-ctl');
+  git(checkout, 'commit', '-q', '-m', 'test: stub tg-ctl');
+  git(checkout, 'push', '-q', 'origin', 'main');
 
-  const proc = deploy('--restart-ctl');
+  const proc = deploy();
   expect(proc.exitCode).toBe(0);
-  expect(proc.stdout.toString()).toContain('restarting tg-ctl');
-  const calls = readFileSync(log, 'utf8');
-  expect(calls).toContain('stop');
-  expect(calls).toContain('start');
+  expect(proc.stdout.toString()).toContain('already up to date');
+  expect(readFileSync(log, 'utf8').trim()).toBe('restart --if-stale');
 });
 
-test('--restart-ctl aborts (exit 1) when the daemon fails to start', () => {
-  setupDaemonDeploy({ statusCode: 0, startCode: 1 }); // start fails
+test('a failed tg-ctl restart fails the deploy with exit 3 — the checkout IS deployed', () => {
+  setupDaemonDeploy({ restartCode: 1 });
 
-  const proc = deploy('--restart-ctl');
-  expect(proc.exitCode).toBe(1);
-  expect(proc.stderr.toString()).toContain('tg-ctl start FAILED');
+  const proc = deploy();
+  expect(proc.exitCode).toBe(3);
+  expect(proc.stderr.toString()).toContain('tg-ctl restart FAILED');
+  expect(git(checkout, 'rev-parse', 'HEAD')).toBe(git(checkout, 'rev-parse', 'origin/main'));
 });
 
-test('--restart-ctl aborts on a stop failure (exit 1, blames stop not start)', () => {
-  const log = setupDaemonDeploy({ statusCode: 0, stopCode: 1 }); // stop fails
+test('--no-restart-ctl never restarts; it reports the daemon status and code lines', () => {
+  const log = setupDaemonDeploy();
 
-  const proc = deploy('--restart-ctl');
-  expect(proc.exitCode).toBe(1);
-  expect(proc.stderr.toString()).toContain('tg-ctl stop FAILED');
-  expect(proc.stderr.toString()).not.toContain('start FAILED');
-  // start must NOT be attempted after a failed stop.
-  expect(readFileSync(log, 'utf8')).not.toContain('start');
-});
-
-test('daemon-code change but NO running daemon: no warning, no restart, exit 0', () => {
-  const log = setupDaemonDeploy({ statusCode: 1 }); // status 1 = NOT running
-
-  const proc = deploy(); // even without --restart-ctl
+  const proc = deploy('--no-restart-ctl');
   expect(proc.exitCode).toBe(0);
-  expect(proc.stderr.toString()).not.toContain('ACTION NEEDED');
-  const calls = readFileSync(log, 'utf8');
-  expect(calls).not.toContain('stop');
-  expect(calls).not.toContain('start');
+  expect(proc.stdout.toString()).toContain('code: 1234567 (current)');
+  expect(proc.stdout.toString()).not.toContain('registrations');
+  expect(readFileSync(log, 'utf8').trim()).toBe('status');
 });
 
-test('--restart-ctl is a no-op when the daemon is not running (does not start one)', () => {
-  const log = setupDaemonDeploy({ statusCode: 1 }); // not running
+test('--dry-run never touches the daemon', () => {
+  const log = setupDaemonDeploy();
 
-  const proc = deploy('--restart-ctl');
+  const proc = deploy('--dry-run');
   expect(proc.exitCode).toBe(0);
-  expect(readFileSync(log, 'utf8')).not.toContain('start');
+  expect(existsSync(log)).toBe(false);
 });
 
 test('resolves the checkout from a `tg` symlink on PATH when no --checkout given', () => {
@@ -341,7 +311,7 @@ test('--help prints usage and exits 0', () => {
   const proc = deploy('--help');
   expect(proc.exitCode).toBe(0);
   expect(proc.stdout.toString()).toContain('Usage:');
-  expect(proc.stdout.toString()).toContain('--restart-ctl');
+  expect(proc.stdout.toString()).toContain('--no-restart-ctl');
 });
 
 test('refuses a detached-HEAD checkout (exit 1)', () => {
@@ -380,22 +350,6 @@ test('warns (but still exits 0) when the deployed tg install-skill fails', () =>
   const proc = deploy();
   expect(proc.exitCode).toBe(0); // install-skill failure is a non-blocking warning
   expect(proc.stderr.toString()).toContain("'tg install-skill' failed");
-});
-
-test('reports "no restart needed" when a running daemon\'s code is untouched', () => {
-  const ctlLog = plantStubCtl({ statusCode: 0 }); // running
-  git(checkout, 'add', 'tg-ctl');
-  git(checkout, 'commit', '-q', '-m', 'test: stub tg-ctl');
-  git(checkout, 'push', '-q', 'origin', 'main');
-  // A docs-only change — does NOT touch tg-ctl or features/.
-  advanceOrigin('README.md', 'docs only\n', 'docs: tweak');
-
-  const proc = deploy();
-  expect(proc.exitCode).toBe(0);
-  expect(proc.stdout.toString()).toContain('no restart needed');
-  const calls = readFileSync(ctlLog, 'utf8');
-  expect(calls).not.toContain('stop');
-  expect(calls).not.toContain('start');
 });
 
 test('resolves a multi-hop tg symlink chain to the final checkout', () => {

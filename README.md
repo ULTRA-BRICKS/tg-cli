@@ -81,24 +81,28 @@ TG_CHAT_ID=<your chat or user ID>
 so the checked-out file **is** the running binary — there is no build step. Deploying a
 merged change is a fast-forward `git pull` in the checkout the symlink points at:
 ```bash
-scripts/deploy.sh                  # update the checkout the `tg` on PATH points at
-scripts/deploy.sh --dry-run        # show what would land, change nothing (always safe)
-scripts/deploy.sh --checkout DIR   # update a specific checkout
+scripts/deploy.sh                    # update the checkout the `tg` on PATH points at
+scripts/deploy.sh --dry-run          # show what would land, change nothing (always safe)
+scripts/deploy.sh --checkout DIR     # update a specific checkout
+scripts/deploy.sh --no-restart-ctl   # update, but leave a stale tg-ctl daemon running
 ```
-When up to date the script is a no-op; otherwise it advances the checkout's `HEAD` to
+When up to date nothing is pulled; otherwise it advances the checkout's `HEAD` to
 `origin/<branch>`. It refuses to pull over tracked local changes (untracked files such
 as a stray `node_modules` do not block it — though `git`'s own fast-forward will still
 abort if an incoming path collides with an untracked file) and refuses a
 non-fast-forward divergence. `tg` itself needs no restart — the next invocation reads
-the new file. Exit codes: `0` up-to-date or deployed, `1` usage/environment error,
-`2` non-fast-forward (needs a human).
+the new file. Exit codes: `0` deployed (or up to date), `1` usage/environment error,
+`2` non-fast-forward (needs a human), `3` the tg-ctl restart failed.
 
 > **`tg-ctl` daemon:** the inbound control daemon (`tg-ctl run`) loads its code into
-> memory at start, so a deploy that changes daemon code (the `tg-ctl` entry or anything
-> under `features/`, which the daemon imports) only takes effect after a restart — which
-> **drops the daemon's pane/cwd/session registration**. `deploy.sh` detects this and prints exactly what to restart (re-binding
-> the same pane); pass `--restart-ctl` to stop/start it automatically (re-register the
-> pane afterwards). A plain `curl … | install.sh` re-run also refreshes a clone (it does
+> memory at start and records which commit that was, so a merged fix only runs once it
+> restarts. Every deploy — including one that finds the checkout already up to date —
+> ends with `tg-ctl restart --if-stale`: a graceful reload (queued messages, questions and
+> pane registrations are on disk and survive) only when the daemon's loaded code differs
+> from the checkout in daemon files; under launchd it comes back under the same job. It
+> exits non-zero unless the old process is gone and a successor holds the lock.
+> `tg-ctl status` shows the loaded commit on its `code:` line (`STALE` when a restart is
+> due). A plain `curl … | install.sh` re-run also refreshes a clone (it does
 > `git pull --ff-only`), but does not handle the daemon.
 
 ---

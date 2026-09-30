@@ -175,3 +175,9 @@ test('launchd wins over a live lock holder (same process, named as launchd)', ()
   const line = daemonStatusLine(daemonRunState(null, false, LAUNCHD, 11062), BOT);
   expect(line).toContain('running (launchd, pid 11062)');
 });
+
+test('a live pidfile pid that does not hold the flock is a reused pid — the lock holder is the daemon (tg-cli#438)', () => {
+  // stop/restart probe the flock even when the pidfile pid is alive; signalling the
+  // pidfile's pid here would SIGTERM an unrelated process and leave the daemon running.
+  expect(daemonRunState(4242, true, undefined, 11062)).toEqual({ kind: 'running', owner: 'process', pid: 11062 });
+});

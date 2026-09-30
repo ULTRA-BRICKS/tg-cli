@@ -198,10 +198,27 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
 - **Commands:**
   - `tg-ctl start` — spawn the detached daemon and exit (no lock here — §6).
     No-op if already running.
-  - `tg-ctl run` — internal: the daemon itself. flock first, then poll loop.
-  - `tg-ctl stop` — read pidfile, `SIGTERM`, clean pidfile.
+  - `tg-ctl run` — internal: the daemon itself. flock first, then pidfile, then the
+    run-info file `tg-ctl.<botid>.run.json` (`{pid, commit, codeDir, startedAt}` — the
+    checkout HEAD it loaded), then the poll loop.
+  - `tg-ctl stop` — locate the daemon through the same chain as `status` (launchd job,
+    flock holder, then a live pidfile pid; a live pidfile pid that does not hold the flock
+    is a reused pid and never signalled — tg-cli#438), `SIGTERM`, wait out the drain
+    (`GRACEFUL_SHUTDOWN_MS` + margin), clean the pidfile only if it still names that pid.
+    Exit 1 when the process is still alive after the wait.
+  - `tg-ctl restart [--if-stale]` — `stop`, then relaunch: a launchd-owned daemon via
+    `launchctl kickstart <domain>/<label>` (it stays under launchd), otherwise the detached
+    `start` spawn. Exit 0 only when the old pid is dead AND a new pid is in the pidfile and
+    alive within 15 s; never launches a replacement over a still-alive old process.
+    `--if-stale` (the deploy step, tg-cli#279): no-op when nothing runs or the loaded code
+    is current; restarts when the checkout HEAD moved with daemon-code changes (any path
+    except docs/tests/scripts/CI/`*.md`/`tg`) or the code identity is unknown.
   - `tg-ctl status` — running? (pidfile, flock holder, launchd — not pidfile alone)
-    mode? target pane? bot id? last update age?
+    loaded code (`code:` line: current / checkout moved without daemon changes / `STALE`
+    / unknown)? mode? target pane? bot id? last update age?
+- **Deploy (tg-cli#279):** `scripts/deploy.sh` fast-forwards the live checkout and runs
+  `tg-ctl restart --if-stale` (also when already up to date, so a hand-pulled checkout
+  converges); exit 3 when that restart fails.
 
 - **Lazy auto-start from `tg`:** on `tg` invocation, auto-start `tg-ctl` **only if both hold**:
   - inside a tmux pane (`TMUX` set) with a detected AI agent, **and**
