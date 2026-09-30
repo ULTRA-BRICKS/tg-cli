@@ -489,6 +489,16 @@ monospace `tg --table` (`<pre>`) stays as the plain fallback grid.
 sending a few real messages to the configured chat as proof IS accepted practice in this repo
 (the chat owner reads them). Keep them few and informative.
 
+**Live e2e run (tg-cli#468)** — `bun scripts/e2e-telegram.ts` (`--dry-run` = preflight
+only) proves inbound behaviour through the real bot: it drives the CTO's headless Telegram
+Web client via qa-cli's `qa telegram chat …` (set `TG_E2E_QA` to run an unreleased qa-cli
+checkout), exercises the LIVE daemon (never starts a poller), creates fixture agents (omp
+in/outside tmux, Claude Code in tmux, codex on request) with random collision-checked
+`/agent` selectors, and removes them afterwards. Every message it sends is a reply, because
+with the bot's threaded mode on a non-reply client message starts a new topic. Use its
+`report.json` + `chat.png` as live acceptance proof for M1–M4 tickets; pure logic and the
+runner live in `features/e2e-telegram/` (tests/e2e-telegram.test.ts).
+
 **Never verify against the native Telegram Desktop app** — checking that a send/reply/hatch
 flow actually works means reading the message through a client, but that client MUST be
 qa-cli's headless Telegram Web driver (`qa telegram login`/`status`, `qa_cli/telegram.py` +

@@ -3,6 +3,29 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.5
+
+**Live Telegram e2e harness (#468): `bun scripts/e2e-telegram.ts`.**
+
+- Sends as the CTO from qa-cli's headless Telegram Web client (`qa telegram chat`,
+  qa-cli#28) to the live bot — never a second poller — against fixture sessions it
+  creates and removes itself: omp in tmux, Claude Code in tmux, omp outside tmux (abduco
+  pty), optionally codex. Asserts delivery into the intended fixture (tmux scrollback,
+  omp/cc transcript) and the fixture agent's `tg` reply for `/agent` routing, reply
+  routing, the `/agent <name>` select card and its Cancel button, a voice/audio note
+  through local Whisper, and an AskUserQuestion card tapped in the client. Topic routing
+  is reported as skipped until M4.
+- Every harness message is a Telegram reply to a main-chat message: with the bot's
+  threaded mode on, a client message that is not a reply opens a new topic and starts the
+  spawn wizard (observed live 2026-09-29).
+- Fixture `/agent` selectors are random and rejected when `matchWindows` would match any
+  live window, cwd or omp title, so a test message can never resonate into a real
+  session; the CTO's last-user-target anchor is restored when the run moved it onto a
+  fixture and left alone when he routed elsewhere meanwhile.
+- `--dry-run` runs the preflight only (daemon running, Telegram Web login, binaries,
+  selectors, Claude account); a missing login exits 3 with the one command to run.
+  Reports land in `~/.cache/tg-cli-e2e/<run>/report.json` plus `chat.png`.
+
 ## 1.54.4
 
 **Merged means running: stale-daemon detection, verified restarts, auto-restart on deploy
