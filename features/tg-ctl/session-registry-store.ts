@@ -119,6 +119,16 @@ export function resolveLocatorToSession(reg: Registry, paneId: string, cwd: stri
   return cwd === undefined || hits[0].cwd === cwd ? hits[0].key : null;
 }
 
+// The live session a `tg` process runs under (spec §3.3; S6's resolve-session
+// will answer this over the hook socket): its agent ancestor's pid is exact, so it
+// wins; else its locator (`$TMUX_PANE` or the `omp:<pid>` origin) must name
+// exactly one live entry.
+export function callerSessionKey(reg: Registry, caller: { agentPid: number | null; locator: string | null }): SessionKey | null {
+  const byPid = caller.agentPid === null ? [] : reg.sessions.filter((e) => e.state === 'live' && e.locators.pid === caller.agentPid);
+  if (byPid.length === 1) return byPid[0].key;
+  return caller.locator ? resolveLocatorToSession(reg, caller.locator, undefined) : null;
+}
+
 export interface MigrationIo {
   read(store: MigrationStore): string | null;
   // null deletes the file.

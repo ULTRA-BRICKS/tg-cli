@@ -239,6 +239,26 @@ test('match: omp --name alias wins over another pane whose window equals that na
   expect(matchWindows('landing', fleet).matches[0]?.paneId).toBe('omp:9');
 });
 
+// Rename (spec §3.2, tg-cli#460): the registry keeps previous primaries as
+// aliases, so `/agent <oldname>` still reaches the renamed session.
+test('match: a former name reaches the renamed session, even over a fuzzy window hit', () => {
+  const fleet = [
+    { ...cand('%1', 's', 0, 'prod', 'omp', '/w/app'), formerNames: ['deploy'] },
+    cand('%2', 's', 1, 'deployer', 'claude', '/w/other'),
+  ];
+  const hit = matchWindows('deploy', fleet);
+  expect(hit.confident).toBe(true);
+  expect(hit.matches.map((c) => c.paneId)).toEqual(['%1']);
+});
+
+test('match: a window that now carries the old name exactly beats the session that gave it up', () => {
+  const fleet = [
+    { ...cand('%1', 's', 0, 'prod', 'omp', '/w/app'), formerNames: ['deploy'] },
+    cand('%2', 's', 1, 'deploy', 'claude', '/w/other'),
+  ];
+  expect(matchWindows('deploy', fleet).matches.map((c) => c.paneId)).toEqual(['%2']);
+});
+
 test('labels: omp title keeps the cwd project token so landing/rig-cli are visible', () => {
   const fleet = [
     cand('omp:99240', 'omp', 99240, 'Save requests to memory/TodoList', 'omp', '/Users/u/work/conloca-landing'),

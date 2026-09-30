@@ -68,6 +68,8 @@ export interface LiveSession {
   cwd: string;
 }
 
+export type SessionName = SessionEntry['name'];
+
 export type RegistryEvent =
   | { kind: 'added'; key: SessionKey }
   | { kind: 'relocated'; key: SessionKey }
@@ -75,7 +77,18 @@ export type RegistryEvent =
   | { kind: 'gone'; key: SessionKey }
   | { kind: 'pruned'; key: SessionKey }
   | { kind: 'promoted'; from: SessionKey; to: SessionKey }
-  | { kind: 'paneReused'; from: SessionKey; to: SessionKey; paneId: string };
+  | { kind: 'paneReused'; from: SessionKey; to: SessionKey; paneId: string }
+  | { kind: 'renamed'; key: SessionKey; from: SessionName; to: SessionName };
+
+// A resolved name that differs from the stored one, and since when it has been
+// seen unchanged (spec §3.2). Held in daemon memory only: a restart restarts the
+// clock, which at worst delays a rename by one debounce.
+export type PendingRenames = ReadonlyMap<SessionKey, { name: SessionName; since: number }>;
+
+// How long a new name must stay stable before it is committed: absorbs omp's
+// auto-title on first input and spinner / `π >` churn normalisation misses.
+export const RENAME_DEBOUNCE_MS = 20_000;
+export const MAX_ALIASES = 5;
 
 export const GONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 // lastSeen of an otherwise-unchanged live entry advances at most this often, so a
@@ -137,12 +150,45 @@ function resolveKey(s: LiveSession, entries: Map<SessionKey, SessionEntry>): Ses
   return s.tmux ? provisionalKey(s.harness, s.tmux) : null;
 }
 
-export function reconcile(prev: Registry, scan: readonly LiveSession[], now: number): { next: Registry; events: RegistryEvent[] } {
+function sameName(a: SessionName, b: SessionName): boolean {
+  return a.primary === b.primary && a.secondary === b.secondary;
+}
+
+// The committed name after this scan, or null to keep the stored one. A new
+// candidate (re)starts its clock in `pending`; one stable for the debounce commits.
+function debounceName(
+  key: SessionKey,
+  stored: SessionName,
+  seen: SessionName,
+  now: number,
+  before: { name: SessionName; since: number } | undefined,
+  pending: Map<SessionKey, { name: SessionName; since: number }>,
+): SessionName | null {
+  if (sameName(stored, seen)) return null;
+  const since = before && sameName(before.name, seen) ? before.since : now;
+  if (now - since >= RENAME_DEBOUNCE_MS) return seen;
+  pending.set(key, { name: seen, since });
+  return null;
+}
+
+// Previous primaries, newest first, never the current name, at most MAX_ALIASES.
+function nextAliases(prior: SessionEntry, to: SessionName): string[] {
+  const olds = prior.name.primary === to.primary ? prior.aliases : [prior.name.primary, ...prior.aliases];
+  return [...new Set(olds.filter((a) => a !== '' && a !== to.primary))].slice(0, MAX_ALIASES);
+}
+
+export function reconcile(
+  prev: Registry,
+  scan: readonly LiveSession[],
+  now: number,
+  prevPending: PendingRenames = new Map(),
+): { next: Registry; events: RegistryEvent[]; pending: PendingRenames } {
   const nowIso = new Date(now).toISOString();
   const entries = new Map<SessionKey, SessionEntry>(prev.sessions.map((e) => [e.key, e]));
   const seen = new Set<SessionKey>();
   const events: RegistryEvent[] = [];
   const panes: Array<{ key: SessionKey; tmux: TmuxLocator }> = [];
+  const pending = new Map<SessionKey, { name: SessionName; since: number }>();
 
   for (const s of scan) {
     const key = resolveKey(s, entries);
@@ -193,12 +239,13 @@ export function reconcile(prev: Registry, scan: readonly LiveSession[], now: num
     const moved = !sameLocators(prior.locators, locators);
     if (prior.state === 'gone') events.push({ kind: 'readopted', key, threadId: prior.threadId });
     else if (moved) events.push({ kind: 'relocated', key });
+    const renamed = debounceName(key, prior.name, name, now, prevPending.get(key) ?? (provisional && prevPending.get(provisional.key)), pending);
+    if (renamed) events.push({ kind: 'renamed', key, from: prior.name, to: renamed });
     const changed =
       moved ||
       prior.state === 'gone' ||
       prior.cwd !== s.cwd ||
-      prior.name.primary !== name.primary ||
-      prior.name.secondary !== name.secondary ||
+      renamed !== null ||
       (s.sessionFile !== null && prior.sessionFile !== s.sessionFile) ||
       (prior.sessionId === null && s.sessionId !== null) ||
       provisional !== undefined;
@@ -210,7 +257,8 @@ export function reconcile(prev: Registry, scan: readonly LiveSession[], now: num
       sessionFile: s.sessionFile ?? prior.sessionFile,
       locators,
       cwd: s.cwd,
-      name,
+      // Nothing re-keys on a rename; the old primary becomes the newest alias.
+      ...(renamed ? { name: renamed, aliases: nextAliases(prior, renamed) } : {}),
       state: 'live',
       lastSeen: nowIso,
     });
@@ -238,5 +286,5 @@ export function reconcile(prev: Registry, scan: readonly LiveSession[], now: num
 
   const sessions = [...entries.values()].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
   const unchanged = sessions.length === prev.sessions.length && sessions.every((e, i) => e === prev.sessions[i]);
-  return { next: unchanged ? prev : { ...prev, sessions }, events };
+  return { next: unchanged ? prev : { ...prev, sessions }, events, pending };
 }

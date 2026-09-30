@@ -4,7 +4,9 @@ import {
   GONE_RETENTION_MS,
   provisionalKey,
   reconcile,
+  RENAME_DEBOUNCE_MS,
   type LiveSession,
+  type PendingRenames,
   type Registry,
   type RegistryEvent,
 } from '../features/tg-ctl/session-registry';
@@ -200,11 +202,94 @@ test('lastSeen advances at most once a minute while nothing else changes (no per
   expect(run(first, [omp()], T0 + 61_000).next.sessions[0].lastSeen).toBe('2026-09-30T10:01:01.000Z');
 });
 
-test('the name follows the scan (tmux window rename) without re-keying', () => {
+// Rename debounce (spec §3.2, tg-cli#460): a resolved name that differs from the
+// stored one is committed only after it stayed stable for RENAME_DEBOUNCE_MS.
+// `ticks` threads the in-memory pending renames through consecutive scans.
+function ticks(start: Registry, steps: Array<[number, LiveSession[]]>, pending: PendingRenames = new Map()) {
+  let reg = start;
+  let pend = pending;
+  const events: RegistryEvent[] = [];
+  for (const [at, scan] of steps) {
+    const r = reconcile(reg, scan, at, pend);
+    reg = r.next;
+    pend = r.pending;
+    events.push(...r.events);
+  }
+  return { reg, pending: pend, events };
+}
+
+const renames = (events: RegistryEvent[]) => events.filter((e) => e.kind === 'renamed');
+
+test('a tmux window rename commits only after it stays stable for the debounce, in place and without re-keying', () => {
   const first = run(emptyRegistry(), [omp()]).next;
-  const { next } = run(first, [omp({ windowName: 'renamed' })], T0 + 2_000);
-  expect(next.sessions[0].key).toBe(`omp:${SID}`);
-  expect(next.sessions[0].name.primary).toBe('renamed');
+  const d = RENAME_DEBOUNCE_MS;
+  const early = ticks(first, [[T0 + 2_000, [omp({ windowName: 'renamed' })]], [T0 + 2_000 + d - 1, [omp({ windowName: 'renamed' })]]]);
+  expect(early.reg.sessions[0].name.primary).toBe('gc-sme-backlog');
+  expect(renames(early.events)).toEqual([]);
+  const done = ticks(early.reg, [[T0 + 2_000 + d, [omp({ windowName: 'renamed' })]]], early.pending);
+  const e = done.reg.sessions[0];
+  expect(e.key).toBe(`omp:${SID}`);
+  expect(e.name).toEqual({ primary: 'renamed', secondary: 'Recover orphaned commits' });
+  expect(e.aliases).toEqual(['gc-sme-backlog']);
+  expect(done.events).toEqual([
+    {
+      kind: 'renamed',
+      key: `omp:${SID}`,
+      from: { primary: 'gc-sme-backlog', secondary: 'Recover orphaned commits' },
+      to: { primary: 'renamed', secondary: 'Recover orphaned commits' },
+    },
+  ]);
+  expect(done.pending.size).toBe(0);
+});
+
+test('a name that flip-flops inside the debounce commits nothing; the stable change then commits exactly once', () => {
+  const first = run(emptyRegistry(), [omp()]).next;
+  const d = RENAME_DEBOUNCE_MS;
+  const churn = ticks(first, [
+    [T0 + 1_000, [omp({ windowName: 'b' })]],
+    [T0 + 1_000 + d / 2, [omp()]], // back to the stored name: pending dropped
+    [T0 + 1_000 + d, [omp({ windowName: 'b' })]], // pending restarts here
+    [T0 + 1_000 + d + d / 2, [omp({ windowName: 'c' })]], // a different name restarts it again
+    [T0 + 1_000 + 2 * d, [omp({ windowName: 'c' })]],
+  ]);
+  expect(churn.reg.sessions[0].name.primary).toBe('gc-sme-backlog');
+  expect(renames(churn.events)).toEqual([]);
+  const settled = ticks(churn.reg, [[T0 + 1_000 + 2 * d + d / 2, [omp({ windowName: 'c' })]], [T0 + 1_000 + 5 * d, [omp({ windowName: 'c' })]]], churn.pending);
+  expect(renames(settled.events)).toHaveLength(1);
+  expect(settled.reg.sessions[0].name.primary).toBe('c');
+});
+
+test('an omp /rename (harness title only) commits as a rename of the secondary without adding an alias', () => {
+  const first = run(emptyRegistry(), [omp()]).next;
+  const r = ticks(first, [[T0 + 1_000, [omp({ harnessTitle: 'New title' })]], [T0 + 1_000 + RENAME_DEBOUNCE_MS, [omp({ harnessTitle: 'New title' })]]]);
+  expect(r.reg.sessions[0].name).toEqual({ primary: 'gc-sme-backlog', secondary: 'New title' });
+  expect(r.reg.sessions[0].aliases).toEqual([]);
+  expect(r.events.map((e) => e.kind)).toEqual(['renamed']);
+});
+
+test('an out-of-tmux omp /rename changes its primary and keeps the old title as an alias', () => {
+  const first = run(emptyRegistry(), [omp({ tmux: null })]).next;
+  const scan = [omp({ tmux: null, harnessTitle: 'Deploy prod' })];
+  const r = ticks(first, [[T0 + 1_000, scan], [T0 + 1_000 + RENAME_DEBOUNCE_MS, scan]]);
+  expect(r.reg.sessions[0].name.primary).toBe('Deploy prod');
+  expect(r.reg.sessions[0].aliases).toEqual(['Recover orphaned commits']);
+});
+
+test('aliases keep the newest previous primaries first, never the current name, capped at 5', () => {
+  let reg = run(emptyRegistry(), [omp({ windowName: 'n0' })]).next;
+  let at = T0;
+  for (const name of ['n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n3']) {
+    const scan = [omp({ windowName: name })];
+    reg = ticks(reg, [[(at += 1_000), scan], [(at += RENAME_DEBOUNCE_MS), scan]]).reg;
+  }
+  expect(reg.sessions[0].name.primary).toBe('n3');
+  expect(reg.sessions[0].aliases).toEqual(['n6', 'n5', 'n4', 'n2', 'n1']);
+});
+
+test('a session that goes gone drops its pending rename', () => {
+  const first = run(emptyRegistry(), [omp()]).next;
+  const r = ticks(first, [[T0 + 1_000, [omp({ windowName: 'b' })]], [T0 + 2_000, []]]);
+  expect(r.pending.size).toBe(0);
 });
 
 test('entries are ordered by key so the serialized store is deterministic', () => {

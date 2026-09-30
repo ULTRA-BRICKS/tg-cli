@@ -34,6 +34,10 @@ export interface InboundOpts {
   // carries no targetAgent (treated as untagged on read). Kept a param, not an
   // import, so this module stays pure/testable.
   resolveAgent?: (pane: string | null) => string | null;
+  // Map the same resolved pane to the registry session key it hosts
+  // (session-registry-and-topics.md §3.3), stamped as `sessionKey` so a later
+  // rename keeps the row in that session's `tg replies`. Omitted / null → no key.
+  resolveSession?: (pane: string | null) => string | null;
 }
 
 function senderAllowed(sender: number | undefined, opts: InboundOpts): boolean {
@@ -63,6 +67,7 @@ export function inboundHistoryRecords(updates: TgUpdate[], opts: InboundOpts): H
     const resolved = opts.resolvePane?.(m) ?? null;
     const pane = resolved ?? opts.pane;
     const targetAgent = opts.resolveAgent?.(pane) ?? undefined;
+    const sessionKey = opts.resolveSession?.(pane) ?? undefined;
     out.push({
       ts: m.date,
       message_id: m.message_id,
@@ -72,6 +77,7 @@ export function inboundHistoryRecords(updates: TgUpdate[], opts: InboundOpts): H
       text: historyText(m),
       pane,
       ...(targetAgent ? { targetAgent } : {}),
+      ...(sessionKey ? { sessionKey } : {}),
     });
   }
   return out;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { accessSync, chmodSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
+import { accessSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join, resolve } from "path"
 // Explicit import (not the global `crypto`) so the multi-part groupId token
@@ -61,7 +61,10 @@ import {
   serializeRoutes,
   withRoutesLock,
 } from "./features/tg-ctl/routes"
-import { appendRecordsToBlob, parseHistory } from "./features/replies/history"
+import { parseHistory } from "./features/replies/history"
+import { appendHistoryFile } from "./features/replies/history-file"
+import { callerSessionKey, parseRegistry } from "./features/tg-ctl/session-registry-store"
+import type { Registry } from "./features/tg-ctl/session-registry"
 import { buildOutboundHistoryRecords, outboundHistoryText } from "./features/replies/outbound"
 import { runReplies } from "./features/replies/cli"
 import { resolveWindowPanes } from "./features/replies/window"
@@ -415,6 +418,25 @@ function currentPaneAgentName(): string | null {
   }
 }
 
+// sessions.json (the daemon is its only writer; `tg` only reads it). Absent or
+// unreadable → an empty registry: history rows then go untagged by session and
+// `tg replies` falls back to the pane + window name.
+function readSessionRegistry(sessionsPath: string): Registry {
+  try {
+    return parseRegistry(readFileSync(sessionsPath, "utf8"))
+  } catch {
+    return parseRegistry(null)
+  }
+}
+
+// The registry session THIS `tg` runs under (spec §3.3): by its agent ancestor's
+// pid, else by $TMUX_PANE or the out-of-tmux omp's `omp:<pid>` origin.
+function ownSessionKey(reg: Registry, ancestor: { agent: string; pid: number } | null): string | null {
+  const pane = process.env.TMUX_PANE || null
+  const locator = pane ?? (ancestor?.agent === "omp" ? `omp:${ancestor.pid}` : null)
+  return callerSessionKey(reg, { agentPid: ancestor?.pid ?? null, locator })
+}
+
 // --- CLI entrypoint (only runs when executed directly, not when imported) ---
 if (import.meta.main) {
   const rawArgs = process.argv.slice(2)
@@ -521,7 +543,8 @@ if (import.meta.main) {
       ...process.env,
     }
     const botToken = repliesEnv.TG_BOT_TOKEN ?? ""
-    const historyPath = ctlPaths(configDir, botIdFromToken(botToken)).history
+    const repliesPaths = ctlPaths(configDir, botIdFromToken(botToken))
+    const historyPath = repliesPaths.history
     const detectRepliesPane = (): string | null => {
       const pane = process.env.TMUX_PANE
       return pane && pane.length > 0 ? pane : null
@@ -554,6 +577,16 @@ if (import.meta.main) {
       // `current` scope filters history to it. SAME derivation the daemon stamps
       // as targetAgent, so the default view actually matches the tagged rows.
       currentAgent: currentPaneAgentName,
+      // The registry view + this session's key: the default scope is the SESSION,
+      // so a rename never splits its history (spec §3.3, tg-cli#460).
+      sessions: () => {
+        const reg = readSessionRegistry(repliesPaths.sessions)
+        if (reg.sessions.length === 0) return null
+        return {
+          sessions: reg.sessions.map((e) => ({ key: e.key, name: e.name.primary, aliases: e.aliases })),
+          current: ownSessionKey(reg, detectAncestorAgent()),
+        }
+      },
       // `--session ext` → the pane ids of every tmux window named exactly "ext".
       resolveWindow: (name: string) => resolveWindowPanes(name, runTmuxListPanes),
       // Local time (Europe/Belgrade for the CTO) — matches the daemon's wrap.
@@ -1707,14 +1740,18 @@ if (import.meta.main) {
   // media-only send). One record is written per outbound message_id — see
   // `buildOutboundHistoryRecords` (features/replies/outbound.ts) for why.
   // Called AFTER transmit so the ids are known.
-  const HISTORY_PATH = originPaneId
-    ? ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).history
-    : null
+  const CTL_PATHS = originPaneId ? ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)) : null
   const recordOutboundHistory = (body: string): void => {
-    if (!HISTORY_PATH || !originPaneId) return
+    if (!CTL_PATHS || !originPaneId) return
     const text = outboundHistoryText(body, { photos: plan.photos.length, documents: plan.documents.length })
     if (text === null) return
     try {
+      // The registry session this send comes from (spec §3.3, tg-cli#460): the
+      // identity `tg replies` scopes on, so a later rename never splits it. It
+      // also names an out-of-tmux omp, which has no pane to derive a name from.
+      const registry = readSessionRegistry(CTL_PATHS.sessions)
+      const sessionKey = ownSessionKey(registry, ancestor)
+      const entry = registry.sessions.find((e) => e.key === sessionKey)
       // randomUUID() only actually lands in a record when the send is truly
       // multi-part (buildOutboundHistoryRecords ignores it otherwise) — a
       // random token, not the group's first id, so it can't collide across
@@ -1729,17 +1766,12 @@ if (import.meta.main) {
         // This session's own agent name (resolveSessionName().primary over its pane) — the
         // SAME label the daemon stamps on inbound, so `tg replies` groups a
         // session's outbound and its inbound under one current-agent scope.
-        // Undefined when unresolvable (also always the case for a non-tmux omp
-        // origin — currentPaneAgentName needs a real TMUX_PANE) → untagged.
-        currentPaneAgentName() ?? undefined,
+        // Out of tmux it is the registry entry's name; undefined → untagged.
+        currentPaneAgentName() ?? entry?.name.primary ?? undefined,
+        sessionKey ?? undefined,
       )
-      // 0o600: the log is a conversation transcript — owner-only, like the daemon socket.
-      writeFileSync(
-        HISTORY_PATH,
-        appendRecordsToBlob(existsSync(HISTORY_PATH) ? readFileSync(HISTORY_PATH, "utf8") : null, recs),
-        { mode: 0o600 },
-      )
-      chmodSync(HISTORY_PATH, 0o600) // enforce on a pre-existing, looser-perm file too
+      // Under the history lock shared with the daemon's inbound writer (tg-cli#136).
+      appendHistoryFile(CTL_PATHS.history, recs)
     } catch {
       // best-effort: never let history bookkeeping break a send
     }

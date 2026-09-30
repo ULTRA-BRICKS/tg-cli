@@ -3,6 +3,7 @@ import { appendRoute, LEGACY_ROUTE_TTL_SEC, parseRoutes } from '../features/tg-c
 import { parseRegistrations } from '../features/tg-ctl/registration-store';
 import { parseLastUserTarget } from '../features/tg-ctl/last-user-target';
 import {
+  callerSessionKey,
   parseRegistry,
   rekeyStores,
   resolveLocatorToSession,
@@ -114,6 +115,19 @@ test('a pane or omp:<pid> locator resolves only to exactly one live entry whose 
   expect(resolveLocatorToSession(REGISTRY, '%8', '/w/gone')).toBeNull();
   const gone = reconcile(REGISTRY, [], NOW + 1000).next;
   expect(resolveLocatorToSession(gone, '%0', '/w/gc')).toBeNull();
+});
+
+// tg-cli#460: `tg` stamps its history rows and scopes `tg replies` with the key of
+// the session it runs under — found by its agent process first (exact), else by
+// its pane / `omp:<pid>` origin (spec §3.3, until S6's resolve-session).
+test('a tg caller resolves to its live session by agent pid first, then by its locator', () => {
+  expect(callerSessionKey(REGISTRY, { agentPid: 600, locator: 'omp:600' })).toBe('omp:headless');
+  expect(callerSessionKey(REGISTRY, { agentPid: 100, locator: '%9' })).toBe(`omp:${SID}`);
+  expect(callerSessionKey(REGISTRY, { agentPid: null, locator: '%0' })).toBe(`omp:${SID}`);
+  expect(callerSessionKey(REGISTRY, { agentPid: 999, locator: '%8' })).toBeNull();
+  expect(callerSessionKey(REGISTRY, { agentPid: null, locator: null })).toBeNull();
+  const gone = reconcile(REGISTRY, [], NOW + 1000).next;
+  expect(callerSessionKey(gone, { agentPid: 100, locator: '%0' })).toBeNull();
 });
 
 test('routes: resolvable rows gain their sessionKey (paneId kept as a hint); the rest become legacy', () => {

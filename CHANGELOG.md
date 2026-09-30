@@ -3,6 +3,26 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.11
+
+**Debounced rename in place; `tg replies` keyed by session; locked history writes (#460, #136).**
+
+- A session rename (tmux window rename, omp `/rename`, harness title change) updates the SAME
+  registry entry once the new name has been stable for 20 s: a flip-flop inside the window
+  commits nothing, the old primary becomes the newest alias (max 5), and a `renamed` event is
+  logged. The daemon runs the committing scan on its first poll tick after the debounce ends. Nothing re-keys.
+- The omp-live extension reports the session's current name (`getSessionName()`) at status
+  time instead of the header title, so `/rename` reaches the registry without a republish.
+- `/agent <oldname>` still reaches a renamed session through its aliases, unless a window now
+  carries that name exactly.
+- History rows carry `sessionKey` plus the name snapshot. Out-of-tmux omp sends are now tagged
+  too. `tg replies` defaults to the caller's registry session (agent pid, then pane / `omp:<pid>`),
+  across renames and panes; `--agent <name>` expands through current names and aliases; rows
+  written before the key existed join a session through its name or aliases; every row of a
+  known session is marked with its current name; `--json` adds `sessionKey`.
+- `tg` and the daemon append to `history.jsonl` under a shared O_EXCL lockfile (the routes.json
+  protocol), so concurrent writers no longer lose each other's rows (#136).
+
 ## 1.54.10
 
 **Routes, registrations and late answers follow the session, not the pane or pid (#459, #354, #100).**

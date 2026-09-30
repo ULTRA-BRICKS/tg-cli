@@ -23,29 +23,63 @@ function agentMatches(rec: HistoryRecord, name: string): boolean {
   return rec.targetAgent !== undefined && rec.targetAgent.toLowerCase() === name.toLowerCase();
 }
 
+// One registry session as `tg replies` sees it (sessions.json, spec §3.3): its
+// key, its current primary name and the primaries it had before renames.
+export interface SessionView {
+  key: string;
+  name: string;
+  aliases: string[];
+}
+
+// The registry at read time, plus the key of the reader's own session when `tg`
+// resolved it (null: not registered, or the daemon has not scanned it yet).
+export interface SessionScope {
+  sessions: SessionView[];
+  current: string | null;
+}
+
+// A row belongs to session `s` when it carries s's key. A row with no key, or
+// with a key the registry no longer knows (a promoted provisional key, a pruned
+// entry), joins through its name snapshot: s's current name or an alias.
+function belongsTo(rec: HistoryRecord, s: SessionView, known: ReadonlySet<string>): boolean {
+  if (rec.sessionKey !== undefined && known.has(rec.sessionKey)) return rec.sessionKey === s.key;
+  return agentMatches(rec, s.name) || s.aliases.some((a) => agentMatches(rec, a));
+}
+
 // Scope the records to a set of AGENTS. `currentAgent` is the reader's own agent
 // name (resolved from its tmux pane), or null when it couldn't be determined.
+// `sessions` is the registry view, when readable:
 //   • all       → pass-through (every agent + untagged)
-//   • untagged  → only rows with NO targetAgent (legacy / broadcast / no target)
-//   • named     → only rows for that agent (case-insensitive)
-//   • current   → only rows for `currentAgent`; when that is null the scope
-//                 DEGRADES to `untagged` (the caller prints a note) so we never
-//                 pretend an unknown reader owns every tagged message.
+//   • untagged  → only rows with NO targetAgent and NO sessionKey
+//   • named     → rows of every session whose current name or alias is that
+//                 name, plus rows whose name snapshot is that name
+//   • current   → the reader's registry session when known; else rows for
+//                 `currentAgent`; when that is null too the scope DEGRADES to
+//                 `untagged` (the caller prints a note) so we never pretend an
+//                 unknown reader owns every tagged message.
 export function filterByAgent(
   records: HistoryRecord[],
   scope: AgentScope,
   currentAgent: string | null,
+  sessions: SessionScope | null = null,
 ): HistoryRecord[] {
+  const known = new Set(sessions?.sessions.map((s) => s.key) ?? []);
   switch (scope.mode) {
     case 'all':
       return records;
     case 'untagged':
-      return records.filter((r) => r.targetAgent === undefined);
-    case 'named':
-      return records.filter((r) => agentMatches(r, scope.name));
-    case 'current':
-      if (currentAgent === null) return records.filter((r) => r.targetAgent === undefined);
+      return records.filter((r) => r.targetAgent === undefined && r.sessionKey === undefined);
+    case 'named': {
+      const want = scope.name.toLowerCase();
+      const hits = (sessions?.sessions ?? []).filter((s) => [s.name, ...s.aliases].some((n) => n.toLowerCase() === want));
+      return records.filter((r) => agentMatches(r, scope.name) || hits.some((s) => belongsTo(r, s, known)));
+    }
+    case 'current': {
+      const own = sessions?.sessions.find((s) => s.key === sessions.current);
+      if (own) return records.filter((r) => belongsTo(r, own, known));
+      if (currentAgent === null) return records.filter((r) => r.targetAgent === undefined && r.sessionKey === undefined);
       return records.filter((r) => agentMatches(r, currentAgent));
+    }
   }
 }
 
@@ -134,18 +168,20 @@ export function collapseMultiPartSends(records: HistoryRecord[]): HistoryRecord[
 
 // --- selection pipeline ---
 
-// direction → panes → since/until → (find ? search) → keep the LAST `limit`,
-// oldest→newest. The pane SET is resolved by the entrypoint (a %-pane id, a
-// window name → its pane ids, the detected pane, or null for --all-sessions) and
-// passed in; keeping it a param keeps this pure.
+// direction → agent → panes → since/until → (find ? search) → keep the LAST
+// `limit`, oldest→newest. The pane SET is resolved by the entrypoint (a %-pane
+// id, a window name → its pane ids, the detected pane, or null for
+// --all-sessions) and passed in, like the registry view; keeping them params
+// keeps this pure.
 export function selectHistory(
   records: HistoryRecord[],
   args: RepliesQuery,
   panes: string[] | null = null,
   currentAgent: string | null = null,
+  sessions: SessionScope | null = null,
 ): HistoryRecord[] {
   let out = filterByDirection(records, args.direction);
-  out = filterByAgent(out, args.agentScope, currentAgent);
+  out = filterByAgent(out, args.agentScope, currentAgent, sessions);
   out = filterByPanes(out, panes);
   out = filterBySince(out, args.since);
   out = filterByUntil(out, args.until);
@@ -191,14 +227,19 @@ export interface FormatLineOpts {
   showMarker: boolean; // prefix ←/→ (used for `all`; off for single-direction)
   full: boolean; // skip the ~200-char truncation
   fmtTime: (unixSec: number) => string;
+  // Session key → its CURRENT name (the registry), so every row of a renamed
+  // session is marked with the name it has now. Absent → the row's snapshot.
+  names?: ReadonlyMap<string, string>;
 }
 
 // The agent-attribution mark: `[→ <agent>]`, or `[→ ?]` for an untagged row
 // (legacy history, a broadcast, or a send whose target couldn't be resolved).
 // Shown on EVERY line, in every scope, so a reader always sees which agent each
-// message belongs to.
-export function agentMark(rec: HistoryRecord): string {
-  return `[→ ${rec.targetAgent ?? '?'}]`;
+// message belongs to. A row of a known session shows that session's current
+// name; any other row the name it was written with.
+function agentMark(rec: HistoryRecord, names: ReadonlyMap<string, string> | undefined): string {
+  const current = rec.sessionKey === undefined ? undefined : names?.get(rec.sessionKey);
+  return `[→ ${current ?? rec.targetAgent ?? '?'}]`;
 }
 
 // One record → one line: `[<time>] #<id> [→ <agent>] <text>`, optionally prefixed
@@ -211,7 +252,7 @@ export function formatLine(rec: HistoryRecord, opts: FormatLineOpts): string {
   const id = rec.message_id === null ? '?' : String(rec.message_id);
   const oneLine = rec.text.replace(/\s*\n\s*/g, ' ');
   const body = !opts.full && oneLine.length > TEXT_TRUNCATE ? `${oneLine.slice(0, TEXT_TRUNCATE)}…` : oneLine;
-  const core = `[${time}] #${id} ${agentMark(rec)} ${body}`;
+  const core = `[${time}] #${id} ${agentMark(rec, opts.names)} ${body}`;
   if (!opts.showMarker) return core;
   const marker = rec.direction === 'agent' ? '→' : '←';
   return `${marker} ${core}`;
@@ -221,13 +262,14 @@ export interface FormatLinesOpts {
   direction: Direction;
   full: boolean;
   fmtTime: (unixSec: number) => string;
+  names?: ReadonlyMap<string, string>;
 }
 
 // Render a list of records. Markers are shown ONLY for `all` (a single-direction
 // view doesn't need to repeat ←/→ on every line).
 export function formatLines(records: HistoryRecord[], opts: FormatLinesOpts): string[] {
   const showMarker = opts.direction === 'all';
-  return records.map((r) => formatLine(r, { showMarker, full: opts.full, fmtTime: opts.fmtTime }));
+  return records.map((r) => formatLine(r, { showMarker, full: opts.full, fmtTime: opts.fmtTime, names: opts.names }));
 }
 
 // --- JSON output (--json) ---
@@ -239,7 +281,8 @@ export interface HistoryJson {
   from: string;
   text: string;
   pane: string | null;
-  targetAgent: string | null; // routed-to / sent-from agent; null when untagged
+  targetAgent: string | null; // routed-to / sent-from agent name at write time; null when untagged
+  sessionKey: string | null; // registry session (`omp:<id>`, …); null on rows written before tg-cli#460
 }
 
 export function buildJsonOutput(records: HistoryRecord[]): HistoryJson[] {
@@ -251,5 +294,6 @@ export function buildJsonOutput(records: HistoryRecord[]): HistoryJson[] {
     text: r.text,
     pane: r.pane,
     targetAgent: r.targetAgent ?? null,
+    sessionKey: r.sessionKey ?? null,
   }));
 }

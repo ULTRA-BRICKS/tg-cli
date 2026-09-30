@@ -171,7 +171,7 @@ import {
   type HookSessionSighting,
   type PendingHookSighting,
 } from "./features/tg-ctl/harness-sessions"
-import { reconcile, sessionKey, type Registry, type RegistryEvent } from "./features/tg-ctl/session-registry"
+import { reconcile, RENAME_DEBOUNCE_MS, sessionKey, type PendingRenames, type Registry, type RegistryEvent } from "./features/tg-ctl/session-registry"
 import { parseRegistry, rekeyStores, resolveLocatorToSession, runMigration, serializeRegistry, type MigrationIo, type MigrationStore } from "./features/tg-ctl/session-registry-store"
 import {
   checkPaneSession,
@@ -316,7 +316,8 @@ import {
   withRoutesLock,
 } from "./features/tg-ctl/routes"
 import { parseLastUserTarget, serializeLastUserTarget, withSessionKey, type LastUserTarget } from "./features/tg-ctl/last-user-target"
-import { appendRecordsToBlob, parseHistory, type HistoryRecord } from "./features/replies/history"
+import { parseHistory, type HistoryRecord } from "./features/replies/history"
+import { appendHistoryFile } from "./features/replies/history-file"
 import { inboundHistoryRecords } from "./features/replies/inbound"
 import { isLikelySlashCommand, parsePendingBatch, serializePendingBatch, stepUpdates } from "./features/tg-ctl/updates"
 import {
@@ -633,16 +634,13 @@ function atomicWrite(path: string, content: string): void {
   renameSync(tmp, path)
 }
 
-// Append history records to the JSONL log, trimmed to the bound. BEST-EFFORT:
+// Append history records to the JSONL log, trimmed to the bound, under the
+// history lock it shares with `tg`'s outbound writer (tg-cli#136). BEST-EFFORT:
 // the recall log is purely informational (like routes), so a read/write error
-// must never break the inbound inject path. Shared by the poll loop's inbound
-// writer; the `tg` entrypoint has the mirror for outbound.
+// must never break the inbound inject path.
 function appendHistory(path: string, records: HistoryRecord[]): void {
-  if (records.length === 0) return
   try {
-    // 0o600: the log is a conversation transcript — owner-only, like the socket.
-    writeFileSync(path, appendRecordsToBlob(readFileOrNull(path), records), { mode: 0o600 })
-    chmodSync(path, 0o600) // enforce on a pre-existing, looser-perm file too
+    if (!appendHistoryFile(path, records)) log(`history: lock contended, ${records.length} inbound row(s) not recorded`)
   } catch {
     // best-effort: never let history bookkeeping break an inject
   }
@@ -1119,7 +1117,18 @@ function listAgentCandidates(): AgentCandidate[] {
   // A pane id is unique per tmux server; dedupe guards a merged/flaky snapshot.
   // Out-of-tmux omp join as paneId omp:<pid> so /agent can pick them; an omp shown
   // in a pane keeps that pane's row and adds its title (never renames the row).
-  return mergeLiveOmpCandidates(dedupeCandidates(out), listLiveOmpAgents())
+  const merged = mergeLiveOmpCandidates(dedupeCandidates(out), listLiveOmpAgents())
+  // Names a session had before a rename (registry aliases, spec §3.2), so
+  // `/agent <oldname>` still reaches it.
+  const registry = sessionRegistry
+  if (registry) {
+    for (const c of merged) {
+      const key = resolveLocatorToSession(registry, c.paneId, undefined)
+      const aliases = key ? registry.sessions.find((e) => e.key === key)?.aliases : undefined
+      if (aliases && aliases.length > 0) c.formerNames = aliases
+    }
+  }
+  return merged
 }
 
 // --- agents OUTSIDE tmux (tg-cli#306) ---
@@ -1358,9 +1367,21 @@ const SESSION_REFRESH_MIN_MS = 2_000
 let pendingHookSessions: PendingHookSighting[] = []
 let hookSessions: HookSessionSighting[] = []
 const MAX_PENDING_HOOK_SESSIONS = 64
+// Names seen but not yet stable for RENAME_DEBOUNCE_MS (spec §3.2); in memory only.
+let pendingRenames: PendingRenames = new Map()
+
+// A pending rename wants the scan that can commit it as soon as its debounce ends,
+// not a full SESSION_SCAN_INTERVAL_MS later.
+function renameCommitDue(now: number): boolean {
+  for (const p of pendingRenames.values()) if (now - p.since >= RENAME_DEBOUNCE_MS) return true
+  return false
+}
 
 function sessionScanWanted(): boolean {
-  return sessionScanForced || (sessionScanEnabled && !sessionScanInFlight && (sessionScanDue || Date.now() - sessionScanAt >= SESSION_SCAN_INTERVAL_MS))
+  if (sessionScanForced) return true
+  if (!sessionScanEnabled || sessionScanInFlight) return false
+  const now = Date.now()
+  return sessionScanDue || now - sessionScanAt >= SESSION_SCAN_INTERVAL_MS || renameCommitDue(now)
 }
 
 // The registry as last scanned (or as persisted, before the first scan of this
@@ -1443,6 +1464,8 @@ function describeRegistryEvent(ev: RegistryEvent): string {
       return `paneReused ${ev.paneId} ${ev.from} → ${ev.to}`
     case "readopted":
       return `readopted ${ev.key} thread=${ev.threadId ?? "-"}`
+    case "renamed":
+      return `renamed ${ev.key} ${JSON.stringify(ev.from.primary)} → ${JSON.stringify(ev.to.primary)}${ev.to.secondary ? ` (${JSON.stringify(ev.to.secondary)})` : ""}`
     default:
       return `${ev.kind} ${ev.key}`
   }
@@ -1482,7 +1505,8 @@ function scanSessionRegistry(ctx: Ctx, discovery: NonNullable<typeof liveOmpCach
     hookSessions = bindHookSessions(hookSessions, pendingHookSessions, panes, procs)
     pendingHookSessions = []
     const scan = listLiveSessions({ panes, procs, serverPid, paneTitles: readPaneTitles(), omp: agents, hookSessions })
-    const { next, events } = reconcile(prev, scan, now)
+    const { next, events, pending } = reconcile(prev, scan, now, pendingRenames)
+    pendingRenames = pending
     const io = sessionStoreIo(ctx.paths)
     for (const ev of events) {
       log(`session-registry: ${describeRegistryEvent(ev)}`)
@@ -11120,11 +11144,19 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // scope to "this agent" (the resolveSessionName primary over the live snapshot — the
         // SAME derivation the reader uses for its own pane). One snapshot for
         // the whole batch; a pane that's gone (or none) → null → untagged.
+        // The registry session the pane (or `omp:<pid>` origin) hosts is stamped
+        // too (§3.3): the identity `tg replies` scopes on across renames, and the
+        // name of an out-of-tmux omp, which has no pane to derive one from.
         const agentPanes = snapshot().panes
+        const registry = sessionRegistry
+        const resolveSession = (pane: string | null): string | null =>
+          pane !== null && registry ? resolveLocatorToSession(registry, pane, undefined) : null
         const resolveAgent = (pane: string | null): string | null => {
           if (pane === null) return null
           const p = agentPanes.find((x) => x.paneId === pane)
-          return p ? resolveSessionName({ tmuxWindow: p.windowName, cwd: p.panePath }).primary || null : null
+          if (p) return resolveSessionName({ tmuxWindow: p.windowName, cwd: p.panePath }).primary || null
+          const key = resolveSession(pane)
+          return registry?.sessions.find((e) => e.key === key)?.name.primary || null
         }
         const resolvePane = (m: TgMessage): string | null => {
           const replyId = m.reply_to_message?.message_id
@@ -11172,6 +11204,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             stalenessSec: ctx.cfg.stalenessSec,
             resolvePane,
             resolveAgent,
+            resolveSession,
           }),
         )
       }

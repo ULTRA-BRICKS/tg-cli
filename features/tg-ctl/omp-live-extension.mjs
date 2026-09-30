@@ -35,6 +35,17 @@ export default function ompLiveExtension(pi) {
     const closePrior = Promise.resolve(prior.queue).catch(() => {}).then(() => prior.endpoint?.close());
     self.queue = Promise.all([self.queue.catch(() => {}), closePrior]);
   }
+  // The session's CURRENT name, read at every status request so an omp `/rename`
+  // reaches tg-ctl's registry without a republish (tg-cli#460). The header title
+  // is only the name the session started with; it is the fallback for an omp
+  // without `getSessionName`.
+  function sessionTitle(ctx) {
+    try {
+      const name = pi.getSessionName?.() ?? ctx.sessionManager.getSessionName?.();
+      if (typeof name === 'string' && name) return name;
+    } catch { /* a torn-down binding: fall back to the header */ }
+    return ctx.sessionManager.getHeader?.()?.title ?? null;
+  }
   function contextSnapshot(ctx) {
     return {
       sessionId: ctx.sessionManager.getSessionId(),
@@ -42,7 +53,7 @@ export default function ompLiveExtension(pi) {
       cwd: ctx.cwd,
       durableSession: process.env.RIG_OMP_SESSION ?? null,
       busy: !ctx.isIdle(),
-      title: ctx.sessionManager.getHeader?.()?.title ?? null,
+      title: sessionTitle(ctx),
     };
   }
   async function publish(ctx) {

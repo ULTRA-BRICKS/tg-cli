@@ -6,13 +6,13 @@ import { tmpdir } from 'node:os';
 import extension from '../features/tg-ctl/omp-live-extension.mjs';
 import { listLiveEndpoints, sendLiveMessage } from '../features/tg-ctl/omp-live-runtime.mjs';
 
-async function setup(t) {
+async function setup(t, pi = {}) {
   const config = await mkdtemp(join(tmpdir(), 'omp-ext-'));
   const root = join(config, 'omp-live');
   const prior = process.env.TG_CTL_CONFIG_DIR;
   process.env.TG_CTL_CONFIG_DIR = config;
   const handlers = new Map(), received = [], notifications = [];
-  extension({ on: (name, fn) => handlers.set(name, fn), sendUserMessage: (text, options) => received.push({ text, options, pid: process.pid }) });
+  extension({ on: (name, fn) => handlers.set(name, fn), sendUserMessage: (text, options) => received.push({ text, options, pid: process.pid }), ...pi });
   const ctx = { hasUI: true, mode: 'tui', getAgentId: () => null, cwd: config, getSessionFile: () => '/session/real.jsonl', isIdle: () => false,
     sessionManager: { getSessionId: () => 'ext-session', getHeader: () => ({ title: 'Original' }) },
     ui: { notify: (...args) => notifications.push(args) } };
@@ -158,4 +158,22 @@ test('#458: a stale reloaded binding never re-claims from the current owner at t
   const [current] = await listLiveEndpoints(f.root);
   await f.handlers.get('turn_end')({}, f.ctx);
   assert.deepEqual((await listLiveEndpoints(f.root)).map(r => r.instanceId), [current.instanceId]);
+});
+
+// #460: the endpoint reports the session's CURRENT name at status time, so an
+// omp `/rename` reaches tg-ctl's registry without a republish; the header title
+// is the name the session started with.
+test('#460: status reports the live session name after /rename, not the header title', async t => {
+  let name = 'Original';
+  const f = await setup(t, { getSessionName: () => name });
+  await f.handlers.get('session_start')({}, f.ctx);
+  assert.equal((await listLiveEndpoints(f.root))[0].title, 'Original');
+  name = 'Renamed';
+  assert.equal((await listLiveEndpoints(f.root))[0].title, 'Renamed');
+});
+
+test('#460: an omp without getSessionName still reports the header title', async t => {
+  const f = await setup(t);
+  await f.handlers.get('session_start')({}, f.ctx);
+  assert.equal((await listLiveEndpoints(f.root))[0].title, 'Original');
 });

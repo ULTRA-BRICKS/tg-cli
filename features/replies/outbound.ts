@@ -72,7 +72,9 @@ export function outboundHistoryText(body: string, attach: OutboundAttachments): 
 // and the default agent-scoped `tg replies` view groups them together. Absent
 // (undefined) when the sender's agent name couldn't be resolved → untagged on
 // read. Stamped on EVERY sibling record of a multi-part send (they are one
-// logical send from one agent).
+// logical send from one agent). `sessionKey` (optional) is the sender's registry
+// session (session-registry-and-topics.md §3.3) — the identity `tg replies`
+// scopes on, so a rename never splits the session's history.
 export function buildOutboundHistoryRecords(
   outboundIds: number[],
   text: string,
@@ -81,6 +83,7 @@ export function buildOutboundHistoryRecords(
   groupToken: string,
   chatId?: number,
   targetAgent?: string,
+  sessionKey?: string,
 ): HistoryRecord[] {
   const uniqueIds = [...new Set(outboundIds)];
   const ids: (number | null)[] = uniqueIds.length > 0 ? uniqueIds : [null];
@@ -104,5 +107,6 @@ export function buildOutboundHistoryRecords(
     pane,
     ...(groupId !== undefined ? { groupId } : {}),
     ...(agent !== undefined ? { targetAgent: agent } : {}),
+    ...(sessionKey ? { sessionKey } : {}),
   }));
 }

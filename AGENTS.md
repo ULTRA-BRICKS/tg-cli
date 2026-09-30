@@ -275,10 +275,11 @@ needed by already-running OMP. Cwd/title are not process identity.
     deliberately overrides reply-route. Plain `/agent <window> …` routing commands are stamped
     with the DEFAULT discovered pane because they route elsewhere by explicit selector rather
     than by the replied-to message.
-  - **Known limitation (matches `routes`):** both writers do read-modify-write rather than a true
-    `O_APPEND`, so a daemon-inbound write racing a concurrent agent-outbound write could lose a
-    record. The daemon is the single inbound writer and outbound writes are short; a file lock is
-    out of scope for a best-effort, bounded log (same posture as the `routes` map).
+  - **Concurrency (#136):** both writers go through `appendHistoryFile`
+    (`features/replies/history-file.ts`), a read-modify-write under the same O_EXCL lockfile
+    protocol as `routes` (`<history>.lock`, PID-liveness staleness). When live writers hold the
+    lock past its ~1 s budget the append is skipped, never run unlocked, so no writer loses
+    another's rows.
 
 - **Durable forwarded-question state (`tg-ctl.<botid>.questions.json`, v1.20.0):** the daemon held
   all question state ONLY in memory (`pendingButtons`/`activeButtonKeys`/`answeredButtons`), so a

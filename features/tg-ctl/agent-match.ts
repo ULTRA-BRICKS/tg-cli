@@ -29,6 +29,9 @@ export interface AgentCandidate {
   // Raw tmux `#{pane_title}` (omp `π > title`, Claude Code `✳ title`); used only
   // when there is no adapter title.
   paneTitle?: string | null;
+  // Names this session had before a rename (the registry's aliases, spec §3.2):
+  // `/agent <oldname>` still reaches it, but only when no current name matches.
+  formerNames?: string[];
 }
 
 // --- command parse ---
@@ -188,11 +191,15 @@ export function uniqueProjectSelectorHits<T>(
   return headHits.length === 1 ? headHits : [];
 }
 
-// Fuzzy-match `selector` (phonetic) against the candidates, in TWO tiers so the
+// Fuzzy-match `selector` (phonetic) against the candidates, in tiers so the
 // window name always takes precedence over the cwd:
 //   1. window NAMES only (fuzzy) — unchanged legacy behaviour. `/agent deploy`
 //      against a real `deploy` window routes there and is never pulled into a tie
 //      by some other pane that merely sits in a `…/deploy` cwd.
+//   1b. unless a window name matched EXACTLY, a name a session had before a
+//      rename (`formerNames`, exact only) wins over a fuzzy window hit: after
+//      `deploy` → `prod`, `/agent deploy` still reaches it rather than a
+//      `deployer` window, while a window now really named `deploy` still wins.
 //   2. only if tier 1 found NOTHING, retry consulting each pane's cwd project dir
 //      too — but the cwd is matched STRICTLY (EXACT only). This makes a
 //      picker-suggested cwd selector route when the window names carry no usable
@@ -213,6 +220,11 @@ export function matchWindows(selector: string, candidates: AgentCandidate[]): Ma
   const selKey = phoneticKey(selector);
   if (!selKey) return { matches: [], confident: false };
   let matches = bestMatches(candidates, (c) => scoreOf(selKey, c.windowName));
+  const exactWindowHit = matches.length > 0 && scoreOf(selKey, matches[0].windowName) === 0;
+  if (!exactWindowHit) {
+    const former = candidates.filter((c) => (c.formerNames ?? []).some((n) => n.trim().toLowerCase() === want));
+    if (former.length > 0) return { matches: former, confident: former.length === 1 };
+  }
   if (matches.length === 0) {
     // Tier 1 found nothing → no window name matched, so rank purely by the STRICT
     // cwd score (EXACT only).

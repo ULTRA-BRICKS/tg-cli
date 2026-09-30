@@ -9,7 +9,7 @@
 
 import { parseRepliesArgs, type AgentScope, type RepliesQuery } from './args';
 import { parseHistory } from './history';
-import { buildJsonOutput, collapseMultiPartSends, formatLines, selectHistory } from './select';
+import { buildJsonOutput, collapseMultiPartSends, formatLines, selectHistory, type SessionScope } from './select';
 
 export interface RepliesCliDeps {
   // The raw JSONL history blob, or null when the file is absent/unreadable.
@@ -23,6 +23,11 @@ export interface RepliesCliDeps {
   // to showing untagged rows plus a note. Optional so existing callers/tests
   // that predate agent scoping keep compiling (undefined ⇒ null ⇒ untagged).
   currentAgent?: () => string | null;
+  // The session registry (sessions.json) as `tg replies` needs it, with the key
+  // of the reader's own session when `tg` resolved it (spec §3.3). The default
+  // scope is that SESSION — across renames and panes; null (no registry / not
+  // registered) falls back to the pane + `currentAgent` name.
+  sessions?: () => SessionScope | null;
   // Resolve a tmux WINDOW NAME (`--session ext`) to the pane ids of every window
   // whose name exactly equals it — a union, since a name can repeat across
   // sessions. Empty when none match / not in tmux (→ a structured not-found error).
@@ -37,9 +42,10 @@ export interface RepliesCliDeps {
 export const REPLIES_USAGE = `Usage: tg replies [user|agent|all] [list | find <query>] [flags]
 
 Recall what was sent over Telegram — by default the messages YOU (the user) sent
-to THIS agent (resolved from the current tmux pane), oldest first, with
-timestamps, #message-ids, and a [→ <agent>] mark showing which agent each
-message went to ([→ ?] = untagged / legacy / no target).
+to THIS agent session (its registry session, so a tmux window rename or an omp
+/rename keeps its history together), oldest first, with timestamps, #message-ids,
+and a [→ <agent>] mark showing which agent each message went to, by its current
+name ([→ ?] = untagged / legacy / no target).
 
 Direction (1st positional, default: user):
   user        only messages you sent to the agent (the default)
@@ -50,8 +56,9 @@ Action (2nd positional, default: list):
   list                 recent messages (default)
   find <query>         case-insensitive substring search (add --regex for regex)
 
-Agent scope (default: the CURRENT agent — this pane's window/project):
-  --agent <name>       only messages for the named agent (case-insensitive)
+Agent scope (default: the CURRENT session — else this pane's window/project):
+  --agent <name>       only messages for the named agent (case-insensitive); a
+                       name a session had before a rename still finds it
   --all                every agent's messages (tagged and untagged)
   --untagged           only untagged messages (legacy history / no target)
                        (--agent/--all/--untagged are mutually exclusive; when the
@@ -65,7 +72,7 @@ Flags:
                        the tail includes one (tg-cli#131 follow-up)
   --full               do not truncate long messages (~200 chars otherwise)
   --json               machine-readable JSON array (ts ms, id, direction, from,
-                       text, pane, targetAgent) — one row per Telegram message_id,
+                       text, pane, targetAgent, sessionKey) — one row per Telegram message_id,
                        so a multi-part send is several rows sharing one ts/text
   --regex              treat the find <query> as a regular expression
   --all-sessions       ignore the current pane; search across every session
@@ -110,14 +117,16 @@ type Scope = { panes: string[] | null } | { error: string };
 //        default and lets the agent filter do the scoping.
 //   • no --session, default `current` scope → [detectedPane] or null (not in tmux)
 //        Kept as a sensible per-session default: the current pane ≈ the current
-//        agent, and the `current` agent filter narrows within it.
+//        agent, and the `current` agent filter narrows within it. Dropped when
+//        the reader's registry session is known: the session key IS the scope,
+//        and a pane filter would hide its rows from a previous pane or process.
 // A `%`-prefixed value is treated as a pane id verbatim (backward compatible);
 // anything else is a tmux window NAME resolved to its pane-id set.
-function resolveScope(parsed: RepliesQuery, deps: RepliesCliDeps): Scope {
+function resolveScope(parsed: RepliesQuery, deps: RepliesCliDeps, ownSession: boolean): Scope {
   if (parsed.allSessions) return { panes: null };
   const sess = parsed.session;
   if (sess === undefined) {
-    if (parsed.agentScope.mode !== 'current') return { panes: null };
+    if (parsed.agentScope.mode !== 'current' || ownSession) return { panes: null };
     const detected = deps.detectPane();
     return { panes: detected ? [detected] : null };
   }
@@ -164,7 +173,11 @@ export function runReplies(argv: string[], deps: RepliesCliDeps): number | null 
     return 1;
   }
 
-  const scope = resolveScope(parsed, deps);
+  // The registry view and the reader's own session in it (null when unknown).
+  const sessions = deps.sessions?.() ?? null;
+  const own = sessions?.sessions.find((s) => s.key === sessions.current) ?? null;
+
+  const scope = resolveScope(parsed, deps, own !== null);
   if ('error' in scope) {
     deps.errlog(`tg replies: ${scope.error}`);
     return 1;
@@ -173,8 +186,10 @@ export function runReplies(argv: string[], deps: RepliesCliDeps): number | null 
 
   const records = parseHistory(deps.readHistory());
 
-  // The reader's own agent name — the default `current` scope filters to it.
-  const currentAgent = deps.currentAgent?.() ?? null;
+  // The reader's own agent name — its session's current name, else the tmux
+  // pane's; the `current` scope falls back to filtering on it.
+  const paneAgent = deps.currentAgent?.() ?? null;
+  const currentAgent = own?.name ?? paneAgent;
   // When the reader can't tell which agent it is AND no explicit agent scope was
   // given, `current` degrades to untagged (see filterByAgent); tell the user why
   // so an empty/partial view isn't mistaken for "no messages".
@@ -186,7 +201,7 @@ export function runReplies(argv: string[], deps: RepliesCliDeps): number | null 
 
   let selected;
   try {
-    selected = selectHistory(records, parsed, panes, currentAgent);
+    selected = selectHistory(records, parsed, panes, paneAgent, sessions);
   } catch (err) {
     // The only throw is an invalid regex from searchHistory.
     deps.errlog(`tg replies: invalid regex: ${err instanceof Error ? err.message : String(err)}`);
@@ -216,6 +231,7 @@ export function runReplies(argv: string[], deps: RepliesCliDeps): number | null 
     direction: parsed.direction,
     full: parsed.full,
     fmtTime: deps.fmtTime,
+    names: new Map(sessions?.sessions.map((s) => [s.key, s.name]) ?? []),
   })) {
     deps.log(line);
   }

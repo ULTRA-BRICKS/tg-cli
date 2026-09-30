@@ -296,7 +296,7 @@ test('buildJsonOutput: machine shape (ts ms, id, direction, from, text, pane)', 
     R({ ts: 1700000000, message_id: 10, direction: 'user', from: 'Alex', text: 'hi', pane: '%1' }),
   ]);
   expect(json).toEqual([
-    { ts: 1700000000000, id: 10, direction: 'user', from: 'Alex', text: 'hi', pane: '%1', targetAgent: null },
+    { ts: 1700000000000, id: 10, direction: 'user', from: 'Alex', text: 'hi', pane: '%1', targetAgent: null, sessionKey: null },
   ]);
 });
 

@@ -93,7 +93,8 @@ returns these fields, the file becomes a thin client, with no caller changes.
 ### 2.3 Reconcile (pure)
 
 `features/tg-ctl/session-registry.ts` exports
-`reconcile(prev: Registry, scan: LiveSession[], now) → { next: Registry, events: RegistryEvent[] }`.
+`reconcile(prev: Registry, scan: LiveSession[], now, pending) → { next: Registry, events: RegistryEvent[], pending }`
+(`pending`: the in-memory §3.2 rename candidates).
 It is pure, and the daemon runs it on the existing snapshot tick (2 s TTL).
 
 | Scan observation | Result | Event |
