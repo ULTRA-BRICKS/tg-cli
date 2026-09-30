@@ -194,7 +194,10 @@ part of it) and the agent receives a quote anchor identifying what you answered:
 `↩ tg#5975 «[date time] the quoted text…»` above your message. `tg#5975` is the
 replied-to message's own Telegram id (tg-cli#130) — if the preview isn't enough
 to place it (e.g. after the agent's context compacted), it can pull the full
-original back with `tg replies`.
+original back with `tg replies`. The quote is the message's text, a media caption, or
+— for a rich report (`<ul>`/`<table>`/headings) — its flattened content; a captionless
+photo/file quotes a label (`«[date] [document report.pdf]»`); with nothing quotable the
+anchor is just `↩ tg#5975` (tg-cli#461).
 
 ### Addressing a specific agent (v1.6.0)
 With several agents running, `/agent <window> <message>` routes to one of them.
@@ -228,6 +231,15 @@ does that and passes `--name <name>`). `tg-ctl inbox` shows what is queued.
 
 ### Q→buttons (v1.5.0, seamless setup in v1.6.0)
 Agent questions and permission prompts are forwarded to Telegram as inline buttons — no need to touch the terminal. Tap to answer; the answer is injected back into the pane immediately. Supports Claude Code question/permission shapes, Codex `PermissionRequest`, and opencode `question.asked`/`permission.asked` events.
+
+**Unanswered reminder (tg-cli#464):** a question/permission card left unanswered for
+20 minutes (counted from when the card opened) gets one reminder listing every card still
+waiting (session, question, `tg#<card id>`, age). Each new reminder deletes the previous
+one, so at most one sits in the chat, and it is closed once no card it listed is still
+open (answered or expired). Quiet hours (default 23:00-08:00 local, `TG_CTL_QUIET_HOURS_START_HOUR` /
+`TG_CTL_QUIET_HOURS_END_HOUR`) hold it until they end. `TG_CTL_UNANSWERED_REMINDER_AFTER_MS`
+sets the threshold (`0` = off); keep it under the 30-min question retention, or unanswered
+questions expire before their reminder. Critical hatch requests keep their own repeating reminder.
 
 **Setup:** run `tg-ctl install-hooks` once — it idempotently wires the Claude Code hooks into `~/.claude/settings.json` and the Codex usage collector into Codex's hooks file (`$CODEX_HOME/hooks.json` when set, otherwise `~/.codex/hooks.json`; backup first, existing hooks preserved), then restart the agent session. If either settings file is malformed, `install-hooks` reports it and exits without clobbering the file. `tg-ctl status` reports q→buttons, StopFailure, Claude statusLine usage telemetry, and Codex usage telemetry separately, including project/local Claude `statusLine` overrides that shadow the user-level collector. If you run `install-hooks` from such a project, it wraps that local statusLine too and backs the file up. Codex requires a manual `/hooks` trust review for the new `tg-ctl codex-usage-hook` Stop hook before it can run. (opencode: see the command's printed guidance.)
 

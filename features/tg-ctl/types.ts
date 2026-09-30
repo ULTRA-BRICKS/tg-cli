@@ -99,6 +99,33 @@ export interface TgTextQuote {
   text: string;
 }
 
+// Bot API 10.1 rich message content (`Message.rich_message`, tg-cli#461). A message sent
+// with sendRichMessage — how `tg --format html` ships any report with a list/table/heading —
+// carries its content ONLY here: `text` is absent. Typed loosely to just the text-bearing
+// fields the reply-quote anchor flattens (features/tg-ctl/reply-preview.ts); every other
+// block/inline kind is ignored.
+//   RichText: a plain string, an array of RichText, or an inline object (bold/url/…) whose
+//   `text` is RichText; custom emoji carry `alternative_text`, formulas `expression`.
+export type TgRichText =
+  | string
+  | TgRichText[]
+  | { type?: string; text?: TgRichText; alternative_text?: string; expression?: string };
+
+export interface TgRichBlock {
+  type?: string;
+  text?: TgRichText; // paragraph / heading / pre / footer / quotes
+  summary?: TgRichText; // details
+  expression?: string; // mathematical_expression block
+  blocks?: TgRichBlock[]; // blockquote / details / collage / slideshow
+  items?: { blocks?: TgRichBlock[] }[]; // list
+  cells?: { text?: TgRichText }[][]; // table
+  caption?: TgRichText; // table: RichText; media: RichBlockCaption `{ text, credit }`
+}
+
+export interface TgRichMessage {
+  blocks?: TgRichBlock[];
+}
+
 // A forum topic service message (Bot API 6.3+). `forum_topic_created` carries the new
 // topic's name; closed/reopened carry no extra fields. The owning message's
 // `message_thread_id` IS the topic id. See docs/specs/tg-forum-topics.md.
@@ -119,6 +146,12 @@ export interface TgMessage {
   document?: TgDocument;
   voice?: TgVoice; // a voice note (OGG/OPUS) — transcribed to text inbound
   audio?: TgVoice; // an audio file/note — same transcribe path as voice
+  // Read only to label a captionless replied-to message in the reply-quote anchor (#461).
+  video?: TgDocument;
+  animation?: TgDocument;
+  video_note?: { file_id: string };
+  sticker?: { file_id: string; emoji?: string };
+  rich_message?: TgRichMessage; // sendRichMessage content; such a message has no `text` (#461)
   reply_to_message?: TgMessage; // the message this one replies to (items 2,3)
   quote?: TgTextQuote; // the user's partial-quote selection from it (item 2)
   // --- forum topics (docs/specs/tg-forum-topics.md) ---
@@ -465,6 +498,7 @@ export interface CtlPaths {
   // written BEFORE the offset advances so a crash between telling Telegram we have it and
   // finishing the work can never lose it; see runDaemon recovery-on-startup
   awarenessNudge: string; // durable per-agent silence-nudge state (tg-ctl#363)
+  unansweredReminder: string; // which open questions got their one reminder + the live reminder message (tg-cli#464)
   runInfo: string; // which commit the running daemon loaded (pid + sha), for stale-code detection (tg-cli#279)
   sessions: string; // session registry keyed by harness session id; the daemon is its ONLY writer (#487)
 }

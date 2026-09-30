@@ -25,6 +25,7 @@ import { parseContinueCallback } from './limits';
 import { botCommandNames } from './bot-commands';
 import { shellPassthroughGate } from './shell-danger-gate';
 import { safeSliceEnd } from './text-util';
+import { mediaLabel, messagePlainText } from './reply-preview';
 
 // Bot API getFile hard limit; larger files cannot be downloaded by bots.
 const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024;
@@ -83,28 +84,34 @@ const QUOTE_HEAD_MAX = 60;
 
 // The quote anchor for a REPLY (items 2, 3): `↩ tg#<id> «[date time] <quote>…»`.
 // The quoted content is the user's PARTIAL selection when present (item 2),
-// otherwise the beginning of the replied-to message (item 3). Shared by text
-// replies and voice-note replies so both anchor identically.
+// otherwise the beginning of the replied-to message (item 3) — its text, caption or
+// flattened rich_message body (tg-cli#461). Shared by text replies and voice-note
+// replies so both anchor identically.
 //
 // `tg#<id>` is the replied-to message's OWN Telegram message_id — same
 // convention as the `{id}` substitution in wrapInbound (tg-cli#28) — so an
 // agent whose context has compacted/forgotten the original can still recover
 // it verbatim via `tg replies --json` (grep the id) instead of relying on the
 // truncated `head` preview below (tg-cli#130).
+//
+// tg-cli#461: the preview is never an empty `«[date] …»`. A message with no text
+// quotes a media label (`«[date] [photo]»`, no ellipsis — nothing was cut); a message
+// with nothing quotable at all drops the «…» part and keeps only `↩ tg#<id>`.
 export function buildReplyAnchor(m: TgMessage, opts: StepOpts): string {
   const rtm = m.reply_to_message;
-  const original = (rtm?.text ?? rtm?.caption ?? '').replace(/\s+/g, ' ').trim();
+  const origId = rtm ? ` tg#${rtm.message_id}` : '';
   const selected = m.quote?.text?.replace(/\s+/g, ' ').trim();
-  const body = selected || original;
+  const body = selected || (rtm ? messagePlainText(rtm) : '');
   // Deliberately NOT `truncateWithEllipsis`: the anchor ends in `…` UNCONDITIONALLY (even
   // an untruncated body gets one, per the module comment above) and cuts at the full
   // QUOTE_HEAD_MAX rather than reserving a unit for the ellipsis — a different contract
   // from the reserve-one-unit shape `truncateWithEllipsis` gives everyone else. Still
   // routed through `safeSliceEnd` so the cut itself never splits a surrogate pair.
-  const head = body.length > QUOTE_HEAD_MAX ? `${body.slice(0, safeSliceEnd(body, QUOTE_HEAD_MAX))}…` : `${body}…`;
+  let head = rtm ? mediaLabel(rtm) : '';
+  if (body) head = body.length > QUOTE_HEAD_MAX ? `${body.slice(0, safeSliceEnd(body, QUOTE_HEAD_MAX))}…` : `${body}…`;
+  if (!head) return `↩${origId}`;
   const when = rtm ? (opts.fmtTime ?? fmtQuoteTimeUtc)(rtm.date) : '';
-  const origId = rtm ? `tg#${rtm.message_id} ` : '';
-  return `↩ ${origId}«[${when}] ${head}»`;
+  return `↩${origId} «[${when}] ${head}»`;
 }
 
 // Build the injected text for a REPLY (items 2, 3). The agent sees which message

@@ -291,6 +291,16 @@ import {
   type DaemonCriticalState,
 } from "./features/tg-ctl/hatch-critical-reminder"
 import {
+  markUnansweredReminderSent,
+  parseUnansweredReminderState,
+  planUnansweredReminder,
+  serializeUnansweredReminderState,
+  unansweredReminderText,
+  UNANSWERED_REMINDER_AFTER_MS,
+  type OpenQuestion,
+  type UnansweredReminderState,
+} from "./features/tg-ctl/unanswered-reminder"
+import {
   buildGraceRecord,
   buildGrantRecord,
   grantDenyReasonText,
@@ -830,17 +840,19 @@ async function clearMessageKeyboard(ctx: Ctx, messageId: number): Promise<void> 
   await botPost(ctx, "editMessageReplyMarkup", { chat_id: ctx.chatId, message_id: messageId })
 }
 
-// Delete a previously-sent message outright (tg-cli#403: reminder-message
-// replacement — a new critical-mode reminder deletes the PREVIOUS reminder
-// rather than letting them pile up in the chat). Returns whether Telegram
-// actually deleted it; the caller falls back to editMessageText with a short
-// placeholder when it didn't (message too old for Bot API delete, already
-// gone, etc.) — deleteMessage itself never throws (botPostResult swallows
-// transport/HTTP-level failures the same as every other botPost* helper).
-async function deleteMessage(ctx: Ctx, messageId: number): Promise<boolean> {
+// Retire a previously-sent reminder ping (tg-cli#403 critical cadence, tg-cli#464
+// unanswered-question reminder): delete it outright, so reminders never pile up in the
+// chat; when Telegram refuses the delete (message too old for a bot delete, already
+// gone, …) edit it to `placeholder` instead. Never throws (botPostResult swallows
+// transport/HTTP failures like every botPost* helper). Only ever called on a reminder's
+// own message id — never on an original request card.
+async function retireReminderMessage(ctx: Ctx, messageId: number, placeholder: string): Promise<void> {
   const result = await botPostResult(ctx, "deleteMessage", { chat_id: ctx.chatId, message_id: messageId })
-  return result.ok
+  if (!result.ok) void editMessageText(ctx, messageId, placeholder)
 }
+const REMINDER_SUPERSEDED_TEXT = "⏰ reminder superseded by a newer one"
+// Every card the reminder listed left the open set — answered, or expired by retention.
+const REMINDER_CLOSED_TEXT = "⏰ reminder closed — none of its questions is open any more"
 
 // Set a reaction on a message (tg-cli#114 lifecycle: 👀 working → 😴 stalled →
 // 👌 done). Skips an emoji Telegram would reject (⏳/✅ are REACTION_INVALID) so
@@ -10043,6 +10055,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       log(`persistAwarenessNudge failed: ${err}`)
     }
   }
+
+  // --- unanswered-question reminder (tg-cli#464) — same load/persist shape as above ---
+  let unansweredReminderState: UnansweredReminderState = parseUnansweredReminderState(readFileOrNull(ctx.paths.unansweredReminder))
+  const persistUnansweredReminder = (): void => {
+    try {
+      atomicWrite(ctx.paths.unansweredReminder, serializeUnansweredReminderState(unansweredReminderState))
+    } catch (err) {
+      log(`persistUnansweredReminder failed: ${err}`)
+    }
+  }
   const fireAutoContinue = async (s: AutoContinueSchedule): Promise<void> => {
     // A reset > ~24.8 days out is clamped to MAX_TIMER_MS, so the timer can wake
     // BEFORE the real reset — re-arm instead of injecting early.
@@ -11120,14 +11142,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             return
           }
           const priorMessageId = state.lastReminderMessageId ?? null
-          if (priorMessageId !== null) {
-            // Replace, never accumulate (acceptance criterion (c)): delete the
-            // PREVIOUS reminder, falling back to an edit-to-placeholder if Telegram
-            // refuses the delete (message too old, already gone, …). The ORIGINAL
-            // request card is never touched here — only prior reminder pings.
-            const deleted = await deleteMessage(ctx, priorMessageId)
-            if (!deleted) void editMessageText(ctx, priorMessageId, "⏰ reminder superseded by a newer one")
-          }
+          // Replace, never accumulate (acceptance criterion (c)). The ORIGINAL request
+          // card is never touched here — only prior reminder pings.
+          if (priorMessageId !== null) await retireReminderMessage(ctx, priorMessageId, REMINDER_SUPERSEDED_TEXT)
           setState(markCriticalReminderSent(sweepNow, sentId))
           criticalChanged = true
           log(`hatch-critical-reminder-sent: key=${key} hookId=${hookId ?? "-"} messageId=${sentId}`)
@@ -11150,6 +11167,46 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           }, () => abandonedButtons.get(key) === entry)
         }
         if (criticalChanged) persistQuestions(sweepNow)
+      }
+
+      // tg-cli#464: one reminder per agent question left unanswered past
+      // UNANSWERED_REMINDER_AFTER_MS, quiet-hours aware; each new reminder replaces
+      // the previous one, and a reminder whose cards were all answered is withdrawn.
+      // Open = a live card (pendingButtons) or a retained one no tap has decided yet
+      // (abandonedButtons without queuedDecision). Critical requests are skipped:
+      // #403's own cadence above already reminds them.
+      if (UNANSWERED_REMINDER_AFTER_MS > 0) {
+        const sweepNow = Date.now()
+        const open: OpenQuestion[] = []
+        const collect = (key: string, req: ButtonRequest, messageId: number | null, openedAt: number): void => {
+          if (req.critical === true) return
+          const label = resolveSessionName({ tmuxWindow: req.windowName, cwd: req.cwd }).primary
+          open.push({ key, openedAt, label, question: req.question, messageId })
+        }
+        for (const [key, e] of pendingButtons) collect(key, e.req, e.messageId, e.at)
+        for (const [key, e] of abandonedButtons) if (!e.queuedDecision) collect(key, e.req, e.messageId, e.at)
+        const plan = planUnansweredReminder(open, unansweredReminderState, sweepNow)
+        unansweredReminderState = plan.state
+        let changed = plan.changed
+        const prior = unansweredReminderState.messageId
+        if (plan.send) {
+          const sentId = await sendMessage(ctx, unansweredReminderText(plan.overdue, sweepNow))
+          if (sentId === null) {
+            // A failed send is never marked: the same questions stay due next sweep.
+            log(`unanswered-reminder-send-failed: open=${plan.overdue.length}`)
+          } else {
+            if (prior !== null) await retireReminderMessage(ctx, prior, REMINDER_SUPERSEDED_TEXT)
+            unansweredReminderState = markUnansweredReminderSent(unansweredReminderState, plan.overdue, sentId)
+            changed = true
+            log(`unanswered-reminder-sent: messageId=${sentId} open=${plan.overdue.length} replaced=${prior ?? "-"}`)
+          }
+        } else if (plan.withdraw && prior !== null) {
+          await retireReminderMessage(ctx, prior, REMINDER_CLOSED_TEXT)
+          unansweredReminderState = { ...unansweredReminderState, messageId: null }
+          changed = true
+          log(`unanswered-reminder-withdrawn: messageId=${prior}`)
+        }
+        if (changed) persistUnansweredReminder()
       }
 
       // Remind only verified original processes. Never spawn an anonymous agent

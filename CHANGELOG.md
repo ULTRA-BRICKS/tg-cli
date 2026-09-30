@@ -3,6 +3,28 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.27
+
+- **Reply quotes are never empty (#461).** A reply to an agent's rich report (anything `tg
+  --format html` sent through `sendRichMessage` — lists, tables, headings) reached the agent as
+  `↩ tg#17821 «[2026-09-24 19:46] …»`: Telegram carries such a message's content in
+  `rich_message.blocks` with no `text`, and the anchor read only `text`/`caption`. All 30 empty
+  previews logged 09-18..09-25 were rich reports. The anchor now quotes the flattened rich text
+  (paragraphs, headings, list items, table cells, details, captions in reading order); a
+  captionless photo/file/voice/sticker quotes a label (`«[date] [document report.pdf]»`); with
+  nothing quotable the anchor is only `↩ tg#<id>`. New pure `features/tg-ctl/reply-preview.ts`.
+- **Unanswered-question reminder (#464).** A question/permission card still open 20 min after it
+  opened (`TG_CTL_UNANSWERED_REMINDER_AFTER_MS`, `0` = off; below the 30-min question retention)
+  gets ONE reminder, a plain message listing every card still waiting — session, question head,
+  `tg#<card id>`, age. A later reminder (another question crossing the threshold) deletes the
+  previous one (edit-to-placeholder if the delete is refused), so reminders never stack; once no
+  listed card is still open (answered or expired) the reminder is withdrawn. Quiet hours are #403's (`TG_CTL_QUIET_HOURS_*`,
+  default 23:00-08:00): a night-time question is reminded once, right after they end. Critical hatch
+  requests are excluded — #403 already reminds them. State (first-seen time per open card, reminded
+  cards, the live reminder's id) persists in `tg-ctl.<bot>.unanswered-reminder.json`, so neither a
+  restart nor a card's hook disconnect/re-attach restarts its clock or re-reminds. The #403 and #464
+  sweeps share one `retireReminderMessage` helper. New pure `features/tg-ctl/unanswered-reminder.ts`.
+
 ## 1.54.23
 
 **`tg-ctl status` says why an omp has no bridge: started before the bridge code, or a real failure (#458).**

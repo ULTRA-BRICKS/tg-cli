@@ -33,16 +33,24 @@ the `[date time]` + `…` framing.
 
 ## `buildReplyAnchor(m, opts)` / `buildReplyInject(m, name, opts)` (pure)
 
-1. `original` = `reply_to_message.text` (or `.caption`), whitespace-collapsed.
+1. `original` = `reply_to_message.text`, else `.caption`, else the flattened
+   `.rich_message.blocks` text (tg-cli#461 — a report sent via `sendRichMessage`
+   has NO `text`; its paragraphs/headings/list items/table cells/captions are
+   joined in reading order, `features/tg-ctl/reply-preview.ts`), whitespace-collapsed.
 2. `selected` = `m.quote.text` (the partial selection), whitespace-collapsed.
 3. `body` = `selected || original` — item 2 wins when a selection exists.
-4. `head` = first `60` chars of `body` + `…` (always ellipsised — item 3).
+4. `head` = first `60` chars of `body` + `…` (always ellipsised — item 3). When
+   `body` is empty, `head` = a media label of the replied-to message
+   (`[photo]`, `[document report.pdf]`, `[voice note]`, `[sticker 👍]`, …), with no
+   ellipsis.
 5. `when` = `opts.fmtTime(reply_to_message.date)`; defaults to a deterministic
    **UTC** `YYYY-MM-DD HH:MM`. The daemon injects a **local-time** formatter so
    the human sees Belgrade time while the pure module + tests stay deterministic.
 6. `origId` = `reply_to_message.message_id`, rendered `tg#<id> ` — same
    convention as the `{id}` substitution in `wrapInbound` (tg-cli#28).
-7. Result (`buildReplyAnchor`): `↩ origId«[when] head»`. `buildReplyInject`
+7. Result (`buildReplyAnchor`): `↩ origId«[when] head»`; when there is no `head`
+   at all (no text, no known media) the quote is omitted: just `↩ tg#<id>` —
+   never an empty `«[when] …»` (tg-cli#461). `buildReplyInject`
    appends a newline + the normal `wrap(name, replyText, m.message_id)` — note
    THIS is the reply's own id (for `tg --reply-to`), distinct from `origId`
    above (the message being answered).

@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { buildReplyInject, stepUpdates, type StepOpts } from '../features/tg-ctl/updates';
+import { buildReplyAnchor, buildReplyInject, stepUpdates, type StepOpts } from '../features/tg-ctl/updates';
 import { DEFAULT_CONTROL, type TgMessage, type TgUpdate } from '../features/tg-ctl/types';
 import { hasUnpairedSurrogate } from '../features/tg-ctl/text-util';
 
@@ -98,6 +98,122 @@ test('the original id in the anchor is the replied-to message id, not the reply\
 test('a falsy (zero) original id still renders — no silent collapse', () => {
   const out = buildReplyInject(reply('ok', 'zero-id original', undefined, 0), 'Alex', opts);
   expect(out.split('\n')[0]).toBe('↩ tg#0 «[2026-06-12 14:30] zero-id original…»');
+});
+
+// --- tg-cli#461: a replied-to message with no `text`/`caption` ---
+//
+// Every empty `↩ tg#N «[date] …»` seen live (30 ids, 2026-09-18..09-25) was a reply to an
+// agent report sent via sendRichMessage: such a Message carries its content in
+// `rich_message.blocks`, never in `text`, so the old `text ?? caption` read produced an
+// empty quote. A media message without a caption (a long report shipped as a file, a
+// photo) is the other no-text shape. The anchor must carry real quoted content or drop
+// the «…» quote entirely — never an empty «[date] …».
+
+const EMPTY_QUOTE = /«\[[^\]]*\] …»/;
+
+const replyTo = (rtm: Omit<TgMessage, 'message_id' | 'chat' | 'date'>, quote?: string): TgMessage => ({
+  message_id: 9,
+  from: { id: CHAT_ID, first_name: 'Alex' },
+  chat: { id: CHAT_ID },
+  date: NOW,
+  text: 'ответ',
+  reply_to_message: { message_id: REPLIED_TO_ID, chat: { id: CHAT_ID }, date: REPLIED_AT, ...rtm },
+  ...(quote ? { quote: { text: quote } } : {}),
+});
+
+// The shape Telegram returns for the tg#17821 report (`<b>Запрос:</b> «…»` + `<ul>`),
+// long enough that only its head fits the anchor.
+const longRichReport = {
+  blocks: [
+    { type: 'paragraph', text: [{ type: 'bold', text: 'Запрос:' }, ' «сравни review-cli с revmux от umputun тщательно и детально»'] },
+    {
+      type: 'list',
+      items: [
+        { label: '•', blocks: [{ type: 'paragraph', text: [{ type: 'code', text: 'docs/compare-revmux.md' }, ' — детальное сравнение'] }] },
+        { label: '•', blocks: [{ type: 'paragraph', text: 'README.md — добавлена ссылка' }] },
+      ],
+    },
+  ],
+};
+
+test('#461: reply to a long rich message quotes its flattened text head', () => {
+  const anchor = buildReplyAnchor(replyTo({ rich_message: longRichReport }), opts);
+  expect(anchor).toBe('↩ tg#42 «[2026-06-12 14:30] Запрос: «сравни review-cli с revmux от umputun тщательно и д…»');
+  expect(anchor).not.toMatch(EMPTY_QUOTE);
+});
+
+test('#461: rich blocks are space-separated and nested containers are walked in reading order', () => {
+  const rich = {
+    blocks: [
+      { type: 'heading', size: 3, text: 'Итог' },
+      { type: 'divider' },
+      { type: 'details', summary: 'PR', blocks: [{ type: 'paragraph', text: '#785' }] },
+      { type: 'table', cells: [[{ text: 'a' }, {}], [{ text: [{ type: 'custom_emoji', custom_emoji_id: '1', alternative_text: '✅' }] }]] },
+      { type: 'mathematical_expression', expression: 'x^2' },
+      { type: 'photo', photo: [], caption: { text: 'скрин' } },
+    ],
+  };
+  expect(buildReplyAnchor(replyTo({ rich_message: rich }), opts)).toBe('↩ tg#42 «[2026-06-12 14:30] Итог PR #785 a ✅ x^2 скрин…»');
+});
+
+test('#461: a partial-quote selection still wins over the rich body', () => {
+  const anchor = buildReplyAnchor(replyTo({ rich_message: longRichReport }, 'детальное сравнение'), opts);
+  expect(anchor).toBe('↩ tg#42 «[2026-06-12 14:30] детальное сравнение…»');
+});
+
+test('#461: reply to a captionless photo quotes a media label, not an empty preview', () => {
+  const anchor = buildReplyAnchor(replyTo({ photo: [{ file_id: 'p1' }] }), opts);
+  expect(anchor).toBe('↩ tg#42 «[2026-06-12 14:30] [photo]»');
+});
+
+test('#461: reply to a captionless document (a long report shipped as a file) names the file', () => {
+  const anchor = buildReplyAnchor(replyTo({ document: { file_id: 'd1', file_name: 'report.pdf' } }), opts);
+  expect(anchor).toBe('↩ tg#42 «[2026-06-12 14:30] [document report.pdf]»');
+});
+
+test('#461: a captioned media message still quotes its caption', () => {
+  const anchor = buildReplyAnchor(replyTo({ photo: [{ file_id: 'p1' }], caption: 'the chart' }), opts);
+  expect(anchor).toBe('↩ tg#42 «[2026-06-12 14:30] the chart…»');
+});
+
+test('#461: a GIF (Telegram sets both animation and document) is labelled an animation', () => {
+  const gif = { animation: { file_id: 'g1', file_name: 'x.gif.mp4' }, document: { file_id: 'g1', file_name: 'x.gif.mp4' } };
+  expect(buildReplyAnchor(replyTo(gif), opts)).toBe('↩ tg#42 «[2026-06-12 14:30] [animation]»');
+});
+
+test('#461: null nodes in raw rich JSON are skipped, never thrown on', () => {
+  const raw = JSON.parse(
+    '{"blocks":[null,{"type":"paragraph","text":[null,"ok",{"type":"bold","text":null}]},{"type":"list","items":[null,{"blocks":null}]},{"type":"table","cells":[null,[null,{"text":"cell"}]]}]}',
+  );
+  expect(buildReplyAnchor(replyTo({ rich_message: raw }), opts)).toBe('↩ tg#42 «[2026-06-12 14:30] ok cell…»');
+});
+
+test('#461: every media kind gets its label', () => {
+  const cases: Array<[Omit<TgMessage, 'message_id' | 'chat' | 'date'>, string]> = [
+    [{ video: { file_id: 'v' } }, '[video]'],
+    [{ video_note: { file_id: 'n' } }, '[video note]'],
+    [{ voice: { file_id: 'o' } }, '[voice note]'],
+    [{ audio: { file_id: 'a' } }, '[audio]'],
+    [{ sticker: { file_id: 's', emoji: '👍' } }, '[sticker 👍]'],
+    [{ document: { file_id: 'd' } }, '[document]'],
+  ];
+  for (const [rtm, label] of cases) expect(buildReplyAnchor(replyTo(rtm), opts)).toBe(`↩ tg#42 «[2026-06-12 14:30] ${label}»`);
+});
+
+test('#461: nothing quotable → the «…» preview is omitted, the tg#id stays for recall', () => {
+  const anchor = buildReplyAnchor(replyTo({}), opts);
+  expect(anchor).toBe('↩ tg#42');
+  // A whitespace-only / empty rich body is "nothing quotable" too.
+  expect(buildReplyAnchor(replyTo({ text: '  \n ' }), opts)).toBe('↩ tg#42');
+  expect(buildReplyAnchor(replyTo({ rich_message: { blocks: [{ type: 'divider' }] } }), opts)).toBe('↩ tg#42');
+});
+
+test('#461: the reply-route inject for a rich-message reply carries the quote end-to-end', () => {
+  const r = stepUpdates([{ update_id: 5, message: replyTo({ rich_message: longRichReport }) }], opts);
+  const route = r.actions[0] as Extract<(typeof r.actions)[number], { kind: 'reply-route' }>;
+  expect(route.kind).toBe('reply-route');
+  expect(route.injectText.split('\n')[0]).toStartWith('↩ tg#42 «[2026-06-12 14:30] Запрос: «сравни');
+  expect(route.injectText).not.toMatch(EMPTY_QUOTE);
 });
 
 // --- stepUpdates integration ---
