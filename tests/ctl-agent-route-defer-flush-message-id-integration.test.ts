@@ -48,6 +48,12 @@ case "$sub" in
     cat >> '${injectLog}'
     printf '\\n' >> '${injectLog}'
     ;;
+  capture-pane)
+    # With an 'enter-lost' marker every Enter is dropped: the last injected text
+    # stays in a Claude Code input box (#463).
+    [ -f '${cwd}/enter-lost' ] || exit 0
+    printf 'transcript\\n\\n────────────────────\\n❯ %s\\n────────────────────\\n  footer\\n' "$(tail -n 1 '${injectLog}')"
+    ;;
 esac
 exit 0
 `;
@@ -110,11 +116,13 @@ function startAsk(cfgDir: string, apiPort: number, request: Record<string, unkno
   return ask;
 }
 
-test('/agent <selector> <text> deferred behind an open question flushes with tg#<id> exactly once (no double-tag)', async () => {
-  const cfgDir = makeCfgDir();
+// Opens a question on the pane, defers `/agent main deploy now` (tg#4321) behind it,
+// answers the question and waits for the flush to type it.
+async function deferAndFlush(cfgDir: string): Promise<{ landed: string[]; sent: string[] }> {
 
   const updateQueue: unknown[][] = [];
   const reactions: Array<Record<string, unknown>> = [];
+  const sent: string[] = [];
   let buttonMessageId = 0;
   let questionCallbackData = '';
 
@@ -137,6 +145,7 @@ test('/agent <selector> <text> deferred behind an open question flushes with tg#
           questionCallbackData = kb[0][0].callback_data;
           return Response.json({ ok: true, result: { message_id: buttonMessageId } });
         }
+        sent.push(String(body.text ?? ''));
         return Response.json({ ok: true, result: { message_id: 900 } });
       }
       if (url.pathname.endsWith('/setMessageReaction')) {
@@ -210,14 +219,33 @@ test('/agent <selector> <text> deferred behind an open question flushes with tg#
     const t0 = Date.now();
     while (Date.now() - t0 < 8000 && injected(cfgDir).length < 1) await Bun.sleep(100);
   }
-  const landed = injected(cfgDir);
+  // The submit check and any report follow the typed text.
+  await Bun.sleep(1500);
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+  return { landed: injected(cfgDir), sent };
+}
+
+test('/agent <selector> <text> deferred behind an open question flushes with tg#<id> exactly once (no double-tag)', async () => {
+  const { landed } = await deferAndFlush(makeCfgDir());
   expect(landed).toHaveLength(1);
   // Exactly one `tg#4321` — a re-wrap-at-flush regression would double it to
   // `tg#4321 tg#4321` (or similar); confirms injectDeferredOne injects the
   // already-wrapped deferred text verbatim, never re-wrapping it.
   expect(landed[0].match(/tg#4321/g)).toHaveLength(1);
   expect(landed[0]).toContain('deploy now');
+}, 30_000);
 
-  daemon.kill('SIGTERM');
-  await daemon.exited;
+test('a deferred message typed but never submitted is reported once as unsubmitted, never as "resend it" (#463)', async () => {
+  const cfgDir = makeCfgDir();
+  writeFileSync(join(cfgDir, 'enter-lost'), '');
+  const { landed, sent } = await deferAndFlush(cfgDir);
+  expect(landed).toHaveLength(1);
+  const reports = sent.filter((t) => t.includes(`pane ${PANE_ID} (claude)`) && t.includes('deploy now'));
+  expect(reports).toHaveLength(1);
+  // The text is already in the box: a "resend it" notice would get it typed twice.
+  expect(sent.some((t) => /not delivered/.test(t))).toBe(false);
+  // …and so would a replay of the update: the ledger records it final, not failed.
+  const ledger = readFileSync(join(cfgDir, 'tg-ctl.123.delivery.jsonl'), 'utf8');
+  expect(ledger.split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((e) => e.msg === 4321).map((e) => e.event)).toEqual(['received', 'queued', 'claimed', 'unsubmitted']);
 }, 30_000);

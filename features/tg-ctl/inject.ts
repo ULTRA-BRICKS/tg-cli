@@ -1,12 +1,14 @@
 // tmux injection plans (spec §5.2, §16 module 5).
 //
 // PURE — these functions return InjectStep[] data; the tg-ctl entrypoint
-// executes the steps (spawnSync tmux, Bun.sleep, pane re-verification).
+// executes the steps (spawnSync tmux, Bun.sleep, pane re-verification, the
+// input-box read of a submit-check).
 // The recipe is the live-proven one: literal send-keys for single lines,
-// bracketed paste via load-buffer/paste-buffer for multi-line, and a paced
-// SEPARATE Enter at the end.
+// bracketed paste via load-buffer/paste-buffer for multi-line, a paced
+// SEPARATE Enter, then a submit check with one retry Enter (tg-cli#463).
 
-import type { InjectStep } from './types';
+import { truncateWithEllipsis } from './text-util';
+import type { AgentKind, InjectStep } from './types';
 
 // {name}/{msg}/{id} substitution in a single pass over the TEMPLATE only, so
 // placeholder-looking text inside the substituted values is never expanded
@@ -46,6 +48,10 @@ export interface TextInjectOpts {
   sessionKey?: string; // refuse unless the pane still hosts this session (§2.6)
 }
 
+// Time for a TUI to redraw after Enter before its input box is read. All three
+// harnesses had cleared the box 600ms after Enter in the 2026-09-30 captures.
+const SUBMIT_SETTLE_MS = 700;
+
 export function buildTextInjectPlan(paneId: string, text: string, opts: TextInjectOpts = {}): InjectStep[] {
   const steps: InjectStep[] = [opts.sessionKey ? { kind: 'verify-pane', paneId, sessionKey: opts.sessionKey } : { kind: 'verify-pane', paneId }];
 
@@ -70,7 +76,30 @@ export function buildTextInjectPlan(paneId: string, text: string, opts: TextInje
   // common failure mode in other tmux-injecting bots).
   steps.push({ kind: 'sleep', ms: opts.gapMs ?? 500 });
   steps.push({ kind: 'tmux', argv: ['tmux', 'send-keys', '-t', paneId, 'Enter'] });
+  // Even a paced Enter is sometimes lost (tg-cli#463: the CTO's message sat typed in
+  // the box, never sent). Check the input box once the TUI has redrawn, retry Enter
+  // ONCE, and fail loudly if the text is still there — never a silent "delivered".
+  steps.push({ kind: 'sleep', ms: SUBMIT_SETTLE_MS });
+  steps.push({ kind: 'submit-check', paneId, text });
+  steps.push({ kind: 'tmux', argv: ['tmux', 'send-keys', '-t', paneId, 'Enter'] });
+  steps.push({ kind: 'sleep', ms: SUBMIT_SETTLE_MS });
+  steps.push({ kind: 'submit-check', paneId, text, final: true });
   return steps;
+}
+
+// The Telegram reply for a message still typed after the retry Enter (the final
+// submit-check). It names the pane and quotes the text so the CTO can finish it.
+export function unsubmittedNotice(paneId: string, agent: AgentKind, text: string): string {
+  const firstLine = text.split('\n', 1)[0];
+  return `⚠️ Typed into pane ${paneId} (${agent}) but NOT sent: Enter was pressed twice and the message is still in its input box — «${truncateWithEllipsis(firstLine, 120)}». Press Enter in that pane, or clear the box and resend.`;
+}
+
+// The typing turn a plan must take: the pane it types into. Text, digit and key plans of one pane
+// share a key, so a late button tap cannot land in the box of a message mid submit-check.
+// null = the plan types into no pane.
+export function paneTypingKey(steps: InjectStep[]): string | null {
+  const target = steps.find((step) => step.kind === 'verify-pane');
+  return target ? `pane:${target.paneId}` : null;
 }
 
 // Control verbs are raw key names — NO -l, tmux must interpret them.

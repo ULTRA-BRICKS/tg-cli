@@ -390,7 +390,11 @@ export type InjectStep =
   // that the pane still hosts THAT session (spec §2.6 pane-reuse guard).
   | { kind: 'verify-pane'; paneId: string; sessionKey?: string }
   | { kind: 'tmux'; argv: string[]; stdin?: string } // tmux command; stdin for load-buffer -
-  | { kind: 'sleep'; ms: number };
+  | { kind: 'sleep'; ms: number }
+  // tg-cli#463: is `text` still in the harness's input box after its Enter? No (or the
+  // box cannot be read) → the plan ends, delivered. Yes → run the steps that follow (the
+  // one retry Enter); yes on the `final` check → fail, reporting the text as unsubmitted.
+  | { kind: 'submit-check'; paneId: string; text: string; final?: true };
 
 // --- pane discovery (spec §16 module 6) ---
 

@@ -3,6 +3,35 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.3
+
+- **A message typed into a tmux pane but never submitted is caught and reported (#463).** After the
+  paced Enter, tg-ctl reads the agent's input box (`tmux capture-pane`) and, if the message is
+  still sitting there — the Enter was lost — presses Enter once more. If it is still there after
+  that, the CTO gets a chat reply naming the pane, the agent and the message ("typed but NOT
+  sent … press Enter in that pane, or clear the box and resend") instead of a silent "delivered";
+  it is never typed a second time. How each harness draws its input box (claude and omp: the
+  bottom-most pair of column-0 `───` rules, claude's opening with its `❯` prompt, so a `───` line
+  inside a pasted message never splits the box; codex: the last `›` composer; plus each one's
+  collapsed-paste placeholder and empty-box hint — "Ask Codex to do anything" is not input)
+  lives in one adapter, `features/tg-ctl/input-box.ts`, built from real captures of claude 2.1,
+  codex 0.153 and omp 18.3 — the transcript echo of a submitted message never counts. Any other
+  harness, or a box that is not on screen, is logged as unverified and never retried. The pane is
+  re-checked before its box is read and before the retry Enter: if it no longer runs the agent
+  process the text was typed into (the pane was reused during the wait), neither happens.
+  An unsubmitted message is reported on every path that types into a pane: inbound messages,
+  deferred (queued) messages, late question answers (button taps and text replies keep their
+  claim, so a re-tap never types the answer twice), grant notices, and auto-continue. The
+  delivery ledger records it as `unsubmitted` — final, like a delivered message — so a replayed
+  update never types it into the same box again, and `tg-ctl audit-delivery` lists it as not
+  delivered ("typed into the pane but never submitted"). A deferred message left unsubmitted gets
+  that one report, not a second "was not delivered … resend it" notice.
+  Every plan typed into a pane — text, a late button tap, auto-continue — takes that pane's turn
+  (in the daemon, and across processes via a lock file in `pane-locks/` of the config dir, a dead
+  owner's lock broken), so a retry Enter never submits two messages joined in one box.
+- **Auto-continue flips the source message to 👀 only when "continue" was actually delivered.**
+  A failed or unsubmitted inject leaves it as it was instead of claiming the agent resumed.
+
 ## 1.55.2
 
 - **Hatch approval taps that did not take effect now do (#403, #433).** Every way to resolve a

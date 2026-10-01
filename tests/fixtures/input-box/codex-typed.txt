@@ -1,0 +1,27 @@
+╭─────────────────────────────────────────────────╮
+│ ✨ Update available! 0.153.4 -> 0.159.2         │
+│ Run npm install -g @openai/codex to update.     │
+│                                                 │
+│ See full release notes:                         │
+│ https://github.com/openai/codex/releases/latest │
+╰─────────────────────────────────────────────────╯
+
+╭──────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.153.4)                       │
+│                                                  │
+│ model:     gpt-6-astra medium   /model to change │
+│ directory: /private/tmp/t463/w                   │
+╰──────────────────────────────────────────────────╯
+
+  Tip: Try the Desktop app. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true
+
+⚠ MCP client for `haft` failed to start: MCP startup failed: Unexpected response type
+
+• You have 2 usage limit resets available. Run /usage to use one.
+
+⚠ MCP startup incomplete (failed: haft)
+
+
+› [TG from tg tg#42] hello codex pending
+
+  gpt-6-astra medium · /private/tmp/t463/w

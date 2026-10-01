@@ -232,7 +232,7 @@ export function buildAuditReport(input: AuditInput): AuditReport {
     if (!inWindow(r.ts)) continue;
     received.set(r.message_id, { msg: r.message_id, date: r.ts, text: r.text, target: r.targetAgent ?? r.pane ?? null });
   }
-  type Outcome = { state: 'claimed' | 'delivered' | 'uncertain' | 'failed' | 'queued'; target: string; error?: string; hold?: LedgerHold };
+  type Outcome = { state: 'claimed' | 'delivered' | 'uncertain' | 'unsubmitted' | 'failed' | 'queued'; target: string; error?: string; hold?: LedgerHold };
   const outcome = new Map<number, Outcome>();
   const updates = new Map<number, number>(); // update_id → message date (or receipt time)
   let suppressedDuplicates = 0;
@@ -308,6 +308,8 @@ export function buildAuditReport(input: AuditInput): AuditReport {
       report.pending.push({ ...m, target: o.target, hold: o.hold });
     } else if (o?.state === 'failed') {
       report.undelivered.push({ ...m, target: o.target, reason: `failed, CTO notified: ${o.error ?? ''}` });
+    } else if (o?.state === 'unsubmitted') {
+      report.undelivered.push({ ...m, target: o.target, reason: 'typed into the pane but never submitted, CTO notified' });
     } else if (o?.state === 'uncertain') {
       report.undelivered.push({ ...m, target: o.target, reason: 'a daemon restart interrupted the delivery, CTO notified' });
     } else if (o?.state === 'claimed') {

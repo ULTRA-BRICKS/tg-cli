@@ -1,0 +1,39 @@
+
+
+ MCP server failed to connect: haft [config: ~/.omp/agent/mcp.json]: Spread syntax requires ...iterable not be null or
+ undefined
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Update Available
+ New version 18.4.4 is available. Run: omp update
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+ [TG from tg tg#42] hello omp pending
+
+
+ Account switched: a@example.com → b@example.com (auto-rotation)
+
+ Hello. Your message said "hello omp pending" and I don't have a task from it. What do you want me to do?
+
+
+ run the bash command: sleep 25 ; then reply ok
+
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ $ sleep 25                                                                                                           │
+├─── Output ───────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Backgrounded early to handle an incoming message; the command keeps running.                                         │
+│ ⟦Backgrounded: bg_1 | Timeout: 60s⟧                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+ [TG from tg tg#43] queued omp msg
+
+
+  ⎋ Sleeping 25 seconds
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ⠏ 5s · ⬢ Sonnet 5.5 👁 · ◔ low · 🗑 t463/w · ⑂ main · ◫ 1.7%/1M ⟲ · S0.07 + 👁 S0.23   ⚙ 1 · Run sleep command then repl…

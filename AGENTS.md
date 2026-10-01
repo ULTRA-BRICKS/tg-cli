@@ -156,6 +156,19 @@ history log, the daemon log and harness transcripts (`features/tg-ctl/delivery-a
 message with no ledger record, no surviving transcript and no log line is "no evidence left",
 never counted as lost: harnesses prune transcripts and reply-route log lines carry no message id.
 
+### tmux delivery is verified, never silent (#463)
+
+Every text inject plan (`buildTextInjectPlan`) ends with a submit check: read the input box,
+retry Enter ONCE, and fail `unsubmitted` if the text is still typed. A caller that gets
+`unsubmitted` must report it to the CTO in the chat and must NOT re-type or re-queue the text
+(it is already in the box); `deliverInboundOnce` records it `unsubmitted` in the delivery
+ledger, final like `delivered`, so a replay never re-types it. Harness box layouts live only
+in `features/tg-ctl/input-box.ts` (tg#16810); fixtures in `tests/fixtures/input-box/` are real
+captures — add a new harness or version there from a live capture, never a hand-drawn screen.
+
+Every plan that types into a pane (text, digit, key) takes the pane's turn (`paneTypingKey`, then the
+`pane-locks/` lock file) — a retry Enter is only safe while nothing else is typing into that box.
+
 ### Existing Features
 
 - `features/agent-role/` — pure coordinator-vs-subagent model (`docs/specs/agent-role-model.md`,
@@ -467,10 +480,12 @@ never counted as lost: harnesses prune transcripts and reply-route log lines car
   update across the swap. That ceiling is the honest bound: a pathological batch whose remaining
   actions take longer than 8 s (or a hung await) hits the hard-exit fallback mid-batch, and — since
   the offset was persisted BEFORE acting — that tail is lost at-most-once (the normal, non-graceful
-  behaviour); in practice a batch is a few `tmux send-keys`, far under the ceiling. A second SIGTERM
-  also exits at once. Offset itself is already durable (persisted before acting + Telegram's 24 h
-  retention), so the successor resumes with no gap. SIGINT (interactive Ctrl-C) still exits
-  immediately — no drain.
+  behaviour); in practice a batch is a few `tmux send-keys` — ~1.2 s per text delivery (~2 s when
+  the #463 submit check retries Enter); a batch's deliveries run concurrently across panes, one after the other
+  within a pane (a pane's typing turn: in-process queue + a cross-process lock file, so
+  `auto-continue-once` cannot interleave) — under the ceiling. A second SIGTERM also exits at once. Offset itself is already durable
+  (persisted before acting + Telegram's 24 h retention), so the successor resumes with no gap.
+  SIGINT (interactive Ctrl-C) still exits immediately — no drain.
 
 - **Inbound voice (STT):** a Telegram voice/audio note → `transcribe-voice` action (updates.ts).
   The daemon downloads the OGG, transcodes to WAV 16 kHz mono via `ffmpeg`, runs the configured

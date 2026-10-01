@@ -85,7 +85,8 @@ import {
   pickTargetPaneFromSet,
 } from "./features/tg-ctl/discover"
 import { isBareWindowName, resolveSessionName } from "./features/tg-ctl/session-name"
-import { buildDigitInjectPlan, buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
+import { buildDigitInjectPlan, buildKeyInjectPlan, buildTextInjectPlan, paneTypingKey, unsubmittedNotice, wrapInbound } from "./features/tg-ctl/inject"
+import { messageStillTyped } from "./features/tg-ctl/input-box"
 import {
   extractPermissionIdentity,
   parsePermissionMenu,
@@ -364,6 +365,7 @@ import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
 import {
   aggregateUsage,
   fsRoutesLockIo,
+  type RoutesLockIo,
   orderByLruMru,
   parseRoutes,
   recognizeRoute,
@@ -1386,7 +1388,7 @@ function ptyOnlyHosts(panes: PaneInfo[], procs: ProcInfo[]): LiveHost[] {
 // under it). `expectPid`: the harness must still be this exact process. No ledger here: the
 // caller owns the claim.
 function typeIntoHost(name: string, text: string, logNote: string, expectPid?: number): Promise<SinkResult> {
-  return serializePerHost(name, async (): Promise<SinkResult> => {
+  return serializeTyping(`host:${name}`, async (): Promise<SinkResult> => {
     const host = listLiveHosts(snapshot().procs).find((h) => h.name === name && (expectPid === undefined || h.harnessPid === expectPid))
     if (!host) return { ok: false, error: `${name} is no longer running under the rig wrapper — message not delivered` }
     log(`host-pty: ${logNote} → ${host.name} (${host.agent} pid ${host.harnessPid}, cwd ${host.cwd ?? "?"})`)
@@ -1394,15 +1396,16 @@ function typeIntoHost(name: string, text: string, logNote: string, expectPid?: n
   })
 }
 
-// Two messages for one host are typed one after the other: interleaved, one's text would ride
-// the other's Enter and the second `attach` could drop the first client mid-write.
-const hostTypingTail = new Map<string, Promise<unknown>>()
-function serializePerHost<T>(name: string, run: () => Promise<T>): Promise<T> {
-  const result = (hostTypingTail.get(name) ?? Promise.resolve()).then(run, run)
+// Two messages for one typing target (a host's PTY, a tmux pane) are typed one after the other:
+// interleaved, one's text would ride the other's Enter, and a pane's submit-check would read a
+// box holding both. `key`: `host:<name>` or `pane:<paneId>`.
+const typingTail = new Map<string, Promise<unknown>>()
+function serializeTyping<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const result = (typingTail.get(key) ?? Promise.resolve()).then(run, run)
   const tail = result.catch(() => undefined)
-  hostTypingTail.set(name, tail)
+  typingTail.set(key, tail)
   void tail.then(() => {
-    if (hostTypingTail.get(name) === tail) hostTypingTail.delete(name)
+    if (typingTail.get(key) === tail) typingTail.delete(key)
   })
   return result
 }
@@ -2204,6 +2207,8 @@ async function routeGrantNotice(ctx: Ctx, req: ButtonRequest, text: string, deli
   if (req.paneId && !ompOrigin) {
     try {
       const res = await executeInjectSteps(buildTextInjectPlan(req.paneId, wrapInbound(ctx.cfg.injectWrap, "tg", text), { sessionKey: req.sessionKey }))
+      // Typed but still in its input box (#463): name the pane and text in the chat.
+      if (!res.ok && res.unsubmitted) await sendMessage(ctx, res.error)
       return res.ok
     } catch (err) {
       log(`grant-notice pane route failed pane=${req.paneId}: ${err instanceof Error ? err.message : String(err)}`)
@@ -2225,6 +2230,12 @@ async function routeGrantNotice(ctx: Ctx, req: ButtonRequest, text: string, deli
   if (target) {
     const res = await deliverOriginalOmp(target, text, deliveryId, req.paneId)
     if (res.ok) return true
+    // Typed into its pane but still unsubmitted (#463): report it and do not queue
+    // it again — the card reports the notice undelivered and names the token path.
+    if (res.unsubmitted) {
+      await sendMessage(ctx, res.error)
+      return false
+    }
     log(`grant-notice omp route failed (falling back to inbox) session=${target.sessionId ?? "-"}: ${res.error}`)
   }
   try {
@@ -2493,8 +2504,10 @@ function runInboxCommand(ctx: Ctx, argv: string[]): number {
 }
 
 // A failed plan; `sessionMismatch`: the §2.6 guard refused (the pane hosts a
-// different session now) and `error` is the named reply for the CTO.
-type InjectFailure = { ok: false; error: string; sessionMismatch?: true }
+// different session now) and `error` is the named reply for the CTO;
+// `unsubmitted`: the text WAS typed but is still in the input box (#463) — never
+// re-type it, report it.
+type InjectFailure = { ok: false; error: string; sessionMismatch?: true; unsubmitted?: true }
 
 // The registry as it describes pane `paneId` NOW (re-scanned first). A scan
 // shared with an earlier delivery of the same burst is trusted only while the
@@ -2523,28 +2536,114 @@ function paneSessionRefusal(sessionKey: string | undefined, paneId: string, obse
   return paneRefusalText(check, paneId)
 }
 
+// The agent process a verify-pane found in the pane (findAgentInPane).
+type HostedAgent = { agent: AgentKind; pid?: number }
+
 // The verify-pane step, shared by both executors. It re-runs discovery on a
 // CURRENT snapshot — the agent may have exited between picking the target and
 // typing into it, and injecting into a bare shell would EXECUTE the text (spec
 // §5.2). With a session key it also requires the pane to still host THAT
 // session (spec §2.6, #354/#100): a tmux server restart or a respawned pane
 // reuses `%N`, and a cwd match is never enough.
-function verifyPaneStep(step: Extract<InjectStep, { kind: "verify-pane" }>): InjectFailure | null {
+function verifyPaneStep(step: Extract<InjectStep, { kind: "verify-pane" }>): InjectFailure | { ok: true; hosted: HostedAgent } {
   const { panes, procs } = snapshot()
   const pane = panes.find((p) => p.paneId === step.paneId)
-  if (!pane || findAgentInPane(pane, procs) === null) {
+  const hosted = pane ? findAgentInPane(pane, procs) : null
+  if (!hosted) {
     return { ok: false, error: `pane ${step.paneId} no longer hosts an agent — message not injected` }
   }
   const refusal = paneSessionRefusal(step.sessionKey, step.paneId, { panes, procs })
-  return refusal === null ? null : { ok: false, error: refusal, sessionMismatch: true }
+  return refusal === null ? { ok: true, hosted } : { ok: false, error: refusal, sessionMismatch: true }
 }
 
-// Execute an InjectStep plan (verify-pane: verifyPaneStep).
-async function executeInjectSteps(steps: InjectStep[]): Promise<{ ok: true } | InjectFailure> {
+// Does pane `paneId` still run the very agent process the text was typed into? A pane
+// can change hands during the settle wait (the agent exits, tmux reuses `%N`).
+function paneStillHosts(paneId: string, hosted: HostedAgent): boolean {
+  const { panes, procs } = snapshot()
+  const pane = panes.find((p) => p.paneId === paneId)
+  const now = pane ? findAgentInPane(pane, procs) : null
+  return now !== null && now.agent === hosted.agent && now.pid === hosted.pid
+}
+
+// The submit-check step (tg-cli#463), shared by both executors: `hosted` is what the
+// plan's verify-pane found. Ends the plan as delivered (the text left the input box,
+// or the box cannot be read, or the pane no longer runs that agent) or unsubmitted
+// (still typed after the retry Enter); "retry-enter" runs the retry Enter that follows.
+// The pane is re-checked before its box is read and again before the retry Enter:
+// another agent's box says nothing about this text, and an Enter there would submit
+// whatever that agent holds.
+function submitCheckStep(step: Extract<InjectStep, { kind: "submit-check" }>, hosted: HostedAgent | null): { ok: true } | InjectFailure | "retry-enter" {
+  const agent = hosted?.agent ?? "unknown agent"
+  const handedOver = (): { ok: true } => {
+    log(`submit-check: pane ${step.paneId} no longer runs the ${agent} (pid ${hosted?.pid ?? "?"}) the message was typed into — submission not verified, no retry Enter`)
+    return { ok: true }
+  }
+  if (hosted !== null && !paneStillHosts(step.paneId, hosted)) return handedOver()
+  const screen = hosted === null ? null : capturePane(step.paneId)
+  const typed = hosted === null || screen === null ? null : messageStillTyped(hosted.agent, screen, step.text)
+  if (hosted === null || typed === null) {
+    log(`submit-check: pane ${step.paneId} (${agent}) — input box not readable, submission not verified`)
+    return { ok: true }
+  }
+  if (!typed) return { ok: true }
+  if (!step.final) {
+    if (!paneStillHosts(step.paneId, hosted)) return handedOver()
+    log(`submit-check: pane ${step.paneId} (${agent}) still shows the message after Enter — retrying Enter once`)
+    return "retry-enter"
+  }
+  log(`submit-check: pane ${step.paneId} (${agent}) still shows the message after the retry Enter — reporting it unsubmitted`)
+  return { ok: false, unsubmitted: true, error: unsubmittedNotice(step.paneId, hosted.agent, step.text) }
+}
+
+// Execute an InjectStep plan (verify-pane: verifyPaneStep; submit-check: submitCheckStep). A plan
+// owns its pane's input until it ends: a second message typed meanwhile would join the first in
+// the box and the retry Enter would send both as one. EVERY plan on a pane takes the turn — a
+// digit or key plan (a late button tap) types into the same pane as a text plan mid-check.
+function executeInjectSteps(steps: InjectStep[]): Promise<{ ok: true } | InjectFailure> {
+  const key = paneTypingKey(steps)
+  return key ? serializeTyping(key, () => runInjectStepsLocked(steps)) : runInjectSteps(steps)
+}
+
+// The in-process turn above cannot see the detached `auto-continue-once` process, which types into
+// the same panes: a pane's typing turn is also a lock file in the config dir (a dead owner's lock
+// is broken). A lock that stays held past the budget is typed through — a stuck owner must not
+// swallow the message.
+const PANE_LOCK_ATTEMPTS = 400
+const PANE_LOCK_DELAY_MS = 50
+function paneLockIo(paneId: string): RoutesLockIo {
+  const dir = join(resolveConfigDir(process.env.HOME ?? "~"), "pane-locks")
+  mkdirSync(dir, { recursive: true })
+  return fsRoutesLockIo(join(dir, `${paneId.replace(/[^A-Za-z0-9]/g, "_")}.lock`))
+}
+
+async function runInjectStepsLocked(steps: InjectStep[]): Promise<{ ok: true } | InjectFailure> {
+  const paneId = (steps.find((step) => step.kind === "verify-pane") as Extract<InjectStep, { kind: "verify-pane" }>).paneId
+  const io = paneLockIo(paneId)
+  let held = false
+  for (let i = 0; i < PANE_LOCK_ATTEMPTS && !held; i++) {
+    held = io.acquire()
+    if (held) break
+    if (io.ownerDead() === true) io.breakIfDead()
+    else await Bun.sleep(PANE_LOCK_DELAY_MS)
+  }
+  if (!held) log(`pane ${paneId} typing lock still held after ${PANE_LOCK_ATTEMPTS * PANE_LOCK_DELAY_MS}ms — typing through`)
+  try {
+    return await runInjectSteps(steps)
+  } finally {
+    if (held) io.release()
+  }
+}
+
+async function runInjectSteps(steps: InjectStep[]): Promise<{ ok: true } | InjectFailure> {
+  let hosted: HostedAgent | null = null
   for (const step of steps) {
     if (step.kind === "verify-pane") {
-      const failed = verifyPaneStep(step)
-      if (failed) return failed
+      const verified = verifyPaneStep(step)
+      if (!verified.ok) return verified
+      hosted = verified.hosted
+    } else if (step.kind === "submit-check") {
+      const checked = submitCheckStep(step, hosted)
+      if (checked !== "retry-enter") return checked
     } else if (step.kind === "tmux") {
       const proc = Bun.spawnSync(step.argv, {
         stdin: step.stdin !== undefined ? new TextEncoder().encode(step.stdin) : undefined,
@@ -2567,10 +2666,21 @@ function injectInbound(messageId: number | null, paneId: string, steps: InjectSt
 }
 
 function executeInjectStepsSync(steps: InjectStep[]): { ok: true } | InjectFailure {
+  const paneId = steps.find((step) => step.kind === "verify-pane")?.paneId
+  if (paneId === undefined) return runInjectStepsSync(steps)
+  return withRoutesLock(paneLockIo(paneId), () => runInjectStepsSync(steps), { attempts: PANE_LOCK_ATTEMPTS, delayMs: PANE_LOCK_DELAY_MS })!
+}
+
+function runInjectStepsSync(steps: InjectStep[]): { ok: true } | InjectFailure {
+  let hosted: HostedAgent | null = null
   for (const step of steps) {
     if (step.kind === "verify-pane") {
-      const failed = verifyPaneStep(step)
-      if (failed) return failed
+      const verified = verifyPaneStep(step)
+      if (!verified.ok) return verified
+      hosted = verified.hosted
+    } else if (step.kind === "submit-check") {
+      const checked = submitCheckStep(step, hosted)
+      if (checked !== "retry-enter") return checked
     } else if (step.kind === "tmux") {
       const proc = Bun.spawnSync(step.argv, {
         stdin: step.stdin !== undefined ? new TextEncoder().encode(step.stdin) : undefined,
@@ -6792,6 +6902,8 @@ async function runAutoContinueOnce(ctx: Ctx, argv: string[]): Promise<number> {
   if (!flags.retryKey) return 2
   if (flags.text !== "continue" && flags.text !== "продолжи") return 2
   if (flags.delayMs > 0) await Bun.sleep(flags.delayMs)
+  // Set when the "continue" stayed typed in the box (#463); reported after the lock.
+  let unsubmitted: string | null = null
   try {
     const result = withRoutesLock(
       fsRoutesLockIo(overloadRetryLockPath(ctx.paths.overloadRetries)),
@@ -6815,6 +6927,7 @@ async function runAutoContinueOnce(ctx: Ctx, argv: string[]): Promise<number> {
         const res = executeInjectStepsSync(buildTextInjectPlan(flags.paneId, flags.text))
         if (!res.ok) {
           log(`auto-continue-once inject failed for ${flags.paneId}: ${res.error}`)
+          if (res.unsubmitted) unsubmitted = res.error
           return finish(1)
         }
         log(`auto-continue-once fired for ${flags.paneId} (${flags.text})`)
@@ -6822,6 +6935,7 @@ async function runAutoContinueOnce(ctx: Ctx, argv: string[]): Promise<number> {
       },
       { attempts: OVERLOAD_RETRY_LOCK_ATTEMPTS, delayMs: OVERLOAD_RETRY_LOCK_DELAY_MS, onContended: "skip" },
     )
+    if (unsubmitted !== null) await sendMessage(ctx, unsubmitted)
     return result ?? 0
   } catch (err) {
     log(`auto-continue-once failed for ${flags.paneId}: ${err}`)
@@ -7655,6 +7769,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         await postRoutePicker(listAgentCandidates(), item.text, `${res.error} — pick where this goes:`, item.sourceMessageId, item.relatedReactionMessageId)
         return false
       }
+      // Typed but still in the input box after the retry Enter (#463): the CTO
+      // hears exactly that — the "resend it" notice below would type it twice.
+      if (res.unsubmitted) {
+        const reply = item.sourceMessageId === null ? {} : { reply_parameters: { message_id: item.sourceMessageId, allow_sending_without_reply: true } }
+        await sendMessage(ctx, res.error, reply)
+        return false
+      }
       error = res.error
     } catch (err) {
       log(`deferred flush into ${paneId} threw: ${err}`)
@@ -7828,7 +7949,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // GRACEFUL_SHUTDOWN_MS misses no update across the swap. The hard-exit fallback
   // bounds a hung/oversized batch: if the remaining actions exceed the ceiling it
   // exits mid-batch and that tail is lost at-most-once (the normal non-graceful
-  // behaviour) — in practice a batch is a few send-keys, far under the ceiling.
+  // behaviour) — in practice a batch is a few send-keys: ~1.2 s per text delivery
+  // (~2 s when the #463 submit check retries Enter); a batch's deliveries run
+  // concurrently, even into one pane.
   // (launchd would SIGKILL after its own grace period regardless.)
   let shuttingDown = false
   let pollAbort: AbortController | null = null
@@ -10640,8 +10763,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // Clear the card's button first so a stale card can't re-arm a second inject.
     if (s.cardMessageId !== null) await clearMessageKeyboard(ctx, s.cardMessageId)
     const res = await executeInjectSteps(buildTextInjectPlan(s.paneId, "continue"))
-    if (!res.ok) log(`auto-continue inject failed for ${s.paneId}: ${res.error}`)
-    else log(`auto-continue fired for ${s.paneId} (agent=${s.agent})`)
+    if (!res.ok) {
+      log(`auto-continue inject failed for ${s.paneId}: ${res.error}`)
+      // Typed but still in the input box (#463): the CTO armed this — tell him.
+      if (res.unsubmitted) {
+        await sendMessage(ctx, res.error, s.sourceMessageId === null ? {} : { reply_parameters: { message_id: s.sourceMessageId, allow_sending_without_reply: true } })
+      }
+      // The agent did not resume: the source keeps its 😴, never a false 👀.
+      return
+    }
+    log(`auto-continue fired for ${s.paneId} (agent=${s.agent})`)
     // Resume: flip the ORIGINAL inbound message (😴 → 👀), not the bot's card.
     if (s.sourceMessageId !== null) await setMessageReaction(ctx, s.sourceMessageId, reactionForStage("working"))
   }
@@ -11220,6 +11351,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const res = retained.req.agent === "omp"
       ? await deliverOriginalOmp(liveOmpForPane(paneId) ?? { cwd: retained.req.cwd ?? "/" }, wrapInbound(ctx.cfg.injectWrap, "tg", answer.label), `answer:${action.requestId}`, paneId)
       : await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
+    // Typed but still in the input box after the retry Enter (#463): keep the claim
+    // — a re-tap would type the answer a second time — and tell the CTO in the chat.
+    if (!res.ok && res.unsubmitted) {
+      log(`ask-late-deliver-unsubmitted: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId}`)
+      await answerCallbackQuery(ctx, action.callbackQueryId, "typed but not sent — see the chat")
+      await sendMessage(ctx, res.error)
+      return true
+    }
     if (!res.ok) {
       // The pane is unreachable (gone / no longer an agent). ROLL BACK the claim:
       // restore the retained entry (with its ORIGINAL `at`, so a failed attempt doesn't
@@ -11305,6 +11444,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     persistQuestions()
 
     const res = await injectInbound(action.messageId, paneId, buildTextInjectPlan(paneId, answer, { sessionKey: retained.req.sessionKey }))
+    // Typed but still in the input box after the retry Enter (#463): keep the claim
+    // — a second reply would type the answer again — and tell the CTO.
+    if (!res.ok && res.unsubmitted) {
+      log(`ask-post-timeout-reply-unsubmitted: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId}`)
+      await sendMessage(ctx, res.error)
+      return false
+    }
     if (!res.ok) {
       answeredButtons.delete(action.requestId)
       abandonedButtons.set(action.requestId, { req: retained.req, messageId: retained.messageId, at: retained.at })

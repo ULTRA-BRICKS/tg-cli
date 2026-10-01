@@ -43,12 +43,15 @@ export type LedgerEvent =
   // A second delivery of an already delivered/claimed message was suppressed.
   | { ts: number; event: 'duplicate'; chat: number; msg: number; target: string; prior: string }
   // A claim from a previous daemon run had no outcome; the CTO was told, it is never re-sent.
-  | { ts: number; event: 'uncertain'; chat: number; msg: number; target: string };
+  | { ts: number; event: 'uncertain'; chat: number; msg: number; target: string }
+  // Typed into the pane but still in its input box after the retry Enter (tg-cli#463); the
+  // CTO was told. Never re-sent: the text is already in the box.
+  | { ts: number; event: 'unsubmitted'; chat: number; msg: number; target: string };
 
 export type LedgerHold = 'deferred' | 'picker' | 'topic-hold';
 
 export type MessageState =
-  | { state: 'claimed' | 'delivered' | 'uncertain'; target: string; at: number }
+  | { state: 'claimed' | 'delivered' | 'uncertain' | 'unsubmitted'; target: string; at: number }
   | { state: 'failed'; target: string; at: number; error: string }
   | { state: 'queued'; target: string; at: number; hold: LedgerHold };
 
@@ -100,6 +103,7 @@ export function parseLedgerLine(line: string): LedgerEvent | null {
     case 'claimed':
     case 'delivered':
     case 'uncertain':
+    case 'unsubmitted':
       return isStr(r.target) ? { ts, event: r.event, chat, msg, target: r.target } : null;
     case 'failed':
       return isStr(r.target) && isStr(r.error) ? { ts, event: 'failed', chat, msg, target: r.target, error: r.error } : null;
@@ -141,6 +145,7 @@ export function applyLedgerEvents(state: LedgerState, events: LedgerEvent[]): Le
       case 'claimed':
       case 'delivered':
       case 'uncertain':
+      case 'unsubmitted':
         state.messages.set(ledgerKey(e.chat, e.msg), { state: e.event, target: e.target, at: e.ts });
         break;
       case 'failed':
@@ -151,7 +156,7 @@ export function applyLedgerEvents(state: LedgerState, events: LedgerEvent[]): Le
         // re-queue a message whose earlier copy was delivered.
         const key = ledgerKey(e.chat, e.msg);
         const prior = state.messages.get(key);
-        if (prior && (prior.state === 'delivered' || prior.state === 'claimed' || prior.state === 'uncertain')) break;
+        if (prior && prior.state !== 'failed' && prior.state !== 'queued') break;
         state.messages.set(key, { state: 'queued', target: e.target, at: e.ts, hold: e.hold });
         break;
       }
@@ -166,7 +171,7 @@ export function applyLedgerEvents(state: LedgerState, events: LedgerEvent[]): Le
 export type DeliveryDecision = { kind: 'deliver' } | { kind: 'suppress'; prior: MessageState };
 
 // THE rule every sink applies. Only a message with no delivery in flight or done may
-// be sent: `delivered` and `uncertain` are final, and a `claimed` seen at runtime is a
+// be sent: `delivered`, `uncertain` and `unsubmitted` are final, and a `claimed` seen at runtime is a
 // concurrent copy of the same message already on its way (startup converts every
 // claim left by a dead run into `uncertain` first — see orphanedClaims). A `failed`
 // or `queued` message may be (re)sent: a failure proved nothing arrived, and a hold is
@@ -178,13 +183,16 @@ export function decideDelivery(prior: MessageState | undefined): DeliveryDecisio
 
 // What a sink reports back after a send. `uncertain`: the send failed AFTER bytes of the
 // message were already written (a PTY connection lost mid-paste) — the text may have
-// arrived, so unlike a plain failure it must never be sent again.
-export type SinkResult = { ok: true } | { ok: false; error: string; uncertain?: boolean };
+// arrived, so unlike a plain failure it must never be sent again. `unsubmitted`: the text was
+// typed into a tmux pane but is still in the agent's input box after the retry Enter (#463) —
+// final for the same reason.
+export type SinkResult = { ok: true } | { ok: false; error: string; uncertain?: boolean; unsubmitted?: true };
 
 // The outcome event a sink's result writes, closing the claim that preceded the send.
 export function sinkOutcomeEvent(ts: number, base: { chat: number; msg: number; target: string }, res: SinkResult): LedgerEvent {
   if (res.ok) return { ts, event: 'delivered', ...base };
   if (res.uncertain) return { ts, event: 'uncertain', ...base };
+  if (res.unsubmitted) return { ts, event: 'unsubmitted', ...base };
   return { ts, event: 'failed', ...base, error: res.error };
 }
 

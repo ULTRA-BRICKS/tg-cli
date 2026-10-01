@@ -61,6 +61,12 @@ case "$sub" in
     done
     ;;
   load-buffer) cat >> '${injectLog}'; printf '\\n' >> '${injectLog}' ;;
+  capture-pane)
+    # Test hook (#463): with the sentinel, every Enter is lost — the pane shows the
+    # last injected text still in a Claude Code input box.
+    [ -f '${cwd}/enter-lost' ] || exit 0
+    printf 'transcript\\n\\n────────────────────\\n❯ %s\\n────────────────────\\n  footer\\n' "$(tail -n 1 '${injectLog}')"
+    ;;
 esac
 exit 0
 `;
@@ -412,6 +418,64 @@ test('POST-TIMEOUT REPLY: a text reply to the retained question card injects the
   expect(await until(() => tg.edits().some((e) => e.includes('Selected answer: Production')), 4000)).toBe(true);
   expect(await until(() => tg.keyboardClears() >= 1, 4000)).toBe(true);
 }, 25_000);
+
+// #463: the answer is typed but both Enters are lost. It must be reported in the chat
+// and the delivery claim kept — a re-tap or a "reply again" would type it a second time.
+const unsubmittedReport = (t: string): boolean => t.includes(`pane ${PANE_ID} (claude)`) && t.includes('Production');
+
+test('LATE-DELIVER unsubmitted: a tap typed into the pane but never submitted is reported, and a re-tap types nothing', async () => {
+  const cfgDir = makeCfgDir();
+  writeFileSync(join(cfgDir, 'enter-lost'), '');
+  const tg = mockTelegram();
+  servers.push(tg);
+  await startDaemon(cfgDir, tg.port);
+
+  const ask = startAsk(cfgDir, tg.port, QUESTION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+  const productionData = tg.optionData(1);
+  ask.kill(9);
+  await ask.exited;
+  expect(await until(() => tg.edits().some((e) => e.includes('Time-out expired.')), 6000)).toBe(true);
+
+  tg.push([tap(productionData!, 710, 1)]);
+  expect(await until(() => tg.plainMessages().some(unsubmittedReport), 8000)).toBe(true);
+  expect(daemonLog(cfgDir)).toContain('ask-late-deliver-unsubmitted');
+
+  tg.push([tap(productionData!, 711, 1)]);
+  expect(await until(() => tg.answeredCbs().length >= 2, 6000)).toBe(true);
+  expect(injected(cfgDir).filter((l) => l.includes('Production'))).toHaveLength(1);
+}, 30_000);
+
+test('POST-TIMEOUT REPLY unsubmitted: a reply typed but never submitted is reported, not rolled back into "reply again"', async () => {
+  const cfgDir = makeCfgDir();
+  writeFileSync(join(cfgDir, 'enter-lost'), '');
+  const tg = mockTelegram();
+  servers.push(tg);
+  await startDaemon(cfgDir, tg.port);
+
+  const ask = startAsk(cfgDir, tg.port, QUESTION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+  ask.kill(9);
+  await ask.exited;
+  expect(await until(() => tg.edits().some((e) => e.includes('Time-out expired.')), 6000)).toBe(true);
+
+  tg.push([
+    {
+      update_id: 720,
+      message: {
+        message_id: 721,
+        from: { id: 1, first_name: 'Alex' },
+        chat: { id: 1 },
+        date: Math.floor(Date.now() / 1000),
+        text: 'Production',
+        reply_to_message: { message_id: 1, chat: { id: 1 }, date: Math.floor(Date.now() / 1000) - 30, text: 'Question from claude\n\nWhere should I deploy?' },
+      },
+    },
+  ]);
+  expect(await until(() => tg.plainMessages().some(unsubmittedReport), 8000)).toBe(true);
+  expect(daemonLog(cfgDir)).toContain('ask-post-timeout-reply-unsubmitted');
+  expect(tg.plainMessages().some((t) => t.includes('reply to the question again'))).toBe(false);
+}, 30_000);
 
 test('LATE-DELIVER failure: an unreachable pane keeps the entry retained for a re-tap (answer not lost)', async () => {
   const cfgDir = makeCfgDir();

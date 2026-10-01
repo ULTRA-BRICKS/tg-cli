@@ -1,0 +1,39 @@
+ Hello. Your message said "hello omp pending" and I don't have a task from it. What do you want me to do?
+
+
+ run the bash command: sleep 25 ; then reply ok
+
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ $ sleep 25                                                                                                           │
+├─── Output ───────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Backgrounded early to handle an incoming message; the command keeps running.                                         │
+│ ⟦Backgrounded: bg_1 | Timeout: 60s⟧                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+ [TG from tg tg#43] queued omp msg
+
+
+ That Telegram message doesn't require any action from me. The sleep job is still running, so I'll wait for it to
+ finish before responding.
+
+ The new message, "queued omp msg", has no instruction in it, so the sleep task stands. I'm waiting for the job to
+ finish.
+
+✔ 1 job settled 1 done
+└─ • ⟦bash⟧ bg_1 sleep 25 · 25.0s
+     (no output)
+
+ ok
+╭── 📄 #1 ───╮
+│[TG from tg…│
+│row 1 of a …│
+│row 2 of a …│
+│row 3 of a …│
+╰ +31 lines ─╯
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ 📄 #1
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ π · ⬢ Sonnet 5.5 🙈 · ◔ low · 🗑 t463/w · ⑂ main · ◫ 1.8%/1M ⟲ · S0.09 + 👁 S0.27        Run sleep command then reply ok

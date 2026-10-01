@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { wrapInbound, buildTextInjectPlan, buildKeyInjectPlan, buildDigitInjectPlan } from '../features/tg-ctl/inject';
+import { wrapInbound, buildTextInjectPlan, buildKeyInjectPlan, buildDigitInjectPlan, paneTypingKey, unsubmittedNotice } from '../features/tg-ctl/inject';
 import type { InjectStep } from '../features/tg-ctl/types';
 
 // --- wrapInbound: {name}/{msg} template substitution ---
@@ -64,12 +64,17 @@ test('the no-id {id} cleanup NEVER mangles the user message (codex regression)',
 
 // --- buildTextInjectPlan: single-line ---
 
-test('single-line text → verify-pane, literal send-keys, sleep, Enter', () => {
+test('single-line text → verify-pane, literal send-keys, sleep, Enter, submit check with one retry Enter', () => {
   expect(buildTextInjectPlan('%3', 'hello world')).toEqual([
     { kind: 'verify-pane', paneId: '%3' },
     { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%3', '-l', 'hello world'] },
     { kind: 'sleep', ms: 500 },
     { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%3', 'Enter'] },
+    { kind: 'sleep', ms: 700 },
+    { kind: 'submit-check', paneId: '%3', text: 'hello world' },
+    { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%3', 'Enter'] },
+    { kind: 'sleep', ms: 700 },
+    { kind: 'submit-check', paneId: '%3', text: 'hello world', final: true },
   ]);
 });
 
@@ -91,6 +96,11 @@ test('multi-line text → load-buffer with stdin, then bracketed paste-buffer', 
     { kind: 'tmux', argv: ['tmux', 'paste-buffer', '-p', '-d', '-t', '%7'] },
     { kind: 'sleep', ms: 500 },
     { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%7', 'Enter'] },
+    { kind: 'sleep', ms: 700 },
+    { kind: 'submit-check', paneId: '%7', text },
+    { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%7', 'Enter'] },
+    { kind: 'sleep', ms: 700 },
+    { kind: 'submit-check', paneId: '%7', text, final: true },
   ]);
 });
 
@@ -129,7 +139,8 @@ test('no escapePrelude by default', () => {
 
 test('custom gapMs replaces the default 500ms pre-Enter sleep', () => {
   const plan = buildTextInjectPlan('%4', 'hi', { gapMs: 1200 });
-  expect(plan.at(-2)).toEqual({ kind: 'sleep', ms: 1200 });
+  const firstEnter = plan.findIndex((s) => s.kind === 'tmux' && s.argv.includes('Enter'));
+  expect(plan[firstEnter - 1]).toEqual({ kind: 'sleep', ms: 1200 });
 });
 
 test('prelude sleep stays 200ms even with custom gapMs', () => {
@@ -138,6 +149,8 @@ test('prelude sleep stays 200ms even with custom gapMs', () => {
   expect(sleeps).toEqual([
     { kind: 'sleep', ms: 200 },
     { kind: 'sleep', ms: 1200 },
+    { kind: 'sleep', ms: 700 },
+    { kind: 'sleep', ms: 700 },
   ]);
 });
 
@@ -156,21 +169,33 @@ test('verify-pane is ALWAYS the first step', () => {
   }
 });
 
-test('Enter is ALWAYS its own final step, preceded by a sleep', () => {
+test('Enter is ALWAYS its own step after a sleep; the only second Enter is the retry behind a submit check', () => {
   const variants = [
     buildTextInjectPlan('%5', 'one'),
     buildTextInjectPlan('%5', 'one\ntwo'),
     buildTextInjectPlan('%5', 'one', { escapePrelude: true, gapMs: 50 }),
   ];
+  const ENTER = { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%5', 'Enter'] };
   for (const plan of variants) {
-    const last = plan.at(-1)!;
-    expect(last).toEqual({ kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%5', 'Enter'] });
+    const enters = plan.flatMap((s, i) => (s.kind === 'tmux' && s.argv.includes('Enter') ? [i] : []));
+    expect(enters).toHaveLength(2);
+    for (const i of enters) expect(plan[i]).toEqual(ENTER); // never rides along with the payload
+    expect(plan[enters[0] - 1].kind).toBe('sleep');
+    // The retry Enter runs only after a check found the text still typed…
+    expect(plan[enters[1] - 1]).toMatchObject({ kind: 'submit-check', paneId: '%5' });
+    expect(plan[enters[1] - 2].kind).toBe('sleep');
+    // …and the plan ends on the final check, which reports a still-typed text.
+    expect(plan.at(-1)).toMatchObject({ kind: 'submit-check', paneId: '%5', final: true });
     expect(plan.at(-2)!.kind).toBe('sleep');
-    // Enter must never ride along with the text payload.
-    for (const step of plan.slice(0, -1)) {
-      if (step.kind === 'tmux') expect(step.argv).not.toContain('Enter');
-    }
   }
+});
+
+test('the unsubmitted notice names the pane and agent and quotes the first line, truncated', () => {
+  const notice = unsubmittedNotice('%5', 'claude', `[TG from Alex tg#9] ${'x'.repeat(300)}\nsecond line`);
+  expect(notice).toContain('pane %5 (claude)');
+  expect(notice).toContain('[TG from Alex tg#9] xxx');
+  expect(notice).not.toContain('second line');
+  expect(notice).toContain('…»');
 });
 
 // --- buildKeyInjectPlan ---
@@ -208,4 +233,14 @@ test('digit plan never includes an Enter step', () => {
   const plan = buildDigitInjectPlan('%8', '3');
   expect(plan.some((s) => s.kind === 'tmux' && s.argv.includes('Enter'))).toBe(false);
   expect(plan.some((s) => s.kind === 'sleep')).toBe(false);
+});
+
+// A late button tap (digit/key plan) types into the same pane as a text plan mid submit-check:
+// they must take the same turn, and plans for different panes must not wait on each other.
+test('paneTypingKey: text, digit and key plans of one pane share a turn; other panes do not', () => {
+  const key = paneTypingKey(buildTextInjectPlan('%5', 'hi'));
+  expect(key).not.toBeNull();
+  expect(paneTypingKey(buildDigitInjectPlan('%5', '1'))).toBe(key);
+  expect(paneTypingKey(buildKeyInjectPlan('%5', 'Escape'))).toBe(key);
+  expect(paneTypingKey(buildTextInjectPlan('%6', 'hi'))).not.toBe(key);
 });

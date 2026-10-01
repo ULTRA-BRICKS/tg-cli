@@ -29,14 +29,18 @@ describe('decideDelivery', () => {
     expect(decideDelivery(state.messages.get(ledgerKey(CHAT, 2))).kind).toBe('deliver');
   });
 
-  test('a delivered, in-flight or uncertain message is never sent again', () => {
+  test('a delivered, in-flight, uncertain or unsubmitted message is never sent again', () => {
     const state = fold([
       { ts: 1, event: 'claimed', chat: CHAT, msg: 1, target: '%1' },
       { ts: 2, event: 'delivered', chat: CHAT, msg: 1, target: '%1' },
       { ts: 3, event: 'claimed', chat: CHAT, msg: 2, target: 'omp:9' },
       { ts: 4, event: 'uncertain', chat: CHAT, msg: 3, target: '%2' },
+      // Typed but left in the input box (#463): a second copy would land in the same box.
+      { ts: 5, event: 'claimed', chat: CHAT, msg: 4, target: '%3' },
+      { ts: 6, event: 'unsubmitted', chat: CHAT, msg: 4, target: '%3' },
+      { ts: 7, event: 'queued', chat: CHAT, msg: 4, target: '%3', hold: 'deferred' },
     ]);
-    for (const msg of [1, 2, 3]) expect(decideDelivery(state.messages.get(ledgerKey(CHAT, msg))).kind).toBe('suppress');
+    for (const msg of [1, 2, 3, 4]) expect(decideDelivery(state.messages.get(ledgerKey(CHAT, msg))).kind).toBe('suppress');
   });
 
   test('a held message is released through the same gate', () => {

@@ -35,7 +35,9 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
   harness failures/limits and optional proactive usage telemetry, not successful
   completion.
 - **No full-session streaming / terminal mirror** — that is `/rc` and every competitor.
-- **No screen-scraping** (`capture-pane`) for the round-trip.
+- **No screen-scraping** (`capture-pane`) for the round-trip. (Delivery checks may read the
+  agent's input box — the #463 submit check below — but agent output never travels to Telegram
+  that way.)
 - **No arbitrary remote shell** — the only injection target is the agent session.
 
 ## 3. Architecture overview
@@ -134,6 +136,14 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
   - `tmux send-keys -t <pane> Enter`.
   - Text and Enter are **separate** calls with a gap — a combined/too-fast Enter is
     dropped by the Ink TUI (the single most common failure in the other bots).
+  - Submit check (tg-cli#463): even a paced Enter is sometimes lost, leaving the message typed
+    in the input box. ~0.7s after Enter, `capture-pane -pJ` and ask the input-box adapter
+    (`features/tg-ctl/input-box.ts` — the only file that knows how claude, codex and omp draw
+    their box) whether the text is still there; if so send Enter ONCE more, re-check, and if it
+    is still typed report it to the CTO in the chat. A harness without an adapter, or a box not
+    on screen, is not verified (logged), never retried. Before the capture and before the retry
+    Enter the pane must still run the same agent process (pid) the text was typed into; a pane
+    reused during the wait is not verified (logged), never read, never sent that Enter.
   - Control verbs (raw keys, no `-l`): `Escape` (exit picker), `BTab` (cycle
     permission mode).
 - **`/stop` / interrupt (corrected by review EXT-1):** `tmux send-keys -t <pane>

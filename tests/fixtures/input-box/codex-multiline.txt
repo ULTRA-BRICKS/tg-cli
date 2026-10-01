@@ -1,0 +1,39 @@
+
+  Tip: Try the Desktop app. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true
+
+⚠ MCP client for `haft` failed to start: MCP startup failed: Unexpected response type
+
+• You have 2 usage limit resets available. Run /usage to use one.
+
+⚠ MCP startup incomplete (failed: haft)
+
+
+› [TG from tg tg#42] hello codex pending
+
+
+⚠ Skill descriptions were shortened to fit the skills context budget. Codex can still see every skill, but some
+  descriptions are shorter. Disable unused skills or plugins to leave more room for the rest.
+
+■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at
+Oct 4th, 2026 4:56 PM.
+
+
+› run shell command: sleep 25 ; then reply ok
+
+
+■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at
+Oct 4th, 2026 4:56 PM.
+
+
+› [TG from tg tg#44] queued codex msg
+
+
+■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at
+Oct 4th, 2026 4:56 PM.
+
+
+› [TG from tg tg#45] line one
+  line two
+  line three
+
+  gpt-5.6-luna medium · /private/tmp/t463/w

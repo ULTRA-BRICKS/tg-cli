@@ -101,11 +101,13 @@ describe('buildAuditReport', () => {
           row(8, 'failed, told the CTO'),
           row(9, 'waiting behind a question'),
           row(10, 'какой статус?'),
+          row(11, 'typed, Enter lost'),
         ],
         ledger: [
           { ts: 1, event: 'delivered', chat: CHAT, msg: 2, target: '%1' },
           { ts: 1, event: 'failed', chat: CHAT, msg: 8, target: '%1', error: 'pane gone' },
           { ts: 1, event: 'queued', chat: CHAT, msg: 9, target: '%1', hold: 'deferred' },
+          { ts: 1, event: 'unsubmitted', chat: CHAT, msg: 11, target: '%1' },
         ],
         copies: [
           { msg: 1, body: 'typed, seen in a transcript', file: 'a.jsonl', recordId: 'x', ts: null, mirror: false },
@@ -114,12 +116,15 @@ describe('buildAuditReport', () => {
         logAttempts: new Set([3]),
       }),
     );
-    expect(report.received).toBe(10);
+    expect(report.received).toBe(11);
     expect(report.delivered).toBe(3); // 1 transcript, 2 ledger, 10 id-less body match
     expect(report.unconfirmed.map((m) => m.msg)).toEqual([3]);
-    // No evidence either way is not a loss; only the ledger's recorded failure is.
+    // No evidence either way is not a loss; only the ledger's recorded failures are.
     expect(report.unverified.map((m) => m.msg)).toEqual([4, 7]);
-    expect(report.undelivered.map((m) => [m.msg, m.reason])).toEqual([[8, 'failed, CTO notified: pane gone']]);
+    expect(report.undelivered.map((m) => [m.msg, m.reason])).toEqual([
+      [8, 'failed, CTO notified: pane gone'],
+      [11, 'typed into the pane but never submitted, CTO notified'],
+    ]);
     expect(report.pending.map((m) => [m.msg, m.hold])).toEqual([[9, 'deferred']]);
     expect(report.notForDelivery).toBe(2);
   });
