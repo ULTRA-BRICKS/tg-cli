@@ -3,6 +3,35 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.0
+
+- **Any harness in a rig-wrapper session is reachable outside tmux.** A Claude Code, Codex, opencode
+  or omp that `rig harness run <harness> --name <label>` hosts in abduco is registered by the wrapper
+  in `~/.config/tg-cli/hosts/<name>.json`; `tg-ctl` trusts a record only while the process table shows
+  its abduco server with exactly one harness of the recorded kind under it, and types inbound
+  Telegram text into the session's PTY through abduco's client socket (low-priority attach, a
+  one-line message typed as is, a multi-line one as a bracketed paste, a gap, a separate Enter). It
+  goes through `deliverInboundOnce` with target `host:<name>`, so it is sent exactly once; a
+  connection lost after text was written is ledger `uncertain` (never re-sent, the CTO is told).
+  `/agent <label|name|project>`, a reply to its message, the sole-agent auto-bind and the picker all
+  reach it; a tmux pane that shows the same session keeps priority, and so does omp-live (the PTY is
+  an omp's fallback only on a proven-absent endpoint). `tg-ctl status` lists `hosted (abduco, outside
+  tmux)`. Spec: `docs/specs/2026-09-30-harness-agnostic-control.md`.
+- **`tg` inside a hosted session** reads `$RIG_SESSION`: the record's label is the `[window]` bracket
+  outside tmux (resolver tier: host label, then harness title, then cwd project; the title is secondary
+  under a label) and `host:<name>` is the route origin, so a CTO reply routes back into the PTY.
+- **Hosted-session delivery details.** Two messages for one host are typed one after the other
+  (never interleaved). Inbound is deferred while the hosted session has an open question and the
+  deferred backlog is flushed through the PTY, not tmux. A PTY write that fails part-way through a
+  packet is ledger `uncertain`; a server that stops reading fails the delivery after 5 s instead of
+  hanging the daemon; C1 controls (U+0080-009F, incl. the one-character CSI) are stripped from typed
+  text. A wrapper-hosted omp is selectable by its wrapper label. The unreachable refusal names
+  `rig harness run` only for the four harnesses the wrapper hosts.
+- **Refusal text no longer names `claude-rotate`** (retired): an agent outside tmux and outside the
+  wrapper is listed as unreachable and `/agent` to it answers with
+  `rig harness run <harness> --name <label>` (or a tmux window). The one-time stranded-inbox report and
+  AGENTS.md/README/skill/spec no longer call Claude Code and Codex "tmux-only".
+
 ## 1.54.33
 
 - **The live e2e harness no longer depends on `claude-rotate` (retired).** The `cc` fixture runs

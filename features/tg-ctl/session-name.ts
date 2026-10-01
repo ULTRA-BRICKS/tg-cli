@@ -84,6 +84,10 @@ export interface SessionNameInput {
   harnessTitle?: string | null;
   // The raw tmux `#{pane_title}` — used only when the adapter has no title.
   paneTitle?: string | null;
+  // The label a rig wrapper gave the abduco session it hosts outside tmux (the host
+  // record's `label`, docs/specs/2026-09-30-harness-agnostic-control.md §3): the part a
+  // window name plays in tmux. Ignored when the session is in a tmux pane.
+  hostLabel?: string | null;
   // Last-resort id when nothing else names the session (e.g. `omp · 1a2b3c4d`).
   fallback?: string | null;
 }
@@ -96,7 +100,8 @@ export interface SessionName {
 // Precedence:
 //   in tmux     primary = window name (non-bare) → cwd basename → title → bare window → fallback
 //               secondary = harness title (when it differs from the primary)
-//   not in tmux primary = harness title → cwd basename → fallback; no secondary
+//   not in tmux primary = host label → harness title → cwd basename → fallback
+//               secondary = harness title when a host label leads and it differs
 // Never a placeholder like "no tmux" (tg-cli#448): a session with no usable signal
 // at all gets '' and the caller omits the bracket.
 export function resolveSessionName(input: SessionNameInput): SessionName {
@@ -104,6 +109,8 @@ export function resolveSessionName(input: SessionNameInput): SessionName {
   const project = cwdBasename(input.cwd);
   const fallback = (input.fallback ?? '').trim();
   if (input.tmuxWindow === null || input.tmuxWindow === undefined) {
+    const hostLabel = (input.hostLabel ?? '').trim();
+    if (hostLabel) return { primary: hostLabel, secondary: title && title.toLowerCase() !== hostLabel.toLowerCase() ? title : null };
     return { primary: title || project || fallback, secondary: null };
   }
   const win = input.tmuxWindow.trim();

@@ -12,6 +12,7 @@ import {
   orphanedClaims,
   parseLedger,
   serializeLedgerEvents,
+  sinkOutcomeEvent,
   type LedgerEvent,
 } from '../features/tg-ctl/delivery-ledger';
 
@@ -88,4 +89,20 @@ describe('restart bookkeeping', () => {
 test('a torn trailing line (a kill mid-append) is skipped, earlier events survive', () => {
   const raw = `${serializeLedgerEvents([{ ts: 1, event: 'delivered', chat: CHAT, msg: 1, target: '%1' }])}{"ts":2,"event":"claim`;
   expect(parseLedger(raw)).toEqual([{ ts: 1, event: 'delivered', chat: CHAT, msg: 1, target: '%1' }]);
+});
+
+describe('sinkOutcomeEvent', () => {
+  const base = { chat: CHAT, msg: 9, target: 'host:claude-3f9a0c1d2e4b' };
+
+  test('a sink that delivered records delivered; one that proved nothing arrived records failed', () => {
+    expect(sinkOutcomeEvent(5, base, { ok: true })).toEqual({ ts: 5, event: 'delivered', ...base });
+    expect(sinkOutcomeEvent(5, base, { ok: false, error: 'socket gone' })).toEqual({ ts: 5, event: 'failed', ...base, error: 'socket gone' });
+  });
+
+  test('a sink whose bytes may have arrived records uncertain — the message is then never re-sent', () => {
+    const ev = sinkOutcomeEvent(5, base, { ok: false, error: 'dropped mid-write', uncertain: true });
+    expect(ev).toEqual({ ts: 5, event: 'uncertain', ...base });
+    const state = fold([ev]);
+    expect(decideDelivery(state.messages.get(ledgerKey(CHAT, 9))).kind).toBe('suppress');
+  });
 });

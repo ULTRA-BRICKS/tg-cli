@@ -245,12 +245,14 @@ reply keeps the quote anchor and reaches the replied-to origin pane).
   transient network blip (3 attempts, jittered ~300ms→2.7s) before giving up,
   so a momentary hiccup no longer silently drops the message.
 
-## Replies need tmux (Claude Code, Codex)
-Replies are typed into your tmux pane. Claude Code and Codex are tmux-only: one started
-OUTSIDE tmux (no \`$TMUX\`) is listed by \`tg-ctl status\` as \`unreachable: not in tmux\`,
-and a \`/agent <name> <text>\` to it is refused — nothing reaches you and nothing is
-queued. Start inside tmux (\`claude-rotate --tmux <name>\`). omp is the exception: it is
-reached outside tmux through its original-process bridge (\`tg-ctl omp-live\`).
+## Replies need a terminal tg-ctl can type into
+Replies are typed into your tmux pane, or — outside tmux — into the abduco session the rig
+wrapper runs you in (\`rig harness run <harness> --name <label>\`; \`tg\` then labels you with
+that name). A Claude Code, Codex or opencode started OUTSIDE tmux and outside the wrapper is
+listed by \`tg-ctl status\` as \`unreachable: not in tmux\`, and a \`/agent <name> <text>\` to it
+is refused — nothing reaches you and nothing is queued. Restart it with
+\`rig harness run <harness> --name <name>\` (or in a tmux window). omp is also reached outside
+tmux through its original-process bridge (\`tg-ctl omp-live\`).
 
 Always use \`tg\`, never direct curl to the Telegram API.
 `;

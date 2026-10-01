@@ -10,8 +10,9 @@
 // not exist for it — silently (incident 2026-09-05: agents `landing` and `rig-fable`).
 // This module makes such agents VISIBLE (status + the no-agent reply list them as
 // unreachable with the reason) and turns `/agent <name> …` to one into a one-line
-// refusal naming how to start it inside tmux. Claude Code and Codex are tmux-only
-// (tg-cli#456, CTO 2026-09-29); only omp works outside tmux, through omp-live (omp.ts).
+// refusal naming how to start it under the rig wrapper or inside tmux. Outside tmux only omp
+// (through omp-live, omp.ts) and sessions a rig wrapper hosts in abduco (host-registry.ts) are
+// reachable (tg-cli#456, CTO 2026-09-29; harness-agnostic control 2026-09-30).
 // The Stop-hook inbox that used to carry `/agent` text to them delivered only at the
 // agent's next turn end, so an idle session never got it (17 messages stranded).
 //
@@ -144,7 +145,7 @@ interface CommandShape {
   // follow-up: removing the tty requirement is only safe for a headless-aware shape).
   headlessAware: boolean;
 }
-// tg-ctl's own launcher flags, understood by every harness row (claude-rotate passes
+// tg-ctl's own launcher flags, understood by every harness row (`rig harness run` passes
 // `--name <label>` to whichever binary it starts): applied on top of each shape so a
 // label like `daemon`/`exec`/`run` is never read as a subcommand.
 const LAUNCHER_VALUE_OPTIONS = new Set(['--name']);
@@ -348,9 +349,8 @@ export function describeUnreachable(a: UnreachableAgent): string {
 }
 
 export const UNREACHABLE_HINT =
-  'Only omp works outside tmux (via omp-live); Claude Code, Codex and the other harnesses are tmux-only — ' +
-  'Telegram cannot reach them there. Restart it inside tmux: `claude-rotate --tmux <name>` (Claude Code) or ' +
-  '`tmux new-window -n <name> <harness>`.';
+  'Not reachable — started outside tmux and outside the rig wrapper. ' +
+  'Restart it with `rig harness run <harness> --name <label>` (or in a tmux window: `tmux new-window -n <label> <harness>`).';
 
 // The reply for a message that could not be injected anywhere. With unreachable agents
 // present it LISTS them (the whole point of #306: never a silent drop, never a bare
@@ -367,25 +367,28 @@ function shellWord(s: string): string {
   return /^[A-Za-z0-9._@%+=:,/-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-// How to start this agent inside tmux: `claude-rotate --tmux <name>` for Claude Code (it
-// opens the tmux window AND passes `--name`), a named tmux window for any other harness.
-// Named like the agent is listed; a placeholder when neither --name nor cwd is known.
-export function tmuxStartCommand(a: UnreachableAgent): string {
+// How to restart this agent under the rig wrapper, which hosts it in abduco where tg-ctl can
+// type into its PTY (docs/specs/2026-09-30-harness-agnostic-control.md §5). Named like the
+// agent is listed; a placeholder when neither --name nor cwd is known.
+const WRAPPER_HARNESSES: ReadonlySet<string> = new Set(['omp', 'claude', 'codex', 'opencode']);
+export function restartCommand(a: UnreachableAgent): string {
   const label = a.name ?? (cwdBasename(a.cwd) || null);
-  const name = label === null ? '<name>' : shellWord(label);
-  return a.agent === 'claude' ? `claude-rotate --tmux ${name}` : `tmux new-window -n ${name} ${a.agent}`;
+  const name = label === null ? '<label>' : shellWord(label);
+  // The wrapper hosts exactly these; any other kind can only be restarted in a tmux window.
+  return WRAPPER_HARNESSES.has(a.agent) ? `rig harness run ${a.agent} --name ${name}` : `tmux new-window -n ${name} ${a.agent}`;
 }
 
-// The ONE-line reply to `/agent <selector> …` that matched only agents outside tmux
-// (tg-cli#456): who it is, that nothing was sent or queued, and how to start it in tmux.
+// The ONE-line reply to `/agent <selector> …` that matched only agents outside tmux and
+// outside the rig wrapper (tg-cli#456): who it is, that nothing was sent or queued, and how
+// to restart it so it becomes reachable.
 export function outsideTmuxRefusalText(selector: string, hits: UnreachableAgent[]): string {
   const who =
     hits.length === 1
       ? `${unreachableLabel(hits[0])} · ${hits[0].agent} runs outside tmux`
       : `'${selector}' matches ${hits.length} sessions outside tmux (${hits.map((a) => `${unreachableLabel(a)} · ${a.agent} pid ${a.pid}`).join(', ')})`;
-  const starts = [...new Set(hits.map(tmuxStartCommand))].join(' or ');
+  const restarts = [...new Set(hits.map(restartCommand))].join(' or ');
   return (
-    `${who} — Telegram cannot reach ${hits.length === 1 ? 'it' : 'them'} there (only omp works outside tmux), ` +
-    `so nothing was sent or queued. Start it in tmux: ${starts}`
+    `${who} and outside the rig wrapper — Telegram cannot reach ${hits.length === 1 ? 'it' : 'them'} there, ` +
+    `so nothing was sent or queued. Restart it with: ${restarts}${restarts.includes('rig harness run') ? ' (or in a tmux window)' : ''}`
   );
 }

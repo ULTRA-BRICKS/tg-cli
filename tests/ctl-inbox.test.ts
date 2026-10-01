@@ -98,7 +98,7 @@ test('strandedReportText: every stranded message on its own line, oldest first, 
   const lines = text.split('\n');
   expect(lines[0]).toContain('3 message(s)');
   expect(lines[0]).toContain('oldest 2026-09-18 12:15 UTC');
-  expect(lines[0]).toContain('tmux-only');
+  expect(lines[0]).toContain('no longer delivers to Claude Code and Codex');
   expect(lines[0]).toContain('/cfg/inbox');
   // The CTO reads this in a plain-text message: tags stripped, newlines collapsed.
   expect(lines.slice(1)).toEqual([

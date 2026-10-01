@@ -589,6 +589,14 @@ test('outboundOriginPaneId stamps omp:<pid> when there is no tmux pane', () => {
   expect(outboundOriginPaneId({})).toBeNull();
 });
 
+test('outboundOriginPaneId: a session a rig wrapper hosts outside tmux stamps host:<name>; a pane or an omp pid still wins', () => {
+  expect(outboundOriginPaneId({ tmuxPane: null, ompAncestorPid: null, hostName: 'claude-3f9a0c1d2e4b' })).toBe('host:claude-3f9a0c1d2e4b');
+  expect(outboundOriginPaneId({ hostName: 'claude-3f9a0c1d2e4b' })).toBe('host:claude-3f9a0c1d2e4b');
+  expect(outboundOriginPaneId({ tmuxPane: '%4', hostName: 'claude-3f9a0c1d2e4b' })).toBe('%4');
+  expect(outboundOriginPaneId({ ompAncestorPid: 7103, hostName: 'omp-6a830edb351d' })).toBe('omp:7103');
+  expect(outboundOriginPaneId({ hostName: '' })).toBeNull();
+});
+
 test('isLiveOmpOriginId / liveOmpPidFromOriginId parse the synthetic origin', () => {
   expect(isLiveOmpOriginId('omp:7103')).toBe(true);
   expect(liveOmpPidFromOriginId('omp:7103')).toBe(7103);

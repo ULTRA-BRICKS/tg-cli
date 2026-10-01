@@ -3,9 +3,9 @@
 // The tg-ctl entrypoint owns the I/O (mkdir/append/rename), the agent-tools omp Stop
 // bridge owns the CONSUMING side.
 //
-// Claude Code and Codex are tmux-only (tg-cli#456): the daemon never queues for them
-// any more — the Stop hook delivered only at their next turn end, so an idle session
-// never got the message. The one writer left is omp's grant-notice fallback (an omp
+// The daemon no longer queues for Claude Code and Codex (tg-cli#456): they are reached through
+// a tmux pane or a rig-wrapper host, never through the Stop hook, which delivered only at their
+// next turn end, so an idle session never got the message. The one writer left is omp's grant-notice fallback (an omp
 // whose omp-live endpoint is unreachable), consumed at that omp's next yield. What the
 // retired cc/codex channel left behind is claimed ONCE (pending.jsonl →
 // stranded-<stamp>.jsonl), listed to the CTO and kept as the archive.
@@ -190,7 +190,7 @@ export function strandedReportText(groups: StrandedGroup[], archiveRoot: string)
   const oldest = rows.length > 0 ? ` (oldest ${minute(rows[0].ts)} UTC)` : '';
   const unreadable = malformed > 0 ? `, plus ${malformed} unreadable line(s) kept as-is in the archive,` : '';
   const lines = [
-    `📭 Claude Code and Codex are tmux-only now (tg-cli#456), so the Stop-hook inbox no longer delivers to them. ` +
+    `📭 The Stop-hook inbox no longer delivers to Claude Code and Codex (tg-cli#456) — they are reached through a tmux pane or the rig wrapper instead. ` +
       `${rows.length} message(s) queued there never reached their agent${oldest}${unreadable} — ` +
       `listed once here, archived as stranded-*.jsonl under ${archiveRoot}:`,
   ];

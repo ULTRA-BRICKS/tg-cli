@@ -211,23 +211,28 @@ title with the project next to it. An omp that rig runs under `abduco` inside a 
 is that pane's agent. If the target is ambiguous or omitted, you get inline
 buttons grouped by tmux session; tap one to route. Bare `/agent` lists the agents.
 
-### Agents outside tmux — tmux-only, except omp (v1.46.0, v1.54.31)
-tg-ctl types replies into an agent's **tmux pane** (`send-keys`). An interactive agent
-started from a plain terminal tab (no `$TMUX`) has no pane, so it used to be invisible:
-not in `tg-ctl status`, messages silently dropped. Now such an agent is **listed as
-unreachable with the reason** — `tg-ctl status`, `/status` and the no-agent reply show
-`landing · claude — unreachable: not in tmux (tty ttys004, cwd …, name landing, pid …)`.
+### Agents outside tmux — the rig wrapper, omp-live, or unreachable (v1.46.0, v1.55.0)
+tg-ctl types replies into the terminal that hosts an agent: its **tmux pane** (`send-keys`), or,
+outside tmux, the **abduco session the rig wrapper runs it in**. Start any harness with
+`rig harness run <claude|codex|opencode|omp> --name <label>`: the wrapper keeps it alive
+(crash → relaunch and resume the same session), writes `~/.config/tg-cli/hosts/<name>.json`,
+and exports `RIG_SESSION`. From then on `/agent <label> <text>`, a reply to its message, or a
+plain message when it is the only agent is typed into its terminal exactly once, and its `tg`
+messages carry `[<label>]` as the `[window]` bracket. `tg-ctl status` lists it under
+`hosted (abduco, outside tmux)`. Spec: `docs/specs/2026-09-30-harness-agnostic-control.md`.
 
-Claude Code and Codex are **tmux-only** (tg-cli#456): `/agent landing <text>` to one
-running outside tmux gets a one-line refusal that says how to start it in tmux —
-`claude-rotate --tmux landing` (it opens the tmux window and passes `--name landing`),
-`tmux new-window -n <name> codex` for Codex — and nothing is queued. The Stop-hook inbox
-that used to take such messages delivered only at the agent's next turn end, so an idle
-session never got them; its leftover messages were listed to you once and archived under
-`~/.config/tg-cli/inbox/*/stranded-*.jsonl`. omp is the exception: it is reached outside
-tmux through its original-process bridge (`tg-ctl omp-live`, see
-`docs/omp-original-process.md`). `tg-ctl inbox` shows what the inbox still holds (an omp
-grant notice waiting for that omp's next turn, and the archive).
+An interactive agent started from a plain terminal tab — no `$TMUX`, not under the wrapper — has
+nothing for tg-ctl to type into. It is **listed as unreachable with the reason** — `tg-ctl
+status`, `/status` and the no-agent reply show
+`landing · claude — unreachable: not in tmux (tty ttys004, cwd …, name landing, pid …)` —
+and `/agent landing <text>` to it gets a one-line refusal naming
+`rig harness run claude --name landing` (or a tmux window); nothing is queued (tg-cli#456). The
+Stop-hook inbox that used to take such messages delivered only at the agent's next turn end, so
+an idle session never got them; its leftover messages were listed to you once and archived under
+`~/.config/tg-cli/inbox/*/stranded-*.jsonl`. omp outside tmux is reached through its
+original-process bridge (`tg-ctl omp-live`, see `docs/omp-original-process.md`), and through its
+wrapper session when the bridge is not loaded. `tg-ctl inbox` shows what the inbox still holds (an
+omp grant notice waiting for that omp's next turn, and the archive).
 
 ### Q→buttons (v1.5.0, seamless setup in v1.6.0)
 Agent questions and permission prompts are forwarded to Telegram as inline buttons — no need to touch the terminal. Tap to answer; the answer is injected back into the pane immediately. Supports Claude Code question/permission shapes, Codex `PermissionRequest`, and opencode `question.asked`/`permission.asked` events.

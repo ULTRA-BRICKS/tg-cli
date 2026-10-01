@@ -151,10 +151,12 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
   Channel mode's residual advantages are only: works without tmux, and native
   event delivery instead of keystroke fragility.
 - **No-agent guard:** inbound arrives but no live agent session is found → reply
-  in TG with ONE harness-neutral line: "No live agent found → not delivered. Run
-  Claude Code / Codex inside tmux (`claude-rotate --tmux <name>`); omp is reachable
-  in or outside tmux." (tg-cli#454: the old "Claude Code not in tmux" text was sent
-  for an omp that was in tmux.)
+  in TG with ONE harness-neutral line: "No live agent found → not delivered. Start
+  Claude Code / Codex in a tmux window or under the rig wrapper (`rig harness run
+  <harness> --name <label>`); omp is reachable in or outside tmux." (tg-cli#454: the old
+  "Claude Code not in tmux" text was sent for an omp that was in tmux. Sessions the rig
+  wrapper hosts outside tmux are reachable through their abduco PTY —
+  `docs/specs/2026-09-30-harness-agnostic-control.md`, which owns that transport.)
 
 ## 6. Singleton / idempotency (HARD requirement)
 

@@ -56,7 +56,7 @@ I/O, fetch, signals, `bun:ffi`):
   after `[window]`; the MAIN/orchestrator agent needs NO flag, its `[window]` bracket
   already carries the session's PRIMARY name from `resolveSessionName` — the tmux window
   name, or its cwd basename when the window is auto-renamed to a version/shell/launcher;
-  outside tmux the harness session title; the harness title is the auto `--title` badge in
+  outside tmux the wrapper's host label (the rig wrapper's `--name`), else the harness session title; the harness title is the auto `--title` badge in
   tmux; explicit flag wins over
   `TG_AGENT` env, which wins over the launcher's `RIG_AGENT_ID` (omp sets it on its task
   subagents; detached children get it from their launcher) and `RIG_DETACHED_AGENT=1`
@@ -105,24 +105,48 @@ create independent writers to its history. Use `tg-ctl omp-live` and the origina
 extension. The endpoint belongs to the top-level TUI session only: OMP rebinds extension
 factories for every in-process task subagent, and a subagent binding must never claim,
 close or withdraw it (#462). The owner republishes a missing endpoint at `turn_end`/
-`agent_end`; a status probe that times out lists the host as alive-busy. An OMP in a tmux
-pane with NO endpoint gets `tmux send-keys` into its own pane (its original TUI — no second
-writer, no spawn), but only on a proven-absent endpoint (`endpoint_unavailable`); every
-other endpoint error fails closed. An OMP outside tmux without an endpoint fails closed; do
-not restore the old spawn fallback to satisfy legacy fixtures. `tg-ctl status` names every
-omp without a bridge. Claude Code and Codex stay tmux-only (#456): outside tmux they are
-listed and refused, never queued — do not restore the Stop-hook inbox for them. See
-`docs/omp-original-process.md` for setup, receipt semantics, and the one-time saved restart
-needed by already-running OMP. Cwd/title are not process identity.
+`agent_end`; a status probe that times out lists the host as alive-busy. An OMP with NO
+endpoint is typed into through the terminal that hosts that exact process — `tmux send-keys`
+into its own pane, else the abduco PTY of the rig-wrapper session it runs in (its original
+TUI — no second writer, no spawn) — but only on a proven-absent endpoint
+(`endpoint_unavailable`); every other endpoint error fails closed. An OMP in no pane and in
+no registered host fails closed; do not restore the old spawn fallback to satisfy legacy
+fixtures. `tg-ctl status` names every omp without a bridge. See `docs/omp-original-process.md`
+for setup, receipt semantics, and the one-time saved restart needed by already-running OMP.
+Cwd/title are not process identity.
+
+### Harness-agnostic control: tmux panes and rig-wrapper hosts (docs/specs/2026-09-30-harness-agnostic-control.md)
+
+A harness session (omp, Claude Code, Codex, opencode) is reached through the terminal that
+hosts it — never through a second process that loads its history. In tmux that is the pane
+(label = window name, `tmux send-keys`). Outside tmux it is the abduco session the rig
+wrapper (`rig harness run <harness> --name <label>`) runs it in: the wrapper writes
+`<config>/hosts/<name>.json` (`features/tg-ctl/host-registry.ts` — pure parse/validate/
+liveness; `host-registry-fs.ts` reads it), `tg-ctl` trusts a record only while the process
+table shows its abduco server with exactly ONE harness of the recorded kind below it, and
+types into the session PTY through abduco's client socket (`abduco-pty.ts` pure packets/recipe,
+`abduco-client.ts` the socket). The delivery target is `host:<name>`, through
+`deliverInboundOnce` like every sink (exactly once; a connection lost after text bytes were
+written is ledger `uncertain`, never re-sent). A tmux pane showing the same session (an
+`abduco -a` client) and omp-live both keep priority. `tg` inside a hosted session reads
+`$RIG_SESSION`: the record's label is the `[window]` name (`resolveSessionName`'s `hostLabel`
+tier) and `host:<name>` the route origin, so a CTO reply routes back. A Claude Code, Codex or
+opencode in NO pane and NO live host is listed by `tg-ctl status` as unreachable and refused
+(`/agent <name> …` → one line naming `rig harness run <harness> --name <label>`), never
+queued — do not restore the Stop-hook inbox for them (#456). Only coordinators register
+(`role: "coordinator"`); tg-ctl never guesses a role from env, pane, cwd or process tree.
 
 ### Exactly-once inbound delivery (#517, #299)
 
 Every inbound Telegram message is keyed by (chat_id, message_id) in the append-only, fsynced
 ledger `tg-ctl.<bot>.delivery.jsonl` (`features/tg-ctl/delivery-ledger.ts`, pure; the daemon owns
-the I/O). The three sinks — `deliverOriginalOmp` (omp-live bridge and its own-pane fallback),
-`injectInbound` (tmux send-keys), the Stop-hook inbox — go through `deliverInboundOnce`: a
+the I/O). The four sinks — `deliverOriginalOmp` (omp-live bridge and its own-pane/own-host
+fallback), `injectInbound` (tmux send-keys), `deliverToHost` (abduco PTY of a rig-wrapper
+session, target `host:<name>`), the Stop-hook inbox — go through `deliverInboundOnce`: a
 delivered or in-flight message is not sent again; otherwise a durable claim, the send, the
-outcome. New delivery paths must reach one of these sinks with the source message id, never
+outcome (`delivered`; `failed` when the sink proved nothing arrived; `uncertain` when it failed
+AFTER writing text — `sinkOutcomeEvent`, never re-sent). New delivery paths must reach one of
+these sinks with the source message id, never
 call `executeInjectSteps` directly for inbound text. Updates already processed are skipped on
 replay (Telegram redelivery, pending-batch journal). A claim a kill left open is reported to the
 CTO at startup ("may not have reached"), never re-sent; picker holds lost by a restart, expired
@@ -193,14 +217,15 @@ never counted as lost: harnesses prune transcripts and reply-route log lines car
   `session-name.ts` (THE session-name resolver, tg-cli#455: `{primary, secondary}` — in tmux the
   window name leads and the harness title — omp endpoint/jsonl title, else the tmux
   `#{pane_title}` a harness painted, `π > …`/`✳ …`, marks stripped — is secondary; outside tmux
-  the title leads; cwd basename is the fallback tier. Shared by the `tg` header, the `/agent`
+  the rig wrapper's host label leads when the session has one, else the title leads (the title
+  is secondary under a label); cwd basename is the fallback tier. Shared by the `tg` header, the `/agent`
   picker, `tg-ctl status`, the history label and question cards; never a `no tmux` placeholder),
   `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker),
   `unreachable.ts` + `inbox.ts` (tg-cli#306, tg-cli#456: agents OUTSIDE tmux — a `ps pid,tty`
-  scan + lsof cwd finds interactive agent processes in no pane; they are listed as
-  `unreachable: not in tmux`. Claude Code and Codex are tmux-only: `/agent <name> …` to one
-  gets a one-line refusal naming how to start it in tmux (`claude-rotate --tmux <name>`,
-  else `tmux new-window -n <name> <harness>`) and nothing is queued. The Stop-hook inbox
+  scan + lsof cwd finds interactive agent processes in no pane and in no rig-wrapper host; they
+  are listed as `unreachable: not in tmux`. `/agent <name> …` to one gets a one-line refusal
+  naming how to restart it under the wrapper (`rig harness run <harness> --name <label>`, or
+  in a tmux window) and nothing is queued. The Stop-hook inbox
   (`<config>/inbox/<key>/pending.jsonl`) now carries only omp's grant-notice fallback (an omp
   whose omp-live endpoint is unreachable), consumed at that omp's next yield; a cc/codex grant
   notice with no pane is not queued (the card names the token path). The retired channel's

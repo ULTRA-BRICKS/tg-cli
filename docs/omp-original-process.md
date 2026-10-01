@@ -64,8 +64,10 @@ exact PID, nothing sent) and the pane still hosts exactly that PID. A timeout, d
 connection, stale identity or any other endpoint error fails closed, because the text may
 already have reached the host; typing it again would duplicate it. The same
 defer-while-waiting rule as every tmux pane applies: text is queued, never typed, while the
-pane has an open forwarded question. An OMP outside tmux without an endpoint still fails
-closed with the install/restart hint. Claude Code and Codex remain tmux-only.
+pane has an open forwarded question. An OMP outside tmux without an endpoint fails closed with
+the install/restart hint, unless a rig wrapper hosts it in abduco (`rig harness run omp`,
+`docs/specs/2026-09-30-harness-agnostic-control.md`): then its own PTY is typed into, exactly
+once, through the same fallback. Other unmanaged outside-tmux sessions stay unreachable.
 
 ## Identity and safety
 

@@ -11,7 +11,7 @@ import {
   parseLsofCwd,
   parsePidTtyList,
   sanitizeAgentName,
-  tmuxStartCommand,
+  restartCommand,
   unreachableLabel,
   type UnreachableAgent,
 } from '../features/tg-ctl/unreachable';
@@ -302,40 +302,43 @@ test('status line names the reason, tty, cwd, name and pid — and no inbox queu
   expect(describeUnreachable(ua({ tty: null }))).toContain('(tty none,');
 });
 
-test('no-agent listing says the agents outside tmux are tmux-only and how to restart them — never promises a queue', () => {
+test('no-agent listing says the agents outside tmux are not hosted by the rig wrapper and how to restart them — never promises a queue', () => {
   expect(noAgentReplyText('legacy', [])).toBe('legacy');
   const listing = noAgentReplyText('legacy', [ua()]);
   expect(listing).toContain('OUTSIDE tmux');
   expect(listing).toContain('landing · claude — unreachable: not in tmux');
-  expect(listing).toContain('claude-rotate --tmux <name>');
-  expect(listing).not.toMatch(/queue|inbox|turn end/i);
+  expect(listing).toContain('outside the rig wrapper');
+  expect(listing).toContain('`rig harness run <harness> --name <label>`');
+  expect(listing).not.toMatch(/queue|inbox|turn end|claude-rotate/i);
 });
 
-test('tmuxStartCommand: claude-rotate for Claude Code, a named tmux window for the other harnesses', () => {
-  expect(tmuxStartCommand(ua())).toBe('claude-rotate --tmux landing');
-  expect(tmuxStartCommand(ua({ agent: 'codex', command: 'codex', name: null, cwd: '/Users/u/work/api' }))).toBe('tmux new-window -n api codex');
-  expect(tmuxStartCommand(ua({ agent: 'opencode', command: 'opencode', name: null, cwd: '/w/web' }))).toBe('tmux new-window -n web opencode');
+test('restartCommand: rig harness run <harness> --name <label>, the label quoted for a shell', () => {
+  expect(restartCommand(ua())).toBe('rig harness run claude --name landing');
+  expect(restartCommand(ua({ agent: 'codex', command: 'codex', name: null, cwd: '/Users/u/work/api' }))).toBe('rig harness run codex --name api');
+  expect(restartCommand(ua({ agent: 'opencode', command: 'opencode', name: null, cwd: '/w/web' }))).toBe('rig harness run opencode --name web');
   // A label a shell would split or expand is single-quoted, embedded quotes escaped.
-  expect(tmuxStartCommand(ua({ name: null, command: 'claude', cwd: "/w/it's mine" }))).toBe("claude-rotate --tmux 'it'\\''s mine'");
+  expect(restartCommand(ua({ name: null, command: 'claude', cwd: "/w/it's mine" }))).toBe("rig harness run claude --name 'it'\\''s mine'");
   // No --name and no cwd: a placeholder, never the synthetic "pid N" label.
-  expect(tmuxStartCommand(ua({ name: null, command: 'claude', cwd: null }))).toBe('claude-rotate --tmux <name>');
+  expect(restartCommand(ua({ name: null, command: 'claude', cwd: null }))).toBe('rig harness run claude --name <label>');
 });
 
-test('outsideTmuxRefusalText: ONE line naming the agent, that nothing was sent or queued, and how to start it in tmux', () => {
+test('outsideTmuxRefusalText: ONE line naming the agent, that nothing was sent or queued, and how to restart it under the rig wrapper', () => {
   const cc = outsideTmuxRefusalText('landing', [ua()]);
   expect(cc).not.toContain('\n');
   expect(cc).toContain('landing · claude runs outside tmux');
+  expect(cc).toContain('outside the rig wrapper');
   expect(cc).toContain('nothing was sent or queued');
-  expect(cc.endsWith('Start it in tmux: claude-rotate --tmux landing')).toBe(true);
+  expect(cc.endsWith('Restart it with: rig harness run claude --name landing (or in a tmux window)')).toBe(true);
+  expect(cc).not.toContain('claude-rotate');
 
   const codex = outsideTmuxRefusalText('api', [ua({ pid: 9, agent: 'codex', command: 'codex', name: null, cwd: '/w/api' })]);
   expect(codex).not.toContain('\n');
   expect(codex).toContain('api · codex runs outside tmux');
-  expect(codex.endsWith('Start it in tmux: tmux new-window -n api codex')).toBe(true);
+  expect(codex.endsWith('Restart it with: rig harness run codex --name api (or in a tmux window)')).toBe(true);
 
-  // Several sessions answer to one selector: still one line, every one named, every distinct start command.
+  // Several sessions answer to one selector: still one line, every one named, every distinct restart command.
   const both = outsideTmuxRefusalText('landing', [ua(), ua({ pid: 9, agent: 'codex', command: 'codex', name: null })]);
   expect(both).not.toContain('\n');
   expect(both).toContain("'landing' matches 2 sessions outside tmux (landing · claude pid 7103, landing · codex pid 9)");
-  expect(both.endsWith('Start it in tmux: claude-rotate --tmux landing or tmux new-window -n landing codex')).toBe(true);
+  expect(both.endsWith('Restart it with: rig harness run claude --name landing or rig harness run codex --name landing (or in a tmux window)')).toBe(true);
 });

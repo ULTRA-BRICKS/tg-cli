@@ -72,6 +72,8 @@ import { resolveWindowPanes } from "./features/replies/window"
 import { agentNameFromDisplayLine } from "./features/tg-ctl/agent-name"
 import { detectAgentViaAncestry, detectAncestorAgent, isProcessRunning } from "./features/branding/detect"
 import { outboundOriginPaneId, parseLsofJsonlPaths, parseOmpSessionMeta, pickPrimaryOmpSessionFile } from "./features/tg-ctl/omp"
+import { hostDisplayName } from "./features/tg-ctl/host-registry"
+import { readOwnHostRecord } from "./features/tg-ctl/host-registry-fs"
 import { parseLsofCwd } from "./features/tg-ctl/unreachable"
 import { parseRegistry } from "./features/tg-ctl/session-registry-store"
 import { resolveRouteSession, type RouteOrigin } from "./features/tg-ctl/session-target"
@@ -1001,15 +1003,20 @@ if (import.meta.main) {
   const ompSession = getOmpSession(ompAncestorPid)
   // omp's adapter title wins; any other agent's title comes from its pane title.
   const harnessTitle = ompSession.title || (ancestor && ancestor.agent !== "omp" ? getPaneTitle() : "")
-  // A session identity exists inside tmux or under an agent ancestor. A bare,
-  // non-agent invocation outside tmux (a cron job, a plain script) gets NO bracket.
-  const hasSessionIdentity = tmuxPane !== null || Boolean(process.env.TMUX) || ancestor !== null
+  // The record of the rig-wrapper abduco session this `tg` runs in ($RIG_SESSION): outside tmux
+  // its label is the `[window]` name and `host:<name>` the route origin
+  // (docs/specs/2026-09-30-harness-agnostic-control.md §2–§3).
+  const ownHost = readOwnHostRecord(configDir, process.env.RIG_SESSION, process.getuid?.() ?? -1)
+  // A session identity exists inside tmux, under an agent ancestor or in a wrapper-hosted session.
+  // A bare, non-agent invocation outside tmux (a cron job, a plain script) gets NO bracket.
+  const hasSessionIdentity = tmuxPane !== null || Boolean(process.env.TMUX) || ancestor !== null || ownHost !== null
   const sessionNameFor = (title: string) =>
     hasSessionIdentity
       ? resolveSessionName({
           tmuxWindow: tmuxPane?.windowName ?? null,
-          cwd: tmuxPane?.panePath || ompSession.cwd || process.cwd(),
+          cwd: tmuxPane?.panePath || ompSession.cwd || ownHost?.cwd || process.cwd(),
           harnessTitle: title,
+          hostLabel: ownHost?.label,
         })
       : { primary: "", secondary: null }
   if (parsed.action === "detectAgent") {
@@ -1603,11 +1610,14 @@ if (import.meta.main) {
   // to the agent that produced it, and order the unrecognized-reply picker by
   // LRU/MRU (docs/specs/reply-quotes.md). Tmux pane if present; otherwise the
   // omp ancestor pid as omp:<pid> so an out-of-tmux omp is still recognizable
-  // (tg-cli#339). A corrupt or unwritable file just degrades to the picker.
+  // (tg-cli#339); otherwise the abduco session a rig wrapper hosts it in, as
+  // host:<name> (docs/specs/2026-09-30-harness-agnostic-control.md). A corrupt or
+  // unwritable file just degrades to the picker.
   const TMUX_PANE = process.env.TMUX_PANE
   const originPaneId = outboundOriginPaneId({
     tmuxPane: TMUX_PANE,
     ompAncestorPid,
+    hostName: ownHost?.name,
   })
   const ROUTES_PATH = originPaneId
     ? ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).routes
@@ -1633,7 +1643,7 @@ if (import.meta.main) {
       }
       return null
     }
-    if (!TMUX_PANE) return null
+    if (!TMUX_PANE) return ownHost?.cwd ?? null
     return readOriginPane().path
   }
   // ONE tmux read of the origin pane: its path (the route cwd, above) and its
@@ -1782,7 +1792,7 @@ if (import.meta.main) {
         // SAME label the daemon stamps on inbound, so `tg replies` groups a
         // session's outbound and its inbound under one current-agent scope.
         // Out of tmux it is the registry entry's name; undefined → untagged.
-        currentPaneAgentName() ?? entry?.name.primary ?? undefined,
+        currentPaneAgentName() ?? (ownHost ? hostDisplayName(ownHost) : undefined) ?? entry?.name.primary ?? undefined,
         sessionKey ?? undefined,
       )
       // Under the history lock shared with the daemon's inbound writer (tg-cli#136).

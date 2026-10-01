@@ -168,6 +168,22 @@ import {
 } from "./features/tg-ctl/omp"
 import { defaultRegistryRoot, listLiveEndpoints, sendLiveMessage } from "./features/tg-ctl/omp-live-runtime.mjs"
 import { selectOriginalEndpoint, originalRequestId, type OriginalOmpEndpoint, type OriginalOmpTarget } from "./features/tg-ctl/omp-live-routing"
+import { connectAbducoSocket } from "./features/tg-ctl/abduco-client"
+import { injectIntoAbducoSession } from "./features/tg-ctl/abduco-pty"
+import {
+  describeHost,
+  hostDisplayName,
+  hostNameFromOriginId,
+  hostOfPid,
+  hostOriginId,
+  hostToCandidate,
+  hostsDir,
+  hostsNotShownElsewhere,
+  liveHosts,
+  type HostRecord,
+  type LiveHost,
+} from "./features/tg-ctl/host-registry"
+import { readHostRecords } from "./features/tg-ctl/host-registry-fs"
 import {
   bindHookSessions,
   hookSightingOf,
@@ -360,7 +376,9 @@ import {
   orphanedClaims,
   parseLedger,
   serializeLedgerEvents,
+  sinkOutcomeEvent,
   type LedgerEvent,
+  type SinkResult,
   type LedgerHold,
   type LedgerState,
 } from "./features/tg-ctl/delivery-ledger"
@@ -457,8 +475,8 @@ export const USAGE = `Usage:
   tg-ctl status          # is it running? pid / bot / target pane / autostart;
                          # \`code:\` names the commit the daemon loaded — STALE when its
                          # checkout has newer daemon code (merged but not restarted);
-                         # also lists agents running OUTSIDE tmux as unreachable — Claude Code
-                         # and Codex are tmux-only (tg-cli#456)
+                         # also lists sessions hosted by the rig wrapper outside tmux (typed into
+                         # their abduco PTY) and agents outside tmux AND the wrapper as unreachable
   tg-ctl audit-delivery [--since DATE] [--until DATE] [--json] [--transcripts DIR]...
                          # report inbound messages never delivered, delivered twice, or
                          # never received (update-id gaps), with dates; read-only
@@ -534,7 +552,7 @@ const CODEX_TRANSCRIPT_TAIL_BYTES = 500_000
 // Spec §5.2 no-agent guard: harness-neutral, one line. Never claims "Claude Code"
 // for whatever was addressed (tg#17036: it was sent for an omp that WAS in tmux).
 export const NO_AGENT_REPLY =
-  "No live agent found → not delivered. Run Claude Code / Codex inside tmux (`claude-rotate --tmux <name>`); omp is reachable in or outside tmux."
+  "No live agent found → not delivered. Start Claude Code / Codex in a tmux window or under the rig wrapper (`rig harness run <harness> --name <label>`); omp is reachable in or outside tmux."
 
 // --- Pure helpers (exported for tests) ---
 
@@ -1186,6 +1204,18 @@ function listAgentCandidates(): AgentCandidate[] {
   // Out-of-tmux omp join as paneId omp:<pid> so /agent can pick them; an omp shown
   // in a pane keeps that pane's row and adds its title (never renames the row).
   const merged = mergeLiveOmpCandidates(dedupeCandidates(out), listLiveOmpAgents())
+  // A session a rig wrapper hosts in abduco outside tmux joins as `host:<name>`.
+  merged.push(...ptyOnlyHosts(panes, procs).map(hostToCandidate))
+  // An omp a rig wrapper hosts is already the `omp:<pid>` row above (that row is how it is reached);
+  // it takes the wrapper's label and id so `/agent <label>` selects it like any other host.
+  const ompHosts = listLiveHosts(procs).filter((h) => h.agent === "omp")
+  for (const c of merged) {
+    const host = c.paneId.startsWith("omp:") ? ompHosts.find((h) => `omp:${h.harnessPid}` === c.paneId) : undefined
+    if (host) {
+      c.windowName = hostDisplayName(host)
+      c.aliases = [...(c.aliases ?? []), host.name]
+    }
+  }
   // Names a session had before a rename (registry aliases, spec §3.2), so
   // `/agent <oldname>` still reaches it.
   const registry = sessionRegistry
@@ -1288,11 +1318,117 @@ function listUnreachableAgents(): UnreachableAgent[] {
   if (unreachableCache && now - unreachableCache.at < UNREACHABLE_SCAN_TTL_MS) return unreachableCache.agents
   const ttyByPid = readPidTtyMap()
   const { panes, procs } = snapshot()
+  const hosts = listLiveHosts(procs)
   const agents = findUnreachableAgents(panes, procs, ttyByPid)
     .filter((a) => a.agent !== "omp")
+    // A harness a rig wrapper hosts in abduco is reachable through its PTY, not unreachable.
+    .filter((a) => hostOfPid(a.pid, procs, hosts) === null)
     .map((a) => ({ ...a, cwd: cwdOfPid(a.pid) }))
   unreachableCache = { at: now, agents }
   return agents
+}
+
+// --- Sessions a rig wrapper hosts in abduco OUTSIDE tmux (docs/specs/2026-09-30-harness-agnostic-control.md) ---
+//
+// The wrapper writes <config>/hosts/<name>.json; tg-ctl only READS it, and a record counts only
+// while the process table still shows its abduco server with exactly one harness below it
+// (liveHosts) — a crashed or exited session drops out without anything having to delete its record.
+// Delivery types the message into the session's PTY through abduco's client socket.
+const hostIssuesLogged = new Set<string>()
+function logHostIssueOnce(key: string, message: string): void {
+  if (hostIssuesLogged.has(key)) return
+  hostIssuesLogged.add(key)
+  log(message)
+}
+
+function loadHostRecords(): HostRecord[] {
+  const { records, rejected } = readHostRecords(hostsDir(resolveConfigDir(process.env.HOME ?? "~")), process.getuid?.() ?? -1)
+  for (const r of rejected) logHostIssueOnce(`${r.file}:${r.reason}`, `host registry: ignoring ${r.file} — ${r.reason}`)
+  return records
+}
+
+function isUnixSocket(path: string): boolean {
+  try {
+    return statSync(path).isSocket()
+  } catch {
+    return false
+  }
+}
+
+// Every registered host the process table proves alive right now. `procs`: the discovery
+// snapshot the caller already holds (this is called from inside hot paths, so it never scans).
+function listLiveHosts(procs: ProcInfo[]): LiveHost[] {
+  const { live, skipped } = liveHosts(loadHostRecords(), procs, isUnixSocket)
+  for (const s of skipped) logHostIssueOnce(`${s.name}:${s.reason}`, `host registry: ${s.name} is not live — ${s.reason}`)
+  return live
+}
+
+// The live hosts whose PTY is the ONLY view of the session: one a tmux pane shows (through an
+// `abduco -a` client) or omp-live already lists is reached through that row, not a second one.
+function ptyOnlyHosts(panes: PaneInfo[], procs: ProcInfo[]): LiveHost[] {
+  const shown = new Set<number>(listLiveOmpAgents().map((a) => a.pid))
+  for (const pane of panes) {
+    const pid = findAgentInPane(pane, procs)?.pid
+    if (pid !== undefined) shown.add(pid)
+  }
+  return hostsNotShownElsewhere(listLiveHosts(procs), shown)
+}
+
+// Types `text` into the PTY of the named host, after any earlier message for it has finished. The
+// host is looked up in a FRESH process table only once its turn comes: during the wait it may
+// have exited (the wrapper relaunching its harness leaves a live abduco server with nothing
+// under it). `expectPid`: the harness must still be this exact process. No ledger here: the
+// caller owns the claim.
+function typeIntoHost(name: string, text: string, logNote: string, expectPid?: number): Promise<SinkResult> {
+  return serializePerHost(name, async (): Promise<SinkResult> => {
+    const host = listLiveHosts(snapshot().procs).find((h) => h.name === name && (expectPid === undefined || h.harnessPid === expectPid))
+    if (!host) return { ok: false, error: `${name} is no longer running under the rig wrapper — message not delivered` }
+    log(`host-pty: ${logNote} → ${host.name} (${host.agent} pid ${host.harnessPid}, cwd ${host.cwd ?? "?"})`)
+    return typeIntoHostNow(host, text)
+  })
+}
+
+// Two messages for one host are typed one after the other: interleaved, one's text would ride
+// the other's Enter and the second `attach` could drop the first client mid-write.
+const hostTypingTail = new Map<string, Promise<unknown>>()
+function serializePerHost<T>(name: string, run: () => Promise<T>): Promise<T> {
+  const result = (hostTypingTail.get(name) ?? Promise.resolve()).then(run, run)
+  const tail = result.catch(() => undefined)
+  hostTypingTail.set(name, tail)
+  void tail.then(() => {
+    if (hostTypingTail.get(name) === tail) hostTypingTail.delete(name)
+  })
+  return result
+}
+
+async function typeIntoHostNow(host: LiveHost, text: string): Promise<SinkResult> {
+  const res = await injectIntoAbducoSession({ connect: connectAbducoSocket, sleep: (ms) => Bun.sleep(ms) }, host.socket, text)
+  if (res.ok) return { ok: true }
+  const who = hostDisplayName(host)
+  log(`host-pty: ${host.name} failed${res.uncertain ? " after the text was partly written" : ""}: ${res.error}`)
+  return {
+    ok: false,
+    uncertain: res.uncertain,
+    error: res.uncertain
+      ? `${who}: ${res.error}. The message may already be in its prompt — check before resending; it was not sent again.`
+      : `${who}: ${res.error} — message not delivered.`,
+  }
+}
+
+// Types an inbound Telegram message into a wrapper-hosted session's PTY at most once
+// (tg-cli#299). The host is re-verified against a fresh process table INSIDE the claim, right
+// before typing: it may have exited, or been replaced, between picking the target and typing — and a replay
+// of an already delivered message must be suppressed without touching the session at all.
+function deliverToHost(name: string, text: string, messageId: number | string | null | undefined): Promise<SinkResult> {
+  return deliverInboundOnce(typeof messageId === "number" ? messageId : null, hostOriginId(name), () => typeIntoHost(name, text, `tg#${messageId ?? "-"}`))
+}
+
+// The one entry for a delivery addressed by route-origin / picker id: null when `paneId` is not a
+// `host:<name>` address (the caller continues with its tmux/omp handling), else the exactly-once
+// delivery into that host's PTY.
+function deliverHostPane(paneId: string, text: string, messageId: number | string | null | undefined): Promise<SinkResult> | null {
+  const name = hostNameFromOriginId(paneId)
+  return name === null ? null : deliverToHost(name, text, messageId)
 }
 
 // `lsof -Fn` n-paths for a pid — used to find omp's primary session jsonl.
@@ -1446,7 +1582,7 @@ function recordFailed(messageId: number, target: string, error: string): void {
 // durable claim, the send, then its outcome; a claim that cannot reach the disk sends
 // nothing (a restart could not know it went out) and fails the delivery instead.
 // `messageId` null: not an inbound message (a key press, a synthetic notice) — sent as is.
-async function deliverInboundOnce<R extends { ok: true } | { ok: false; error: string }>(
+async function deliverInboundOnce<R extends SinkResult>(
   messageId: number | null | undefined,
   target: string,
   send: () => Promise<R>,
@@ -1472,8 +1608,7 @@ async function deliverInboundOnce<R extends { ok: true } | { ok: false; error: s
     recordDelivery([{ ts: Date.now(), event: "failed", ...base, error: err instanceof Error ? err.message : String(err) }])
     throw err
   }
-  const outcome: { ok: true } | { ok: false; error: string } = res
-  recordDelivery([outcome.ok ? { ts: Date.now(), event: "delivered", ...base } : { ts: Date.now(), event: "failed", ...base, error: outcome.error }])
+  recordDelivery([sinkOutcomeEvent(Date.now(), base, res)])
   return res
 }
 
@@ -1481,12 +1616,12 @@ async function deliverInboundOnce<R extends { ok: true } | { ok: false; error: s
 // endpoint there is still the original process — typing into its own TUI is its
 // normal input path, not a second history writer and not a spawn (#458).
 // A numeric `messageId` is an inbound Telegram message: sent at most once (tg-cli#299).
-async function deliverOriginalOmp(target: OriginalOmpTarget, text: string, messageId?: number | string, paneId?: string | null): Promise<{ ok: true } | { ok: false; error: string }> {
+async function deliverOriginalOmp(target: OriginalOmpTarget, text: string, messageId?: number | string, paneId?: string | null): Promise<SinkResult> {
   if (typeof messageId !== "number") return sendOriginalOmp(target, text, messageId, paneId)
   return deliverInboundOnce(messageId, paneId ?? `omp:${target.pid ?? "?"}`, () => sendOriginalOmp(target, text, messageId, paneId))
 }
 
-async function sendOriginalOmp(target: OriginalOmpTarget, text: string, messageId?: number | string, paneId?: string | null): Promise<{ ok: true } | { ok: false; error: string }> {
+async function sendOriginalOmp(target: OriginalOmpTarget, text: string, messageId?: number | string, paneId?: string | null): Promise<SinkResult> {
   let code: string
   try {
     await refreshOriginalHosts()
@@ -1500,9 +1635,15 @@ async function sendOriginalOmp(target: OriginalOmpTarget, text: string, messageI
   }
   // Only a proven-absent endpoint may fall back: any other code means the endpoint
   // exists (or may have accepted the text), and typing it again would duplicate it.
-  if (code === 'endpoint_unavailable' && paneId && !paneId.startsWith("omp:") && target.pid !== undefined) {
-    const res = await typeIntoOwnOmpPane(paneId, target.pid, text)
-    if (res) return res
+  // The fallback is the terminal that hosts this exact process — its tmux pane, else the
+  // abduco session the rig wrapper runs it in: its own TUI either way, no second writer.
+  if (code === 'endpoint_unavailable' && target.pid !== undefined) {
+    if (paneId && !paneId.startsWith("omp:")) {
+      const res = await typeIntoOwnOmpPane(paneId, target.pid, text)
+      if (res) return res
+    }
+    const hosted = await typeIntoHostOfOmp(target.pid, text)
+    if (hosted) return hosted
   }
   log(`omp-live: rejected reason=${code} (no replacement process started)`)
   // A timed-out or dropped connection already handed the text to a live, busy host.
@@ -1512,13 +1653,21 @@ async function sendOriginalOmp(target: OriginalOmpTarget, text: string, messageI
   return { ok: false, error: `Original OMP bridge: ${code}. Run tg-ctl omp-live install. Save/stop the original before resuming it once to load the bridge; never start a second copy. No second agent was started.` }
 }
 // null = the pane no longer hosts exactly this OMP pid; the caller fails closed.
-async function typeIntoOwnOmpPane(paneId: string, pid: number, text: string): Promise<{ ok: true } | { ok: false; error: string } | null> {
+async function typeIntoOwnOmpPane(paneId: string, pid: number, text: string): Promise<SinkResult | null> {
   const { panes, procs } = snapshot()
   const pane = panes.find((p) => p.paneId === paneId)
   const hosted = pane ? findAgentInPane(pane, procs) : null
   if (hosted?.agent !== "omp" || hosted.pid !== pid) return null
   log(`omp-live: no endpoint for pid=${pid} — tmux send-keys into its own pane ${paneId} (original process, no spawn)`)
   return executeInjectSteps(buildTextInjectPlan(paneId, text))
+}
+// null = no live rig-wrapper host runs exactly this omp pid; the caller fails closed.
+async function typeIntoHostOfOmp(pid: number, text: string): Promise<SinkResult | null> {
+  const { procs } = snapshot()
+  const host = hostOfPid(pid, procs, listLiveHosts(procs))
+  if (!host || host.agent !== "omp" || host.harnessPid !== pid) return null
+  log(`omp-live: no endpoint for pid=${pid} — abduco PTY of ${host.name} (original process, no spawn)`)
+  return typeIntoHost(host.name, text, `omp pid ${pid}`, pid)
 }
 
 function liveOmpForPane(paneId: string, agentPid?: number): LiveOmpAgent | null {
@@ -2720,12 +2869,19 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
         ? `target: ambiguous —\n${formatCandidates(found.candidates)}`
         : "target: no agent pane found",
   )
-  // Agents that run OUTSIDE tmux (tg-cli#306) — listed, not omitted, with the reason
-  // and how to restart them in tmux (tmux-only, tg-cli#456); the silent-invisibility
-  // this replaces was the incident.
+  // Sessions a rig wrapper hosts in abduco outside tmux: reachable through their PTY.
+  const statusSnapshot = snapshot()
+  const hosted = ptyOnlyHosts(statusSnapshot.panes, statusSnapshot.procs)
+  if (hosted.length > 0) {
+    lines.push(`hosted (abduco, outside tmux): ${hosted.length}`)
+    for (const h of hosted) lines.push(`  - ${describeHost(h)}`)
+  }
+  // Agents outside tmux AND outside the rig wrapper (tg-cli#306) — listed, not omitted, with the
+  // reason and how to restart them so Telegram can reach them; the silent-invisibility this
+  // replaces was the incident.
   const unreachable = listUnreachableAgents()
   if (unreachable.length > 0) {
-    lines.push(`unreachable (not in tmux, tmux-only): ${unreachable.length}`)
+    lines.push(`unreachable (outside tmux and the rig wrapper): ${unreachable.length}`)
     for (const a of unreachable) lines.push(`  - ${describeUnreachable(a)}`)
     lines.push(`  ${UNREACHABLE_HINT}`)
   }
@@ -7406,7 +7562,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // re-queued (no future answer may ever flush it), so the CTO is told (tg-cli#299).
     let error: string
     try {
-      const res = await injectInbound(item.sourceMessageId, paneId, buildTextInjectPlan(paneId, item.text, { sessionKey: item.sessionKey }))
+      // A hosted session is typed into through its abduco PTY, never a tmux plan.
+      const res = await (deliverHostPane(paneId, item.text, item.sourceMessageId) ??
+        injectInbound(item.sourceMessageId, paneId, buildTextInjectPlan(paneId, item.text, { sessionKey: item.sessionKey })))
       if (res.ok) {
         item.delivered = true
         await setSeenReactions(item.sourceMessageId, item.relatedReactionMessageId)
@@ -7415,7 +7573,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       log(`deferred flush into ${paneId} failed: ${res.error}`)
       // The pane hosts a different session now (§2.6): nothing was typed. Name
       // the move and hand the text back through the picker instead of dropping it.
-      if (res.sessionMismatch) {
+      if ("sessionMismatch" in res && res.sessionMismatch) {
         await postRoutePicker(listAgentCandidates(), item.text, `${res.error} — pick where this goes:`, item.sourceMessageId, item.relatedReactionMessageId)
         return false
       }
@@ -7960,6 +8118,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const res = await deliverOriginalOmp(live, wrapped, sourceMessageId ?? undefined, live.paneId)
       return res.ok ? { ok: true } : { ok: false, error: res.error }
     }
+    // A hosted session asks its questions unscoped (no TMUX_PANE), which defers every target
+    // (paneHasPendingQuestion): such a message waits in the queue below, never typed into the prompt.
+    const hostDelivery = shouldDeferInbound(paneId) ? null : deliverHostPane(paneId, wrapped, sourceMessageId)
+    if (hostDelivery) {
+      const res = await hostDelivery
+      return res.ok ? { ok: true } : { ok: false, error: res.error }
+    }
     if (shouldDeferInbound(paneId)) {
       const item = enqueueDeferred(paneId, wrapped, sourceMessageId)
       if (deferReactionViaAck) markDeferredForAck(item)
@@ -8147,6 +8312,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (recordAnchor) recordLastUserTarget(paneId, ompCwd)
       return true
     }
+    const hostDelivery = shouldDeferInbound(paneId) ? null : deliverHostPane(paneId, prewrappedText, sourceMessageId)
+    if (hostDelivery) {
+      const res = await hostDelivery
+      if (!res.ok) {
+        await sendMessage(ctx, res.error, out)
+        return false
+      }
+      if (recordAnchor) recordLastUserTarget(paneId, cwd)
+      return true
+    }
     const refusal = paneSessionRefusal(sessionKey, paneId)
     if (refusal !== null) {
       await sendMessage(ctx, refusal, out)
@@ -8183,22 +8358,22 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return true
   }
 
-  // `/agent <selector> …` that matched no tmux pane, checked against the non-omp agents
-  // running OUTSIDE tmux. Claude Code and Codex are tmux-only (tg-cli#456): a ONE-line
-  // refusal naming how to start it inside tmux — nothing is sent or queued (the Stop-hook
-  // inbox this replaces delivered only at a turn end an idle session never reached).
-  // true when it refused (the caller stops), false when nothing outside tmux matches.
+  // `/agent <selector> …` that matched no candidate (a tmux pane, omp-live or a rig-wrapper
+  // host), checked against the non-omp agents running outside tmux AND outside the wrapper
+  // (tg-cli#456): a ONE-line refusal naming how to restart it under the wrapper — nothing is
+  // sent or queued (the Stop-hook inbox this replaces delivered only at a turn end an idle
+  // session never reached). true when it refused (the caller stops), false when nothing matches.
   const refuseOutsideTmux = async (selector: string, out: Record<string, unknown> = {}): Promise<boolean> => {
     const hits = matchUnreachable(selector, listUnreachableAgents())
     if (hits.length === 0) return false
-    log(`agent-route: selector="${selector}" → outside tmux (${hits.map((a) => `${a.agent} pid ${a.pid}`).join(", ")}) — refused, tmux-only`)
+    log(`agent-route: selector="${selector}" → outside tmux and the rig wrapper (${hits.map((a) => `${a.agent} pid ${a.pid}`).join(", ")}) — refused`)
     await sendMessage(ctx, outsideTmuxRefusalText(selector, hits), out)
     return true
   }
 
   // A `/agent <selector> <message>` whose selector matched NO tmux pane: try the agents
   // running OUTSIDE tmux. An omp gets the (already wrapped) text through its original-
-  // process bridge; any other harness gets the tmux-only refusal. No match returns null
+  // process bridge; any other harness gets the refusal. No match returns null
   // so the caller keeps its legacy "no agent matching" error. Never a silent drop.
   const tryRouteOutsideTmux = async (
     selector: string,
@@ -8585,6 +8760,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         await setSeenReactions(null, relatedReactionMessageId)
         return true
       }
+      const hostDelivery = shouldDeferInbound(paneId) ? null : deliverHostPane(paneId, action.injectText, action.messageId)
+      if (hostDelivery) {
+        const res = await hostDelivery
+        if (!res.ok) {
+          await sendMessage(ctx, res.error)
+          return false
+        }
+        await setSeenReactions(null, relatedReactionMessageId)
+        return true
+      }
       if (shouldDeferInbound(paneId)) {
         markDeferredForAck(enqueueDeferred(paneId, action.injectText, action.messageId, relatedReactionMessageId, sessionKey))
         return true
@@ -8663,6 +8848,17 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return false
       }
       if (route.legacySince !== undefined) return toPicker(goneOriginLabel(), `legacy route ${route.paneId}`)
+      // A session a rig wrapper hosts outside tmux: its route origin IS `host:<name>`. The host
+      // is re-verified by deliverToHost; a gone one gets the picker, never a same-project guess.
+      const originHost = hostNameFromOriginId(route.paneId)
+      if (originHost !== null) {
+        const host = listLiveHosts(snapshot().procs).find((h) => h.name === originHost)
+        if (!host) return toPicker(goneOriginLabel(), `host ${originHost} gone`)
+        log(`reply-route: replyTo=${replyTo} → ${route.paneId} (abduco PTY) msg="${msgPreview}"`)
+        const delivered = await injectVerbatim(route.paneId)
+        if (delivered) recordLastUserTarget(route.paneId, host.cwd ?? route.cwd)
+        return delivered
+      }
       const exactOrigin = route.agentPid !== undefined || route.serverPid !== undefined || route.paneId.startsWith("omp:")
       if (route.sessionKey === undefined && !exactOrigin) return null
       // A resumed omp's new process publishes a new endpoint; pick it up before

@@ -101,10 +101,10 @@ test('a fully headless claude session (no tty anywhere, parented under launchd) 
   // agent-naming reply replaced it, exactly as it does when a tty IS available.
   expect(sentMessages.some((m) => String(m.text).startsWith('Claude Code not in tmux'))).toBe(false);
 
-  // Found, so `/agent landing …` is refused by name (tmux-only, tg-cli#456) — not "no agent matching".
+  // Found, so `/agent landing …` is refused by name (outside tmux and the rig wrapper, tg-cli#456) — not "no agent matching".
 
   const refusal = sentMessages.find((m) => String(m.text).includes('landing · claude runs outside tmux'));
-  expect(String(refusal?.text).endsWith('Start it in tmux: claude-rotate --tmux landing')).toBe(true);
+  expect(String(refusal?.text).endsWith('Restart it with: rig harness run claude --name landing (or in a tmux window)')).toBe(true);
   expect(existsSync(join(cfgDir, 'inbox', 'landing'))).toBe(false);
 
   const listing = sentMessages.find((m) => String(m.text).includes('OUTSIDE tmux'));

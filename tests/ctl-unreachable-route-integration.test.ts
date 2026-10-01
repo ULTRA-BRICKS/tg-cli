@@ -7,9 +7,10 @@ import { agentInboxKey } from '../features/tg-ctl/unreachable';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 
 // Integration test (tg-cli#456, replacing the tg-cli#306 inbox channel): Claude Code and
-// Codex are tmux-only. An interactive claude/codex running OUTSIDE tmux is still listed
-// (never silently invisible), but `/agent <name> …` to it gets a ONE-line refusal naming
-// how to start it in tmux, and nothing is written to its Stop-hook inbox. Messages the
+// Codex are reached through a tmux pane or a rig-wrapper host. An interactive claude/codex
+// running OUTSIDE tmux and outside the wrapper is still listed (never silently invisible),
+// but `/agent <name> …` to it gets a ONE-line refusal naming how to restart it, and nothing
+// is written to its Stop-hook inbox. Messages the
 // retired channel queued before (stranded in pending.jsonl) are listed to the CTO ONCE
 // through the daemon's own reply path and archived — a restarted daemon never repeats it.
 // tmux / ps / lsof are PATH-shimmed with a fake process table.
@@ -247,7 +248,7 @@ afterAll(async () => {
 
 const env = { PATH: `${binDir}:${process.env.PATH ?? ''}`, HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: `http://127.0.0.1:${server.port}` };
 const texts = (): string[] => sentMessages.map((m) => String(m.text));
-const isStrandedReport = (t: string): boolean => t.startsWith('📭 Claude Code and Codex are tmux-only now');
+const isStrandedReport = (t: string): boolean => t.startsWith('📭 The Stop-hook inbox no longer delivers to Claude Code and Codex');
 const strandedReports = (): string[] => texts().filter(isStrandedReport);
 
 // The daemon is a real subprocess (no in-process clock to fake): poll for the
@@ -268,18 +269,22 @@ beforeAll(async () => {
   closeSync(logFd);
 });
 
-test('/agent to a claude/codex outside tmux: a one-line refusal naming how to start it in tmux, and nothing queued', async () => {
-  expect(await until(() => texts().filter((t) => t.includes('Start it in tmux')).length >= 3, 20_000)).toBe(true);
+test('/agent to a claude/codex outside tmux and the rig wrapper: a one-line refusal naming how to restart it, and nothing queued', async () => {
+  // the actions run concurrently and the listing for the plain message also says "Restart it
+  // with": wait for each refusal itself, not for a count of the phrase
+  expect(
+    await until(() => texts().filter((t) => t.includes('landing · claude runs outside tmux')).length >= 2 && texts().some((t) => t.includes('api · codex runs outside tmux')), 20_000),
+  ).toBe(true);
 
-  const refusals = texts().filter((t) => t.includes('Start it in tmux'));
+  const refusals = texts().filter((t) => t.includes('runs outside tmux') && t.includes('Restart it with'));
   const cc = refusals.filter((t) => t.includes('landing · claude runs outside tmux'));
   // `/agent landing deploy now` AND a bare `/agent landing` both refuse the same way.
   expect(cc).toHaveLength(2);
   for (const t of refusals) expect(t).not.toContain('\n');
   expect(cc[0]).toContain('nothing was sent or queued');
-  expect(cc[0].endsWith('Start it in tmux: claude-rotate --tmux landing')).toBe(true);
+  expect(cc[0].endsWith('Restart it with: rig harness run claude --name landing (or in a tmux window)')).toBe(true);
   const codex = refusals.find((t) => t.includes('api · codex runs outside tmux'));
-  expect(codex?.endsWith('Start it in tmux: tmux new-window -n api codex')).toBe(true);
+  expect(codex?.endsWith('Restart it with: rig harness run codex --name api (or in a tmux window)')).toBe(true);
 
   // No inbox write for either agent (named key and cwd key alike).
   expect(existsSync(join(cfgDir, 'inbox', 'landing'))).toBe(false);
@@ -289,7 +294,7 @@ test('/agent to a claude/codex outside tmux: a one-line refusal naming how to st
   const listing = texts().find((t) => t.includes('OUTSIDE tmux'));
   expect(listing).toContain('landing · claude — unreachable: not in tmux (tty ttys004, cwd /Users/u/work/landing, name landing, pid 7103)');
   expect(listing).toContain('api · codex — unreachable: not in tmux');
-  expect(listing).toContain('claude-rotate --tmux <name>');
+  expect(listing).toContain('`rig harness run <harness> --name <label>`');
   expect(listing).not.toMatch(/queued|Stop-hook/);
   expect(texts().some((t) => t.startsWith('Claude Code not in tmux'))).toBe(false);
 }, 30_000);

@@ -176,6 +176,18 @@ export function decideDelivery(prior: MessageState | undefined): DeliveryDecisio
   return { kind: 'suppress', prior };
 }
 
+// What a sink reports back after a send. `uncertain`: the send failed AFTER bytes of the
+// message were already written (a PTY connection lost mid-paste) — the text may have
+// arrived, so unlike a plain failure it must never be sent again.
+export type SinkResult = { ok: true } | { ok: false; error: string; uncertain?: boolean };
+
+// The outcome event a sink's result writes, closing the claim that preceded the send.
+export function sinkOutcomeEvent(ts: number, base: { chat: number; msg: number; target: string }, res: SinkResult): LedgerEvent {
+  if (res.ok) return { ts, event: 'delivered', ...base };
+  if (res.uncertain) return { ts, event: 'uncertain', ...base };
+  return { ts, event: 'failed', ...base, error: res.error };
+}
+
 // Claims a dead daemon left without an outcome — each needs an `uncertain` notice.
 export function orphanedClaims(state: LedgerState): Array<{ chat: number; msg: number; target: string }> {
   const out: Array<{ chat: number; msg: number; target: string }> = [];

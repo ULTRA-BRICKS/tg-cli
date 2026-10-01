@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { matchAgentCommand, paneIdByPid } from './discover';
 import type { AgentKind, PaneInfo, ProcInfo } from './types';
 import { uniqueProjectSelectorHits, type AgentCandidate } from './agent-match';
+import { hostOriginId } from './host-registry';
 import { resolveSessionName } from './session-name';
 import { normalizeTty, parseAgentNameFromCommand } from './unreachable';
 
@@ -243,18 +244,20 @@ export function liveOmpPidFromOriginId(paneId: string): number | null {
 }
 
 /**
- * Origin id `tg` stamps on an outbound route. A real tmux pane wins; otherwise
- * the omp ancestor pid so a Telegram reply can find a session with no pane.
+ * Origin id `tg` stamps on an outbound route. A real tmux pane wins; otherwise the omp
+ * ancestor pid so a Telegram reply can find a session with no pane; otherwise the abduco
+ * session a rig wrapper hosts it in (`host:<name>`, host-registry.ts).
  */
 export function outboundOriginPaneId(opts: {
   tmuxPane?: string | null;
   ompAncestorPid?: number | null;
+  hostName?: string | null;
 }): string | null {
   const pane = opts.tmuxPane?.trim();
   if (pane) return pane;
   const pid = opts.ompAncestorPid;
   if (pid && pid > 0) return liveOmpPaneId(pid);
-  return null;
+  return opts.hostName ? hostOriginId(opts.hostName) : null;
 }
 
 /** Live omp process that owns this origin — synthetic omp:<pid> or a tmux pane id. */

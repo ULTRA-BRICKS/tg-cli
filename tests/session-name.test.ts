@@ -75,3 +75,27 @@ test('isBareWindowName: wrapper/launcher auto-rename names are bare, user labels
   expect(isBareWindowName('gc-sme-backlog')).toBe(false);
   expect(isBareWindowName('omp-fixes')).toBe(false);
 });
+
+// A session a rig wrapper hosts in abduco outside tmux has no window: the wrapper's
+// label (the `--name` it was started with) plays the window's part — primary, with the
+// harness title secondary — so the same session reads the same in or out of tmux.
+test('outside tmux with a host label: the label is primary, the harness title secondary', () => {
+  expect(resolveSessionName({ hostLabel: 'tg-cli', cwd: '/w/other', harnessTitle: 'Fix routing' })).toEqual({
+    primary: 'tg-cli',
+    secondary: 'Fix routing',
+  });
+});
+
+test('outside tmux without a host label: unchanged — title, then cwd project, then fallback', () => {
+  expect(resolveSessionName({ hostLabel: null, cwd: '/w/rig-cli', harnessTitle: 'Fix rig' })).toEqual({ primary: 'Fix rig', secondary: null });
+  expect(resolveSessionName({ hostLabel: '  ', cwd: '/w/rig-cli' })).toEqual({ primary: 'rig-cli', secondary: null });
+  expect(resolveSessionName({ hostLabel: undefined, fallback: 'claude · 3f9a0c1d' })).toEqual({ primary: 'claude · 3f9a0c1d', secondary: null });
+});
+
+test('a host label equal to the harness title is not repeated as secondary', () => {
+  expect(resolveSessionName({ hostLabel: 'Rig', harnessTitle: 'rig' })).toEqual({ primary: 'Rig', secondary: null });
+});
+
+test('a tmux window still wins over the host label: a pane showing the hosted session is named by its window', () => {
+  expect(resolveSessionName({ tmuxWindow: 'ext', hostLabel: 'tg-cli', cwd: '/w/x', harnessTitle: 'T' })).toEqual({ primary: 'ext', secondary: 'T' });
+});
