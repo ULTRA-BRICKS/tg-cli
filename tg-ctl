@@ -278,6 +278,7 @@ import {
   buildButtonMessage,
   buildClaudeQuestionAnswerOutput,
   buildPostTimeoutQuestionMessage,
+  ASK_TIMEOUT_MAX_MS,
   callbackRequestId,
   clampRequestTimeoutMs,
   collectQuestionAnswers,
@@ -324,16 +325,21 @@ import {
 import {
   buildGraceRecord,
   buildGrantRecord,
+  closeDecidedCard,
+  dropSettledDecided,
   grantDenyReasonText,
+  hatchDenyNoticeText,
   hatchGrantNoticeText,
   isGrantableRequest,
   parseGrantStore,
   pruneGrantStore,
   pullGrant,
+  retireGraceRecord,
   routeForRequest,
   serializeGrantStore,
   upsertGraceRecord,
   verifyGrant,
+  type GraceRecord,
   type GrantStoreData,
 } from "./features/tg-ctl/grants"
 import {
@@ -4109,10 +4115,10 @@ interface AbandonedButton {
   criticalState?: DaemonCriticalState
 }
 
-// Shared by permissionRequestIdForMessage's two lookups (PendingButton and
-// AbandonedButton have compatible {req, messageId} shapes) — a single copy of
-// the "is this the one decidable permission card at this message_id" predicate
-// instead of two independently-written loops that could silently drift apart
+// Shared by permissionRequestIdForMessage's lookups (PendingButton, AbandonedButton
+// and the grace store's GraceRecord have compatible {req, messageId} shapes) — a
+// single copy of the "is this the one decidable permission card at this message_id"
+// predicate instead of independently-written loops that could silently drift apart
 // if the definition of "decidable" ever changes (review finding).
 function findDecidablePermissionRequestId(
   entries: Iterable<[string, { req: ButtonRequest; messageId: number | null }]>,
@@ -4207,6 +4213,18 @@ const GRANT_TTL_MS = (() => {
   const raw = Number(process.env.TG_CTL_GRANT_TTL_MS)
   return Number.isFinite(raw) && raw > 0 ? raw : 24 * 60 * 60_000
 })()
+// How long a NON-critical ask can wait on its socket at most: its timeoutMs is clamped to
+// ASK_TIMEOUT_MAX_MS, and the unscoped backstop retires it by then. A restored record still
+// marked pending but older than this is a stale copy (a lost questions write after the
+// card was answered), so its grace window is anchored no later than this past posting.
+const ASK_LIVE_MAX_MS = Math.max(ASK_TIMEOUT_MAX_MS, UNSCOPED_ABANDON_MS)
+// How long a decided card's record (grants.ts DecidedCard) is kept: past the latest grace
+// window a stale questions-store copy of the card could still open — anchored at most
+// ASK_LIVE_MAX_MS after posting, and the decision comes no earlier than the posting. A
+// critical ask has no such bound (its restart anchor is the restart itself), so its record
+// is kept while a copy of the card is on disk (null; grants.ts dropSettledDecided).
+const DECIDED_RETAIN_MS = GRACE_WINDOW_MS + ASK_LIVE_MAX_MS
+const decidedRetainMs = (req: ButtonRequest): number | null => (req.critical ? null : DECIDED_RETAIN_MS)
 
 // PURE — the single source of truth for "which retention window applies to
 // this entry's kind" (review finding, round 5: this ternary was duplicated
@@ -6989,15 +7007,22 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   const notifyAbandonedLongOutage = (key: string, entry: AbandonedButton): void => {
     const label = resolveSessionName({ tmuxWindow: entry.req.windowName, cwd: entry.req.cwd }).primary
     if (entry.messageId !== null) {
-      void clearMessageKeyboard(ctx, entry.messageId)
       const hookId = parseHatchHookId(entry.req.requestId)
+      // A hatch card whose 24h grace window is still open stays TAPPABLE past the 12h
+      // retention (tg-cli#403): its long-outage text promises exactly that, and a tap
+      // then mints from the grace record (handleGraceStoreTap). editMessageText drops
+      // the keyboard unless it rides along, so it is re-sent; every other card retires.
+      const now = Date.now()
+      const graceOpen =
+        hookId !== null && !entry.queuedDecision && grantsData.grace.some((g) => g.key === key && now < g.graceExpiresAt)
+      if (!graceOpen) void clearMessageKeyboard(ctx, entry.messageId)
       void editMessageText(
         ctx,
         entry.messageId,
         hookId !== null
           ? hatchAbandonedLongOutageText(entry.req, hookId, entry.queuedDecision?.label)
           : abandonedLongOutageText(entry.req, label, entry.queuedDecision?.label),
-        undefined,
+        graceOpen ? buildButtonMessage(ctx.chatId, entry.req).reply_markup : undefined,
         hatchParseMode(entry.req),
       )
     }
@@ -7127,9 +7152,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           // A LIVE pending scoped question and an abandoned one are equivalent on
           // disk — both restore as "abandoned" (no live socket), recoverable by a
           // late tap or a reconnect. Unscoped (paneId-less) pending is skipped: it
-          // can't be late-delivered (no pane) and must not resurrect to re-wedge.
+          // can't be late-delivered (no pane) and must not resurrect to re-wedge —
+          // except a hatch permission, whose card stays answerable through its grace
+          // record: dropping it made every tap after a daemon restart "expired"
+          // (tg-cli#403).
           ...[...pendingButtons.values()]
-            .filter((e) => e.req.paneId && (e.req.kind === "permission" || e.req.options?.length))
+            .filter((e) =>
+              e.req.kind === "permission"
+                ? Boolean(e.req.paneId) || isHatchRequest(e.req)
+                : Boolean(e.req.paneId && e.req.options?.length),
+            )
             .map((e) => ({
               req: e.req as unknown as Record<string, unknown>,
               messageId: e.messageId,
@@ -7138,6 +7170,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
               // must survive a restart too — otherwise every daemon bounce would
               // silently reset the human's reminder cadence.
               ...(e.criticalState ? { criticalState: e.criticalState } : {}),
+              pending: true as const,
             })),
           ...[...abandonedButtons.values()].map((e) => ({
             req: e.req as unknown as Record<string, unknown>,
@@ -7162,6 +7195,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         })),
       }
       atomicWrite(ctx.paths.questions, serializeQuestionStore(data))
+      // The write above is the file without any card this process no longer holds, so a
+      // decided card with no expiry (a critical one) has no stale copy left to guard:
+      // drop its record now rather than only at the next restart (grants.ts dropSettledDecided).
+      if (dropSettledDecided(grantsData, new Set([...pendingButtons.keys(), ...abandonedButtons.keys()]))) persistGrants()
     } catch (err) {
       // Best-effort, like routes/topics: a persist failure must never break the hot
       // forward/answer path. The state simply isn't durable until the next mutation.
@@ -7201,18 +7238,23 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
   }
-  // A hatch permission ask EXPIRED (both live retire paths — the unscoped backstop
-  // timer and the hook socket close — converge on retireAbandonedEntry, which calls
-  // this): upsert its grace record so a late Approve tap stays addressable for
-  // GRACE_WINDOW_MS (24h), outliving the 12h abandoned retention. Fail-soft with a
-  // loud log: losing grace degrades the feature but never authorizes anything.
+  // THE one place a hatch card gets its grace record — a live expiry (both live retire
+  // paths, the unscoped backstop timer and the hook socket close, converge on
+  // retireAbandonedEntry, which calls onHatchExpired) and both restore paths below — so a
+  // late Approve tap stays addressable for GRACE_WINDOW_MS (24h), outliving the 12h
+  // abandoned retention. Only a hatch permission gets one, once: a card that already has
+  // a record keeps it and its anchor (a second retire, a restore re-seeing the card).
+  // Returns whether it wrote one.
+  const ensureHatchGrace = (req: ButtonRequest, key: string, messageId: number | null, expiredAt: number): boolean => {
+    const parsedHookId = req.kind === "permission" ? parseHatchHookId(req.requestId) : null
+    if (parsedHookId === null || grantsData.grace.some((g) => g.key === key)) return false
+    const hookId = req.hookId ?? parsedHookId
+    upsertGraceRecord(grantsData.grace, buildGraceRecord(req, key, hookId, routeForRequest(req), messageId, expiredAt, GRACE_WINDOW_MS))
+    return true
+  }
+  // Fail-soft with a loud log: losing grace degrades the feature but never authorizes anything.
   const onHatchExpired = (entry: PendingButton, pendingKey: string): void => {
-    const hookId = entry.req.hookId ?? parseHatchHookId(entry.req.requestId)
-    if (!hookId) return
-    upsertGraceRecord(
-      grantsData.grace,
-      buildGraceRecord(entry.req, pendingKey, hookId, routeForRequest(entry.req), entry.messageId, Date.now(), GRACE_WINDOW_MS),
-    )
+    if (!ensureHatchGrace(entry.req, pendingKey, entry.messageId, Date.now())) return
     if (!persistGrants()) log(`grace persist failed for ${pendingKey} — late taps on this card will not be addressable`)
   }
   // Restore durable state on bootstrap. A restored scoped question lands in
@@ -7238,26 +7280,51 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   {
     const nowRestore = Date.now()
     const raw = parseQuestionStore(readFileOrNull(ctx.paths.questions), nowRestore, Number.MAX_SAFE_INTEGER, ANSWERED_REPLAY_MS)
+    const keysOnDisk = new Set<string>()
+    for (const rec of raw.questions) {
+      const req = normalizeButtonRequest(rec.req)
+      if (req) keysOnDisk.add(callbackRequestId(req))
+    }
+    // A decided critical card's record is kept while a stale copy of it is on disk; one
+    // whose copy is gone guards nothing any more (grants.ts dropSettledDecided).
+    const decidedSettled = dropSettledDecided(grantsData, keysOnDisk)
     let expiredOnRestore = false
+    let graceOnRestore = false
+    let decidedOnRestore = false
+    let pendingOnRestore = false
     for (const rec of raw.questions) {
       const req = normalizeButtonRequest(rec.req)
       if (!req) continue
       if (!req.paneId && !(req.kind === "permission" && isHatchRequest(req))) continue
       if (req.kind === "question" && !req.options?.length) continue
+      // A card a human already decided stays closed (grants.ts DecidedCard): the
+      // best-effort questions write of that decision may have been lost, and restoring
+      // the card — retained, with a fresh grace record — would let a later Approve tap or
+      // "да" reply undo a Deny (tg-cli#433). Dropped here, it leaves the file below.
+      if (grantsData.decided.some((d) => d.key === callbackRequestId(req))) {
+        decidedOnRestore = true
+        continue
+      }
+      // When this card expired — the start of its grace window. An entry still pending
+      // when the old process wrote it lost its live socket with that process, so it
+      // expired at this restart; `rec.at` is only when it was posted (a 14-minute-old
+      // ask would otherwise get a grace window 14 minutes short). A non-critical ask
+      // cannot have been live longer than ASK_LIVE_MAX_MS, so an older pending mark is a
+      // stale copy and its window starts no later than that (a critical ask waits without
+      // limit). An abandoned entry's `rec.at` is already its expiry moment
+      // (retainAbandonedQuestion).
+      let expiredAt = rec.at
+      if (rec.pending) {
+        expiredAt = req.critical ? nowRestore : Math.min(nowRestore, rec.at + ASK_LIVE_MAX_MS)
+        pendingOnRestore = true
+      }
       if (isAbandonedExpired(req.kind, rec.at, nowRestore, req.critical)) {
         // Grant protocol v1.1 (tg-cli#398): a hatch permission that expired while
         // the daemon was DOWN never ran retireAbandonedEntry in THIS process —
-        // write its grace record here (the restore-time retire path; `rec.at` is
-        // its abandon/expiry moment). parseGrantStore prunes past-grace records
-        // on load, so an over-aged one simply never materializes.
-        const expiredHookId = req.kind === "permission" ? req.hookId ?? parseHatchHookId(req.requestId) : null
-        if (expiredHookId !== null) {
-          upsertGraceRecord(
-            grantsData.grace,
-            buildGraceRecord(req, callbackRequestId(req), expiredHookId, routeForRequest(req), rec.messageId, rec.at, GRACE_WINDOW_MS),
-          )
-          expiredOnRestore = true
-        }
+        // write its grace record here (the restore-time retire path).
+        // parseGrantStore prunes past-grace records on load, so an over-aged one
+        // simply never materializes.
+        ensureHatchGrace(req, callbackRequestId(req), rec.messageId, expiredAt)
         // Carry the queuedDecision through (same rule as the live-abandonedButtons
         // restore below): a tap that was never delivered before the daemon went
         // down for the whole retention window must still be NAMED in the give-up
@@ -7277,6 +7344,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // dropped rather than silently scheduling reminders nobody asked for.
       const criticalState = req.critical === true ? rec.criticalState : undefined
       abandonedButtons.set(callbackRequestId(req), { req, messageId: rec.messageId, at: rec.at, queuedDecision, criticalState })
+      // A restored hatch ask lost its live socket with the old process — a paneless
+      // requester can never reconnect — so it has EXPIRED just like a socket-close
+      // retire: give it the grace record that retire would have written, so the card
+      // stays answerable for the full 24h rather than dying with the 12h retention
+      // (tg-cli#403). A pane-scoped ask that does reconnect is then answered live,
+      // which retires the record again (executeAction's answer-question case).
+      if (ensureHatchGrace(req, callbackRequestId(req), rec.messageId, expiredAt)) graceOnRestore = true
     }
     const restored = raw
     for (const a of restored.answered) {
@@ -7285,19 +7359,23 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (abandonedButtons.size || answeredButtons.size) {
       log(`questions restored: ${abandonedButtons.size} retained, ${answeredButtons.size} answered`)
     }
-    // A record notified-and-dropped above was never added to `abandonedButtons`,
-    // so it is gone from MEMORY — but the on-disk file still holds it (this block
-    // never wrote back). Left alone that stale record would: re-fire the identical
-    // (no-op) card edit on every subsequent restart until something else happens to
-    // mutate and persist, AND count against MAX_RETAINED_QUESTIONS on a future
-    // write, which could starve an actually-recent entry — or even a DIFFERENT
-    // still-expired-but-not-yet-notified entry — of its own notice (review
-    // finding). Persist once now so the file matches memory immediately — and
-    // the grants file with it (the restore-time grace upserts above).
-    if (expiredOnRestore) {
-      persistQuestions()
-      persistGrants()
-    }
+    // A record notified-and-dropped above (or dropped as already decided) was never
+    // added to `abandonedButtons`, so it is gone from MEMORY — but the on-disk file
+    // still holds it (this block never wrote back). Left alone that stale record would:
+    // re-fire the identical (no-op) card edit on every subsequent restart until
+    // something else happens to mutate and persist, AND count against
+    // MAX_RETAINED_QUESTIONS on a future write, which could starve an actually-recent
+    // entry — or even a DIFFERENT still-expired-but-not-yet-notified entry — of its own
+    // notice (review finding). Persist once now so the file matches memory immediately
+    // — and the grants file with it (the restore-time grace upserts above).
+    // The questions write also drops a restored entry's `pending` mark: its grace window is
+    // anchored now, and a later restart must not re-anchor it (re-opening a card whose
+    // window closed) — so the grace records it anchored go to disk first.
+    // The questions file is the only durable copy of a card the restore just dropped or
+    // re-anchored, so a failed grants write (fail-closed) leaves it untouched: writing it
+    // anyway would lose the card with no grace record to carry it on the next restart.
+    const grantsDurable = !(expiredOnRestore || graceOnRestore || decidedSettled) || persistGrants()
+    if (grantsDurable && (expiredOnRestore || decidedOnRestore || pendingOnRestore)) persistQuestions()
   }
   // /agent (and unrecognized-reply) selection awaiting a button tap: token →
   // message + candidate list. `prewrapped` = inject the message verbatim (a reply
@@ -10625,10 +10703,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // routes the contract's consume-instructions message to the origin (omp ACP /
   // inbox — never a live permission menu, the exact no-menu skip this fixes); a
   // tap beyond grace is told it is too late (the agent must re-request) and
-  // mints NOTHING. A belated Deny has nothing to deliver (no deny-grant exists
-  // in the contract) — it just retires the card. `expiredAt` is the ask's
-  // expiry moment (the grace anchor): the retained entry's `at` on the retained
-  // path, the grace record's `expiredAt` on the grace-only path.
+  // mints NOTHING. A belated Deny is final: it retires the grace record, revokes
+  // an unconsumed grant an earlier Approve minted, and routes a deny notice to
+  // the same origin (tg-cli#433, #403). `expiredAt` is the ask's
+  // expiry moment (the grace anchor): the card's grace record's `expiredAt` whenever it
+  // has one — a restored pending ask's retained `at` is its posting time, not its expiry
+  // (tg-cli#510) — else the retained entry's `at`.
   const handleHatchLateTap = async (
     action: Extract<Action, { kind: "answer-question" }>,
     req: ButtonRequest,
@@ -10638,22 +10718,60 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   ): Promise<boolean> => {
     const now = Date.now()
     if (answer.decision === "deny") {
-      if (cardId !== null) {
-        void clearMessageKeyboard(ctx, cardId)
-        void editMessageText(ctx, cardId, buildAnsweredQuestionText(req, answer.label), undefined, hatchParseMode(req))
+      // A Deny is FINAL (tg-cli#433): retire the grace record so no later tap on this
+      // card — a raced or duplicate Approve, a text reply — can mint, record the card as
+      // decided so a restart that still finds it in the best-effort questions store does
+      // not re-open it, and revoke a grant an earlier Approve minted that the agent has
+      // not consumed yet. Durable BEFORE the denial is confirmed (the mint's fail-closed
+      // rule): a lost write rolls back and asks for another tap.
+      const grant = grantsData.grants.find((g) => g.request_id === req.requestId) ?? null
+      if (grant && grant.consumed_at !== null) {
+        log(`hatch-late-deny-too-late: ${describeAskRequest(req)} key=${action.requestId} approvalId=${grant.approval_id} — grant already used`)
+        // Nothing a tap does on this card can change any more: retire its buttons.
+        if (cardId !== null) void clearMessageKeyboard(ctx, cardId)
+        await answerCallbackQueryOrNotify(ctx, action, `too late to deny — grant ${grant.approval_id} was already used`)
+        return true
       }
-      log(`hatch-late-deny: ${describeAskRequest(req)} key=${action.requestId} — expired ask, nothing to deliver`)
-      await answerCallbackQuery(ctx, action.callbackQueryId, "denied — the request had already expired; the agent must re-request")
+      const grantIndex = grant ? grantsData.grants.indexOf(grant) : -1
+      if (grant) grantsData.grants.splice(grantIndex, 1)
+      const undoClose = closeDecidedCard(grantsData, action.requestId, "deny", now, decidedRetainMs(req))
+      if (!persistGrants()) {
+        undoClose()
+        if (grant) grantsData.grants.splice(grantIndex, 0, grant)
+        log(`hatch-late-deny-failed: ${describeAskRequest(req)} key=${action.requestId} — grant store write failed`)
+        await answerCallbackQueryOrNotify(ctx, action, "could not record the denial — tap again")
+        return true
+      }
+      const revoked = grant?.approval_id ?? null
+      if (cardId !== null) {
+        const label = revoked ? `${answer.label} — grant ${revoked} revoked` : answer.label
+        void editMessageText(ctx, cardId, buildAnsweredQuestionText(req, label), undefined, hatchParseMode(req))
+      }
+      // Proactive delivery (tg-cli#403 (d)): the requester learns the outcome instead
+      // of waiting. Past the grace window the ask is long dead and a notice is noise —
+      // unless it carries a revocation the agent must hear about.
+      const shouldNotify = now < expiredAt + GRACE_WINDOW_MS || revoked !== null
+      const delivered = shouldNotify
+        ? await routeGrantNotice(
+            ctx,
+            req,
+            hatchDenyNoticeText({ requestId: req.requestId, question: req.question, deniedAt: now, revokedApprovalId: revoked }),
+            `deny:${req.requestId}`,
+          )
+        : false
+      log(`hatch-late-deny: ${describeAskRequest(req)} key=${action.requestId} revoked=${revoked ?? "-"} notice=${shouldNotify ? (delivered ? "delivered" : "failed") : "-"}`)
+      const told = delivered ? " — the agent was told" : shouldNotify ? " — could not reach the agent" : ""
+      await answerCallbackQuery(ctx, action.callbackQueryId, revoked ? `denied — grant ${revoked} revoked${told}` : `denied${told}`)
       return true
     }
-    if (now >= expiredAt + GRACE_WINDOW_MS) {
+    const unusedGrant = grantsData.grants.some((g) => g.request_id === req.requestId && g.consumed_at === null)
+    if (now >= expiredAt + GRACE_WINDOW_MS && !unusedGrant) {
       // Beyond the 24h grace window: NO grant (contract §4's too-late branch).
-      // Retire the stale grace record so this card can never mint later.
-      const i = grantsData.grace.findIndex((g) => g.key === action.requestId)
-      if (i >= 0) {
-        grantsData.grace.splice(i, 1)
-        persistGrants()
-      }
+      // Retire the stale grace record so this card can never mint later. A card
+      // whose Approve already minted a grant still unused keeps its record (it
+      // outlives the window so a Deny can revoke that grant) and re-routes the
+      // grant below.
+      if (retireGraceRecord(grantsData.grace, action.requestId)) persistGrants()
       if (cardId !== null) {
         void clearMessageKeyboard(ctx, cardId)
         void editMessageText(ctx, cardId, "too late — the 24h late-approval window has closed; the agent must request approval again")
@@ -10700,7 +10818,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (!persistGrants()) {
         grantsData.grants.pop()
         log(`hatch-grant-mint-failed: ${describeAskRequest(req)} key=${action.requestId} — grant store write failed`)
-        await answerCallbackQuery(ctx, action.callbackQueryId, "could not record the grant — tap again")
+        await answerCallbackQueryOrNotify(ctx, action, "could not record the grant — tap again")
         return true
       }
       log(
@@ -10833,7 +10951,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (parseHatchHookId(retained.req.requestId) !== null) {
         abandonedButtons.delete(action.requestId)
         persistQuestions()
-        return handleHatchLateTap(action, retained.req, retained.messageId ?? action.messageId, answer, retained.at)
+        const graceAnchor = grantsData.grace.find((g) => g.key === action.requestId)?.expiredAt ?? retained.at
+        return handleHatchLateTap(action, retained.req, retained.messageId ?? action.messageId, answer, graceAnchor)
       }
       const label = resolveSessionName({ tmuxWindow: retained.req.windowName, cwd: retained.req.cwd }).primary
       const paneId = retained.req.paneId
@@ -11281,6 +11400,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           // "answered" vs aged-out.
           const priorAnswer = answeredButtons.get(action.requestId)
           const stillAnswered = priorAnswer !== undefined && Date.now() - priorAnswer.at <= ANSWERED_REPLAY_MS
+          // Nothing answers for this card any more (e.g. a hatch card whose 24h grace
+          // window closed — it kept its buttons past the 12h retention): retire its
+          // buttons so they never outlive what a tap can do (tg-cli#403).
+          if (!stillAnswered && action.messageId !== null) void clearMessageKeyboard(ctx, action.messageId)
           await answerCallbackQueryOrNotify(ctx, action, stillAnswered ? "already answered" : "expired")
           return true
         }
@@ -11300,6 +11423,23 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         if (answer.status !== "answered") {
           await answerCallbackQueryOrNotify(ctx, action, "expired")
           return true
+        }
+        // A live answer on a hatch card is final: it retires the card's grace record (a
+        // restored ask has one while live again — a raced tap must not mint) and records
+        // the card as decided, so a restart that still finds it in the best-effort
+        // questions store — this answer's write of it can fail — does not re-open it
+        // (tg-cli#433). Durable BEFORE the answer goes out, like a late Deny: a lost write
+        // refuses the answer and the card stays live for another tap, never confirmed on
+        // memory alone.
+        if (pending.req.kind === "permission" && isHatchRequest(pending.req)) {
+          const decision = answer.decision === "deny" ? "deny" : "allow"
+          const undoClose = closeDecidedCard(grantsData, action.requestId, decision, Date.now(), decidedRetainMs(pending.req))
+          if (!persistGrants()) {
+            undoClose()
+            log(`ask-answer-refused: ${describeAskRequest(pending.req)} key=${action.requestId} — grant store write failed`)
+            await answerCallbackQueryOrNotify(ctx, action, "could not record the answer — tap again")
+            return true
+          }
         }
         pendingButtons.delete(action.requestId)
         activeButtonKeys.delete(action.requestId)
@@ -11858,7 +11998,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           return null
         },
         permissionRequestIdForMessage: (messageId) =>
-          findDecidablePermissionRequestId(pendingButtons, messageId) ?? findDecidablePermissionRequestId(abandonedButtons, messageId),
+          findDecidablePermissionRequestId(pendingButtons, messageId) ??
+          findDecidablePermissionRequestId(abandonedButtons, messageId) ??
+          // A grace-only hatch card (retained entry pruned past its 12h retention) is
+          // decided by a text reply exactly like by a tap (handleGraceStoreTap).
+          findDecidablePermissionRequestId(grantsData.grace.map((g): [string, GraceRecord] => [g.key, g]), messageId),
       })
 
       // The batch is durably journaled BEFORE this point (see the atomicWrite above), so

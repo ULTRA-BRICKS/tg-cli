@@ -3,6 +3,41 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.2
+
+- **Hatch approval taps that did not take effect now do (#403, #433).** Every way to resolve a
+  hatch card was replayed against a real daemon and a fake Bot API that tracks each card's
+  buttons, and the failing ones are fixed:
+  - A restart of the daemon (deploy, idle exit, crash) while a paneless hatch ask was waiting
+    dropped it, so every tap on its card answered "expired". The ask is now persisted and
+    restored with its 24h grace record: a tap mints the grant and notifies the agent (an omp;
+    a paneless Claude Code / Codex is tmux-only, #456, so its card names the token path). The
+    24h count from the restart that ended the wait, not from when the card was posted.
+  - At the 12h retention the card lost its Approve/Reject buttons although its text promised a
+    tap works until the 24h grace window closes. The buttons now stay, and the tap mints the grant.
+  - A text reply ("да", "ok", "нет" …) to a card past its 12h retention now decides it, like a
+    tap.
+  - A late Deny is final: it retires the grace record, so a raced or repeated Approve on the
+    same card can no longer mint a grant (#433 item 1). It stays final across a daemon restart:
+    the grant store records the decided card, and the restore skips it even when the
+    best-effort questions store still holds it. A Deny after an Approve revokes the grant if
+    the agent has not used it yet — also after the 24h grace window closed, since the grant
+    lives 24h from the Approve and the card's grace record now lasts as long as that unused
+    grant. The agent is told either way, through the same route as a grant notice, instead of
+    waiting on an approval that never comes.
+  - A live answer on a hatch card is final too: it retires the card's grace record (an ask that
+    re-attached after a restart has one), so a raced tap cannot re-open it, and records the
+    decided card, so a restart cannot re-open it even when the answer's questions-store write
+    was lost. If that cannot be written to the grant store, the answer is refused ("could not
+    record the answer — tap again") and the card stays live. A card on disk still marked as
+    waiting but posted longer ago than any ask can wait (15 minutes) is such a stale copy and
+    gets no fresh grace window. A critical ask waits without limit, so the record of its
+    decided card is kept as long as a copy of the card is on disk, not a day.
+  - A tap on a card nothing answers for any more (a hatch card whose 24h grace window closed, a
+    card whose grant was already used, or any other dead card) removes its buttons along with
+    the toast.
+  - Grant and deny notices clamp the quoted question without splitting an emoji (#433 item 5).
+
 ## 1.55.1
 
 - **The omp-live extension reports the abduco session name from `$RIG_SESSION`** (the `rig harness run`

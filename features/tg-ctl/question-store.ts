@@ -53,6 +53,10 @@ export interface RetainedQuestionRecord {
   // (imported, not re-declared — review finding: two independently-maintained
   // copies of the same shape would silently drift the moment either is edited).
   criticalState?: DaemonCriticalState;
+  // Written for a LIVE pending entry — its requester was still waiting on the socket, and
+  // `at` is when the card was POSTED. The restore marks the moment it expired (the restart
+  // itself) as the start of a hatch card's grace window, not the posting time (tg-cli#510).
+  pending?: true;
 }
 
 export interface RetainedAnswerRecord {
@@ -160,6 +164,7 @@ function parseQuestions(value: unknown, now: number, maxAgeMs: number): Retained
       at: rec.at,
       ...(queuedDecision ? { queuedDecision } : {}),
       ...(criticalState ? { criticalState } : {}),
+      ...(rec.pending === true ? { pending: true as const } : {}),
     });
   }
   // Newest first, capped: on overflow keep the freshest (most likely still tappable).

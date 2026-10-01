@@ -1,6 +1,6 @@
 {
   "name": "tg-cli",
-  "version": "1.55.1",
+  "version": "1.55.2",
   "type": "module",
   "scripts": {
     "test": "bun test"

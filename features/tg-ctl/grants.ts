@@ -25,6 +25,7 @@
 import { agentInboxKey } from './unreachable';
 import { hatchEnvVarName, type AskOperation, type AskOrigin, type ButtonRequest } from './questions';
 import { isRecord } from './guards';
+import { truncateWithEllipsis } from './text-util';
 
 // hgr- + 12 lowercase hex (crypto.randomBytes(6) in the entrypoint).
 export const GRANT_ID_RE = /^hgr-[0-9a-f]{12}$/;
@@ -61,9 +62,27 @@ export interface GrantRecord {
   consumed_at: number | null;
 }
 
+// A hatch card a human DECIDED (a late Deny, or any live answer on a hatch ask): durable
+// proof the card is closed. The questions store is best-effort, so a lost write can leave
+// the decided card retained on disk; the restore skips any card with this record instead
+// of granting it a fresh grace record, which would let a later Approve tap or "да" reply
+// undo the decision (tg-cli#433: a Deny must be final). Kept until the latest grace window
+// a stale copy of the card could still open has closed (the caller's retention, tg-ctl's
+// DECIDED_RETAIN_MS): past it, a restored card could not mint anyway. A critical ask waits
+// without limit, so a stale copy of its card would get a fresh window from ANY later
+// restart: its record has no expiry (`expiresAt: null`) and is kept for as long as a copy
+// of the card is on disk (dropSettledDecided).
+export interface DecidedCard {
+  key: string; // callbackRequestId of the ask, as on its GraceRecord
+  decision: 'allow' | 'deny';
+  decidedAt: number;
+  expiresAt: number | null;
+}
+
 export interface GrantStoreData {
   grace: GraceRecord[];
   grants: GrantRecord[];
+  decided: DecidedCard[];
 }
 
 // The daemon-observed stable route identity for an ask — the SAME identity the
@@ -217,10 +236,12 @@ export function grantDenyReasonText(reason: VerifyGrantOutcome extends { kind: '
   }
 }
 
-// The contract's routed late-approval message (final wording). ONE line (the
-// notice travels through inbox JSONL / ACP prompts / pane text where embedded
-// newlines would fragment it); the question is clamped to its first line and
-// 120 chars so a novel-length prompt can't swamp the consume instructions.
+// Routed notices quote the ask's question as ONE line (the notice travels through inbox
+// JSONL / ACP prompts / pane text where embedded newlines would fragment it), clamped so a
+// novel-length prompt can't swamp the instructions — cut surrogate-safely (text-util.ts).
+const NOTICE_QUESTION_MAX = 120;
+
+// The contract's routed late-approval message (final wording).
 export function hatchGrantNoticeText(args: {
   requestId: string;
   question: string;
@@ -229,8 +250,7 @@ export function hatchGrantNoticeText(args: {
   approvedAt: number;
   expiresAt: number;
 }): string {
-  const firstLine = args.question.split('\n', 1)[0].trim();
-  const short = firstLine.length > 120 ? `${firstLine.slice(0, 117)}…` : firstLine;
+  const short = truncateWithEllipsis(args.question.split('\n', 1)[0].trim(), NOTICE_QUESTION_MAX);
   const approvedTs = new Date(args.approvedAt).toISOString();
   const expiresTs = new Date(args.expiresAt).toISOString();
   const envVar = hatchEnvVarName(args.hookId);
@@ -241,6 +261,27 @@ export function hatchGrantNoticeText(args: {
     `For a pre-write hook (or any hook): simply retry the identical operation in the same directory — the grant is consumed automatically (pull). ` +
     `Do this ONLY if you have not already achieved the same goal another way. ` +
     `Grant is single-use, bound to the original command+directory, and expires ${expiresTs}.`
+  );
+}
+
+// The routed message for a belated Deny (tg-cli#403 (d): the requester is told the outcome
+// proactively — a deny as well as an approve — instead of waiting on a card nobody will
+// approve). Same one-line shape and routing as the grant notice. When the Deny revokes a
+// grant an earlier Approve minted, it says so: the agent may already hold that id.
+export function hatchDenyNoticeText(args: {
+  requestId: string;
+  question: string;
+  deniedAt: number;
+  revokedApprovalId: string | null;
+}): string {
+  const short = truncateWithEllipsis(args.question.split('\n', 1)[0].trim(), NOTICE_QUESTION_MAX);
+  const revoked = args.revokedApprovalId
+    ? `The earlier approval ${args.revokedApprovalId} is REVOKED and can no longer be consumed. `
+    : '';
+  return (
+    `Your earlier hatch request ${args.requestId} (${short}) was DENIED by the user at ${new Date(args.deniedAt).toISOString()}. ` +
+    revoked +
+    `Do NOT retry it or work around the gate that raised it; if the need is still real, ask the user directly.`
   );
 }
 
@@ -262,6 +303,51 @@ export function upsertGraceRecord(grace: GraceRecord[], rec: GraceRecord): void 
   const i = grace.findIndex((g) => g.key === rec.key);
   if (i >= 0) grace[i] = rec;
   else grace.push(rec);
+}
+
+// A decision that closes the card — a late Deny, a live answer on a hatch ask — retires
+// its grace record, so no later tap or text reply on the same card can mint a grant, and
+// records the card as decided (see DecidedCard), so no restart re-opens it (tg-cli#433: a
+// Deny must be final). `retainMs` null keeps the record while a copy of the card is on
+// disk (a critical ask, see DecidedCard). Returns the undo for a caller whose durable write
+// fails: it puts the grace record back and restores the previous decided record, or
+// removes the new one.
+export function closeDecidedCard(
+  data: GrantStoreData,
+  key: string,
+  decision: DecidedCard['decision'],
+  now: number,
+  retainMs: number | null,
+): () => void {
+  const retired = retireGraceRecord(data.grace, key);
+  const i = data.decided.findIndex((d) => d.key === key);
+  const prior = i >= 0 ? data.decided[i] : null;
+  const rec: DecidedCard = { key, decision, decidedAt: now, expiresAt: retainMs === null ? null : now + retainMs };
+  if (prior) data.decided[i] = rec;
+  else data.decided.push(rec);
+  return () => {
+    const j = data.decided.indexOf(rec);
+    if (j >= 0) {
+      if (prior) data.decided[j] = prior;
+      else data.decided.splice(j, 1);
+    }
+    if (retired) data.grace.push(retired);
+  };
+}
+
+// The restore's cleanup of the records with no expiry: one whose card is no longer in the
+// questions store (`keysOnDisk`, the callbackRequestIds read at this restart) has no stale
+// copy left to guard, so it is dropped. In place; true when anything was dropped.
+export function dropSettledDecided(data: GrantStoreData, keysOnDisk: ReadonlySet<string>): boolean {
+  const before = data.decided.length;
+  data.decided = data.decided.filter((d) => d.expiresAt !== null || keysOnDisk.has(d.key));
+  return data.decided.length !== before;
+}
+
+// A tap past the grace window retires the card's grace record, so it can never mint later.
+export function retireGraceRecord(grace: GraceRecord[], key: string): GraceRecord | null {
+  const i = grace.findIndex((g) => g.key === key);
+  return i >= 0 ? grace.splice(i, 1)[0] : null;
 }
 
 // Mint gate (fail-closed): a grant is useless unless it can be BOUND — the
@@ -294,12 +380,6 @@ export function buildGrantRecord(
     expires_at: approvedAt + ttlMs,
     consumed_at: null,
   };
-}
-
-// Double-mint guard: a request that already has a grant (consumed or not —
-// a consumed grant means the approval was already USED) must not mint another.
-export function grantExistsFor(grants: GrantRecord[], requestId: string): boolean {
-  return grants.some((g) => g.request_id === requestId);
 }
 
 // --- (de)serialization: versioned, fail-soft, pruned on both directions ---
@@ -381,18 +461,35 @@ function parseGrace(v: unknown): GraceRecord | null {
   };
 }
 
-// Drop grace records past their window and grants past their TTL (a grant
-// that can never allow again carries no information worth keeping — its
-// consumed proof is meaningless once expired). In place.
+function parseDecided(v: unknown): DecidedCard | null {
+  if (!isRecord(v)) return null;
+  const key = optStr(v.key);
+  const decision = v.decision === 'allow' || v.decision === 'deny' ? v.decision : null;
+  const decidedAt = typeof v.decidedAt === 'number' && Number.isFinite(v.decidedAt) ? v.decidedAt : null;
+  const expiresAt = v.expiresAt === null ? null : typeof v.expiresAt === 'number' && Number.isFinite(v.expiresAt) ? v.expiresAt : undefined;
+  if (!key || decision === null || decidedAt === null || expiresAt === undefined) return null;
+  return { key, decision, decidedAt, expiresAt };
+}
+
+// Drop grants past their TTL (a grant that can never allow again carries no information
+// worth keeping — its consumed proof is meaningless once expired), grace records past
+// their window and decided cards past theirs (one with no expiry: dropSettledDecided). In
+// place. A grace record whose card minted a grant the agent has not used yet outlives its
+// window until that grant expires: the grant lives 24h from the Approve, and a late Deny
+// tap on the card is how the human revokes it — without the record the tap would find
+// nothing and answer "expired".
 export function pruneGrantStore(data: GrantStoreData, now: number): void {
-  data.grace = data.grace.filter((g) => now < g.graceExpiresAt);
   data.grants = data.grants.filter((g) => now < g.expires_at);
+  data.grace = data.grace.filter(
+    (rec) => now < rec.graceExpiresAt || data.grants.some((g) => g.request_id === rec.requestId && g.consumed_at === null),
+  );
+  data.decided = data.decided.filter((d) => d.expiresAt === null || now < d.expiresAt);
 }
 
 export function serializeGrantStore(data: GrantStoreData, now: number): string {
-  const clean: GrantStoreData = { grace: [...data.grace], grants: [...data.grants] };
+  const clean: GrantStoreData = { grace: [...data.grace], grants: [...data.grants], decided: [...data.decided] };
   pruneGrantStore(clean, now);
-  return `${JSON.stringify({ version: GRANT_STORE_VERSION, grace: clean.grace, grants: clean.grants }, null, 1)}\n`;
+  return `${JSON.stringify({ version: GRANT_STORE_VERSION, grace: clean.grace, grants: clean.grants, decided: clean.decided }, null, 1)}\n`;
 }
 
 // Fail-soft (never throws): garbage / wrong version / malformed records all
@@ -400,7 +497,7 @@ export function serializeGrantStore(data: GrantStoreData, now: number): string {
 // Pruned against `now` on read too, so a long-down daemon doesn't resurrect
 // dead records.
 export function parseGrantStore(raw: string | null, now: number): GrantStoreData {
-  const empty: GrantStoreData = { grace: [], grants: [] };
+  const empty: GrantStoreData = { grace: [], grants: [], decided: [] };
   if (!raw) return empty;
   let parsed: unknown;
   try {
@@ -411,7 +508,8 @@ export function parseGrantStore(raw: string | null, now: number): GrantStoreData
   if (!isRecord(parsed) || parsed.version !== GRANT_STORE_VERSION) return empty;
   const grace = Array.isArray(parsed.grace) ? parsed.grace.map(parseGrace).filter((g): g is GraceRecord => g !== null) : [];
   const grants = Array.isArray(parsed.grants) ? parsed.grants.map(parseGrant).filter((g): g is GrantRecord => g !== null) : [];
-  const data: GrantStoreData = { grace, grants };
+  const decided = Array.isArray(parsed.decided) ? parsed.decided.map(parseDecided).filter((d): d is DecidedCard => d !== null) : [];
+  const data: GrantStoreData = { grace, grants, decided };
   pruneGrantStore(data, now);
   return data;
 }

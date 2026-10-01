@@ -13,7 +13,9 @@ import {
   GRANT_ID_RE,
   buildGraceRecord,
   buildGrantRecord,
-  grantExistsFor,
+  closeDecidedCard,
+  dropSettledDecided,
+  hatchDenyNoticeText,
   hatchGrantNoticeText,
   operationMatches,
   parseGrantStore,
@@ -23,9 +25,11 @@ import {
   verifyGrant,
   type GraceRecord,
   type GrantRecord,
+  type GrantStoreData,
 } from '../features/tg-ctl/grants';
 import { normalizeHookPayload, type HookEnv } from '../features/tg-ctl/hook-normalize';
 import { ASK_TIMEOUT_MAX_MS, clampRequestTimeoutMs, type ButtonRequest } from '../features/tg-ctl/questions';
+import { hasUnpairedSurrogate } from '../features/tg-ctl/text-util';
 import { normalizeButtonRequest } from '../tg-ctl';
 
 const NOW = 1_800_000_000_000; // fixed clock for determinism
@@ -164,7 +168,7 @@ test('upsertGraceRecord: same callback key replaces (re-retire never duplicates)
   expect(grace[0].messageId).toBe(2);
 });
 
-test('buildGrantRecord + grantExistsFor: grant mirrors contract §4 fields byte-for-byte', () => {
+test('buildGrantRecord: grant mirrors contract §4 fields byte-for-byte', () => {
   const req = hatchReq({ origin: { agent: 'omp', sessionId: 's1' }, operation: { fingerprint: 'fp1', cwd: '/repo' } });
   const g = buildGrantRecord(req, 'hgr-abcdef012345', 'acp:s1', NOW, 24 * 60 * 60_000);
   expect(g.approval_id).toBe('hgr-abcdef012345');
@@ -176,16 +180,15 @@ test('buildGrantRecord + grantExistsFor: grant mirrors contract §4 fields byte-
   expect(g.approved_at).toBe(NOW);
   expect(g.expires_at).toBe(NOW + 24 * 60 * 60_000);
   expect(g.consumed_at).toBeNull();
-  expect(grantExistsFor([g], REQUEST_ID)).toBe(true);
-  expect(grantExistsFor([g], 'hatch-other-aaaaaaaaaaaa')).toBe(false);
 });
 
 // --- store (de)serialization: fail-soft, versioned, pruned ---
 
-test('grant store roundtrip: serialize → parse preserves grace + grants with contract field names on disk', () => {
+test('grant store roundtrip: serialize → parse preserves grace + grants + decided cards with contract field names on disk', () => {
   const data = {
     grace: [buildGraceRecord(hatchReq(), 'cbkey', HOOK_ID, 'inbox:cwd-x', 7, NOW, 24 * 60 * 60_000)],
     grants: [grant()],
+    decided: [{ key: 'cbkey-denied', decision: 'deny' as const, decidedAt: NOW, expiresAt: NOW + 1000 }],
   };
   const raw = serializeGrantStore(data, NOW);
   // The on-disk JSON carries the contract's snake_case grant fields verbatim.
@@ -199,29 +202,87 @@ test('grant store roundtrip: serialize → parse preserves grace + grants with c
   expect(parsed.grace[0].requestId).toBe(REQUEST_ID);
   expect(parsed.grants).toHaveLength(1);
   expect(parsed.grants[0].approval_id).toBe('hgr-0123456789ab');
+  // A Deny's record survives the restart that must not re-open its card (tg-cli#433).
+  expect(parsed.decided).toEqual(data.decided);
 });
 
 test('grant store parse: garbage / unknown version / null degrade to empty, never throw', () => {
-  expect(parseGrantStore('not json', NOW)).toEqual({ grace: [], grants: [] });
-  expect(parseGrantStore('{"version":99}', NOW)).toEqual({ grace: [], grants: [] });
-  expect(parseGrantStore(null, NOW)).toEqual({ grace: [], grants: [] });
-  expect(parseGrantStore('{"version":1,"grants":[{"approval_id":5}]}', NOW)).toEqual({ grace: [], grants: [] });
+  const empty = { grace: [], grants: [], decided: [] };
+  expect(parseGrantStore('not json', NOW)).toEqual(empty);
+  expect(parseGrantStore('{"version":99}', NOW)).toEqual(empty);
+  expect(parseGrantStore(null, NOW)).toEqual(empty);
+  expect(parseGrantStore('{"version":1,"grants":[{"approval_id":5}],"decided":[{"key":"k","decision":"maybe"}]}', NOW)).toEqual(empty);
 });
 
-test('grant store prune: past-grace records and expired grants are dropped (parse AND serialize)', () => {
+test('grant store prune: past-grace records, expired grants and expired decided cards are dropped (parse AND serialize)', () => {
   const data = {
     grace: [buildGraceRecord(hatchReq(), 'cbkey', HOOK_ID, 7, NOW - 2000, 1000)], // grace closed 1000ms ago
     grants: [grant({ expires_at: NOW - 1 })], // expired
+    decided: [{ key: 'cbkey', decision: 'deny' as const, decidedAt: NOW - 2000, expiresAt: NOW - 1 }], // expired
   };
-  expect(parseGrantStore(serializeGrantStore(data, NOW), NOW)).toEqual({ grace: [], grants: [] });
-  const inMemory = { grace: [...data.grace], grants: [...data.grants] };
+  const empty = { grace: [], grants: [], decided: [] };
+  expect(parseGrantStore(serializeGrantStore(data, NOW), NOW)).toEqual(empty);
+  const inMemory = { grace: [...data.grace], grants: [...data.grants], decided: [...data.decided] };
   pruneGrantStore(inMemory, NOW);
-  expect(inMemory).toEqual({ grace: [], grants: [] });
+  expect(inMemory).toEqual(empty);
+});
+
+// A late Deny revokes an unused grant through its card's grace record, and the grant lives
+// 24h from the Approve — past the grace window when the Approve came late in it.
+test('grant store prune: a past-grace record outlives its window while its card has an unused grant', () => {
+  const pastGrace = buildGraceRecord(hatchReq(), 'cbkey', HOOK_ID, null, 7, NOW - 2000, 1000);
+  const withUnused = { grace: [pastGrace], grants: [grant()], decided: [] };
+  pruneGrantStore(withUnused, NOW);
+  expect(withUnused.grace).toHaveLength(1);
+
+  const withUsed = { grace: [pastGrace], grants: [grant({ consumed_at: NOW - 1 })], decided: [] };
+  pruneGrantStore(withUsed, NOW);
+  expect(withUsed.grace).toHaveLength(0);
+});
+
+// A critical ask waits without limit, so its decided card's record has no expiry: it
+// survives any restart while a copy of the card is on disk, and only then.
+test('grant store: a decided card with no expiry survives parse and prune until its card leaves the questions store', () => {
+  const forever = { key: 'crit', decision: 'deny' as const, decidedAt: NOW - 1, expiresAt: null };
+  const timed = { key: 'timed', decision: 'deny' as const, decidedAt: NOW - 1, expiresAt: NOW + 1000 };
+  const later = NOW + 365 * 24 * 60 * 60_000;
+  expect(parseGrantStore(serializeGrantStore({ grace: [], grants: [], decided: [forever] }, NOW), later).decided).toEqual([forever]);
+  // A record with no expiresAt at all is malformed, not "no expiry".
+  expect(parseGrantStore('{"version":1,"decided":[{"key":"k","decision":"deny","decidedAt":1}]}', NOW).decided).toEqual([]);
+
+  const data: GrantStoreData = { grace: [], grants: [], decided: [forever, timed] };
+  expect(dropSettledDecided(data, new Set(['crit']))).toBe(false);
+  expect(data.decided).toEqual([forever, timed]);
+  // A timed record is the prune's business, never dropped for a missing card.
+  expect(dropSettledDecided(data, new Set())).toBe(true);
+  expect(data.decided).toEqual([timed]);
+});
+
+test('closeDecidedCard: retires the grace record and records the decision; the undo restores both', () => {
+  const grace = buildGraceRecord(hatchReq(), 'k', HOOK_ID, null, 7, NOW - 10, 1000);
+  const data: GrantStoreData = {
+    grace: [grace],
+    grants: [],
+    decided: [{ key: 'k', decision: 'allow', decidedAt: NOW - 5, expiresAt: NOW + 5 }],
+  };
+  const prior = data.decided[0];
+  const undoReplace = closeDecidedCard(data, 'k', 'deny', NOW, 1000);
+  expect(data.grace).toEqual([]);
+  expect(data.decided).toEqual([{ key: 'k', decision: 'deny', decidedAt: NOW, expiresAt: NOW + 1000 }]);
+  undoReplace();
+  expect(data.grace).toEqual([grace]);
+  expect(data.decided).toEqual([prior]);
+
+  const undoAdd = closeDecidedCard(data, 'other', 'deny', NOW, 1000);
+  expect(data.grace).toEqual([grace]);
+  expect(data.decided.map((d) => d.key)).toEqual(['k', 'other']);
+  undoAdd();
+  expect(data.decided).toEqual([prior]);
 });
 
 test('grant store parse: a consumed-but-unexpired grant survives (single-use proof across restarts)', () => {
   const g = grant({ consumed_at: NOW + 10 });
-  const parsed = parseGrantStore(serializeGrantStore({ grace: [], grants: [g] }, NOW), NOW + 20);
+  const parsed = parseGrantStore(serializeGrantStore({ grace: [], grants: [g], decided: [] }, NOW), NOW + 20);
   expect(parsed.grants).toHaveLength(1);
   expect(parsed.grants[0].consumed_at).toBe(NOW + 10);
 });
@@ -258,6 +319,28 @@ test('hatchGrantNoticeText: a multi-line/novel-length question is clamped to one
   });
   expect(text).not.toContain('line two');
   expect(text.split('\n')).toHaveLength(1);
+});
+
+// tg-cli#433 item 5: the clamp must never leave half of a surrogate pair (an emoji
+// straddling the cut) — the downstream consumer would get invalid UTF-16 text.
+test('both routed notices clamp the question without orphaning a surrogate half', () => {
+  // Slide the emoji across every cut position near the 120-unit clamp.
+  for (let at = 110; at <= 122; at += 1) {
+    const question = `${'x'.repeat(at)}😀${'y'.repeat(20)} tail`;
+    const grantNotice = hatchGrantNoticeText({
+      requestId: REQUEST_ID,
+      question,
+      hookId: HOOK_ID,
+      approvalId: 'hgr-0123456789ab',
+      approvedAt: NOW,
+      expiresAt: NOW + 1000,
+    });
+    const denyNotice = hatchDenyNoticeText({ requestId: REQUEST_ID, question, deniedAt: NOW, revokedApprovalId: null });
+    for (const text of [grantNotice, denyNotice]) {
+      expect(text).not.toContain(' tail');
+      expect(hasUnpairedSurrogate(text)).toBe(false);
+    }
+  }
 });
 
 // --- per-request timeoutMs (contract §1: cap 15 min, absent → 115s default) ---

@@ -357,11 +357,24 @@ never counted as lost: harnesses prune transcripts and reply-route log lines car
   `tg-ctl ask` client for a SCOPED question reconnect-and-resends the same requestId across a
   mid-block socket drop; the restored daemon re-attaches the pending entry (no duplicate card) or
   replays the stored answer (#98, now persisted). (c) **dead-card UX** — a genuinely-dead card (an
-  unscoped question, or a send-failed forward) has its inline keyboard cleared on expiry. A SCOPED
+  unscoped question, or a send-failed forward) has its inline keyboard cleared on expiry, and a tap
+  on a card nothing answers for any more clears its keyboard with the "expired" toast. A SCOPED
   permission is reconnectable the same as a scoped question (`askDaemonOnce`); only UNSCOPED
   requests (no `paneId` — no card to late-deliver/re-attach to) keep the single-attempt client path,
-  since resending those would post a duplicate card. `question-store.ts` owns the on-disk format
-  (PURE); the entrypoint owns the I/O.
+  since resending those would post a duplicate card. The one unscoped kind that IS persisted is a
+  hatch permission (`RIG_HATCH_REQUEST_*`, tg-cli#403): live or retained, it restores with its 24h
+  grace record (`grants.ts`), so a tap after a daemon restart still mints a grant (a record written
+  while still live carries `pending: true`, and its grace window starts at the restart that ended
+  it — capped at posting + the longest a non-critical ask can wait, `ASK_LIVE_MAX_MS`, so a stale
+  copy never gets a fresh window); its card keeps Approve/Reject past the 12h retention until the
+  grace window closes (a text reply decides it too), and a late Deny retires the grace record,
+  revokes an unconsumed grant and routes a deny notice (tg-cli#433). A late Deny, or any live
+  answer on a hatch card, also writes a `decided` record to the grant store (fail-closed: a lost
+  write refuses the decision), kept `DECIDED_RETAIN_MS` (grace + `ASK_LIVE_MAX_MS`) — for a
+  critical ask, which waits without limit, `expiresAt: null` until its card is gone from the
+  questions store (`dropSettledDecided` at restore); the restore skips any card with one, so
+  a stale questions-store copy cannot re-open it after a restart.
+  `question-store.ts` owns the on-disk format (PURE); the entrypoint owns the I/O.
 - **Pane-inject late-delivery for permissions (`features/tg-ctl/permission-menu.ts`, tg-cli#267):**
   for `claude` specifically, a disconnected permission's hook has already fallen back to Claude
   Code's OWN numbered terminal "Do you want to proceed?" menu — answerable directly by
