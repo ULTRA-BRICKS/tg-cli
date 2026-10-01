@@ -94,6 +94,11 @@ test('--detect-agent wins anywhere as a dedicated info action', () => {
   expect(parseArgs(['hi', '--detect-agent'], dir, HOME)).toEqual({ action: 'detectAgent' });
 });
 
+test('--session-topic wins anywhere as a dedicated info action', () => {
+  expect(parseArgs(['--session-topic'], dir, HOME)).toEqual({ action: 'sessionTopic' });
+  expect(parseArgs(['hi', '--session-topic'], dir, HOME)).toEqual({ action: 'sessionTopic' });
+});
+
 test('--subagent value is trimmed', () => {
   expect(parseArgs(['--subagent', '  padded-name  ', 'body'], dir, HOME)).toEqual({
     action: 'send',

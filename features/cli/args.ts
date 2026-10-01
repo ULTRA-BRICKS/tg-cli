@@ -48,6 +48,7 @@ export type ParseResult =
   | { action: 'lsEmojiHelpers' }
   | { action: 'detectModel' }
   | { action: 'detectAgent' }
+  | { action: 'sessionTopic' }
   | { action: 'formatHelp' }
   | { action: 'error'; message: string }
   | {
@@ -308,7 +309,7 @@ const TAG_GATES: Record<string, TagGate> = {
  *
  * Precedence (the reconciliation point for "unknown dashed → error"):
  *   1. -h/--help and -v/--version win anywhere, before everything else.
- *   2. Info-only flags --ls-emoji-helpers / --detect-model / --detect-agent win next.
+ *   2. Info-only flags --ls-emoji-helpers / --detect-model / --detect-agent / --session-topic win next.
  *   3. Real flags are matched: --format (with value validation), --photo,
  *      --file (each consuming a path value).
  *   4. ONLY a dashed token that matched none of the above is "unknown" → error.
@@ -369,6 +370,9 @@ export function parseArgs(
   }
   for (const a of args) {
     if (a === '--detect-agent') return { action: 'detectAgent' };
+  }
+  for (const a of args) {
+    if (a === '--session-topic') return { action: 'sessionTopic' };
   }
   for (const a of args) {
     if (a === '--format-help') return { action: 'formatHelp' };

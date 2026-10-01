@@ -143,6 +143,11 @@ with the SAME environment as you, so those MUST pass \`--subagent\`. Precedence:
 signal (Claude Code sets it on the main thread too). The deprecated alias \`--agent\` still
 works. Check the resolved \`[window]\` label for the current shell: \`tg --detect-agent\`.
 
+A detached child (\`nohup\`, reparented to pid 1) cannot be matched to your session's topic, so
+its messages post to General. Hand it yours when you launch it:
+\`TG_TOPIC="$(tg --session-topic 2>/dev/null)" nohup … &\` — \`tg --session-topic\` prints
+this shell's topic id, or nothing.
+
 (Not the same flag as \`tg-ctl\`'s own \`--agent <name>\` — that one selects a closed
 harness kind for inbound telemetry, on a different binary.)
 

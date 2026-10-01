@@ -24,12 +24,12 @@ async function setup(t, pi = {}) {
   return { root, handlers, ctx, received, notifications };
 }
 
-test('extension enqueues a followUp into the existing busy context', async t => {
+test('a message arriving mid-turn steers the busy context (wakes a wait tool); followUp would starve until the run ends', async t => {
   const f = await setup(t);
   await f.handlers.get('session_start')({}, f.ctx);
   assert.equal((await listLiveEndpoints(f.root))[0].busy, true);
   await sendLiveMessage({ root: f.root, pid: process.pid, requestId: 'ext', text: 'follow up' });
-  assert.deepEqual(f.received, [{ text: 'follow up', options: { deliverAs: 'followUp' }, pid: process.pid }]);
+  assert.deepEqual(f.received, [{ text: 'follow up', options: { deliverAs: 'steer' }, pid: process.pid }]);
 });
 
 test('print, ACP-like headless and subagent contexts never publish', async t => {

@@ -3,6 +3,24 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.4
+
+- **A Telegram message sent to an omp that is mid-turn now reaches it (#552).** The omp-live
+  bridge delivered a message to a busy omp as a `followUp`, which omp drains only when the whole
+  run ends, and the `wait` tool is woken by steering only. An orchestrator parked in `wait` on
+  its subagents therefore never saw the CTO's message, while the daemon logged `accepted` and the
+  delivery ledger said `delivered` (tg#19011: absent from the session file minutes after
+  acceptance, while tg#19003, sent to the idle agent, arrived in a second). A busy omp now gets
+  the message as `steer`, exactly like text typed into its TUI; an idle one still starts a turn
+  as an `aside`.
+- **`tg --session-topic` hands a detached worker its parent's topic (#553).** A `nohup`-detached
+  `omp -p` worker (`rig-detached-omp`) is reparented to pid 1, so the daemon cannot tie its `tg`
+  calls, nor those of tools that shell out to `tg` such as the task-cli `[task created]`
+  notifier, to any session, and they posted to General. The new flag prints the forum topic of
+  the session it runs in, creating it on the first ask, or nothing (exit 0) when there is none, so
+  a launcher can run `TG_TOPIC="$(tg --session-topic 2>/dev/null)" nohup … &` and every message
+  of the child lands in the parent's topic. Spec §4.3 and the `tg` skill text describe it.
+
 ## 1.55.3
 
 - **A message typed into a tmux pane but never submitted is caught and reported (#463).** After the

@@ -229,6 +229,9 @@ Options:
                        env > RIG_AGENT_ID > RIG_DETACHED_AGENT. Deprecated
                        alias: --agent. Check the auto [window] label for the
                        current shell: --detect-agent.
+  --session-topic      print the forum topic id of the session this shell runs
+                       in (created on first ask), or nothing. A launcher of a
+                       detached child exports it: TG_TOPIC=$(tg --session-topic).
   --reply-to <id>      thread the outbound message UNDER an inbound Telegram
                        message (sets reply_to_message_id). The id is the inbound
                        message's Telegram message_id — the tg-ctl daemon surfaces
@@ -1054,6 +1057,28 @@ if (import.meta.main) {
   const CHAT_ID = env.TG_CHAT_ID
   const CHAT_ID_NUMBER = Number(CHAT_ID)
   const currentChatId = Number.isFinite(CHAT_ID_NUMBER) ? CHAT_ID_NUMBER : undefined
+
+  // `tg --session-topic`: the forum topic of the session this shell runs in, for a launcher to
+  // hand to a child that cannot be matched itself (`export TG_TOPIC=$(tg --session-topic)` before
+  // a nohup-detached `omp -p` worker, which is reparented to pid 1 and so loses the ancestry the
+  // daemon matches on). Same daemon lookup as a send, creating the topic on the first ask. Prints
+  // the id, or nothing: outside a session, topics off, daemon down — never an error exit, so the
+  // launcher's `$(...)` stays harmless.
+  if (parsed.action === "sessionTopic") {
+    const ctl = resolveControlConfig(parseControlConfig(configYamlRaw))
+    if (hasSessionIdentity && (ctl.topics || ctl.privateTopics) && BOT_TOKEN) {
+      const answer = parseResolvedSession(
+        await askDaemon(ctlPaths(configDir, botIdFromToken(BOT_TOKEN)).socket, {
+          kind: "resolve-session",
+          tmuxPane: process.env.TMUX_PANE ?? null,
+          tmuxServerPid: tmuxServerPidFromEnv(process.env.TMUX),
+          ancestorPids: ancestor ? [ancestor.pid] : [],
+        }, SESSION_LOOKUP_TIMEOUT_MS),
+      )
+      if (answer?.threadId) console.log(String(answer.threadId))
+    }
+    process.exit(0)
+  }
 
   // --dry-run needs no credentials at all: it never reaches the network, so an
   // agent can iterate against the escalation-format gate (or any other guard

@@ -36,7 +36,7 @@ tg-ctl omp-live send 12345 --request-id manual-unique-001 --session EXACT_SESSIO
 
 The receipt means **accepted/queued in the original process**, not read by the model,
 not completed, and not successful execution of the requested task. A model response or
-independent artifact check is still needed for those claims. Busy inputs use OMP's own `followUp` queue; idle inputs use `aside` to start a turn
+independent artifact check is still needed for those claims. Busy inputs are delivered as `steer`, exactly like text typed into the TUI (a `followUp` is drained only when the whole run ends, so an orchestrator parked in `wait` would not see the message until then, tg-cli#552); idle inputs use `aside` to start a turn
 without interrupting a concurrent turn that wins the admission race. Native permission and question hooks remain the approval channel.
 
 ## Endpoint ownership (#462) and self-heal (#458)

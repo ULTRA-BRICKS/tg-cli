@@ -233,6 +233,15 @@ not create a topic, so idle sessions do not spam topics.
 - When the daemon is down or times out, `tg` posts to General with the `[name]` header, as today.
 - `--topic` / `TG_TOPIC` still win when set explicitly.
 - No env stamping is needed for existing sessions.
+- **Detached workers (tg-cli#553).** A one-shot `omp -p --no-session` worker is not a session (§2.1)
+  and a `nohup` launch reparents it to pid 1, so the ancestry the daemon matches on is gone: its `tg`
+  calls, and those of tools that shell out to `tg` (the task-cli `[task created]` notifier), find no
+  session and post to General. §1 says subagents share the parent's topic; the hand-off is the
+  launcher's. `tg --session-topic` prints the topic of the session it runs in (the §4.3 lookup,
+  creating it on the first ask; nothing, exit 0, when there is none), and a launcher run from the
+  parent session exports it for the child: `TG_TOPIC="$(tg --session-topic 2>/dev/null)"`. The
+  worker's sends then follow the `TG_TOPIC` rule above. A child whose launcher ran outside any
+  session still posts to General; it is never guessed into another session's topic (§4.4).
 
 Question, permission and hatch cards (`questions.ts` `buildButtonMessage`) resolve the card's
 session key and add `message_thread_id` the same way. Callback handling is unchanged, because

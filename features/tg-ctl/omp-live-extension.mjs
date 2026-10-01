@@ -74,7 +74,10 @@ export default function ompLiveExtension(pi) {
         send: text => {
           if (!live()) throw new Error('stale_extension');
           // OMP schedules this in this process. It preserves normal hooks and permissions.
-          return pi.sendUserMessage(text, { deliverAs: ctx.isIdle() ? 'aside' : 'followUp' });
+          // Busy: steer, as a message typed into the TUI does. A followUp is drained only when the whole
+          // run ends, and only steering wakes a parked `wait` tool, so an orchestrator waiting on
+          // subagents would never see the CTO's message (tg#19011).
+          return pi.sendUserMessage(text, { deliverAs: ctx.isIdle() ? 'aside' : 'steer' });
         },
       });
       if (!live()) { await endpoint.close(); return; }
