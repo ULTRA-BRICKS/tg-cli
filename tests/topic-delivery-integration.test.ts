@@ -5,6 +5,7 @@ import { join } from 'path';
 import type { Server, Subprocess } from 'bun';
 import { parseRegistry, serializeRegistry } from '../features/tg-ctl/session-registry-store';
 import type { SessionEntry } from '../features/tg-ctl/session-registry';
+import { parseHistory } from '../features/replies/history';
 
 // A session's forum topic follows its registry session (docs/specs/session-registry-and-topics.md
 // §4.4 rows 2–3, §4.7; tg-cli#465, #466), against a real daemon and a fake Bot API. The registry —
@@ -185,7 +186,7 @@ function startAsk(fx: Fixture, port: number, sessionId: string, paneId: string):
 }
 
 // Polls: the conditions are side effects of a separate daemon process, with no signal to await.
-async function waitFor<T>(what: string, probe: () => T | undefined | null | false, timeoutMs = 15_000): Promise<T> {
+async function waitFor<T>(what: string, probe: () => T | undefined | null | false, timeoutMs = 30_000): Promise<T> {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
     const got = probe();
@@ -267,7 +268,7 @@ test('a bound topic follows its registry session: delivered while live (whatever
   expect(reply).toMatchObject({ message_thread_id: THREAD, text: '`alpha` is not running — resume with `claude --resume`' });
   expect(injected(fx).length).toBe(before);
   expect(entryOf(fx, 'cc:sess1')?.state).toBe('gone');
-}, 60_000);
+}, 120_000);
 
 test('a tmux rename retitles the session topic once; nothing reaches back into tmux', async () => {
   // The window was renamed `beta` while the session was away: the re-adopting scan sees the new
@@ -279,3 +280,72 @@ test('a tmux rename retitles the session topic once; nothing reaches back into t
   expect(api.calls.filter((c) => c.method === 'editForumTopic')).toHaveLength(1);
   expect(injected(fx).filter((l) => l.startsWith('rename-window'))).toEqual([]);
 }, 90_000);
+
+test('a topic message is logged for `tg replies` under the topic\'s session, with the thread it came from', async () => {
+  const { fx, api } = await readoptedSession();
+  api.updates.push([topicMsg('hello topic')]);
+  await waitFor('delivery', () => injected(fx).find((l) => l.includes('hello topic')));
+  const rows = parseHistory(readFileSync(join(fx.cfgDir, 'tg-ctl.123.history.jsonl'), 'utf8')).filter((r) => r.direction === 'user' && r.text === 'hello topic');
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({ pane: '%5', targetAgent: 'alpha', sessionKey: 'cc:sess1', threadId: THREAD });
+}, 120_000);
+
+// A permission hook of the live session in pane %5. Its stdout is the hook's reply to the agent.
+function startPermissionAsk(fx: Fixture, port: number): Subprocess {
+  const ask = Bun.spawn([process.execPath, TG_CTL, 'ask'], {
+    env: { HOME: fx.cfgDir, TG_CTL_CONFIG_DIR: fx.cfgDir, TG_API_BASE: `http://127.0.0.1:${port}`, TMUX_PANE: '%5' },
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'ignore',
+  });
+  procs.push(ask);
+  ask.stdin.write(
+    `${JSON.stringify({
+      requestId: 'p1',
+      agent: 'claude',
+      kind: 'permission',
+      question: 'Allow bash command: rm -rf /tmp/test?',
+      permissionEvent: 'PermissionRequest',
+      promptTurnId: 'turn1',
+      origin: { sessionId: 'sess1' },
+      cwd: fx.cfgDir,
+    })}\n`,
+  );
+  ask.stdin.end();
+  return ask;
+}
+
+test('a text reply inside the topic answers the permission card posted there, instead of reaching the agent as prose', async () => {
+  const { fx, api } = await readoptedSession();
+  // The daemon forwards cards of registered panes only (the first, session-naming hook above is
+  // dropped as unregistered by design).
+  writeFileSync(join(fx.cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ cwd: fx.cfgDir }));
+  const ask = startPermissionAsk(fx, api.port);
+  const card = await waitFor('permission card', () => api.sent.find((m) => m.reply_markup !== undefined && String(m.text).includes('rm -rf')));
+  // Posted into the session's topic; the fake Bot API numbers its messages from 100 in send order.
+  expect(card.message_thread_id).toBe(THREAD);
+  const cardMessageId = 100 + api.sent.indexOf(card);
+
+  const id = nextUpdate++;
+  api.updates.push([
+    {
+      update_id: id,
+      message: {
+        message_id: id,
+        from: { id: 1, first_name: 'Alex' },
+        chat: { id: 1 },
+        date: Math.floor(Date.now() / 1000),
+        text: 'yes',
+        message_thread_id: THREAD,
+        is_topic_message: true,
+        reply_to_message: { message_id: cardMessageId, chat: { id: 1 }, date: Math.floor(Date.now() / 1000) - 30, text: 'Permission from claude' },
+      },
+    },
+  ]);
+
+  const out = await new Response(ask.stdout).text();
+  await ask.exited;
+  expect(JSON.parse(out)).toMatchObject({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } });
+  // Never typed into the agent as chat.
+  expect(injected(fx).filter((l) => l.includes('yes'))).toEqual([]);
+}, 120_000);

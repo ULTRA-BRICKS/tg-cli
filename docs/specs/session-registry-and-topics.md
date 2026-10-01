@@ -242,6 +242,14 @@ not create a topic, so idle sessions do not spam topics.
   parent session exports it for the child: `TG_TOPIC="$(tg --session-topic 2>/dev/null)"`. The
   worker's sends then follow the `TG_TOPIC` rule above. A child whose launcher ran outside any
   session still posts to General; it is never guessed into another session's topic (§4.4).
+- A reply (`tg --reply-to <id>`) posts where the message it answers sits (tg-cli#551). Telegram
+  does not put a reply into its anchor's topic in a private chat with topics — a send naming no
+  `message_thread_id` lands in General — so every history row records `threadId` (a topic id, or
+  `null` for General; absent on rows older than the field): the daemon stamps it on each inbound
+  message, `tg` on each outbound one. `tg` reads the anchor's row: a topic id is stamped on every
+  chunk of the send, `null` keeps the reply in General (no lookup, so no topic is opened for a
+  session that posted nothing into one), and an anchor with no row falls back to the session
+  lookup above. `--topic` / `TG_TOPIC` still win.
 
 Question, permission and hatch cards (`questions.ts` `buildButtonMessage`) resolve the card's
 session key and add `message_thread_id` the same way. Callback handling is unchanged, because
@@ -260,6 +268,11 @@ Decision table, evaluated in order for a message with `message_thread_id = T`:
 | 5 | `forum_topic_created` / `_edited` / `_closed` service messages | Record them only. There is no spawn wizard and no `tmux rename-window`. A user topic rename is left alone until the next session rename overwrites it (§4.7). |
 
 No path drops a message silently. Every branch either delivers or answers in T.
+
+A text reply to a permission or hatch card, or to an abandoned question card, answers that card
+before any row above applies (cards are posted into the session's topic, so "yes" / "no" / the answer arrives here);
+its notices stay in T. The history row of a message in T belongs to T's session (key, name, pane
+when it has one) — never to the flat chat's default target — and records `threadId = T` (§4.3).
 
 ### 4.5 Private-topic "thread not found"
 

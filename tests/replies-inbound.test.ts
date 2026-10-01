@@ -29,6 +29,7 @@ test('inboundHistoryRecords: one user record per text message, UNWRAPPED text + 
       from: 'Alex',
       text: 'do the thing',
       pane: '%3',
+      threadId: null,
     },
   ]);
 });

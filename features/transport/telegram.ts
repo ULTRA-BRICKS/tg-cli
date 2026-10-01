@@ -24,8 +24,9 @@ export interface TelegramCtx {
   chatId: string;
   // Best-effort route bookkeeping: main owns the daemon ROUTES_PATH/TMUX_PANE
   // state and injects this recorder. Called once per returned message id so a
-  // reply to any sent message routes back to this pane.
-  recordRoute: (messageId: number) => void;
+  // reply to any sent message routes back to this pane. `threadId` is the topic the message
+  // landed in (null = General), so its history row can answer a later `--reply-to` (tg-cli#551).
+  recordRoute: (messageId: number, threadId: number | null) => void;
   // Threaded reply target (`--reply-to <message_id>`). When set, the FIRST
   // outbound sendMessage carries reply_to_message_id so it threads UNDER that
   // inbound Telegram message. Only the first message is threaded — a >4096
@@ -277,7 +278,8 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
       return;
     }
     if (result && typeof result === 'object' && typeof (result as { message_id?: unknown }).message_id === 'number') {
-      recordRoute((result as { message_id: number }).message_id);
+      // The thread THIS message landed in: a later chunk's fallback must not relabel earlier ones.
+      recordRoute((result as { message_id: number }).message_id, !threadDropped && messageThreadId !== undefined ? messageThreadId : null);
     }
   };
 

@@ -38,6 +38,20 @@ export interface InboundOpts {
   // (session-registry-and-topics.md §3.3), stamped as `sessionKey` so a later
   // rename keeps the row in that session's `tg replies`. Omitted / null → no key.
   resolveSession?: (pane: string | null) => string | null;
+  // The session a forum topic belongs to (tg-cli#551), for a message inside that topic. Such a
+  // message is delivered to the topic's session, never to the flat chat's default target and never
+  // by reply-route recognition, so none of `pane`/`resolvePane`/`resolveAgent`/`resolveSession`
+  // applies to it. null → the topic is unowned: the row carries no pane and no session. Omitted
+  // (topics mode off: a topic message takes the flat path) → stamped like any flat message.
+  resolveTopic?: (threadId: number) => TopicSession | null;
+}
+
+// What a topic's owner contributes to a history row. `pane` is null for a session in no pane (an
+// omp outside tmux) or one that is gone.
+export interface TopicSession {
+  pane: string | null;
+  agent: string | null;
+  sessionKey: string | null;
 }
 
 function senderAllowed(sender: number | undefined, opts: InboundOpts): boolean {
@@ -55,6 +69,12 @@ function historyText(m: TgMessage): string {
   return '[message]';
 }
 
+// A topic service message (created / renamed / closed / reopened) is Telegram reporting a topic
+// change, not something the CTO said.
+function isTopicServiceMessage(m: TgMessage): boolean {
+  return Boolean(m.forum_topic_created || m.forum_topic_edited || m.forum_topic_closed || m.forum_topic_reopened);
+}
+
 export function inboundHistoryRecords(updates: TgUpdate[], opts: InboundOpts): HistoryRecord[] {
   const out: HistoryRecord[] = [];
   for (const u of updates) {
@@ -62,13 +82,24 @@ export function inboundHistoryRecords(updates: TgUpdate[], opts: InboundOpts): H
     if (!m) continue; // callback queries + non-message updates are not history
     if (!senderAllowed(m.from?.id, opts)) continue; // a group member is never logged
     if (m.chat.id !== opts.chatId) continue; // the daemon serves its configured chat only
+    if (isTopicServiceMessage(m)) continue;
     // Owner inbound is not dropped by age (#183): if Telegram delivered it after
     // daemon downtime it is still a real request and belongs in recall.
     const from = m.from?.first_name || m.from?.username || 'tg';
-    const resolved = opts.resolvePane?.(m) ?? null;
-    const pane = resolved ?? opts.pane;
-    const targetAgent = opts.resolveAgent?.(pane) ?? undefined;
-    const sessionKey = opts.resolveSession?.(pane) ?? undefined;
+    const threadId = m.is_topic_message && m.message_thread_id !== undefined ? m.message_thread_id : null;
+    let pane: string | null;
+    let targetAgent: string | undefined;
+    let sessionKey: string | undefined;
+    if (threadId !== null && opts.resolveTopic) {
+      const topic = opts.resolveTopic(threadId);
+      pane = topic?.pane ?? null;
+      targetAgent = topic?.agent ?? undefined;
+      sessionKey = topic?.sessionKey ?? undefined;
+    } else {
+      pane = (opts.resolvePane?.(m) ?? null) ?? opts.pane;
+      targetAgent = opts.resolveAgent?.(pane) ?? undefined;
+      sessionKey = opts.resolveSession?.(pane) ?? undefined;
+    }
     out.push({
       ts: m.date,
       message_id: m.message_id,
@@ -79,6 +110,8 @@ export function inboundHistoryRecords(updates: TgUpdate[], opts: InboundOpts): H
       pane,
       ...(targetAgent ? { targetAgent } : {}),
       ...(sessionKey ? { sessionKey } : {}),
+      // A forum topic message only: a non-forum reply thread also carries message_thread_id.
+      threadId,
     });
   }
   return out;

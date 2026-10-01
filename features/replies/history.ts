@@ -46,6 +46,12 @@ export interface HistoryRecord {
   // Telegram's message_id is sequential PER CHAT, so two chats' multi-part
   // sends could otherwise start at the same id (review: tg-cli#131 follow-up).
   groupId?: string;
+  // Where the message sits in a forum chat (tg-cli#551): a topic id, or `null` for General (no
+  // thread). ABSENT = unknown (a row written before this field, or by a path that never learned
+  // it). `tg --reply-to <id>` reads it to post the answer into the topic of the message it
+  // answers — Telegram does not infer the topic from the reply anchor in a private chat with
+  // topics, so a reply that names no thread lands in General.
+  threadId?: number | null;
 }
 
 // Keep the tail only — recency is what `replies` shows, and the file must not
@@ -87,6 +93,8 @@ function parseLine(line: string): HistoryRecord | null {
   // resolvable target), never an invalid record.
   const targetAgent = typeof r.targetAgent === 'string' && r.targetAgent !== '' ? r.targetAgent : undefined;
   const sessionKey = typeof r.sessionKey === 'string' && r.sessionKey !== '' ? r.sessionKey : undefined;
+  // A topic id is a positive integer; null is General. Anything else is "unknown", never trusted.
+  const threadId = r.threadId === null || (typeof r.threadId === 'number' && Number.isInteger(r.threadId) && r.threadId > 0) ? (r.threadId as number | null) : undefined;
   return {
     ts: r.ts,
     message_id: r.message_id,
@@ -98,7 +106,28 @@ function parseLine(line: string): HistoryRecord | null {
     ...(groupId !== undefined ? { groupId } : {}),
     ...(targetAgent !== undefined ? { targetAgent } : {}),
     ...(sessionKey !== undefined ? { sessionKey } : {}),
+    ...(threadId !== undefined ? { threadId } : {}),
   };
+}
+
+// Where message `messageId` of `chatId` sits (tg-cli#551): its topic id, `null` for General,
+// `undefined` when no row records it (never seen, trimmed away, or a legacy row without the field).
+// Scans from the newest line and parses only the lines that can carry the id, so the lookup on a
+// full history file costs one split and a handful of parses. The latest row for an id wins.
+export function threadOfMessageInBlob(raw: string | null, chatId: number, messageId: number): number | null | undefined {
+  if (!raw) return undefined;
+  const needle = `"message_id":${messageId},`;
+  const lines = raw.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].includes(needle)) continue;
+    const rec = parseLine(lines[i]);
+    if (!rec || rec.message_id !== messageId) continue;
+    // A row without chat_id (legacy) never carries a threadId and must not shadow or stand in for
+    // another chat's row of the same id: only an exact chat match counts.
+    if (rec.chat_id !== chatId) continue;
+    return rec.threadId;
+  }
+  return undefined;
 }
 
 // Parse a whole JSONL blob, dropping any line that doesn't decode into a valid

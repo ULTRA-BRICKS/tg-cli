@@ -74,7 +74,10 @@ export function outboundHistoryText(body: string, attach: OutboundAttachments): 
 // read. Stamped on EVERY sibling record of a multi-part send (they are one
 // logical send from one agent). `sessionKey` (optional) is the sender's registry
 // session (session-registry-and-topics.md §3.3) — the identity `tg replies`
-// scopes on, so a rename never splits the session's history.
+// scopes on, so a rename never splits the session's history. `threadIds` (optional) maps each
+// outbound id to the thread THAT message was posted into — a topic id, or null for General — so a
+// later `tg --reply-to` of any chunk finds its own topic even when a later chunk fell back to
+// General (tg-cli#551); an id missing from the map (or no map) → unknown.
 export function buildOutboundHistoryRecords(
   outboundIds: number[],
   text: string,
@@ -84,6 +87,7 @@ export function buildOutboundHistoryRecords(
   chatId?: number,
   targetAgent?: string,
   sessionKey?: string,
+  threadIds?: ReadonlyMap<number, number | null>,
 ): HistoryRecord[] {
   const uniqueIds = [...new Set(outboundIds)];
   const ids: (number | null)[] = uniqueIds.length > 0 ? uniqueIds : [null];
@@ -108,5 +112,6 @@ export function buildOutboundHistoryRecords(
     ...(groupId !== undefined ? { groupId } : {}),
     ...(agent !== undefined ? { targetAgent: agent } : {}),
     ...(sessionKey ? { sessionKey } : {}),
+    ...(message_id !== null && threadIds?.has(message_id) ? { threadId: threadIds.get(message_id) } : {}),
   }));
 }

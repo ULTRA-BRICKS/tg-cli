@@ -248,6 +248,9 @@ export type Action =
       requestId: string;
       value: string;
       messageId: number | null;
+      // The forum topic a TEXT-reply answer came from: its "expired"/"already answered" notice
+      // (no callback query to toast) is posted there, not to General (tg-cli#551).
+      threadId?: number;
     }
   | {
       kind: 'close-question-card';
@@ -262,6 +265,8 @@ export type Action =
       text: string;
       from: string;
       messageId: number;
+      // The forum topic the reply came from: its refusal notices are posted there (tg-cli#551).
+      threadId?: number;
     }
   // Delivery receipt: set a 👀 reaction on the source message IF every action
   // emitted for it succeeded. Follows the message's delivery action(s); never

@@ -365,8 +365,11 @@ Caveats while this is experimental:
   or in the session's name.
 - **An agent's own posts go to its session's topic.** Each session gets one bot-created topic on
   its first `tg` send or question/permission card; `tg` finds it by asking the daemon, so no
-  `--topic`/`TG_TOPIC` is needed (either one still overrides, and `--reply-to` stays under the
-  replied message). A resumed session keeps its topic and says "reattached" there. A topic that
+  `--topic`/`TG_TOPIC` is needed (either one still overrides). A `--reply-to` answer goes where
+  the message it answers sits: in the topic the CTO wrote in (Telegram does not infer it from the
+  reply anchor in a private chat with topics — without the thread the answer lands in General),
+  in General for a General message, in the session's own topic when no record of the message
+  survives. A resumed session keeps its topic and says "reattached" there. A topic that
   rejects a post is retried once, then the post (text or media) goes to General with a notice; a
   deleted topic is recreated on the next post.
 

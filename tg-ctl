@@ -373,7 +373,7 @@ import {
   withRoutesLock,
 } from "./features/tg-ctl/routes"
 import { parseLastUserTarget, serializeLastUserTarget, withSessionKey, type LastUserTarget } from "./features/tg-ctl/last-user-target"
-import { parseHistory, type HistoryRecord } from "./features/replies/history"
+import { parseHistory, threadOfMessageInBlob, type HistoryRecord } from "./features/replies/history"
 import {
   applyLedgerEvents,
   compactLedger,
@@ -392,7 +392,7 @@ import {
 } from "./features/tg-ctl/delivery-ledger"
 import { AUDIT_USAGE, buildAuditReport, formatAuditReport, logDeliveryIds, parseAuditArgs, transcriptCopies, type InjectedCopy } from "./features/tg-ctl/delivery-audit"
 import { appendHistoryFile } from "./features/replies/history-file"
-import { inboundHistoryRecords } from "./features/replies/inbound"
+import { inboundHistoryRecords, type TopicSession } from "./features/replies/inbound"
 import { isLikelySlashCommand, parsePendingBatch, serializePendingBatch, stepUpdates } from "./features/tg-ctl/updates"
 import {
   appendTopic,
@@ -859,7 +859,7 @@ async function answerCallbackQueryOrNotify(
   text: string,
 ): Promise<void> {
   if (!action.callbackQueryId) {
-    await sendMessage(ctx, text)
+    await sendMessage(ctx, text, typeof action.threadId === "number" ? { message_thread_id: action.threadId } : {})
     return
   }
   await answerCallbackQuery(ctx, action.callbackQueryId, text)
@@ -7512,10 +7512,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   const pendingAgent = new Map<string, PendingAgentEntry>()
   const PICKER_TTL_MS = 10 * 60_000
   // The one notice for an inbound message the daemon gave up on (tg-cli#299): a reply
-  // under the CTO's own message, so he sees exactly which one to resend.
+  // under the CTO's own message, so he sees exactly which one to resend. In the topic the message
+  // was written in (its history row records it): a reply anchor alone does not name the thread,
+  // so without it the notice lands in General (tg-cli#551).
   const tellUndelivered = async (messageId: number, notice: string): Promise<void> => {
     log(`undelivered: tg#${messageId} ${notice}`)
-    await sendMessage(ctx, `⚠️ tg#${messageId} ${notice}`, { reply_parameters: { message_id: messageId, allow_sending_without_reply: true } })
+    const threadId = threadOfMessageInBlob(readFileOrNull(ctx.paths.history), ctx.chatId, messageId)
+    await sendMessage(ctx, `⚠️ tg#${messageId} ${notice}`, {
+      reply_parameters: { message_id: messageId, allow_sending_without_reply: true },
+      ...(typeof threadId === "number" ? { message_thread_id: threadId } : {}),
+    })
   }
   // A picker holds its message only in memory until a tap: the ledger records the hold
   // (a restart loses it and startup reports it), and a picker nobody taps reports its
@@ -11314,14 +11320,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // the user to re-tap once the agent is free; never falsely confirm delivery.
     if (shouldDeferInbound(paneId)) {
       log(`ask-late-deliver-busy: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId}`)
-      await answerCallbackQuery(ctx, action.callbackQueryId, "agent is busy — tap again shortly")
+      await answerCallbackQueryOrNotify(ctx, action, "agent is busy — tap again shortly")
       return true
     }
     const refusal = paneSessionRefusal(retained.req.sessionKey, paneId)
     if (refusal !== null) {
       log(`ask-late-deliver-refused: session left pane ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId}`)
-      await answerCallbackQuery(ctx, action.callbackQueryId, "not delivered — that session left its pane")
-      await sendMessage(ctx, refusal)
+      await answerCallbackQueryOrNotify(ctx, action, "not delivered — that session left its pane")
+      await sendMessage(ctx, refusal, replyContext(action.threadId))
       return true
     }
     const wrapped = wrapInbound(ctx.cfg.injectWrap, "tg", answer.label)
@@ -11368,7 +11374,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       abandonedButtons.set(action.requestId, { req: retained.req, messageId: retained.messageId, at: retained.at })
       persistQuestions()
       log(`ask-late-deliver-failed: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId} err=${res.error}`)
-      await answerCallbackQuery(ctx, action.callbackQueryId, "could not reach the terminal — tap again")
+      await answerCallbackQueryOrNotify(ctx, action, "could not reach the terminal — tap again")
       return true
     }
     log(`ask-late-delivered: ${describeAskRequest(retained.req)} key=${action.requestId} label=${answer.label} pane=${paneId}`)
@@ -11420,19 +11426,19 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       retained.req.multiQuestion ||
       retained.messageId !== action.questionMessageId
     ) {
-      await sendMessage(ctx, "that question is no longer waiting — resend if needed")
+      await sendMessage(ctx, "that question is no longer waiting — resend if needed", replyContext(action.threadId))
       return false
     }
     if (Date.now() - retained.at > ABANDONED_RETAIN_MS) {
       retireExpiredAbandonedQuestion(action.requestId, retained, action.questionMessageId)
       log(`ask-post-timeout-reply-expired: ${describeAskRequest(retained.req)} key=${action.requestId} ageMs=${Date.now() - retained.at}`)
-      await sendMessage(ctx, "that question expired — resend if needed")
+      await sendMessage(ctx, "that question expired — resend if needed", replyContext(action.threadId))
       return false
     }
     const paneId = retained.req.paneId
     if (shouldDeferInbound(paneId)) {
       log(`ask-post-timeout-reply-busy: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId}`)
-      await sendMessage(ctx, "agent is busy — reply to the question again shortly")
+      await sendMessage(ctx, "agent is busy — reply to the question again shortly", replyContext(action.threadId))
       return false
     }
 
@@ -11456,7 +11462,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       abandonedButtons.set(action.requestId, { req: retained.req, messageId: retained.messageId, at: retained.at })
       persistQuestions()
       log(`ask-post-timeout-reply-failed: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId} err=${res.error}`)
-      await sendMessage(ctx, res.sessionMismatch ? res.error : "could not reach the terminal — reply to the question again")
+      await sendMessage(ctx, res.sessionMismatch ? res.error : "could not reach the terminal — reply to the question again", replyContext(action.threadId))
       return false
     }
 
@@ -12200,6 +12206,25 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           const key = resolveSession(pane)
           return registry?.sessions.find((e) => e.key === key)?.name.primary || null
         }
+        // A message inside a forum topic belongs to the topic's session — the one `topic-route`
+        // delivers it to (tg-cli#551): the registry owner, else the session on the pane a
+        // pre-registry binding names. A gone owner keeps its key but has no pane to stamp (the
+        // `%N` may host a stranger now); a topic nobody owns stamps nothing.
+        const resolveTopic = (threadId: number): TopicSession | null => {
+          const owner = topicOwner(threadId)
+          if (owner) {
+            return {
+              pane: owner.state === "live" ? paneLocatorOf(owner) : null,
+              agent: owner.name.primary || null,
+              sessionKey: owner.key,
+            }
+          }
+          const binding = findTopic(loadTopics(), threadId)
+          if (binding?.status !== "bound" || !binding.paneId) return null
+          // The binding's own cwd must match, exactly as resolveTopicSession requires: a pane id is reused freely.
+          const key = registry ? resolveLocatorToSession(registry, binding.paneId, binding.path) : null
+          return { pane: binding.paneId, agent: resolveAgent(binding.paneId), sessionKey: key }
+        }
         const resolvePane = (m: TgMessage): string | null => {
           const replyId = m.reply_to_message?.message_id
           if (replyId === undefined) return null
@@ -12247,6 +12272,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             resolvePane,
             resolveAgent,
             resolveSession,
+            ...(ctx.cfg.topics || ctx.cfg.privateTopics ? { resolveTopic } : {}),
           }),
         )
       }

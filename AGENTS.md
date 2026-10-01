@@ -65,7 +65,12 @@ I/O, fetch, signals, `bun:ffi`):
   alias `--agent`; `--detect-agent` prints the resolved `[window]` label (+ `title: <secondary>`, and
   `subagent: <label>` when the shell's env marks a subagent); NOT the same flag as `tg-ctl`'s own `--agent`),
   `--reply-to <message_id>` (thread the message UNDER an inbound one — `reply_to_message_id`
-  on sendMessage, `reply_parameters` on sendRichMessage; the `answer` tag requires it),
+  on sendMessage, `reply_parameters` on sendRichMessage; the `answer` tag requires it. The send
+  also posts INTO the topic the anchor message sits in: Telegram does not infer a topic from the
+  reply anchor in a private chat with topics, so `tg` reads the anchor's thread from its history
+  row (`threadId`: topic id, `null` = General; written by the daemon for inbound and by `tg` for
+  outbound) and stamps it on every chunk; an anchor with no row falls back to the session's own
+  topic via the daemon lookup, a General anchor stays in General),
   `--topic <id>` (post INTO a forum topic — stamps `message_thread_id` on EVERY outbound
   primitive so an agent's reply threads into its bound topic instead of General; falls back to
   the `TG_TOPIC` env, flag wins; no flag/env → General, byte-identical to before),
@@ -306,7 +311,10 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
 
 - **Message history & recall (`tg replies`, v1.11.0):** an append-only JSONL log at
   `tg-ctl.<botid>.history.jsonl` (path added to `CtlPaths`, next to `routes`) records one
-  `{ts, message_id, direction, from, text, pane, groupId?, targetAgent?}` object per line. TWO
+  `{ts, message_id, direction, from, text, pane, groupId?, targetAgent?, sessionKey?, threadId?}`
+  object per line (`threadId`: the forum topic the message sits in, `null` = General, absent =
+  unknown — `tg --reply-to` reads it; a message inside a topic is stamped with the TOPIC's session,
+  not the flat default target). TWO
   writers, both best-effort (a corrupt/unwritable log NEVER breaks a send or an inject, exactly
   like `routes`): the `tg-ctl` poll loop appends every inbound message it processes (stamped with
   the routed target pane AND `targetAgent` — the routed pane's PRIMARY session name via `resolveSessionName`),

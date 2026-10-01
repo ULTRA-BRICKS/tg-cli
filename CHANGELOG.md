@@ -3,6 +3,31 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.5
+
+- **An agent's `tg --reply-to <id>` answer to a message written inside a topic now lands in that
+  topic, not in General (#551).** Telegram does not put a reply into its anchor's topic in a
+  private chat with topics, and `tg` skipped the session-topic lookup for every `--reply-to`
+  send — while the `answer` tag *requires* `--reply-to`, so every answer to a topic message left
+  the topic (tg#19001, the CTO's tg#19003 complaint). History rows now record where a message
+  sits (`threadId`: a topic id, `null` = General, absent = unknown): the daemon stamps inbound
+  messages, `tg` its outbound ones. A reply posts into its anchor's topic on every chunk, stays
+  in General for a General anchor, and falls back to the session's own topic when no row records
+  the anchor; `--topic` / `TG_TOPIC` still win, and a topic Telegram refuses falls back to
+  General like any advisory thread.
+- **A text reply to a permission/hatch card or an abandoned question card now answers the card
+  inside a topic too.** Cards are posted into the session's topic, but the topic triage skipped the
+  decision and post-timeout-answer handling the flat chat has, so "yes" / "no" / the answer was
+  typed into the agent as prose and the card stayed pending. Its notices ("expired", "agent is
+  busy", "session left its pane", …) now reach the CTO — before, a text reply had no callback
+  query to toast and some were silent — and stay in the topic. (A reply to a still-LIVE question
+  card is routed to the agent as in the flat chat.)
+- **A message inside a topic is logged under the topic's session.** Its `tg replies` row was
+  stamped from the flat chat's default target (or no pane at all), so the session's own recall
+  missed the CTO's topic messages and another agent's recall could show them. Topic service
+  messages (created / renamed / closed) no longer leave `[message]` rows. The "not delivered"
+  notice for a topic message is posted in that topic.
+
 ## 1.55.4
 
 - **A Telegram message sent to an omp that is mid-turn now reaches it (#552).** The omp-live

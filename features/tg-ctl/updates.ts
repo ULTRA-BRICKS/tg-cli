@@ -367,36 +367,14 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         // check) is exactly the kind of coupling a future edit can silently
         // desync into a runtime TypeError (review finding).
         const reply = m.reply_to_message;
-        const decisionToken = !isVerbatimText ? parseDecisionReplyToken(m.text) : null;
-        const decisionRequestId = decisionToken && reply
-          ? (opts.permissionRequestIdForMessage?.(reply.message_id) ?? null)
-          : null;
-        const postTimeoutRequestId = reply
-          ? (opts.postTimeoutQuestionRequestIdForMessage?.(reply.message_id) ?? null)
-          : null;
-        // bangGate?.warning is checked FIRST: isBangReply implies isVerbatimText, so
-        // the decisionToken/postTimeoutRequestId branches below are already
-        // unreachable for a bang reply (both require `!isVerbatimText`) — this only
+        const cardReply = cardReplyAction(m, name, opts);
+        // bangGate?.warning is checked FIRST: isBangReply implies isVerbatimText, and a card
+        // reply is never verbatim text, so cardReply is already null for a bang reply — this only
         // intercepts the reply-route branch a blocked bang reply would otherwise take.
         action = bangGate?.warning
           ? { kind: 'reply', text: bangGate.warning }
-          : decisionRequestId && decisionToken && reply
-          ? {
-              kind: 'answer-question',
-              callbackQueryId: '',
-              requestId: decisionRequestId,
-              value: decisionToken,
-              messageId: reply.message_id,
-            }
-          : postTimeoutRequestId && !isVerbatimText && reply
-            ? {
-                kind: 'post-timeout-question-reply',
-                requestId: postTimeoutRequestId,
-                questionMessageId: reply.message_id,
-                text: m.text,
-                from: name,
-                messageId: m.message_id,
-              }
+          : cardReply
+          ? cardReply
           : reply && (!isVerbatimText || isBangReply)
             ? {
                 kind: 'reply-route',
@@ -543,6 +521,27 @@ export function isLikelySlashCommand(text: string): boolean {
   return /^\/[a-zA-Z][\w-]*(\s|$)/.test(text);
 }
 
+// A plain TEXT reply to a card the daemon posted — a permission/hatch card ("yes"/"no" and kin)
+// or an abandoned question card (any prose is its deferred answer) — answers that card instead of
+// reaching the agent as chat. A /command or !shell reply never does. `threadId`: the forum topic
+// the reply was written in, so the answer's notices stay there. null for any other message.
+function cardReplyAction(m: TgMessage, name: string, opts: StepOpts, threadId?: number): Extract<Action, { kind: 'answer-question' | 'post-timeout-question-reply' }> | null {
+  const reply = m.reply_to_message;
+  const text = m.text;
+  if (!reply || !text || text.startsWith('/') || text.startsWith('!')) return null;
+  const thread = threadId !== undefined ? { threadId } : {};
+  const decisionToken = parseDecisionReplyToken(text);
+  const decisionRequestId = decisionToken ? (opts.permissionRequestIdForMessage?.(reply.message_id) ?? null) : null;
+  if (decisionRequestId && decisionToken) {
+    return { kind: 'answer-question', callbackQueryId: '', requestId: decisionRequestId, value: decisionToken, messageId: reply.message_id, ...thread };
+  }
+  const postTimeoutRequestId = opts.postTimeoutQuestionRequestIdForMessage?.(reply.message_id) ?? null;
+  if (postTimeoutRequestId) {
+    return { kind: 'post-timeout-question-reply', requestId: postTimeoutRequestId, questionMessageId: reply.message_id, text, from: name, messageId: m.message_id, ...thread };
+  }
+  return null;
+}
+
 // Daemon verbs answered in ANY forum topic, bound or not (§4.4 row 1). `/stop` and `/kill` are
 // deliberately absent: in a bound topic they reach that topic's session, and in an unknown topic
 // they are held like any other message.
@@ -571,6 +570,10 @@ function topicActionFor(updateId: number, m: TgMessage, name: string, opts: Step
   if (TOPIC_GLOBAL_CMDS.has(verb)) {
     return [textAction(text, name, opts, m.message_id, m.chat.id, m.reply_to_message?.message_id ?? null, threadId)];
   }
+  // A text reply to a question/permission/hatch card answers the card — the cards are posted into
+  // the session's topic, so the answer arrives here (tg-cli#551).
+  const cardReply = cardReplyAction(m, name, opts, threadId);
+  if (cardReply) return [cardReply];
   const payload = topicPayloadOf(updateId, m, name, opts);
   if (typeof payload === 'string') return [{ kind: 'reply', text: payload, threadId }];
   return (opts.topicStatusOf?.(threadId) ?? null) === null

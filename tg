@@ -62,7 +62,7 @@ import {
   serializeRoutes,
   withRoutesLock,
 } from "./features/tg-ctl/routes"
-import { parseHistory } from "./features/replies/history"
+import { parseHistory, threadOfMessageInBlob } from "./features/replies/history"
 import { appendHistoryFile } from "./features/replies/history-file"
 import { callerSessionKey, parseRegistry } from "./features/tg-ctl/session-registry-store"
 import type { Registry } from "./features/tg-ctl/session-registry"
@@ -237,14 +237,16 @@ Options:
                        message's Telegram message_id — the tg-ctl daemon surfaces
                        it in the injected wrap as "[TG from Alex #<id>]". The
                        answer tag REQUIRES this: answering means answering a
-                       SPECIFIC message.
+                       SPECIFIC message. The reply posts into the topic that
+                       message sits in (General stays General).
   --topic <id>         post INTO a forum topic: sets message_thread_id on every
                        outbound message so an agent's reply threads into its
                        bound topic instead of General (forum chats only). Falls
                        back to the TG_TOPIC env when the flag is absent; the flag
-                       wins. With neither (and no --reply-to), a tg inside a
-                       registry session posts into that session's own topic when
-                       control.topics is on; otherwise to General.
+                       wins. With neither, a tg inside a registry session posts
+                       into that session's own topic when control.topics is on
+                       (a --reply-to follows its message's topic first);
+                       otherwise to General.
   --table              read delimited rows from STDIN (TSV, or "a | b" per line),
                        render an aligned monospace table wrapped in <pre>, and
                        send it. The plain FALLBACK grid; a REAL native bordered
@@ -1126,6 +1128,8 @@ if (import.meta.main) {
   // closed / foreign id, so a thread rejection must fall back to General rather
   // than kill the send (handled in the transport via threadIdAdvisory).
   let threadIdAdvisory = false
+  // Set when Telegram refused an ADVISORY thread and the send fell back to General.
+  let topicFallback: string | null = null
   if (messageThreadId === undefined && env.TG_TOPIC) {
     // A launcher/daemon that writes TG_TOPIC via a file or with a trailing
     // newline would otherwise fail the regex and silently degrade to General;
@@ -1731,8 +1735,11 @@ if (import.meta.main) {
   // agent message — see recordOutboundHistory below, which now logs a
   // recall-able history record for each one, not just the first).
   const outboundIds: number[] = []
-  const recordRoute = (messageId: number): void => {
+  // The thread each outbound message landed in (null = General), as the transport reports it.
+  const outboundThreads = new Map<number, number | null>()
+  const recordRoute = (messageId: number, threadId: number | null): void => {
     outboundIds.push(messageId)
+    outboundThreads.set(messageId, threadId)
     if (!ROUTES_PATH || !originPaneId) return
     try {
       // Resolve the route cwd (a tmux display-message lookup) BEFORE taking the
@@ -1819,6 +1826,9 @@ if (import.meta.main) {
         // Out of tmux it is the registry entry's name; undefined → untagged.
         currentPaneAgentName() ?? (ownHost ? hostDisplayName(ownHost) : undefined) ?? entry?.name.primary ?? undefined,
         sessionKey ?? undefined,
+        // The thread each message actually landed in (null = General, also after a fallback): a
+        // later `tg --reply-to` of any of these ids finds its topic from it (tg-cli#551).
+        outboundThreads,
       )
       // Under the history lock shared with the daemon's inbound writer (tg-cli#136).
       appendHistoryFile(CTL_PATHS.history, recs)
@@ -2174,19 +2184,36 @@ if (import.meta.main) {
     }
   }
 
-  // Session topic (docs/specs/session-registry-and-topics.md §4.3, tg-cli#467): with no
-  // --topic / TG_TOPIC, ask the daemon which registry session this `tg` runs in; it answers
-  // with that session's topic, creating it on the first ask. Skipped for a --reply-to send
-  // (the reply belongs under the message it answers, wherever that is), outside any session,
-  // and when topics are off. The thread is ADVISORY: a rejection retries once after 1 s,
-  // then falls back to General, and the outcome is reported so the daemon counts misses.
+  // Where the send posts (docs/specs/session-registry-and-topics.md §4.3, tg-cli#467, #551).
+  // `--topic` / `TG_TOPIC` were resolved above and win. Otherwise a REPLY (`--reply-to`) goes
+  // where the message it answers sits: Telegram does not put a reply into its anchor's topic in a
+  // private chat with topics — without message_thread_id it lands in General — so the thread is
+  // read from the anchor's history row (a topic id, or null = General: it stays there). An anchor
+  // no row records (older than the history, a legacy row) and every non-reply send ask the daemon
+  // which registry session this `tg` runs in; it answers with that session's topic, creating it
+  // on the first ask. Skipped outside any session and when topics are off. The thread is
+  // ADVISORY: a rejection retries once after 1 s for a session topic, then falls back to
+  // General, and the outcome is reported so the daemon counts misses.
   let resolvedSession: ResolvedSession | null = null
-  let topicFallback: string | null = null
   const ctlCfg = resolveControlConfig(parseControlConfig(configYamlRaw))
-  const ctlSocket = ctlPaths(configDir, botIdFromToken(BOT_TOKEN)).socket
-  if (messageThreadId === undefined && replyTo === undefined && hasSessionIdentity && (ctlCfg.topics || ctlCfg.privateTopics)) {
+  const ctlFiles = ctlPaths(configDir, botIdFromToken(BOT_TOKEN))
+  const topicsOn = ctlCfg.topics || ctlCfg.privateTopics
+  let anchorThread: number | null | undefined
+  if (messageThreadId === undefined && replyTo !== undefined && topicsOn && currentChatId !== undefined) {
+    try {
+      anchorThread = threadOfMessageInBlob(readFileSync(ctlFiles.history, "utf8"), currentChatId, replyTo)
+    } catch {
+      // no readable history — the anchor is unknown
+    }
+  }
+  if (messageThreadId === undefined && anchorThread !== undefined) {
+    if (anchorThread !== null) {
+      messageThreadId = anchorThread
+      threadIdAdvisory = true
+    }
+  } else if (messageThreadId === undefined && hasSessionIdentity && topicsOn) {
     resolvedSession = parseResolvedSession(
-      await askDaemon(ctlSocket, {
+      await askDaemon(ctlFiles.socket, {
         kind: "resolve-session",
         tmuxPane: process.env.TMUX_PANE ?? null,
         tmuxServerPid: tmuxServerPidFromEnv(process.env.TMUX),
@@ -2212,9 +2239,8 @@ if (import.meta.main) {
     replyToMessageId: replyTo,
     messageThreadId,
     threadIdAdvisory,
-    ...(sessionTopic
-      ? { threadRetryDelayMs: 1000, onThreadFallback: (description: string) => void (topicFallback = description) }
-      : {}),
+    ...(sessionTopic ? { threadRetryDelayMs: 1000 } : {}),
+    ...(threadIdAdvisory ? { onThreadFallback: (description: string) => void (topicFallback = description) } : {}),
   })
   // fileCheckDeps: defined earlier (before code-as-pdf/md-as-pdf), reused here
   // unchanged so the pre- and post-conversion checks agree on what "ok" means.
@@ -2226,7 +2252,7 @@ if (import.meta.main) {
   // counter; a General fallback counts a miss, and the daemon posts the notice and, once
   // the topic is proven gone, recreates it. Best-effort, bounded like the lookup.
   if (sessionTopic) {
-    await askDaemon(ctlSocket, {
+    await askDaemon(ctlFiles.socket, {
       kind: "topic-result",
       key: sessionTopic.key,
       threadId: sessionTopic.threadId,

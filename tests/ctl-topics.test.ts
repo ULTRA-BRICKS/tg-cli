@@ -557,3 +557,59 @@ test('an OLD topic message is still triaged, never age-dropped (#183)', () => {
   expect(r.actions[0]).toMatchObject({ kind: 'topic-route' });
   expect(r.skippedStale).toBe(0);
 });
+
+// --- a text reply to a card answers the card, in a topic too (tg-cli#551) ---
+// Question, permission and hatch cards are posted INTO the session's topic, so the CTO's "yes" /
+// "no" / answer text arrives as a topic message; before this it was typed into the agent as plain
+// prose and the card stayed pending.
+
+const cardOpts = (over: Record<string, unknown> = {}) => ({
+  ...bound,
+  permissionRequestIdForMessage: (id: number) => (id === 60 ? 'perm_1' : null),
+  postTimeoutQuestionRequestIdForMessage: (id: number) => (id === 50 ? 'q_123' : null),
+  ...over,
+});
+const replyTo = (message_id: number) => ({ message_id, chat: { id: CHAT_ID }, date: NOW - 30, text: 'card' });
+
+test('topic: "yes" replying to a permission card in the topic resolves it as allow, notices stay in the topic', () => {
+  const r = stepUpdates([inTopic(101, { text: 'yes', reply_to_message: replyTo(60) })], cardOpts());
+  expect(r.actions).toEqual([
+    { kind: 'answer-question', callbackQueryId: '', requestId: 'perm_1', value: 'allow', messageId: 60, threadId: 50 },
+    { kind: 'ack', messageId: 101 },
+  ]);
+});
+
+test('topic: "no" replying to a permission card resolves it as deny', () => {
+  const r = stepUpdates([inTopic(102, { text: 'нет', reply_to_message: replyTo(60) })], cardOpts());
+  expect(r.actions[0]).toMatchObject({ kind: 'answer-question', requestId: 'perm_1', value: 'deny', threadId: 50 });
+});
+
+test('topic: a prose reply to an abandoned question card is its deferred answer', () => {
+  const r = stepUpdates([inTopic(103, { text: 'Production', reply_to_message: replyTo(50) })], cardOpts());
+  expect(r.actions).toEqual([
+    { kind: 'post-timeout-question-reply', requestId: 'q_123', questionMessageId: 50, text: 'Production', from: 'Alex', messageId: 103, threadId: 50 },
+    { kind: 'ack', messageId: 103 },
+  ]);
+});
+
+test('topic: a reply to a message that is not a card still routes to the session', () => {
+  const r = stepUpdates([inTopic(104, { text: 'yes', reply_to_message: replyTo(999) })], cardOpts());
+  expect(r.actions[0]).toMatchObject({ kind: 'topic-route', threadId: 50 });
+});
+
+test('topic: an unrecognised word replying to a permission card is prose for the session, not a decision', () => {
+  const r = stepUpdates([inTopic(105, { text: 'maybe later', reply_to_message: replyTo(60) })], cardOpts());
+  expect(r.actions[0]).toMatchObject({ kind: 'topic-route', threadId: 50 });
+});
+
+test('topic: a /command or !shell reply to a card is never a decision', () => {
+  const slash = stepUpdates([inTopic(106, { text: '/stop', reply_to_message: replyTo(50) })], cardOpts());
+  expect(slash.actions[0]).toMatchObject({ kind: 'topic-route' });
+  const bang = stepUpdates([inTopic(107, { text: '!ls', reply_to_message: replyTo(50) })], cardOpts());
+  expect(bang.actions[0]).toMatchObject({ kind: 'topic-route' });
+});
+
+test('topic: a card answered from an unknown topic still answers the card (the card owns its session)', () => {
+  const r = stepUpdates([inTopic(108, { text: 'yes', reply_to_message: replyTo(60) }, 77)], cardOpts({ topicStatusOf: () => null }));
+  expect(r.actions[0]).toMatchObject({ kind: 'answer-question', requestId: 'perm_1', threadId: 77 });
+});
