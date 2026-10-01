@@ -16,7 +16,8 @@ semantic versioning.
 - **`tg` labels omp/detached subagents with no flag.** The `[subagent]` bracket precedence is now
   `--subagent` > `TG_AGENT` > `RIG_AGENT_ID` > `RIG_DETACHED_AGENT=1` (→ `[detached]`). Claude
   Code / Codex / opencode in-process subagents share their parent's env, so they still pass
-  `--subagent`.
+  `--subagent`. Labels are one line of at most 80 characters whatever their source, and
+  `tg --detect-agent` prints `subagent: <label>` when the shell's env marks a subagent.
 - **`tg-ctl ask` cards name the real subagent.** `ButtonRequest.subagent` comes from the hook
   payload's top-level `agent_id` first (label `<agent_type>#<last 8 id chars>`), then the hook process
   env. The `features/agent-detect/` auto-detection is deleted: `tg-ctl ask` still ran it, and

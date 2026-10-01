@@ -65,7 +65,7 @@ function makeHome(): string {
 async function runSend(
   args: string[],
   extraEnv: Record<string, string> = {},
-): Promise<{ exitCode: number; stderr: string }> {
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   const home = makeHome();
   const proc = Bun.spawn(['bun', TG_SCRIPT, ...args], {
     // Deliberately NOT inheriting process.env: a dev/CI machine running these
@@ -79,12 +79,12 @@ async function runSend(
       TG_API_BASE: `http://127.0.0.1:${server.port}`,
       ...extraEnv,
     },
-    stdout: 'ignore',
+    stdout: 'pipe',
     stderr: 'pipe',
   });
-  const stderr = await new Response(proc.stderr).text();
+  const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
   const exitCode = await proc.exited;
-  return { exitCode, stderr };
+  return { exitCode, stdout, stderr };
 }
 
 test('`tg --subagent hyperide-fixer` sends a message carrying "[hyperide-fixer]"', async () => {
@@ -152,6 +152,13 @@ test('precedence --subagent > TG_AGENT > RIG_AGENT_ID > RIG_DETACHED_AGENT', asy
   expect(sent[1].text as string).toContain(styledBracket('from-tg-agent'));
   expect(sent[2].text as string).toContain(styledBracket('from-rig'));
   expect(sent[3].text as string).toContain(styledBracket('detached'));
+});
+
+test('`tg --detect-agent` also names the subagent bracket this shell\'s env resolves to', async () => {
+  const bare = await runSend(['--detect-agent']);
+  const launched = await runSend(['--detect-agent'], { RIG_AGENT_ID: 'RoleAudit' });
+  expect(bare.stdout).not.toContain('subagent:');
+  expect(launched.stdout).toContain('subagent: RoleAudit');
 });
 
 test('an omp MAIN session (RIG_DETACHED_AGENT empty, no RIG_AGENT_ID) is sent exactly like a bare coordinator', async () => {

@@ -221,7 +221,6 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
     };
   }
 
-  const roleEnv = withPayloadRole(p, env);
   const cwd = typeof p.cwd === 'string' ? p.cwd : undefined;
   const session = typeof p.session_id === 'string' ? p.session_id.slice(0, 8) : '';
   const input = asRecord(p.tool_input);
@@ -234,6 +233,10 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
     const reqs = normalizeAskUserQuestions(p, env);
     return reqs && reqs.length === 1 ? reqs[0] : null;
   }
+
+  // Everything below builds its request from the payload-first role (the AskUserQuestion
+  // branch above resolves it itself, per question set).
+  const roleEnv = withPayloadRole(p, env);
 
   // ExitPlanMode → plan-approval: a harness BLOCKING prompt ("the plan is ready,
   // proceed?"). It is gated as a tool (PreToolUse / PermissionRequest), but its

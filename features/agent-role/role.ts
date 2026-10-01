@@ -45,8 +45,9 @@ export interface RoleEnv {
 // token the agent-tools hook bridges use for that marker.
 export const DETACHED_LABEL = 'detached';
 
-// A fresh literal per call: verdicts are plain mutable records and must never alias.
-const coordinator = (): RoleVerdict => ({ role: 'coordinator', source: 'none' });
+// Labels land in a Telegram header bracket and a card line: one line, bounded. A
+// launcher-exported id or an LLM-authored opencode session title can be any length.
+const MAX_LABEL_CHARS = 80;
 
 function nonBlank(v: unknown): string | undefined {
   if (typeof v !== 'string') return undefined;
@@ -54,14 +55,26 @@ function nonBlank(v: unknown): string | undefined {
   return t ? t : undefined;
 }
 
+// A displayable label: whitespace collapsed to single spaces, capped by code point.
+function displayLabel(v: unknown): string | undefined {
+  const t = nonBlank(v)?.replace(/\s+/g, ' ');
+  if (!t) return undefined;
+  const chars = Array.from(t);
+  return chars.length > MAX_LABEL_CHARS ? chars.slice(0, MAX_LABEL_CHARS).join('') : t;
+}
+
+// Fresh literals per call: verdicts are plain mutable records and must never alias.
+const coordinator = (): RoleVerdict => ({ role: 'coordinator', source: 'none' });
+const subagent = (label: string, source: RoleSource): RoleVerdict => ({ role: 'subagent', label, source });
+
 // The env-carried subagent identity, explicit label first: `TG_AGENT`, then the
 // launcher/harness-managed `RIG_AGENT_ID`, then the anonymous detached marker.
 export function envRole(env: RoleEnv): RoleVerdict {
-  const explicit = nonBlank(env.TG_AGENT);
-  if (explicit) return { role: 'subagent', label: explicit, source: 'tg-agent-env' };
-  const launcher = nonBlank(env.RIG_AGENT_ID);
-  if (launcher) return { role: 'subagent', label: launcher, source: 'launcher-env' };
-  if (nonBlank(env.RIG_DETACHED_AGENT) === '1') return { role: 'subagent', label: DETACHED_LABEL, source: 'launcher-env' };
+  const explicit = displayLabel(env.TG_AGENT);
+  if (explicit) return subagent(explicit, 'tg-agent-env');
+  const launcher = displayLabel(env.RIG_AGENT_ID);
+  if (launcher) return subagent(launcher, 'launcher-env');
+  if (nonBlank(env.RIG_DETACHED_AGENT) === '1') return subagent(DETACHED_LABEL, 'launcher-env');
   return coordinator();
 }
 
@@ -71,8 +84,8 @@ export function envRole(env: RoleEnv): RoleVerdict {
 // process env byte-for-byte, so they are only labelled by an explicit
 // `--subagent` / `TG_AGENT`.
 export function senderRole(flag: string | undefined, env: RoleEnv): RoleVerdict {
-  const explicit = nonBlank(flag);
-  if (explicit) return { role: 'subagent', label: explicit, source: 'flag' };
+  const explicit = displayLabel(flag);
+  if (explicit) return subagent(explicit, 'flag');
   return envRole(env);
 }
 
@@ -88,8 +101,8 @@ export function hookPayloadRole(payload: unknown): RoleVerdict | null {
   const agentType = nonBlank(p.agent_type);
   // The RANDOM tail, not the head: Codex ids are UUIDv7, whose first 8 hex chars are a
   // timestamp that stays equal for ~65 s (two workers fanned out together share it).
-  const label = agentType ? `${agentType}#${agentId.replaceAll('-', '').slice(-8)}` : agentId;
-  return { role: 'subagent', label, source: 'hook-payload' };
+  const label = displayLabel(agentType ? `${agentType}#${agentId.replaceAll('-', '').slice(-8)}` : agentId);
+  return label ? subagent(label, 'hook-payload') : null;
 }
 
 export interface OpencodeSessionRecord {
@@ -103,6 +116,5 @@ export interface OpencodeSessionRecord {
 // none. The title (`… (@explore subagent)`) is the human label, the id the fallback.
 export function opencodeSessionRole(session: OpencodeSessionRecord | undefined): RoleVerdict {
   if (!session || !nonBlank(session.parentID)) return coordinator();
-  const label = nonBlank(session.title) ?? nonBlank(session.id) ?? 'subagent';
-  return { role: 'subagent', label, source: 'session-parent' };
+  return subagent(displayLabel(session.title) ?? displayLabel(session.id) ?? 'subagent', 'session-parent');
 }

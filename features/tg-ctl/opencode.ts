@@ -19,13 +19,14 @@ export interface OpencodeReplyPlan {
 
 // `session` is the opencode session record of `properties.sessionID` (`GET /session/:id`),
 // fetched by the caller: a child session (`parentID` set) is a `task` subagent and its
-// ask is labelled with it (docs/specs/agent-role-model.md §3).
+// ask is labelled with it (docs/specs/agent-role-model.md §3). A record for another
+// session id is ignored, never applied.
 export function opencodeEventToButtonRequest(event: OpencodeEvent, session?: OpencodeSessionRecord): ButtonRequest | null {
   const p = event.properties ?? {};
   const sessionId = stringField(p, 'sessionID') ?? stringField(p, 'sessionId');
   const requestId = stringField(p, 'requestID') ?? stringField(p, 'requestId') ?? stringField(p, 'id');
   if (!sessionId || !requestId) return null;
-  const subagent = opencodeSessionRole(session).label;
+  const subagent = opencodeSessionRole(session?.id && session.id !== sessionId ? undefined : session).label;
 
   if (event.type === 'question.asked' || event.type === 'question.v2.asked') {
     if (Array.isArray(p.questions) && p.questions.length !== 1) return null;

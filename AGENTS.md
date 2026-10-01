@@ -62,8 +62,8 @@ I/O, fetch, signals, `bun:ffi`):
   subagents; detached children get it from their launcher) and `RIG_DETACHED_AGENT=1`
   (→ `detached`); `CLAUDE_CODE_CHILD_SESSION` is NOT a role signal; Claude Code / Codex /
   opencode IN-PROCESS subagents share their parent's env and MUST pass the flag; deprecated
-  alias `--agent`; `--detect-agent` prints
-  the resolved `[window]` label (+ `title: <secondary>`); NOT the same flag as `tg-ctl`'s own `--agent`),
+  alias `--agent`; `--detect-agent` prints the resolved `[window]` label (+ `title: <secondary>`, and
+  `subagent: <label>` when the shell's env marks a subagent); NOT the same flag as `tg-ctl`'s own `--agent`),
   `--reply-to <message_id>` (thread the message UNDER an inbound one — `reply_to_message_id`
   on sendMessage, `reply_parameters` on sendRichMessage; the `answer` tag requires it),
   `--topic <id>` (post INTO a forum topic — stamps `message_thread_id` on EVERY outbound

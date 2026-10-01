@@ -1014,12 +1014,15 @@ if (import.meta.main) {
       : { primary: "", secondary: null }
   if (parsed.action === "detectAgent") {
     // The auto `[window]` label this session's messages get with no flag (the
-    // resolver's primary name, or "(none)"), and the harness title on a second line
-    // when it is shown as the secondary name. There is NO env-based subagent
-    // auto-detection; a subagent self-labels with `--subagent`.
+    // resolver's primary name, or "(none)"), the harness title on a second line
+    // when it is shown as the secondary name, and — when the shell's env marks it
+    // a subagent (TG_AGENT / RIG_AGENT_ID / RIG_DETACHED_AGENT) — the `[subagent]`
+    // bracket it gets, as `subagent: <label>`.
     const name = sessionNameFor(harnessTitle)
     console.log(name.primary || "(none)")
     if (name.secondary) console.log(`title: ${name.secondary}`)
+    const role = senderRole(undefined, env)
+    if (role.label) console.log(`subagent: ${role.label}`)
     process.exit(0)
   }
 

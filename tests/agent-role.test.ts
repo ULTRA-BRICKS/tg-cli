@@ -140,6 +140,19 @@ test('opencode: a question raised in a child session is labelled with its subage
   expect(opencodeEventToButtonRequest(event, ocSessions.subagentChild)?.subagent).toBe('Audit wearable CAD (@explore subagent)');
   expect(opencodeEventToButtonRequest(event, ocSessions.topLevel)?.subagent).toBeUndefined();
   expect(opencodeEventToButtonRequest(event)?.subagent).toBeUndefined();
+  // A record fetched for ANOTHER session must never label this session's card.
+  expect(opencodeEventToButtonRequest(event, { ...ocSessions.subagentChild, id: 'ses_other' })?.subagent).toBeUndefined();
+});
+
+test('labels are one bounded line whatever the source (LLM-authored titles, launcher ids)', () => {
+  const long = 'x'.repeat(300);
+  expect(envRole({ RIG_AGENT_ID: long }).label).toBe('x'.repeat(80));
+  expect(envRole({ TG_AGENT: 'a\n  b\tc' }).label).toBe('a b c');
+  expect(senderRole(long, {}).label).toHaveLength(80);
+  expect(opencodeSessionRole({ id: 's', parentID: 'p', title: `Audit\n${long}` }).label).toHaveLength(80);
+  expect(hookPayloadRole({ agent_id: 'abc', agent_type: long })?.label).toHaveLength(80);
+  // Capped by code point: an emoji at the cut is never split into a lone surrogate.
+  expect(envRole({ RIG_AGENT_ID: '😀'.repeat(200) }).label).toBe('😀'.repeat(80));
 });
 
 // ---------------------------------------------------------- detached children
