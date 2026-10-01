@@ -129,19 +129,21 @@ test('opencode: a session with a parentID is a subagent labelled by its title; a
 });
 
 test('opencode: a question raised in a child session is labelled with its subagent', () => {
-  const event = {
+  const ask = (sessionID: string) => ({
     type: 'question.asked',
     properties: {
-      sessionID: ocSessions.subagentChild.id,
+      sessionID,
       id: 'que_1',
       questions: [{ question: 'Proceed?', header: 'Go', options: [{ label: 'Yes', description: '' }], custom: false }],
     },
-  };
-  expect(opencodeEventToButtonRequest(event, ocSessions.subagentChild)?.subagent).toBe('Audit wearable CAD (@explore subagent)');
-  expect(opencodeEventToButtonRequest(event, ocSessions.topLevel)?.subagent).toBeUndefined();
-  expect(opencodeEventToButtonRequest(event)?.subagent).toBeUndefined();
-  // A record fetched for ANOTHER session must never label this session's card.
-  expect(opencodeEventToButtonRequest(event, { ...ocSessions.subagentChild, id: 'ses_other' })?.subagent).toBeUndefined();
+  });
+  const child = ask(ocSessions.subagentChild.id);
+  expect(opencodeEventToButtonRequest(child, ocSessions.subagentChild)?.subagent).toBe('Audit wearable CAD (@explore subagent)');
+  expect(opencodeEventToButtonRequest(child)?.subagent).toBeUndefined();
+  expect(opencodeEventToButtonRequest(ask(ocSessions.topLevel.id), ocSessions.topLevel)?.subagent).toBeUndefined();
+  // A record fetched for ANOTHER session — or one carrying no id — never labels this session's card.
+  expect(opencodeEventToButtonRequest(child, { ...ocSessions.subagentChild, id: 'ses_other' })?.subagent).toBeUndefined();
+  expect(opencodeEventToButtonRequest(child, { parentID: 'ses_p', title: 'Other' })?.subagent).toBeUndefined();
 });
 
 test('labels are one bounded line whatever the source (LLM-authored titles, launcher ids)', () => {

@@ -102,6 +102,7 @@ export function hookPayloadRole(payload: unknown): RoleVerdict | null {
   // The RANDOM tail, not the head: Codex ids are UUIDv7, whose first 8 hex chars are a
   // timestamp that stays equal for ~65 s (two workers fanned out together share it).
   const label = displayLabel(agentType ? `${agentType}#${agentId.replaceAll('-', '').slice(-8)}` : agentId);
+  // agentId is non-blank, so the label is always defined; the guard only narrows the type.
   return label ? subagent(label, 'hook-payload') : null;
 }
 
