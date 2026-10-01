@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { createServer } from 'net';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { readHostRecordFile, readHostRecords } from '../features/tg-ctl/host-registry-fs';
@@ -56,6 +57,25 @@ test('a directory named like a record is not one', () => {
   const dir = hostsDir();
   mkdirSync(join(dir, 'claude-3f9a0c1d2e4b.json'));
   expect(readHostRecords(dir, UID).rejected[0].reason).toBe('not a regular file');
+});
+
+test('a FIFO named like a record is rejected without hanging the read', () => {
+  const dir = hostsDir();
+  expect(Bun.spawnSync(['mkfifo', join(dir, 'claude-3f9a0c1d2e4b.json')]).exitCode).toBe(0);
+  expect(readHostRecords(dir, UID).rejected).toEqual([{ file: 'claude-3f9a0c1d2e4b.json', reason: 'not a regular file' }]);
+});
+
+test('a unix socket named like a record is rejected, not skipped as vanished', async () => {
+  // a socket path holds ~104 bytes on Darwin: tmpdir() (/var/folders/...) is too long for it
+  const dir = mkdtempSync('/tmp/tgh-');
+  dirs.push(dir);
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(join(dir, 'claude-3f9a0c1d2e4b.json'), resolve));
+  try {
+    expect(readHostRecords(dir, UID).rejected).toEqual([{ file: 'claude-3f9a0c1d2e4b.json', reason: 'not a regular file' }]);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test('a record that vanished between listing and reading is not an error', () => {

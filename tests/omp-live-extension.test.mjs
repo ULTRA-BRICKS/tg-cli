@@ -177,3 +177,33 @@ test('#460: an omp without getSessionName still reports the header title', async
   await f.handlers.get('session_start')({}, f.ctx);
   assert.equal((await listLiveEndpoints(f.root))[0].title, 'Original');
 });
+
+// A session `rig harness run omp` hosts exports RIG_SESSION (the abduco name) and scrubs
+// RIG_OMP_SESSION; `rig omp save-panes` matches a pane to its omp-live host by this field.
+test('#538: the descriptor carries the abduco session name from RIG_SESSION, not the retired RIG_OMP_SESSION', async t => {
+  const priorNew = process.env.RIG_SESSION, priorOld = process.env.RIG_OMP_SESSION;
+  process.env.RIG_SESSION = 'omp-0123456789ab';
+  process.env.RIG_OMP_SESSION = 'omp-retired-name';
+  t.after(() => {
+    for (const [key, value] of [['RIG_SESSION', priorNew], ['RIG_OMP_SESSION', priorOld]]) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  });
+  const f = await setup(t);
+  await f.handlers.get('session_start')({}, f.ctx);
+  assert.equal((await listLiveEndpoints(f.root))[0].durableSession, 'omp-0123456789ab');
+});
+
+test('#538: an omp with only the retired RIG_OMP_SESSION reports no durableSession (matched by abduco ancestry instead)', async t => {
+  const priorNew = process.env.RIG_SESSION, priorOld = process.env.RIG_OMP_SESSION;
+  delete process.env.RIG_SESSION;
+  process.env.RIG_OMP_SESSION = 'omp-retired-name';
+  t.after(() => {
+    for (const [key, value] of [['RIG_SESSION', priorNew], ['RIG_OMP_SESSION', priorOld]]) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  });
+  const f = await setup(t);
+  await f.handlers.get('session_start')({}, f.ctx);
+  assert.equal((await listLiveEndpoints(f.root))[0].durableSession, null);
+});

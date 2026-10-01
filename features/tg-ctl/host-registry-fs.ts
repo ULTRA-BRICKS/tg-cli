@@ -2,7 +2,7 @@
 // validation and liveness rules; this is only the filesystem half, shared by `tg-ctl` — every
 // record — and `tg` — its own). Read-only: tg-cli never writes or deletes a record.
 
-import { lstatSync, readdirSync, readFileSync } from 'fs';
+import { closeSync, constants, fstatSync, openSync, readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { hostRecordPath, hostsDir, parseHostRecord, type HostParse, type HostRecord } from './host-registry';
 
@@ -10,15 +10,31 @@ const SUFFIX = '.json';
 
 // One record file; null when it vanished between listing and reading (the wrapper deleted
 // it on a user-requested exit — not a problem). The uid is the reader's own: a record
-// another user could have planted is never trusted.
+// another user could have planted is never trusted. The file is classified through the
+// descriptor it is read from (open, then fstat), never by a path check followed by a
+// read: nothing can be swapped in between. O_NOFOLLOW refuses a symlink at open (ELOOP);
+// O_NONBLOCK keeps a FIFO planted in the directory from hanging the open.
 export function readHostRecordFile(dir: string, file: string, ownUid: number): HostParse | null {
+  const stem = file.slice(0, -SUFFIX.length);
+  let fd: number;
   try {
-    const path = join(dir, file);
-    const st = lstatSync(path);
-    const raw = st.isFile() ? readFileSync(path, 'utf8') : '';
-    return parseHostRecord(file.slice(0, -SUFFIX.length), raw, { isRegularFile: st.isFile(), isSymlink: st.isSymbolicLink(), uid: st.uid }, ownUid);
+    fd = openSync(join(dir, file), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (err) {
+    // The uid is irrelevant to every non-regular verdict: parseHostRecord refuses those first.
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ELOOP') return parseHostRecord(stem, '', { isRegularFile: false, isSymlink: true, uid: ownUid }, ownUid);
+    // A socket or device node cannot be opened for reading: still "not a regular file", not "vanished".
+    if (code === 'ENXIO' || code === 'ENODEV' || code === 'EOPNOTSUPP') return parseHostRecord(stem, '', { isRegularFile: false, isSymlink: false, uid: ownUid }, ownUid);
+    return null;
+  }
+  try {
+    const st = fstatSync(fd);
+    const raw = st.isFile() ? readFileSync(fd, 'utf8') : '';
+    return parseHostRecord(stem, raw, { isRegularFile: st.isFile(), isSymlink: false, uid: st.uid }, ownUid);
   } catch {
     return null;
+  } finally {
+    closeSync(fd);
   }
 }
 

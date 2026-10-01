@@ -23,7 +23,7 @@ export interface TmuxLocator {
 export interface SessionLocators {
   pid: number | null;
   tmux: TmuxLocator | null;
-  durableSession: string | null; // abduco session name from `rig omp run`
+  durableSession: string | null; // abduco session name from `rig harness run`
 }
 
 export interface SessionEntry {

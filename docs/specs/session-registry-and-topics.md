@@ -56,7 +56,7 @@ interface SessionEntry {
   locators: {                                     // re-resolved on every scan; never identity
     pid: number | null
     tmux: { serverPid: number; paneId: string; panePid: number } | null
-    durableSession: string | null                 // abduco name from `rig omp run` ($RIG_OMP_SESSION)
+    durableSession: string | null                 // abduco name from `rig harness run` ($RIG_SESSION)
   }
   cwd: string
   name: { primary: string; secondary: string | null }   // resolveSessionName (#485)

@@ -50,7 +50,7 @@ export interface LiveHost extends HostRecord {
   harnessPid: number;
 }
 
-// What the entrypoint learned from lstat() of the record file.
+// What the entrypoint learned from the record file's open descriptor (open, fstat).
 export interface HostFileFacts {
   isRegularFile: boolean;
   isSymlink: boolean;

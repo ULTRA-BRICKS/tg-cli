@@ -51,7 +51,7 @@ export default function ompLiveExtension(pi) {
       sessionId: ctx.sessionManager.getSessionId(),
       sessionFile: ctx.getSessionFile?.() ?? ctx.sessionManager.getSessionFile?.() ?? null,
       cwd: ctx.cwd,
-      durableSession: process.env.RIG_OMP_SESSION ?? null,
+      durableSession: process.env.RIG_SESSION ?? null,
       busy: !ctx.isIdle(),
       title: sessionTitle(ctx),
     };

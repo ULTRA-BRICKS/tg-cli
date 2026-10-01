@@ -3,6 +3,18 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.1
+
+- **The omp-live extension reports the abduco session name from `$RIG_SESSION`** (the `rig harness run`
+  contract; `$RIG_OMP_SESSION` is retired), so a pane of a launcher-hosted omp is matched to its
+  omp-live host by `rig omp save-panes` (#538). An omp already running keeps its old env and stays
+  matched through its abduco ancestry.
+- **Reading a host record no longer checks the file by path before reading it** (CodeQL
+  `js/file-system-race` in `features/tg-ctl/host-registry-fs.ts`, which had turned the CodeQL
+  self-gate red on `main`): the record is opened with `O_NOFOLLOW` and classified through that
+  descriptor, so a symlink, FIFO or socket planted in the hosts directory is still rejected as "not a
+  regular file".
+
 ## 1.55.0
 
 - **Any harness in a rig-wrapper session is reachable outside tmux.** A Claude Code, Codex, opencode
