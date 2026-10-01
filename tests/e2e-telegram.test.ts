@@ -2,6 +2,7 @@
 // chat/daemon/fixture world. The live run itself is scripts/e2e-telegram.ts.
 import { describe, expect, test } from 'bun:test';
 import {
+  parseClaudeAuthStatus,
   planFixtures,
   randomToken,
   restoreDecision,
@@ -377,6 +378,33 @@ describe('planFixtures', () => {
     expect(fixtures.map((f) => [f.kind, f.inTmux, f.harness])).toEqual([
       ['omp', true, 'omp'], ['cc', true, 'claude'], ['omp-notmux', false, 'omp'], ['codex', true, 'codex'],
     ]);
+  });
+});
+
+describe('parseClaudeAuthStatus', () => {
+  test('reads loggedIn from the JSON `claude auth status` prints', () => {
+    expect(parseClaudeAuthStatus('{\n  "loggedIn": true,\n  "authMethod": "claude.ai"\n}\n')).toBe('logged-in');
+    expect(parseClaudeAuthStatus('{"loggedIn": false}')).toBe('logged-out');
+  });
+
+  test('a notice line before or after the JSON does not hide the verdict', () => {
+    expect(parseClaudeAuthStatus('Update available: 2.1.300\n{"loggedIn": true}')).toBe('logged-in');
+    expect(parseClaudeAuthStatus('Update available: 2.1.300\n{\n  "loggedIn": true\n}')).toBe('logged-in');
+    expect(parseClaudeAuthStatus('{\n  "loggedIn": true\n}\nRun `claude update` to upgrade\n')).toBe('logged-in');
+  });
+
+  test('nested objects and a leading unrelated object do not confuse it', () => {
+    expect(parseClaudeAuthStatus('{\n  "loggedIn": true,\n  "account": {\n    "plan": "max"\n  }\n}')).toBe('logged-in');
+    expect(parseClaudeAuthStatus('{\n  "account": {\n    "plan": "max"\n  },\n  "loggedIn": false\n}')).toBe('logged-out');
+    expect(parseClaudeAuthStatus('{}\n{\n  "loggedIn": true\n}')).toBe('logged-in');
+  });
+
+  test('output that is not a clear answer is unknown — never a reason to tell the operator to log in', () => {
+    expect(parseClaudeAuthStatus('')).toBe('unknown');
+    expect(parseClaudeAuthStatus('error: unknown command "auth"')).toBe('unknown');
+    expect(parseClaudeAuthStatus('{"loggedIn": "true"}')).toBe('unknown');
+    expect(parseClaudeAuthStatus('{"authMethod": "claude.ai"}')).toBe('unknown');
+    expect(parseClaudeAuthStatus('[true]')).toBe('unknown');
   });
 });
 

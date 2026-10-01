@@ -1,7 +1,7 @@
 // Live Telegram e2e harness (tg-cli#468) — PURE planning: run tokens, fixture
 // selectors that cannot resonate into a real session, the fixture agents'
-// instructions, spoken-number matching for the voice scenario, and the
-// last-user-target restore decision. All I/O lives in scripts/e2e-telegram.ts.
+// instructions, spoken-number matching for the voice scenario, the
+// last-user-target restore decision, and the `claude auth status` reading. All I/O lives in scripts/e2e-telegram.ts.
 //
 // Why selectors are checked against the live window names: `/agent <sel>`
 // matches tmux window names FUZZILY (prefix / substring / edit distance, see
@@ -152,6 +152,33 @@ export function transcriptHasNumber(transcript: string, n: number): boolean {
   if (new RegExp(`(^|\\D)${n}(\\D|$)`).test(transcript)) return true;
   const words = transcript.toLowerCase().replace(/[^a-z]+/g, ' ').trim();
   return ` ${words} `.includes(` ${numberWords(n)} `);
+}
+
+// What `claude auth status` said about the login: 'logged-in' / 'logged-out' when it printed a
+// JSON object with a boolean `loggedIn`, 'unknown' for everything else (old claude without the
+// subcommand, a timeout, unparseable or differently-shaped output) — a caller must not tell the
+// operator to log in on 'unknown'. The object may be pretty-printed (nested or not) or on one
+// line, with notice lines around it: from the first line starting with `{`, the first prefix
+// ending at a `}` line that parses as an object carrying a boolean `loggedIn` decides.
+export type ClaudeAuthState = 'logged-in' | 'logged-out' | 'unknown';
+
+export function parseClaudeAuthStatus(stdout: string): ClaudeAuthState {
+  const lines = stdout.split('\n');
+  for (let first = lines.findIndex((line) => line.startsWith('{')); first >= 0 && first < lines.length; first += 1) {
+    if (!lines[first].startsWith('{')) continue;
+    for (let last = first; last < lines.length; last += 1) {
+      if (!lines[last].trimEnd().endsWith('}')) continue;
+      try {
+        const parsed: unknown = JSON.parse(lines.slice(first, last + 1).join('\n'));
+        if (typeof parsed === 'object' && parsed !== null && 'loggedIn' in parsed && typeof parsed.loggedIn === 'boolean') {
+          return parsed.loggedIn ? 'logged-in' : 'logged-out';
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+  return 'unknown';
 }
 
 // NFKC-fold the bot's Unicode-styled text (bold window names) for matching.

@@ -26,6 +26,7 @@ import {
   FIXTURE_KICKOFF,
   fixtureInstructions,
   isFixtureKind,
+  parseClaudeAuthStatus,
   planFixtures,
   randomToken,
   statusNames,
@@ -50,7 +51,7 @@ const HELP = `usage: bun scripts/e2e-telegram.ts [--dry-run] [--fixtures omp,cc,
 
 Live e2e of the tg bot through the CTO's headless Telegram Web client (qa-cli).
 Requires: the tg-ctl daemon running (never started here), \`qa telegram login\` done,
-tmux, abduco (omp-notmux), omp / claude / codex, say + ffmpeg (voice).
+\`claude auth login\` done for ~/.claude (cc fixture), tmux, abduco (omp-notmux), omp / claude / codex, say + ffmpeg (voice).
 
   --dry-run      preflight only: daemon, Telegram Web login, binaries, collision-free
                  /agent selectors; prints the plan; sends nothing, starts nothing
@@ -61,8 +62,8 @@ tmux, abduco (omp-notmux), omp / claude / codex, say + ffmpeg (voice).
 
 Env: TG_E2E_QA — qa command (default "qa"; e.g. "uv run --project ~/xp/qa-cli qa").
      TG_CTL_CONFIG_DIR — tg-cli config dir (default ~/.config/tg-cli).
-Exit: 0 all scenarios passed/skipped, 1 a scenario failed, 2 usage, 3 Telegram Web
-not logged in, 4 tg-ctl daemon not running or a prerequisite missing.`;
+Exit: 0 all scenarios passed/skipped, 1 a scenario failed, 2 usage, 3 Telegram Web or
+Claude Code (~/.claude) not logged in, 4 tg-ctl daemon not running or a binary missing.`;
 
 const LOCALE_ENV: Record<string, string> = {
   ...Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined)),
@@ -204,12 +205,10 @@ function qaChat(peer: string, username: string): ChatClient {
 interface Launch {
   model: string;
   codexModel: string;
-  // CLAUDE_CONFIG_DIR of a logged-in Claude account (claude-rotate layout), or null for ~/.claude.
-  claudeConfigDir: string | null;
 }
 
 function launchScript(spec: FixtureSpec, dir: string, launch: Launch): string {
-  const { model, codexModel, claudeConfigDir } = launch;
+  const { model, codexModel } = launch;
   const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
   const head = `#!/bin/sh\n# tg-cli e2e fixture ${spec.selector} (${spec.kind})\ncd ${q(dir)} || exit 1\necho $$ > agent.pid\n`;
   if (spec.harness === 'omp') {
@@ -221,12 +220,12 @@ function launchScript(spec: FixtureSpec, dir: string, launch: Launch): string {
     );
   }
   if (spec.harness === 'claude') {
-    const account = claudeConfigDir ? `CLAUDE_CONFIG_DIR=${q(claudeConfigDir)} ` : '';
     // settings.json carries tg-ctl's q→buttons hooks (what `tg-ctl install-hooks` adds),
-    // so the question scenario tests the daemon even where the account dir lacks them.
+    // so the question scenario tests the daemon even where ~/.claude lacks them. CLAUDE_CONFIG_DIR
+    // is unset so a run started from inside another Claude Code session still uses ~/.claude.
     return (
       head +
-      `${account}exec claude --model ${q(model)} --permission-mode dontAsk --allowedTools 'Bash(tg *)' ` +
+      `exec ${CLAUDE_STOCK.map(q).join(' ')} --model ${q(model)} --permission-mode dontAsk --allowedTools 'Bash(tg *)' ` +
       `--settings ${q(join(dir, 'settings.json'))} ` +
       `--append-system-prompt "$(cat instructions.txt)" "$(cat kickoff.txt)"\n`
     );
@@ -266,10 +265,15 @@ function jsonlUnder(dir: string): string[] {
 // its default ("No") — the fixture needs no CLAUDE.md imports.
 const CLAUDE_QUESTION_HOOK_CMD = 'tg-ctl ask';
 
-// Whether the Claude account's own settings.json forwards AskUserQuestion to tg-ctl
+// The cc fixture always runs against the stock config dir: every spawn of claude (the fixture's
+// launch script and the login preflight) goes through CLAUDE_STOCK, which unsets CLAUDE_CONFIG_DIR.
+const CLAUDE_DIR = join(homedir(), '.claude');
+const CLAUDE_STOCK = ['env', '-u', 'CLAUDE_CONFIG_DIR', 'claude'] as const;
+
+// Whether ~/.claude/settings.json forwards AskUserQuestion to tg-ctl
 // (unreadable or malformed settings count as "no").
-function accountHasQuestionHook(configDir: string | null): boolean {
-  const path = join(configDir ?? join(homedir(), '.claude'), 'settings.json');
+function claudeHasQuestionHook(): boolean {
+  const path = join(CLAUDE_DIR, 'settings.json');
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(path, 'utf8'));
@@ -347,7 +351,7 @@ function liveHost(root: string, run: string, launch: Launch): FixtureHost {
       if (f.paneId) parts.push(sh(['tmux', 'capture-pane', '-p', '-J', '-S', '-3000', '-t', f.paneId]).stdout);
       if (f.harness === 'omp') parts.push(transcriptText(jsonlUnder(join(f.dir, 'sessions'))));
       if (f.harness === 'claude') {
-        const projects = join(launch.claudeConfigDir ?? join(homedir(), '.claude'), 'projects');
+        const projects = join(CLAUDE_DIR, 'projects');
         const own = existsSync(projects) ? readdirSync(projects).filter((d) => d.endsWith(`-${f.selector}`)) : [];
         parts.push(transcriptText(own.flatMap((d) => jsonlUnder(join(projects, d)))));
       }
@@ -400,19 +404,15 @@ function liveNames(statusText: string): LiveName[] {
   return [...names, ...statusNames(statusText)];
 }
 
-// The CTO runs Claude Code through claude-rotate (one CLAUDE_CONFIG_DIR per account);
-// use its current account when logged in, else the first logged-in one. Never
-// changes claude-rotate's own "current" choice.
-function loggedInClaudeAccount(): string | null {
-  if (!Bun.which('claude-rotate')) return null;
-  const rows = sh(['claude-rotate', 'rotate', 'list', '--no-verify'], { timeoutSec: 60 })
-    .stdout.split('\n')
-    .map((line) => line.match(/^\s*(\*)?\s*(account-\S+)\s+(logged in|NOT logged in)/))
-    .filter((m): m is RegExpMatchArray => m !== null);
-  const usable = rows.filter((m) => m[3] === 'logged in');
-  const pick = usable.find((m) => m[1] === '*') ?? usable[0];
-  if (!pick) throw new Blocked('no logged-in Claude Code account (claude-rotate rotate list)', 4);
-  return join(homedir(), '.claude-accounts', pick[2]);
+// The cc fixture runs `claude` against ~/.claude: refuse up front when that login is gone,
+// with the one command that fixes it.
+function requireClaudeLogin(): void {
+  const status = sh([...CLAUDE_STOCK, 'auth', 'status'], { timeoutSec: 60 });
+  const state = parseClaudeAuthStatus(status.stdout);
+  if (state === 'logged-in') return;
+  if (state === 'logged-out') throw new Blocked('Claude Code is not logged in (~/.claude). Run once, in a terminal:\n  claude auth login', 3);
+  const output = (status.stdout + status.stderr).trim().slice(0, 300) || '(no output)';
+  throw new Blocked(`cannot tell whether Claude Code is logged in: \`claude auth status\` gave no usable answer (exit ${status.code}): ${output}`, 4);
 }
 
 function requireBinaries(kinds: readonly FixtureKind[]): void {
@@ -447,6 +447,7 @@ async function main(): Promise<number> {
     throw new Blocked(`tg-ctl daemon is not running — start it first (this harness never starts one):\n${status.stdout}`, 4);
   }
   requireBinaries(args.fixtures);
+  if (args.fixtures.includes('cc')) requireClaudeLogin();
 
   const chat = qaChat(botId, username);
   try {
@@ -458,7 +459,6 @@ async function main(): Promise<number> {
     throw error;
   }
 
-  const claudeConfigDir = args.fixtures.includes('cc') ? loggedInClaudeAccount() : null;
   const run = randomToken(Math.random, 5);
   const fixtures = planFixtures(args.fixtures, liveNames(status.stdout), Math.random);
   const out = args.out || join(homedir(), '.cache', 'tg-cli-e2e', run);
@@ -467,8 +467,7 @@ async function main(): Promise<number> {
     run,
     bot: `@${username} (${botId})`,
     threadedMode: bot.has_topics_enabled === true,
-    claudeConfigDir,
-    ...(args.fixtures.includes('cc') ? { claudeAccountForwardsQuestions: accountHasQuestionHook(claudeConfigDir) } : {}),
+    ...(args.fixtures.includes('cc') ? { claudeForwardsQuestions: claudeHasQuestionHook() } : {}),
     fixtures: fixtures.map((f) => ({ kind: f.kind, selector: f.selector, inTmux: f.inTmux })),
     scenarios: [
       ...fixtures.flatMap((f) => [`start:${f.kind}`, `ready:${f.kind}`, `agent-route:${f.kind}`, `reply-route:${f.kind}`]),
@@ -490,7 +489,7 @@ async function main(): Promise<number> {
   const report = await runE2E(
     {
       chat,
-      host: liveHost(join(out, 'fixtures'), run, { model: args.model, codexModel: args.codexModel, claudeConfigDir }),
+      host: liveHost(join(out, 'fixtures'), run, { model: args.model, codexModel: args.codexModel }),
       anchor: {
         read: () => (existsSync(anchorPath) ? readFileSync(anchorPath, 'utf8') : null),
         write: (content) => {

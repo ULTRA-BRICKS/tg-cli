@@ -23,7 +23,7 @@ export interface LiveOmpAgent {
   title: string | null;
   paneId: string | null;
   tty: string | null;
-  /** `--name` from the process argv when present (claude-rotate / omp). */
+  /** `--name` from the process argv when present. */
   name?: string | null;
 }
 

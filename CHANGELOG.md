@@ -3,6 +3,17 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.54.33
+
+- **The live e2e harness no longer depends on `claude-rotate` (retired).** The `cc` fixture runs
+  the stock `claude` against `~/.claude` (`CLAUDE_CONFIG_DIR` is unset for it, so a run started
+  from inside another Claude Code session cannot leak that session's account dir). The
+  preflight now checks `claude auth status`: a missing login exits 3 with `claude auth login`,
+  an answer it cannot read (old claude, timeout) exits 4 without that advice. The report field
+  `claudeAccountForwardsQuestions` is now `claudeForwardsQuestions` and `claudeConfigDir` is
+  gone. Comment-only rewording in `omp.ts` / `tg-awareness-nudge.ts`; no runtime change for
+  the daemon.
+
 ## 1.54.32
 
 - **One coordinator-vs-subagent model (`docs/specs/agent-role-model.md`).** A run is a subagent

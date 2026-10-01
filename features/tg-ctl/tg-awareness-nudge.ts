@@ -53,7 +53,7 @@ export interface AwarenessNudgeAgentState {
   // The live agent's session identity the last time this key was observed.
   // A KEY (a tmux pane id, or in principle a reused pid) can survive an
   // agent being replaced in place — e.g. Ctrl-C, then a new omp session
-  // started in the same tmux pane — while omp/claude-rotate assigns the new
+  // started in the same tmux pane — while the harness assigns the new
   // process a fresh sessionId. When the currently-observed sessionId for a
   // key differs from the one recorded here, this state belongs to a
   // DIFFERENT session and must not be inherited: a stale nudge marker would
