@@ -647,3 +647,61 @@ Each CLI registers a skill into your agent harnesses (`<tool> install-skill`) so
 ## License
 
 MIT
+
+### Independent personal Telegram and calls (optional)
+
+`tg-mtproto` and `tg-call` are independent Python entrypoints in this repository.
+They do not invoke qa-cli or calbot. See [the client specification](docs/specs/independent-telegram-clients.md).
+Use a dedicated Python environment with `features/telegram_client/requirements.txt`;
+`install.sh` links the commands but does not install Python dependencies or authorize accounts.
+Run the entrypoints with that environment's Python (or put its `python3` first on PATH).
+Calls additionally need ffmpeg and a validated, appropriately patched ntgcalls build.
+
+```sh
+./tg-mtproto doctor             # offline; never prompts for login
+./tg-call status                # offline; never rings
+./tg-mtproto status --online    # get_me; refuses missing/foreign auth
+./tg-mtproto dialogs --limit 30
+./tg-mtproto history --peer <confirmed-id> --limit 30 --before-id <message-id>
+```
+
+Both stores default to `~/.local/share/tg-cli/auth` (0700), with separate owner-only
+personal/caller files. Keep `--store` outside repositories. Output errors are codes,
+not raw library exceptions. Exit 3 means a missing credential or safety gate; 1 means
+an operation failed; 130 means interruption. Offline status reports configuration,
+not a working connection. History uses MTProto reads without marking chats read.
+
+After **separate authorization to log in**, run `tg-mtproto login --begin-login
+--expected-id <confirmed-personal-id>` in a private terminal. Existing API ID/hash,
+phone, code and optional password are prompted without echo. The command never
+creates API keys or accounts, and no other command falls back to it.
+
+Authorized offline service migration:
+
+```sh
+./tg-call import-calendar --source-session /path/to/voice_caller.session \
+  --source-config /path/to/calendar/.env --expected-id <confirmed-service-id>
+```
+
+The ID may be omitted only if the source already configures MTPROTO_SERVICE_USER_ID.
+This uses a consistent SQLite backup including WAL; only the temporary copy is
+opened by Pyrofork. It never calls Telegram. Do not run a copied authorization
+concurrently with its source. `tg-call status --online` and `notify` require
+`--source-session-idle-confirmed`; that flag is an operator assertion, not an
+automatic check that another host is idle. Existing auth is never overwritten.
+
+After independently confirming the contact from actual history, preparing notification
+speech audio, and coordinating ownership of the calling session:
+
+```sh
+./tg-mtproto arm --peer <confirmed-contact-id> --trigger ~/.local/share/tg-cli/triggers/tony.sqlite
+./tg-mtproto watch-call --trigger ~/.local/share/tg-cli/triggers/tony.sqlite \
+  --audio /private/path/tony-wrote.wav --source-session-idle-confirmed
+```
+
+The watcher subscribes to new incoming updates; it does not poll. It makes at most
+one attempt. A failure or crash after claiming requires manual reconciliation, so
+an uncertain call never repeats automatically. The recipient is the verified personal
+account owner. This is not activated by installation and needs process supervision
+on an always-on host to survive the Mac disconnecting. Neither live auth nor a real
+call is established by the module tests. No trigger for Tony is currently configured.

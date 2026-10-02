@@ -1,0 +1,5 @@
+# Optional standalone runtime; install in a dedicated tg-cli venv, never the calbot venv.
+pyrofork>=2.3,<3
+py-tgcalls>=2.2,<3
+# Telegram call audio also needs ffmpeg and a validated ntgcalls build.
+# Do not replace a patched ntgcalls binary without a separate media verification.
