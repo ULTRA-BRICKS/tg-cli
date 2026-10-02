@@ -26,11 +26,20 @@ def parser(role):
             name, help="offline metadata only; never log in or ring"
         )
         q.add_argument(
+            "--providers-config",
+            type=Path,
+            help="offline provider readiness, no secret values",
+        )
+        q.add_argument(
             "--online", action="store_true", help="verify get_me without login"
         )
         if role == "caller":
             q.add_argument("--source-session-idle-confirmed", action="store_true")
     if role == "caller":
+        commands.add_parser(
+            "live-smoke",
+            help="offline duplex integration with fake audio; no call or provider network",
+        )
         q = commands.add_parser(
             "import-calendar",
             help="offline consistent snapshot; source stays read-only",
@@ -148,6 +157,11 @@ async def watch(store, args):
 async def execute(role, args):
     store = AuthStore(args.store)
     command = args.command
+    if command == "live-smoke":
+        from .smoke import smoke
+
+        emit(await smoke())
+        return 0
     if command in ("doctor", "status"):
         try:
             auth = store.load(role)
@@ -172,6 +186,35 @@ async def execute(role, args):
                 else ("pyrogram", "pytgcalls", "ntgcalls")
             )
         }
+        if role == "caller":
+            from .providers import media_readiness
+
+            result["media"] = media_readiness(
+                Path.home() / ".local/share/tg-cli/ntgcalls-runtime-receipt.json"
+            )
+            result["conversation"] = {
+                "native_adapter": True,
+                "live_transport_verified": False,
+                "providers_configured": False,
+                "bracho": "unresolved",
+                "smoke_command": "tg-call live-smoke",
+                "ready": False,
+            }
+        if args.providers_config:
+            from .providers import readiness
+
+            result["provider_readiness"] = readiness(
+                json.loads(args.providers_config.read_text())
+            )
+            if role == "caller":
+                result["conversation"]["providers_configured"] = result[
+                    "provider_readiness"
+                ]["configured"]
+                result["conversation"]["bracho"] = (
+                    "configured"
+                    if result["provider_readiness"]["voice_ready"]
+                    else "unresolved"
+                )
         if args.online:
             if role == "caller" and not args.source_session_idle_confirmed:
                 raise ClientError("SOURCE_SESSION_OWNERSHIP_NOT_CONFIRMED")
@@ -180,7 +223,10 @@ async def execute(role, args):
                     online_verified=True, user_id=app.me.id, username=app.me.username
                 )
         emit(result)
-        return 0 if result["configured"] else 3
+        ready = result["configured"] and (
+            not args.providers_config or result["provider_readiness"]["configured"]
+        )
+        return 0 if ready else 3
     if command == "import-calendar":
         emit(
             await import_calendar(

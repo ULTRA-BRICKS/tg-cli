@@ -26,3 +26,33 @@ The notification audio is prepared separately and supplied explicitly; for the T
 ## Verification limits
 
 Credential-free tests cover account mismatch, missing auth, store separation and permissions, source WAL backup, failure redaction, concurrent event dedup, restart and uncertain-result behavior. Live personal auth, exact Tony identity, media capability and server supervision remain deployment acceptance gates; unit tests do not prove them.
+
+## Duplex integration checkpoint (2026-10-02)
+
+Extract the HyperCalendarBot native bridge contract into `duplex.py`, using direct
+injected ports rather than a calendar API or business agent. Keep the existing
+48 kHz PCM16 mono/32 ms input and sequence header contract, file PLAY/PLAY_DONE,
+skip_stream interruption, record capture and hangup cleanup. Tests use fake native
+I/O; an additional no-network test binds the actual pinned PyTgCalls event classes.
+Bracho remains a named unresolved profile: AISIS spec 140 identifies a persona but
+contains no confirmed acoustic preset/sample. Never fall back to xenia.
+
+The bounded acceptance criterion is local duplex fake-audio integration plus a
+no-call doctor/smoke command. It is not real Telegram audio or provider acceptance.
+
+## Provider activation and offline readiness
+
+`providers.py` supplies Nova-3 RU over aiohttp WebSocket, a generic CallAgent
+executable binding, local Silero package TTS in a cancellable subprocess, and
+verified TorchScript Silero VAD. Provider constructors/imports do not contact
+external services. STT creates a per-utterance socket and fences finals by epoch
+and generation; finalization does not block incoming native audio. Errors end the
+call instead of silently leaving an unanswered provider turn. Child processes are
+reaped on timeout/cancellation and stdout is capped. Local weights require an
+explicit path plus SHA-256; no torch.hub downloads and no default voice.
+
+Offline doctor reports configuration, environment-variable presence, executable
+presence, model hashes and import availability separately from live verification.
+`voice-runtime.lock` preserves the source macOS CPU dependency pins. No production
+credentials or weights have been installed. `attach_configured_session` is a
+library entry point for a separately authorized, already connected call.

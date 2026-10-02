@@ -713,3 +713,72 @@ used to read personal messages. Phone/code/2FA are entered without echo in a pri
 terminal. Do not send them in chat. `runtime.lock` is the hash-pinned PyPI runtime
 subset; the ntgcalls binary still needs the documented installed patch and media
 acceptance independently of the package version.
+
+### Independent conversational transport checkpoint
+
+`python3 tg-call live-smoke` runs an entirely offline duplex integration with fake
+native I/O and mock STT/CallAgent/TTS; it never logs in, dials, or contacts a provider.
+It exercises actual PCM framing, VAD boundaries, private WAV playback, interruption,
+reconnect and hangup cleanup. `tg-call doctor` reports authorization separately from
+conversation readiness. Run the native event binding test with the dedicated runtime:
+
+```
+~/.local/share/tg-cli/runtime/bin/python tests/telegram-duplex.test.py
+```
+
+`telegram_client.duplex.native_transport(calls, peer, vad)` binds installed
+PyTgCalls callbacks for an already connected call. The auth/call owner remains
+responsible for independent `connected(store, "caller")` lifetime; constructing this
+adapter never starts a client or dials. `Conversation` accepts injected streaming
+STT, model and PCM TTS ports. `CallAgentAdapter` preserves the generic
+`run({userId, transcript}) -> {responseText, endCall}` contract.
+STT adapters must stamp final callbacks with captured transport epoch and turn
+generation (`final(text, epoch, generation)`) to reject stale utterances.
+
+Production readiness is deliberately false: provider bindings, pinned local VAD
+weights and the Bracho provider/voice ID still need explicit configuration. No new
+provider credentials were copied. Output uses serialized WAV chunks and native
+PLAY_DONE, not a continuous PCM output device. Real remote-audio latency, native
+late PLAY_DONE ordering after STOP, and live reconnect behavior remain unverified.
+A real call requires separate authorization. See `features/telegram_client/NOTICE`
+for source provenance and unresolved source licensing.
+
+Provider adapters are in `telegram_client.providers`: Nova-3 RU streaming via
+pinned aiohttp; the generic CallAgent JSON stdin executable contract; cancellable
+local Silero TTS worker; hash-verified local Silero TorchScript VAD. No adapter
+activates on import or doctor. `providers.example.json` contains no credentials;
+`credential_env` names an explicitly supplied environment variable. Run:
+
+```
+python3 tg-call doctor --providers-config features/telegram_client/providers.example.json
+```
+
+`build_providers(config)` explicitly activates the configured bindings;
+`attach_configured_session(calls, peer, config)` attaches them to a caller-owned,
+already connected native call. It does not create authorization or dial. The
+caller must separately authorize provider use. The configured generic agent
+executable receives `{userId, transcript}` on stdin and returns JSON
+`{responseText, endCall}` on stdout; it owns persistent user context/tool policy.
+TTS requires an explicit supported speaker, local Silero `v5_ru` package and its
+SHA-256; VAD requires a local Silero TorchScript model and its SHA-256. Do not map
+Bracho to a built-in Silero voice without the actual confirmed preset. If the
+existing Bracho profile uses another engine, configure that engine adapter rather
+than relabeling a Silero speaker. `voice-runtime.lock` records the existing
+calbot macOS CPU Torch/numpy dependency closure; it was not installed in this step.
+The model paths and hashes are deliberately unset; no weight or key was copied.
+
+Provider validation is offline or local mock I/O only. Silero synthesis runs in a
+killable process per text chunk (cold-start latency remains to measure); native
+output remains serialized WAV playback. RU Nova is implemented; Flux EN is not
+wired into this independent provider layer. No real provider health is claimed.
+
+Pinned PyTgCalls 2.2.11 does not implement `skip_stream`. The native adapter uses
+its existing NTgCalls `set_stream_sources(CAPTURE, MediaDescription())` operation
+to clear outgoing sources instead; it never falls back to buffered `pause` or
+`play(None)` (which could redial a disconnected peer). This private binding seam
+is version-sensitive and covered by the installed-native contract test; remote
+buffer flushing remains unverified without a separately approved live call.
+
+With `--providers-config`, doctor exits 3 until both caller auth metadata and
+provider configuration checks pass; a zero status still does not claim live
+Telegram/provider audio verification.

@@ -9,3 +9,13 @@ test("independent Telegram clients: auth guards, SQLite WAL snapshot and one-sho
   expect(new TextDecoder().decode(result.stderr)).toContain("OK")
   expect(result.exitCode).toBe(0)
 })
+
+for (const suite of ["telegram-conversation.test.py", "telegram-duplex.test.py", "telegram-providers.test.py"]) {
+  test(suite, () => {
+    const result = Bun.spawnSync(["python3", join(import.meta.dir, suite)], {
+      cwd: join(import.meta.dir, ".."), timeout: 20000,
+    })
+    expect(new TextDecoder().decode(result.stderr)).toContain("OK")
+    expect(result.exitCode).toBe(0)
+  })
+}
