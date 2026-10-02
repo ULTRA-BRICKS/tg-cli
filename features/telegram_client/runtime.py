@@ -147,7 +147,20 @@ async def import_calendar(store, source, config, expected_id=None):
     return {"imported": True, "online_verified": False, "role": "caller"}
 
 
-async def login(store, expected):
+def login_api(store, reuse_caller_api):
+    """Reuse only application credentials, never the caller authorization."""
+    import getpass
+
+    if reuse_caller_api:
+        caller = store.load("caller")
+        return {"api_id": caller["api_id"], "api_hash": caller["api_hash"]}
+    return {
+        "api_id": int(getpass.getpass("Existing Telegram API ID: ")),
+        "api_hash": getpass.getpass("Existing Telegram API hash: "),
+    }
+
+
+async def login(store, expected, reuse_caller_api=False):
     """Explicit user-operated secure prompts; never used as an auth fallback."""
     import getpass
     from pyrogram.errors import SessionPasswordNeeded
@@ -157,8 +170,8 @@ async def login(store, expected):
     if store.path("personal").exists():
         raise ClientError("SESSION_ALREADY_EXISTS")
     check_identity(expected, expected)
-    api_id = int(getpass.getpass("Existing Telegram API ID: "))
-    api_hash = getpass.getpass("Existing Telegram API hash: ")
+    api = login_api(store, reuse_caller_api)
+    api_id, api_hash = api["api_id"], api["api_hash"]
     phone = getpass.getpass("Phone: ")
     with role_lock(store, "personal"):
         app = client_class()(

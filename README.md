@@ -705,3 +705,11 @@ an uncertain call never repeats automatically. The recipient is the verified per
 account owner. This is not activated by installation and needs process supervision
 on an always-on host to survive the Mac disconnecting. Neither live auth nor a real
 call is established by the module tests. No trigger for Tony is currently configured.
+
+For an approved personal login after importing the caller, `login --reuse-caller-api`
+reuses only that application's API ID/hash. The personal authorization is newly
+created for `--expected-id` and stored separately; the caller session is never
+used to read personal messages. Phone/code/2FA are entered without echo in a private
+terminal. Do not send them in chat. `runtime.lock` is the hash-pinned PyPI runtime
+subset; the ntgcalls binary still needs the documented installed patch and media
+acceptance independently of the package version.

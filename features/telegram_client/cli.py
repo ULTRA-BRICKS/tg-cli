@@ -56,6 +56,11 @@ def parser(role):
         )
         q.add_argument("--begin-login", action="store_true", required=True)
         q.add_argument("--expected-id", type=int, required=True)
+        q.add_argument(
+            "--reuse-caller-api",
+            action="store_true",
+            help="reuse app ID/hash only; create separate personal authorization",
+        )
         q = commands.add_parser(
             "dialogs", help="bounded dialog/unread inventory; no mark-read call"
         )
@@ -183,7 +188,7 @@ async def execute(role, args):
             )
         )
     elif command == "login":
-        await login(store, args.expected_id)
+        await login(store, args.expected_id, args.reuse_caller_api)
         emit({"configured": True, "role": "personal"})
     elif command == "notify":
         await notification_call(store, args.recipient, args.audio)

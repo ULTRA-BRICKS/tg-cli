@@ -101,6 +101,27 @@ class ClientTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_personal_login_reuses_app_credentials_not_caller_session(self):
+        from telegram_client.runtime import login_api
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = AuthStore(Path(directory) / "auth")
+            store.save(
+                "caller",
+                dict(
+                    expected_id=7,
+                    api_id=123,
+                    api_hash="fixture-app",
+                    session="caller-session-not-personal",
+                ),
+            )
+            before = store.path("caller").read_bytes()
+            self.assertEqual(
+                login_api(store, True), {"api_id": 123, "api_hash": "fixture-app"}
+            )
+            self.assertEqual(store.path("caller").read_bytes(), before)
+            self.assertFalse(store.path("personal").exists())
+
     def test_wal_snapshot_is_consistent_without_writing_original(self):
         from telegram_client.runtime import sqlite_snapshot
 
