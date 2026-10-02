@@ -782,3 +782,26 @@ buffer flushing remains unverified without a separately approved live call.
 With `--providers-config`, doctor exits 3 until both caller auth metadata and
 provider configuration checks pass; a zero status still does not claim live
 Telegram/provider audio verification.
+
+### Shared call-lib and conversational start
+
+The `tg-call-lib` wheel packages this same `telegram_client` source; there is no
+second implementation. `tg-call library-info` and `tg-call-json`'s `describe`
+request report distribution version and module path. The prepared Bun consumer
+is in `adapters/calbot/`; it has not been deployed into the running application.
+
+`tg-call start --providers-config CONFIG` is fail-closed. A real start additionally
+requires `--confirm-call --allow-provider-network --source-session-idle-confirmed`,
+ready provider/media checks, `voice.status: "confirmed"`, an explicit Bracho
+mapping and `agent.protocol: "call-agent-json-v1"`. Before Telegram connects,
+the configured agent's metadata handshake must identify a production-ready
+wrapper. `call-agent-mock` is deterministic and always rejected for live use.
+Missing authorization never invokes login. One dial attempt is owned by the
+shared library, with a 30-second dial bound and at most 1800 seconds of conversation;
+CLI cancellation/JSON-runner SIGTERM close the session and release its auth lock.
+
+Build the local wheel with an already available setuptools backend; install the
+result with `pip --no-index --no-deps` into a separate test/runtime venv. Runtime
+and voice dependencies remain governed by the supplied hashed locks. Local VAD
+weights/license receipts live outside the code repository and are not bundled.
+See `adapters/calbot/README.md` for the JSON wrapper and consumer protocol.

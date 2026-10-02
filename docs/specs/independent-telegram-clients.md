@@ -56,3 +56,25 @@ presence, model hashes and import availability separately from live verification
 `voice-runtime.lock` preserves the source macOS CPU dependency pins. No production
 credentials or weights have been installed. `attach_configured_session` is a
 library entry point for a separately authorized, already connected call.
+
+## Shared library and consumer wiring
+
+The user authorized completing packaging, conversational CLI start and a prepared
+calbot adapter in the isolated checkout, with no running-calbot mutation, paid
+provider calls or real calls. Package the existing feature module as the single
+`tg-call-lib` Python distribution; keep entrypoints thin, following repo conventions.
+`call_lib.start_conversation` owns preflight, provider preparation, independent
+caller lifetime, one dial attempt, timeout and cleanup. CLI and JSON bridge use
+that exact function; the calbot TypeScript adapter invokes the installed bridge.
+Version identity is exposed offline. Tests inject one fake owner and real mock
+audio through both consumers and compare module/version identity.
+
+Start requires explicit call/provider/source-idle consent, configured providers,
+confirmed named voice and agent protocol, plus a production-ready JSON wrapper
+metadata handshake before opening Telegram. Mock wrappers are never live-ready.
+Missing auth never triggers login; no retries/redial. Workspace model copies need
+source hash equality and retained license; they are not included in the wheel.
+
+Implementation steps: red CLI/package tests; shared owner/package/JSON runner;
+consumer identity and fail-closed tests; wheel build and isolated offline install;
+VAD copy with MIT/receipt; relevant Python/Bun/type/build gates and separate commit.

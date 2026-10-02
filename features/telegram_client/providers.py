@@ -202,6 +202,19 @@ class JsonCallAgent:
     def __init__(self, command):
         self.command = command
 
+    async def describe(self):
+        result = await process_json(
+            self.command,
+            {"action": "describe", "protocol": "call-agent-json-v1"},
+            timeout=5,
+        )
+        if (
+            not isinstance(result, dict)
+            or result.get("protocol") != "call-agent-json-v1"
+        ):
+            raise ClientError("AGENT_PROTOCOL_UNSUPPORTED")
+        return result
+
     async def run(self, turn):
         result = await process_json(self.command, turn)
         if not isinstance(result, dict) or not isinstance(

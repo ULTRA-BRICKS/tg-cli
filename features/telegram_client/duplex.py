@@ -22,6 +22,7 @@ class NativeDuplex:
         self.media_factory, self.record_factory = media_factory, record_factory
         self.vad, self.timeout = vad, timeout
         self.stop_source = lambda: self.calls.skip_stream(self.peer)
+        self.leave_source = lambda: self.calls.leave_call(self.peer)
         self.session = None
         self.lock = asyncio.Lock()
         self.done = asyncio.Event()
@@ -105,7 +106,7 @@ class NativeDuplex:
         self.closed = True
         self.done.set()
         try:
-            await asyncio.wait_for(self.calls.leave_call(self.peer), self.timeout)
+            await asyncio.wait_for(self.leave_source(), self.timeout)
         finally:
             self.buffer.clear()
             self.directory.cleanup()
@@ -148,6 +149,26 @@ def native_transport(calls, peer, vad):
             )
 
         transport.stop_source = clear_capture
+
+    from ntgcalls import ConnectionNotFound
+    from pytgcalls.exceptions import NotInCallError
+
+    raw_stop = transport.stop_source
+
+    async def stop_existing():
+        try:
+            await raw_stop()
+        except (ConnectionNotFound, NotInCallError):
+            pass  # The peer already ended the call; no source remains to stop.
+
+    async def leave_existing():
+        try:
+            await calls.leave_call(peer)
+        except (ConnectionNotFound, NotInCallError):
+            pass
+
+    transport.stop_source = stop_existing
+    transport.leave_source = leave_existing
 
     @calls.on_update()
     async def update(_, event):

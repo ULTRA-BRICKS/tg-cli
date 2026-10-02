@@ -92,6 +92,33 @@ class DuplexTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.failure, "CALL_INPUT_FAILED")
         await port.hangup()
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("pytgcalls"), "native runtime not installed"
+    )
+    async def test_native_cleanup_after_peer_left_is_idempotent(self):
+        from ntgcalls import ConnectionNotFound
+        from pytgcalls.exceptions import NotInCallError
+        from telegram_client.duplex import native_transport
+
+        class Binding:
+            async def set_stream_sources(self, *args):
+                raise ConnectionNotFound()
+
+        class Calls:
+            _binding = Binding()
+
+            def on_update(self):
+                return lambda handler: handler
+
+            async def leave_call(self, peer):
+                raise NotInCallError()
+
+        port = native_transport(Calls(), 123, lambda pcm: False)
+        await port.stop_audio()
+        await port.hangup()
+        self.assertTrue(port.closed)
+        self.assertFalse(Path(port.directory.name).exists())
+
     async def test_native_play_failure_removes_private_audio(self):
         class Calls:
             async def play(self, peer, path):

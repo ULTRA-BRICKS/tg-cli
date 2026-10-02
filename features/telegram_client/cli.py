@@ -37,6 +37,17 @@ def parser(role):
             q.add_argument("--source-session-idle-confirmed", action="store_true")
     if role == "caller":
         commands.add_parser(
+            "library-info", help="shared package version and module path; offline"
+        )
+        q = commands.add_parser(
+            "start", help="explicit conversational call; fails closed before connection"
+        )
+        q.add_argument("--providers-config", type=Path, required=True)
+        q.add_argument("--confirm-call", action="store_true")
+        q.add_argument("--allow-provider-network", action="store_true")
+        q.add_argument("--source-session-idle-confirmed", action="store_true")
+        q.add_argument("--maximum-seconds", type=int, default=1800)
+        commands.add_parser(
             "live-smoke",
             help="offline duplex integration with fake audio; no call or provider network",
         )
@@ -154,9 +165,41 @@ async def watch(store, args):
         emit({"state": trigger.status()})
 
 
+async def conversational_start(
+    store, config, consent, backend=None, maximum_seconds=1800
+):
+    from . import call_lib
+
+    return await call_lib.start_conversation(
+        store, config, consent, backend, maximum_seconds
+    )
+
+
 async def execute(role, args):
     store = AuthStore(args.store)
     command = args.command
+    if command == "library-info":
+        from .call_lib import identity
+
+        emit(identity())
+        return 0
+    if command == "start":
+        from .call_lib import Consent
+
+        config = json.loads(args.providers_config.read_text())
+        emit(
+            await conversational_start(
+                store,
+                config,
+                Consent(
+                    args.confirm_call,
+                    args.allow_provider_network,
+                    args.source_session_idle_confirmed,
+                ),
+                maximum_seconds=args.maximum_seconds,
+            )
+        )
+        return 0
     if command == "live-smoke":
         from .smoke import smoke
 
@@ -303,3 +346,11 @@ def main(role):
     except Exception:
         emit({"ok": False, "error": "CLIENT_OPERATION_FAILED"})
         return 1
+
+
+def caller_main():
+    return main("caller")
+
+
+def personal_main():
+    return main("personal")

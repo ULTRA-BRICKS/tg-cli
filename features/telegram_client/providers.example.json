@@ -1,8 +1,26 @@
 {
   "user_id": 0,
-  "stt": {"provider": "deepgram-nova-3", "credential_env": "TG_CALL_DEEPGRAM_KEY"},
-  "agent": {"command": []},
-  "tts": {"python": "", "model": "", "sha256": ""},
-  "vad": {"model": "", "sha256": ""},
-  "voice": {"name": "bracho", "provider": "silero", "voice_id": null, "status": "unresolved"}
+  "stt": {
+    "provider": "deepgram-nova-3",
+    "credential_env": "TG_CALL_DEEPGRAM_KEY"
+  },
+  "agent": {
+    "command": [],
+    "protocol": "call-agent-json-v1"
+  },
+  "tts": {
+    "python": "",
+    "model": "",
+    "sha256": ""
+  },
+  "vad": {
+    "model": "",
+    "sha256": ""
+  },
+  "voice": {
+    "name": "bracho",
+    "provider": "silero",
+    "voice_id": null,
+    "status": "unresolved"
+  }
 }

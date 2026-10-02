@@ -10,7 +10,7 @@ test("independent Telegram clients: auth guards, SQLite WAL snapshot and one-sho
   expect(result.exitCode).toBe(0)
 })
 
-for (const suite of ["telegram-conversation.test.py", "telegram-duplex.test.py", "telegram-providers.test.py"]) {
+for (const suite of ["telegram-conversation.test.py", "telegram-duplex.test.py", "telegram-providers.test.py", "telegram-call-lib.test.py"]) {
   test(suite, () => {
     const result = Bun.spawnSync(["python3", join(import.meta.dir, suite)], {
       cwd: join(import.meta.dir, ".."), timeout: 20000,
