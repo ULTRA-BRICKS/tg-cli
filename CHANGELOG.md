@@ -3,6 +3,22 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.30.2
+
+**Fix (HYP-907): preserve selected Telegram reply quotes; enable private topics automatically.**
+
+- When a Telegram reply includes a highlighted partial quote, `tg` now forwards
+  the whole selected span into the agent quote anchor instead of truncating it to
+  the whole-message preview limit.
+- Whole-message reply fallback previews are still capped at 60 characters, and
+  empty/whitespace-only selections fall back to that preview.
+- `tg-ctl /new` now attempts private-chat topic creation by default via Bot API
+  `createForumTopic`, with no special forum chat or BotFather setup step in the
+  normal path. If Telegram rejects the API call, the daemon falls back to the flat
+  `/new` spawn. Set `control.private_topics: false` to opt out.
+- Updated the reply-quote and forum-topic specs to match current topic reply,
+  daemon-command, topic-rename, and private-topic behavior.
+
 ## 1.30.0
 
 **Feature (HYP-891 follow-up): empty-editor watermark WARN heuristic in `pre-send-photo`.**

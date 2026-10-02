@@ -4241,14 +4241,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
 
   // Create a private-chat forum topic via Bot API 9.4 `createForumTopic` and return the new
   // `message_thread_id`, or null on any failure (the daemon falls back to flat-chat behaviour).
-  // Graceful: a failure is logged once with a BotFather hint and NEVER thrown — the caller
-  // continues with the flat /new path. No retry: a flaky network gets a second chance on the
-  // NEXT /new; a misconfigured bot (Threaded Mode off) gets the log hint.
+  // Graceful: a failure is logged and NEVER thrown — the caller continues with the flat /new
+  // path. No retry: a flaky network gets a second chance on the NEXT /new. BotFather is not
+  // a hard prerequisite for our path; this code asks Telegram to create the private topic
+  // directly and only falls back if that API call is unavailable/rejected.
   const createPrivateTopic = async (name: string): Promise<number | null> => {
     const json = await botPost(ctx, "createForumTopic", { chat_id: ctx.chatId, name })
     const result = json?.result
     if (!result || typeof result !== "object") {
-      log("Private chat topics not enabled — enable Threaded Mode in BotFather.")
+      log("Private chat topic creation failed — falling back to flat /new.")
       return null
     }
     const threadId = (result as { message_thread_id?: unknown }).message_thread_id
@@ -4347,7 +4348,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const slug = slugifyTopicName(session.name, 0)
     const spawnToken = `new-${session.token}-${Math.floor(Date.now() / 1000)}`
     // Private-chat topic: try to create a per-session topic BEFORE spawning so the window is born
-    // with TG_TOPIC already set. Failure (Threaded Mode off, API error) → graceful flat fallback.
+    // with TG_TOPIC already set. Any createForumTopic failure → graceful flat fallback.
     const threadId = ctx.cfg.privateTopics ? await createPrivateTopic(session.name) : null
     if (threadId !== null) {
       return spawnNewSessionWithTopic(session, modelId, threadId, slug, promptMessageId)

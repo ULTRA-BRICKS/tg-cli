@@ -8,7 +8,7 @@
 
 export interface ControlConfig {
   enabled: boolean;
-  transport: 'auto' | 'tmux' | 'channel'; // 'channel' reserved for v1.2+
+  transport: "auto" | "tmux" | "channel"; // 'channel' reserved for v1.2+
   session?: string; // fixed tmux session name (else auto-discover)
   injectWrap: string; // template: {name}, {msg}
   stalenessSec: number; // drop inbound older than this (default 300)
@@ -19,11 +19,11 @@ export interface ControlConfig {
   // handling (1:1 behaviour byte-identical). Opt in per machine with `control.topics: true`
   // once the chat is a forum supergroup with the bot as a topic-managing admin.
   topics: boolean;
-  // Private-chat forum topics (Bot API 9.4). Default OFF: when true the daemon calls
+  // Private-chat forum topics (Bot API 9.4). Default ON: the daemon calls
   // `createForumTopic` after each flat /new spawn and binds the returned thread to the new
-  // agent (same TopicBinding store as supergroup topics). Requires BotFather "Threaded Mode"
-  // to be enabled for the bot — if `createForumTopic` fails the daemon falls back silently
-  // to the current flat-chat behaviour. Opt in with `control.private_topics: true`.
+  // agent (same TopicBinding store as supergroup topics). This needs no forum supergroup and
+  // no BotFather setup for our path; if Telegram rejects `createForumTopic`, the daemon falls
+  // back silently to the current flat-chat behaviour. Opt out with `control.private_topics: false`.
   privateTopics: boolean;
 }
 
@@ -33,21 +33,21 @@ export interface ControlConfig {
 // detected agent, and D3 (bot-per-machine) becomes a practical requirement.
 export const DEFAULT_CONTROL: ControlConfig = {
   enabled: true,
-  transport: 'auto',
+  transport: "auto",
   // `{id}` renders the inbound Telegram message_id as `#<id>` — the agent passes
   // it to `tg --reply-to <id>` to thread its answer under this exact message.
   // When no id is available (a /agent route, a media item) `{id}` collapses with
   // its leading space (see wrapInbound), so the wrap stays `[TG from {name}] …`.
-  injectWrap: '[TG from {name} {id}] {msg}',
+  injectWrap: "[TG from {name} {id}] {msg}",
   stalenessSec: 300,
   idleExitMin: 30,
   allowedSenders: [],
   // OFF by default — topic mode activates only when the operator opts in (the routing half
   // ships before the spawn executor, so an accidental opt-in must not break the flat path).
   topics: false,
-  // OFF by default — private-chat topics auto-degrade when BotFather Threaded Mode is not
-  // enabled (createForumTopic fails → fall through to flat behaviour).
-  privateTopics: false,
+  // ON by default — private-chat topics auto-degrade when createForumTopic is unavailable
+  // (createForumTopic fails → fall through to flat behaviour).
+  privateTopics: true,
 };
 
 // --- Telegram update shapes (only the fields we read) ---
@@ -79,7 +79,9 @@ export interface TgVoice {
 }
 
 // The user's partial selection when replying (Bot API 7.0+): the substring of
-// the replied-to message they highlighted. Forwarded verbatim into the agent.
+// the replied-to message they highlighted. The reply anchor whitespace-collapses
+// it, preserves it without the whole-message preview length cap, and appends
+// the standard anchor ellipsis.
 export interface TgTextQuote {
   text: string;
 }
@@ -136,24 +138,38 @@ export interface TgUpdate {
 
 // Actions are data; the entrypoint executes them in order.
 export type Action =
-  | { kind: 'inject-text'; text: string; messageId: number } // already wrapped (or verbatim /cmd passthrough)
-  | { kind: 'inject-key'; key: 'Escape' } // /stop
-  | { kind: 'kill-agent' } // /kill — SIGINT to the registered pane's agent pid
-  | { kind: 'status' } // /status — entrypoint composes the reply
+  | { kind: "inject-text"; text: string; messageId: number } // already wrapped (or verbatim /cmd passthrough)
+  | { kind: "inject-key"; key: "Escape" } // /stop
+  | { kind: "kill-agent" } // /kill — SIGINT to the registered pane's agent pid
+  | { kind: "status" } // /status — entrypoint composes the reply
   // /tasks [<agent>] [<status>] — entrypoint resolves the agent→project scope,
   // spawns task-cli + gh, composes a rich-HTML board table, sends it (#115).
-  | { kind: 'tasks'; agent: string | null; status: string | null }
+  | { kind: "tasks"; agent: string | null; status: string | null }
   // A tap on a limit-stop's "auto-continue" button (lc:<pane>:<resetAt>): the
   // entrypoint arms a timer that injects "continue" into that pane at reset time
   // (immediately if already past), persisted so a restart re-arms it (#113).
-  | { kind: 'limit-continue'; callbackQueryId: string; paneId: string; resetAt: number; sourceMessageId: number | null; messageId: number | null }
+  | {
+      kind: "limit-continue";
+      callbackQueryId: string;
+      paneId: string;
+      resetAt: number;
+      sourceMessageId: number | null;
+      messageId: number | null;
+    }
   // /agent [<win>] <msg> — entrypoint discovers panes, fuzzy-matches the window
   // (phonetic), routes <msg> to that agent or asks via session-grouped buttons.
-  | { kind: 'agent-route'; selector: string | null; rest: string; all: string; from: string; messageId: number }
+  | {
+      kind: "agent-route";
+      selector: string | null;
+      rest: string;
+      all: string;
+      from: string;
+      messageId: number;
+    }
   // A tap on a /agent selection button (tga:<token>:<index>): the entrypoint
   // looks up the pending message + candidate and injects it into the chosen pane.
   | {
-      kind: 'agent-callback';
+      kind: "agent-callback";
       callbackQueryId: string;
       token: string;
       index: number;
@@ -163,14 +179,20 @@ export type Action =
   // A reply: route by the recognized origin pane (routes map) when known, else
   // a session-grouped picker ordered LRU/MRU. injectText is already wrapped +
   // carries the quote anchor (items 2,3); it is injected verbatim.
-  | { kind: 'reply-route'; replyToMessageId: number; injectText: string; from: string; messageId: number }
-  | { kind: 'reply'; text: string } // sendMessage back to the chat
-  | { kind: 'answer-callback'; callbackQueryId: string; text: string }
+  | {
+      kind: "reply-route";
+      replyToMessageId: number;
+      injectText: string;
+      from: string;
+      messageId: number;
+    }
+  | { kind: "reply"; text: string } // sendMessage back to the chat
+  | { kind: "answer-callback"; callbackQueryId: string; text: string }
   // messageId is the Telegram message the tapped button belongs to (null when
   // Telegram omits it); the daemon rejects taps whose message does not match
   // the pending prompt, so a stale tap can never answer a later same-key hook.
   | {
-      kind: 'answer-question';
+      kind: "answer-question";
       callbackQueryId: string;
       requestId: string;
       value: string;
@@ -179,12 +201,12 @@ export type Action =
   // Delivery receipt: set a 👀 reaction on the source message IF every action
   // emitted for it succeeded. Follows the message's delivery action(s); never
   // emitted for pure error replies (those ARE the failure signal).
-  | { kind: 'ack'; messageId: number }
+  | { kind: "ack"; messageId: number }
   | {
-      kind: 'download-media';
+      kind: "download-media";
       fileId: string;
       suggestedName: string; // daemon-chosen: <update_id>.<ext>
-      mediaKind: 'photo' | 'document';
+      mediaKind: "photo" | "document";
       fileSize?: number;
       caption?: string;
       from: string; // display name for the wrap
@@ -198,7 +220,7 @@ export type Action =
   // entrypoint, not the step function, knows whether Whisper is configured: an
   // unconfigured note becomes an onboarding reply there, never a silent drop.
   | {
-      kind: 'transcribe-voice';
+      kind: "transcribe-voice";
       fileId: string;
       suggestedName: string; // daemon-chosen: <update_id>.ogg
       fileSize?: number;
@@ -211,53 +233,85 @@ export type Action =
     }
   // --- forum topics (docs/specs/tg-forum-topics.md) ---
   // A new topic was created → start the per-topic /new flow (ask path, then model).
-  | { kind: 'topic-new'; threadId: number; name: string; from: string }
+  | { kind: "topic-new"; threadId: number; name: string; from: string }
   // A user message inside a topic still in the /new flow → feed the path answer (a working
   // directory) to the state machine. `text` is the raw user text (the path the user typed).
-  | { kind: 'topic-answer'; threadId: number; text: string; from: string; messageId: number }
+  | { kind: "topic-answer"; threadId: number; text: string; from: string; messageId: number }
   // A tap on a model button (tgm:<threadId>:<modelId>) inside an awaiting-model topic → spawn
   // the agent with that model. callbackQueryId answers the tap; messageId is the prompt message
   // (carried for editMessageReplyMarkup that clears the buttons on bind — increment 4).
-  | { kind: 'topic-model'; callbackQueryId: string; threadId: number; modelId: string; messageId: number | null }
+  | {
+      kind: "topic-model";
+      callbackQueryId: string;
+      threadId: number;
+      modelId: string;
+      messageId: number | null;
+    }
   // A tap on a recent-path button (tgp:<threadId>:<index>:<nonce>) inside an awaiting-path topic →
   // resolve the index against the binding's persisted pathChoices (only if the nonce matches the
   // binding's pathChoicesNonce — else a stale button) and advance like a typed path. callbackQueryId
   // answers the tap; messageId is the prompt (its keyboard is cleared on advance).
-  | { kind: 'topic-path'; callbackQueryId: string; threadId: number; index: number; nonce: number; messageId: number | null }
+  | {
+      kind: "topic-path";
+      callbackQueryId: string;
+      threadId: number;
+      index: number;
+      nonce: number;
+      messageId: number | null;
+    }
   // A tap on a re-spawn button (tgr:<threadId>) for a topic whose pane died → re-launch the
   // agent with the retained path + model and re-bind. callbackQueryId answers the tap.
-  | { kind: 'topic-respawn'; callbackQueryId: string; threadId: number; messageId: number | null }
+  | { kind: "topic-respawn"; callbackQueryId: string; threadId: number; messageId: number | null }
   // A user message inside a BOUND topic → inject into that topic's pane. injectText is
   // already wrapped; the entrypoint maps threadId→paneId and threads the ack with threadId.
-  | { kind: 'topic-route'; threadId: number; injectText: string; from: string; messageId: number }
+  | { kind: "topic-route"; threadId: number; injectText: string; from: string; messageId: number }
   // A user message inside a CLOSED topic (its pane died earlier) → the entrypoint offers a
   // one-tap re-spawn (retained path + model) instead of a silent dead-end (increment 4). Carries
   // the wrapped text + messageId so that if a SAME-BATCH re-spawn tap already re-bound the topic
   // before this action runs, the entrypoint routes the message to the now-live pane instead of
   // dropping it (codex r9 #1). injectText is empty for a media-only message (offer only).
-  | { kind: 'topic-dead'; threadId: number; injectText: string; messageId: number }
+  | { kind: "topic-dead"; threadId: number; injectText: string; messageId: number }
   // Topic closed / reopened service messages → mark the binding (entrypoint persists).
-  | { kind: 'topic-close'; threadId: number }
-  | { kind: 'topic-reopen'; threadId: number }
+  | { kind: "topic-close"; threadId: number }
+  | { kind: "topic-reopen"; threadId: number }
   // Topic renamed service message → persist new name + update the tmux-window slug.
-  | { kind: 'topic-rename'; threadId: number; name: string }
+  | { kind: "topic-rename"; threadId: number; name: string }
   // --- flat-chat /new command (issue #27; NON-topic) ---
   // A `/new [<model>] [<dir>] name [<task>]` slash command in the flat chat → start the
   // interactive new-session flow (ask dir, then model, then spawn). All parts but `name` are
   // optional; omitted model/dir are picked via inline buttons. Distinct from topic-new (which is
   // keyed to a forum threadId) — a flat /new carries no thread, so the entrypoint mints a token.
-  | { kind: 'new-command'; model: string | null; dir: string | null; name: string; task: string; from: string }
+  | {
+      kind: "new-command";
+      model: string | null;
+      dir: string | null;
+      name: string;
+      task: string;
+      from: string;
+    }
   // A tap on a flat-/new model button (tnm:<token>:<modelId>) → spawn the agent with that model.
   // callbackQueryId answers the tap; messageId is the prompt (its keyboard is cleared on spawn).
-  | { kind: 'new-model'; callbackQueryId: string; token: string; modelId: string; messageId: number | null }
+  | {
+      kind: "new-model";
+      callbackQueryId: string;
+      token: string;
+      modelId: string;
+      messageId: number | null;
+    }
   // A tap on a flat-/new recent-dir button (tnp:<token>:<index>) → resolve the index against the
   // pending session's dirChoices and advance like a typed path. callbackQueryId answers the tap.
-  | { kind: 'new-dir'; callbackQueryId: string; token: string; index: number; messageId: number | null }
+  | {
+      kind: "new-dir";
+      callbackQueryId: string;
+      token: string;
+      index: number;
+      messageId: number | null;
+    }
   // A free-text message answering an in-flight flat-/new prompt (the awaiting-dir step — an
   // absolute path typed instead of tapping a button). `text` is the raw user text. The entrypoint
   // matches it to the SINGLE pending session in awaiting-dir (a flat chat has at most one /new in
   // flight at a time); a stray one with no pending session falls through to normal handling.
-  | { kind: 'new-answer'; text: string; from: string; messageId: number };
+  | { kind: "new-answer"; text: string; from: string; messageId: number };
 
 export interface StepResult {
   actions: Action[];
@@ -268,9 +322,9 @@ export interface StepResult {
 // --- tmux injection plans (spec §16 module 5) ---
 
 export type InjectStep =
-  | { kind: 'verify-pane'; paneId: string } // entrypoint re-checks agent still in pane
-  | { kind: 'tmux'; argv: string[]; stdin?: string } // tmux command; stdin for load-buffer -
-  | { kind: 'sleep'; ms: number };
+  | { kind: "verify-pane"; paneId: string } // entrypoint re-checks agent still in pane
+  | { kind: "tmux"; argv: string[]; stdin?: string } // tmux command; stdin for load-buffer -
+  | { kind: "sleep"; ms: number };
 
 // --- pane discovery (spec §16 module 6) ---
 
@@ -300,7 +354,7 @@ export interface ProcInfo {
   command: string; // full command line
 }
 
-export type AgentKind = 'claude' | 'opencode' | 'codex' | 'pi' | 'aider' | 'unknown';
+export type AgentKind = "claude" | "opencode" | "codex" | "pi" | "aider" | "unknown";
 
 // Snapshot written by `tg` / `tg-ctl start` at auto-start time (spec §5.2).
 export interface Registration {
@@ -318,7 +372,7 @@ export interface TargetPane {
 
 export type DiscoverResult =
   | { ok: true; target: TargetPane }
-  | { ok: false; reason: 'no-agent' | 'ambiguous'; candidates: TargetPane[] };
+  | { ok: false; reason: "no-agent" | "ambiguous"; candidates: TargetPane[] };
 
 // --- lock/status helpers (spec §16 module 3) ---
 
@@ -344,7 +398,7 @@ export interface CtlPaths {
 //   awaiting-model — got a path; asked for the model
 //   bound          — agent spawned + pane bound; messages route here
 //   closed         — topic closed or its pane died; re-attaches on reopen/next message
-export type TopicStatus = 'awaiting-path' | 'awaiting-model' | 'bound' | 'closed';
+export type TopicStatus = "awaiting-path" | "awaiting-model" | "bound" | "closed";
 
 // One forum topic's binding to an agent. Persisted as a JSON array (CtlPaths.topics),
 // written by the entrypoint on every state transition (same pattern as routes).

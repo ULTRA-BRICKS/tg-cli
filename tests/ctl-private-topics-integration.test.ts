@@ -7,14 +7,14 @@ import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon
 import { parseTopics } from '../features/tg-ctl/topics';
 
 // End-to-end private-chat forum topics (Bot API 9.4): the REAL daemon + a fake Telegram server.
-// Exercises the `control.private_topics: true` path where a flat `/new` spawn calls
+// Exercises the default-on private topic path where a flat `/new` spawn calls
 // `createForumTopic`, writes a `bound` TopicBinding, and spawns with TG_TOPIC stamped.
 //
 // Two main scenarios:
 //   1. createForumTopic SUCCEEDS → daemon spawns via spawnTopicWindow (TG_TOPIC in argv),
 //      writes a `bound` binding in the topics store, and the forum_topic_created echo is
 //      silently swallowed (no re-flow started).
-//   2. createForumTopic FAILS (Threaded Mode off, API error) → graceful fallback to plain
+//   2. createForumTopic FAILS (API error / unsupported account) → graceful fallback to plain
 //      spawnNewWindow (no TG_TOPIC, no binding written, same success message).
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
@@ -57,15 +57,14 @@ exit 0
 `;
 }
 
-function makeCfgDir(privateTopics: boolean): { cfgDir: string; spawnLog: string } {
+function makeCfgDir(privateTopics?: boolean): { cfgDir: string; spawnLog: string } {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-pt-'));
   cfgDirs.push(cfgDir);
   const spawnLog = join(cfgDir, 'spawn.log');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
-  writeFileSync(
-    join(cfgDir, 'config.yaml'),
-    `control:\n  enabled: true\n  private_topics: ${privateTopics}\n`,
-  );
+  const privateTopicsLine =
+    privateTopics === undefined ? '' : `  private_topics: ${privateTopics}\n`;
+  writeFileSync(join(cfgDir, 'config.yaml'), `control:\n  enabled: true\n${privateTopicsLine}`);
   writeFileSync(
     join(cfgDir, 'tg-ctl.123.registration.json'),
     JSON.stringify({ paneId: '%1', cwd: cfgDir }),
@@ -139,7 +138,7 @@ const sent = (sends: Array<Record<string, unknown>>, needle: string): boolean =>
 test(
   'private_topics: createForumTopic succeeds → spawns with TG_TOPIC env, writes bound binding',
   async () => {
-    const { cfgDir, spawnLog } = makeCfgDir(true);
+    const { cfgDir, spawnLog } = makeCfgDir();
     const topicsFile = join(cfgDir, 'tg-ctl.123.topics.json');
 
     // The server returns threadId=42 for createForumTopic; normal endpoints for spawn flow.
@@ -226,10 +225,10 @@ test(
 test(
   'private_topics: createForumTopic fails → falls back to flat spawn, NO topic binding written',
   async () => {
-    const { cfgDir, spawnLog } = makeCfgDir(true);
+    const { cfgDir, spawnLog } = makeCfgDir();
     const topicsFile = join(cfgDir, 'tg-ctl.123.topics.json');
 
-    // The server returns an API error for createForumTopic (Threaded Mode off).
+    // The server returns an API error for createForumTopic.
     const queue: unknown[][] = [[textMsg(20, `/new claude-default ${cfgDir} flatproj`)]];
     const sends: Array<Record<string, unknown>> = [];
     const server = Bun.serve({
@@ -243,7 +242,7 @@ test(
           return Response.json({ ok: true, result: [] });
         }
         if (url.pathname.endsWith('/createForumTopic')) {
-          // Simulate Threaded Mode not enabled → API error
+          // Simulate Telegram rejecting createForumTopic → API error.
           return Response.json(
             { ok: false, description: 'FORUM_NOT_ENABLED' },
             { status: 400 },
@@ -307,7 +306,7 @@ test(
 test(
   'private_topics: forum_topic_created echo after createForumTopic does NOT restart /new flow',
   async () => {
-    const { cfgDir, spawnLog } = makeCfgDir(true);
+    const { cfgDir, spawnLog } = makeCfgDir();
 
     // First: /new + immediate spawn; then: the Telegram echo arrives.
     const queue: unknown[][] = [
@@ -376,6 +375,63 @@ test(
   },
 );
 
+test(
+  'private_topics: explicit false opts out of createForumTopic and keeps flat /new',
+  async () => {
+    const { cfgDir, spawnLog } = makeCfgDir(false);
+
+    const queue: unknown[][] = [[textMsg(40, `/new claude-default ${cfgDir} explicitflat`)]];
+    const creates: Array<Record<string, unknown>> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname.endsWith('/getUpdates')) {
+          const batch = queue.shift();
+          if (batch) return Response.json({ ok: true, result: batch });
+          await Bun.sleep(60);
+          return Response.json({ ok: true, result: [] });
+        }
+        if (url.pathname.endsWith('/createForumTopic')) {
+          creates.push((await req.json()) as Record<string, unknown>);
+          return Response.json({ ok: true, result: { message_thread_id: 42 } });
+        }
+        if (url.pathname.endsWith('/sendMessage')) {
+          return Response.json({ ok: true, result: { message_id: 900 } });
+        }
+        if (url.pathname.endsWith('/answerCallbackQuery')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/editMessageReplyMarkup')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMessageReaction')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMyCommands')) return Response.json({ ok: true, result: true });
+        return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+      },
+    });
+    servers.push(server);
+
+    const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
+    const daemon: Subprocess = await spawnDaemon(reg, {
+      tgCtlPath: TG_CTL,
+      cfgDir,
+      env: {
+        PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
+        HOME: cfgDir,
+        TG_CTL_CONFIG_DIR: cfgDir,
+        TG_API_BASE: `http://127.0.0.1:${server.port}`,
+      },
+      logFd,
+    });
+    closeSync(logFd);
+
+    await waitFor(() => spawnArgvLog(spawnLog).length > 0);
+    const argv = spawnArgvLog(spawnLog);
+    expect(argv.length).toBe(1);
+    expect(argv[0]).not.toContain('TG_TOPIC');
+    expect(creates.length).toBe(0);
+
+    daemon.kill();
+  },
+);
+
 // --- Unit-level: parseControlConfig + resolveControlConfig handles private_topics ---
 
 import { parseControlConfig, resolveControlConfig } from '../features/tg-ctl/config';
@@ -395,11 +451,12 @@ test('parseControlConfig parses private_topics flag with the same token sets as 
   expect(parseControlConfig('control:\n  private_topics: maybe\n')).toEqual({}); // unrecognized → ignore
 });
 
-test('resolveControlConfig: privateTopics defaults OFF and an explicit true flows through', () => {
-  expect(resolveControlConfig({}).privateTopics).toBe(false);
+test('resolveControlConfig: privateTopics defaults ON and an explicit false opts out', () => {
+  expect(resolveControlConfig({}).privateTopics).toBe(true);
   expect(resolveControlConfig({ privateTopics: true }).privateTopics).toBe(true);
+  expect(resolveControlConfig({ privateTopics: false }).privateTopics).toBe(false);
 });
 
-test('resolveControlConfig of an empty partial includes privateTopics: false', () => {
+test('resolveControlConfig of an empty partial includes privateTopics: true', () => {
   expect(resolveControlConfig({})).toEqual(DEFAULT_CONTROL);
 });
