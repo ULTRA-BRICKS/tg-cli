@@ -3,6 +3,30 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.52.6
+
+**Fix (tg-cli#399, refs #333/#355): daemon liveness truthfulness — name the real log sink, reconcile orphan pidfiles and stale plists, truthful multi-question outcomes.**
+
+- `tg-ctl status` prints a `log:` line for a running daemon naming the file its stderr —
+  its ONLY log sink — actually lands on (probed via `lsof -d 2`): the launchd plist's
+  StandardErrorPath, the `tg-ctl start` capture, or a foreground terminal. Root cause of
+  the RC-4 misdiagnosis: the canonical log file sat dark 2026-08-25→09-10 while the
+  launchd-owned daemon served 291 approvals logged to `launchd.tg-ctl.err.log`.
+- `tg-ctl status` cleans a stale pidfile (reported as `cleaned`) when NOTHING is alive —
+  pid dead, no flock holder, no launchd job — mirroring `stop`'s cleanup.
+- `autostart:` line reports a STALE own unit truthfully: unit file on disk but the job is
+  NOT loaded (launchd only) → `STALE … run tg-ctl enable to load it`, instead of
+  "enabled" from file existence alone.
+- `tg-ctl ask` multi-question failure logs each question's OWN outcome (expired /
+  declined:reason / timed-out / unreachable via the single-question verdict, plus
+  `not-attempted` for questions never reached) instead of one conflated
+  "declined, timed out, or partial" line (tg-cli#355 residual).
+- Reconciliation (read-only, machine-wide): one tg-ctl binary on PATH
+  (`~/.files/bin/tg-ctl` → `~/.files/repos/tg-cli/tg-ctl`), one bot (8574086668), one
+  live daemon (launchd `ai.hyperide.tg-ctl`, KeepAlive) — the "unreachable" hatch denies
+  were the pre-#370 ambiguous client wording counting 115s human timeouts as daemon
+  failure, plus pre-#324 status reading the pidfile alone. Full finding in the PR body.
+
 ## 1.52.5
 
 **Fix (tg-cli#322): fire-and-forget omp ACP delivery; journal getUpdates batches before offset advance.**

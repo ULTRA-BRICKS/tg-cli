@@ -139,10 +139,16 @@ export function daemonRunState(
 
 // The first line of `tg-ctl status`. A live launchd-owned daemon is never "not running", even
 // when the pidfile is missing or stale (tg-cli#316 — the 2026-09-08 pid 11062 lie).
-export function daemonStatusLine(state: DaemonRunState, botId: string): string {
+// `stalePidfileCleaned` marks that the CALLER reconciled the stale pidfile (unlinked it —
+// see planStalePidfileReconcile) so the wording says the garbage bookkeeping is gone, not
+// just that it was found.
+export function daemonStatusLine(state: DaemonRunState, botId: string, stalePidfileCleaned = false): string {
   const suffix = ` — bot ${botId}`;
   if (state.kind === 'not-running') return `tg-ctl: not running${suffix}`;
-  if (state.kind === 'stale-pidfile') return `tg-ctl: not running (stale pidfile, pid ${state.pid})${suffix}`;
+  if (state.kind === 'stale-pidfile') {
+    const cleaned = stalePidfileCleaned ? ', cleaned' : '';
+    return `tg-ctl: not running (stale pidfile${cleaned}, pid ${state.pid})${suffix}`;
+  }
   if (state.owner === 'process') return `tg-ctl: running (pid ${state.pid})${suffix}`;
   const note =
     state.note === undefined
@@ -153,7 +159,73 @@ export function daemonStatusLine(state: DaemonRunState, botId: string): string {
   return `tg-ctl: running (launchd, pid ${state.pid})${suffix} (job ${state.label}${note})`;
 }
 
+// Plan the orphan-pid reconcile for `status` (RC-4): a pidfile whose pid is dead AND for
+// which no other source of life exists (no launchd job for this bot, no flock holder) is
+// garbage bookkeeping — the daemon is genuinely down and the file misleads the next
+// reader. Returns the dead pid for the caller to unlink + report as cleaned; null for
+// EVERY live shape (the pidfile may still be the live daemon's, or already superseded by
+// a launchd/lock-holder report). Pure — the caller performs the unlink, mirroring
+// stopDaemon's cleanup, which is safe exactly because every liveness signal was checked
+// first and the pidfile is informational only (spec §6).
+export type StalePidfileClean = { pid: number };
 
+export function planStalePidfileReconcile(state: DaemonRunState): StalePidfileClean | null {
+  return state.kind === 'stale-pidfile' ? { pid: state.pid } : null;
+}
+
+// Parse `lsof -F n` output (one record per line, `n` records name the file). Pure half of
+// the daemon-log-sink probe; the entrypoint spawns lsof and hands the stdout here.
+export function parseLsofNamedPaths(stdout: string): string[] {
+  const paths: string[] = [];
+  for (const line of stdout.split('\n')) {
+    if (line.startsWith('n') && line.length > 1) paths.push(line.slice(1));
+  }
+  return paths;
+}
+
+// The `log:` status line — WHERE the daemon's log lines actually land (RC-4). The daemon's
+// log() writes to STDERR ONLY, so the real sink is whoever captures that fd: launchd's
+// StandardErrorPath, tg-ctl start's captured file (the canonical path), or a foreground
+// terminal. The 2026-08-25→09-10 incident: the canonical log sat dark for 16 days while
+// the launchd-owned daemon served 291 approvals, all logged to the plist's error file —
+// two agents read the dark canonical log as "daemon dead". This line names the REAL sink
+// and, when it differs from the canonical file, says so explicitly.
+//   stdErrPath === canonicalLogPathResolved → the tg-ctl start capture
+//   /dev/tty* or /dev/pts/*                  → a foreground run's terminal
+//   /dev/null                                → stderr is discarded (nothing is logged)
+//   anything else                            → a supervisor-captured file, NOT the canonical one
+//   null                                     → honestly unknown; the canonical file is named as a
+//                                             POINTER, not asserted as the sink
+// `canonicalLogPathResolved` (defaults to `canonicalLogPath`) is the canonical path AFTER
+// realpath(3): lsof reports the kernel's RESOLVED vnode path, so a canonical path behind a
+// symlink or a /var→/private/var style alias would otherwise compare unequal to the very
+// file it names and the line would misdirect the reader away from the canonical log
+// (review finding). The UNRESOLVED path is what gets DISPLAYED (what the user configured).
+export function daemonLogSinkLine(
+  stdErrPath: string | null,
+  canonicalLogPath: string,
+  canonicalLogPathResolved: string = canonicalLogPath,
+): string {
+  if (stdErrPath === null) {
+    return `log: unknown — the daemon logs to its stderr and its destination could not be inspected (canonical file: ${canonicalLogPath})`;
+  }
+  if (stdErrPath === canonicalLogPathResolved) {
+    return `log: ${canonicalLogPath} (the daemon's stderr, captured by tg-ctl start)`;
+  }
+  if (stdErrPath === '/dev/null') {
+    return `log: /dev/null (stderr discarded — the daemon's log output goes nowhere; canonical file: ${canonicalLogPath})`;
+  }
+  if (/^\/dev\/(tty|pts)/.test(stdErrPath)) {
+    return `log: ${stdErrPath} (foreground run — the daemon logs to this terminal, not ${canonicalLogPath})`;
+  }
+  if (!stdErrPath.startsWith('/')) {
+    // Kernel object names ("pipe:[…]", "socket:[…]") — a wrapper captured stderr in
+    // memory. There is no log FILE to tail; saying "supervisor-captured" here would
+    // present a guess as fact (review finding).
+    return `log: ${stdErrPath} (the daemon's stderr is a pipe/socket, not a file — no log file to tail; canonical file: ${canonicalLogPath})`;
+  }
+  return `log: ${stdErrPath} (the daemon's stderr lands HERE — supervisor-captured — NOT ${canonicalLogPath})`;
+}
 // Does the pidfile on disk belong to US? `cleanExit` (and any other shutdown
 // path) MUST gate its `unlink(pidfile)` on this. The bug it guards (tg#93): on a
 // launchd relaunch a daemon that is shutting down — or whose ownership a newer

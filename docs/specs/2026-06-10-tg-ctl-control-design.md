@@ -199,7 +199,11 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
   - `tg-ctl run` — internal: the daemon itself. flock first, then poll loop.
   - `tg-ctl stop` — read pidfile, `SIGTERM`, clean pidfile.
   - `tg-ctl status` — running? (pidfile, flock holder, launchd — not pidfile alone)
-    mode? target pane? bot id? last update age?
+    mode? target pane? bot id? last update age? A stale pidfile with nothing alive is
+    cleaned (reported as `cleaned`); a running daemon's `log:` line names the file its
+    stderr — its only log sink — actually lands on (the launchd StandardErrorPath, the
+    `tg-ctl start` capture, or a foreground terminal), NOT assumed to be the canonical
+    log next to the pidfile.
 
 - **Lazy auto-start from `tg`:** on `tg` invocation, auto-start `tg-ctl` **only if both hold**:
   - inside a tmux pane (`TMUX` set) with a detected AI agent, **and**

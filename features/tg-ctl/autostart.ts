@@ -403,6 +403,27 @@ export function autostartKindLabel(kind: AutostartKind): string {
   return '';
 }
 
+// Pure tri-state decision for "is tg-ctl's own launchd unit loaded?" from ONE raw
+// `launchctl print gui/<uid>/<label>` result (exit + stdout + stderr). `false` (genuinely
+// not loaded) is claimed ONLY on positive evidence, because the caller turns it into a
+// STALE status line that prescribes an action — a probe failure misread as not-loaded
+// would be an actionable false claim (review finding). Empirically verified on this
+// machine (macOS launchctl):
+//   exit 0                                      → loaded (a dump printed)
+//   exit 113, "Could not find service <label>…" → the domain EXISTS, the job is absent
+//   exit 112, "Could not find domain for user…" → no GUI login (headless/SSH-only); the
+//                                                  plist still loads at next login → unknown
+//   anything else (transient launchctl failure)  → unknown
+export function ownUnitLoadedFromPrint(result: {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}): boolean | undefined {
+  if (result.exitCode === 0 && result.stdout.trim().length > 0) return true;
+  if (/Could not find service /.test(result.stderr)) return false;
+  return undefined;
+}
+
 // Render the `autostart:` status line from already-resolved facts (the I/O — file existence + the
 // launchctl probe — happens in the caller; this is the pure precedence + formatting). Precedence:
 //   1. kind 'none'        → no OS autostart support (won't survive reboot)
@@ -412,11 +433,32 @@ export function autostartKindLabel(kind: AutostartKind): string {
 // Own-unit BEFORE external so a daemon enabled via `tg-ctl enable` keeps its precise label even if an
 // external job also happens to run it. externalLabel is only meaningful on launchd (the caller passes
 // undefined elsewhere).
-export function autostartStatusLine(kind: AutostartKind, ownUnitInstalled: boolean, externalLabel: string | undefined): string {
+//
+// `ownUnitLoaded` (launchd only; undefined when not probed — systemd keeps the existing line): a
+// unit file on disk whose job is NOT loaded is a STALE plist — the file-existence check alone would
+// say "enabled" while launchd has bootout'd the job, so the daemon would NOT come back at login
+// (RC-4: status must reconcile stale plists and report truthfully). The STALE wording names the fix.
+export function autostartStatusLine(
+  kind: AutostartKind,
+  ownUnitInstalled: boolean,
+  externalLabel: string | undefined,
+  ownUnitLoaded?: boolean,
+): string {
   if (kind === 'none') {
     return 'autostart: not supported on this OS — `tg-ctl start` runs now but won\'t survive reboot';
   }
   if (ownUnitInstalled) {
+    // Launchd only: the loaded probe runs solely there (a systemd unit's enabled contract
+    // IS the file + `enable --now`, so existence stays the truth for it). When the own
+    // unit is stale but an EXTERNAL supervisor is live, name it — autostart IS assured,
+    // and blindly running `tg-ctl enable` would install a SECOND supervisor for the same
+    // daemon (review finding: the STALE branch must not swallow the external probe).
+    if (kind === 'launchd' && ownUnitLoaded === false) {
+      if (externalLabel) {
+        return `autostart: STALE own unit — ${autostartKindLabel(kind)} is on disk but NOT loaded; an external supervisor (launchd: ${externalLabel}) keeps the daemon autostarted — load the own unit only if you intend to replace it`;
+      }
+      return `autostart: STALE — ${autostartKindLabel(kind)} is on disk but NOT loaded; run \`tg-ctl enable\` to load it`;
+    }
     return `autostart: enabled (${kind}, ${autostartKindLabel(kind)})`;
   }
   if (externalLabel) {
