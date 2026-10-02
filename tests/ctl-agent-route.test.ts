@@ -60,6 +60,7 @@ test('tga: callback → agent-callback action', () => {
     index: 2,
     from: 'Alex',
     messageId: 77,
+    languageCode: null,
   });
 });
 

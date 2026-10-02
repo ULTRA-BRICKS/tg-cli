@@ -11,7 +11,7 @@ import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon
 //   1. assert a bare `/agent` posts an inline keyboard (not plain text) whose
 //      buttons carry DISTINCT labels from the WINDOW NAMES (tg-cli#75 fix C) — not
 //      the cwd basenames the daemon used to fall back to ("hyperide");
-//   2. tap one button and assert the select-only confirmation (no inject).
+//   2. tap one button and assert the next plain message routes to that selected agent.
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -77,7 +77,7 @@ const server = Bun.serve({
       // the harness immune to a double poll re-delivering the same `/agent`.
       const offset = Number(url.searchParams.get('offset') ?? '0');
       // First poll: deliver the bare `/agent` text message. After the picker is
-      // posted, deliver a tap on its first button.
+      // posted, deliver a tap on the ext button.
       if (offset <= 100 && sentMessages.length === 0) {
         return Response.json({
           ok: true,
@@ -86,7 +86,7 @@ const server = Bun.serve({
               update_id: 100,
               message: {
                 message_id: 10,
-                from: { id: 1, first_name: 'Alex' },
+                from: { id: 1, first_name: 'Alex', language_code: 'ru' },
                 chat: { id: 1 },
                 date: Math.floor(Date.now() / 1000),
                 text: '/agent',
@@ -104,7 +104,7 @@ const server = Bun.serve({
               update_id: 200,
               callback_query: {
                 id: 'cb1',
-                from: { id: 1, first_name: 'Alex' },
+                from: { id: 1, first_name: 'Alex', language_code: 'ru' },
                 message: { message_id: 77, chat: { id: 1 }, date: Math.floor(Date.now() / 1000) },
                 data: callbackData,
               },
@@ -112,9 +112,8 @@ const server = Bun.serve({
           ],
         });
       }
-      // After the select-only tap is answered, deliver the SUGGESTED command
-      // (`/agent rig hello there`) to prove the handed-back selector actually
-      // routes — the finding-#1 round-trip the unit test asserts in isolation.
+      // After the select-only tap is answered, deliver a normal message. The selected
+      // target must own this next message; it must not fall back to last/default routing.
       if (offset <= 300 && callbackServed && answeredCallbacks.length > 0 && !routeMsgServed) {
         routeMsgServed = true;
         return Response.json({
@@ -124,10 +123,10 @@ const server = Bun.serve({
               update_id: 300,
               message: {
                 message_id: 30,
-                from: { id: 1, first_name: 'Alex' },
+                from: { id: 1, first_name: 'Alex', language_code: 'ru' },
                 chat: { id: 1 },
                 date: Math.floor(Date.now() / 1000),
-                text: '/agent rig hello there',
+                text: 'hello selected agent',
               },
             },
           ],
@@ -143,7 +142,8 @@ const server = Bun.serve({
         | { inline_keyboard?: Array<Array<{ callback_data?: string }>> }
         | undefined;
       const firstBtn = markup?.inline_keyboard?.[0]?.[0]?.callback_data;
-      if (firstBtn) callbackData = firstBtn;
+      const extBtn = markup?.inline_keyboard?.flat().find((b) => b.text?.includes('ext'))?.callback_data;
+      if (extBtn || firstBtn) callbackData = extBtn ?? firstBtn ?? null;
       return Response.json({ ok: true, result: { message_id: 77 } });
     }
     if (url.pathname.endsWith('/editMessageText')) {
@@ -190,8 +190,8 @@ test('bare /agent posts an inline-keyboard picker with distinct cwd labels, and 
   const injected = (): boolean => {
     const log = existsSync(tmuxLog) ? readFileSync(tmuxLog, 'utf8') : '';
     // Per-LINE match (the fake tmux logs one invocation per line): send-keys /
-    // paste-buffer and `-t %5001` must be on the SAME line, not merely co-present.
-    return /^(send-keys|paste-buffer)\b.*-t %5001\b/m.test(log);
+    // paste-buffer and `-t %5003` must be on the SAME line, not merely co-present.
+    return /^(send-keys|paste-buffer)\b.*-t %5003\b/m.test(log);
   };
   while (
     Date.now() < tEnd &&
@@ -231,22 +231,27 @@ test('bare /agent posts an inline-keyboard picker with distinct cwd labels, and 
   for (const label of labels) expect(String(picker.text)).not.toContain(label);
 
   // 2. The tap was acknowledged as a selection and the prompt was edited to the
-  //    select-only confirmation — nothing was injected (no tmux send-keys).
-  expect(answeredCallbacks).toEqual([{ callback_query_id: 'cb1', text: 'selected' }]);
+  //    next-message confirmation with a localized Cancel button.
+  expect(answeredCallbacks).toEqual([{ callback_query_id: 'cb1', text: 'выбрано' }]);
   expect(editedMessages.length).toBeGreaterThanOrEqual(1);
   const edited = String(editedMessages[0].text);
-  expect(edited).toContain('selected rig · claude');
-  expect(edited).toContain('/agent rig');
+  expect(edited).toContain('Выбран ext · claude');
+  expect(edited).toContain('следующее сообщение');
+  expect(edited).not.toContain('send: /agent');
+  const editMarkup = editedMessages[0].reply_markup as
+    | { inline_keyboard?: Array<Array<{ text: string; callback_data: string }>> }
+    | undefined;
+  const cancelButton = editMarkup?.inline_keyboard?.flat()[0];
+  expect(cancelButton?.text).toBe('Отмена');
+  expect(cancelButton?.callback_data).toMatch(/^tgc:a\d+$/);
 
-  // 3. Round-trip (finding #1): the suggested `/agent rig hello there` confidently
-  //    routed to the cwd-`rig` pane %5001 and injected — the cwd-derived selector
-  //    really addresses the picked agent (matchWindows scores the cwd, not just
-  //    the bare window name "4").
+  // 3. The next plain text after the tap routes to the selected ext pane %5003.
   const log = existsSync(tmuxLog) ? readFileSync(tmuxLog, 'utf8') : '';
-  // send-keys / paste-buffer targeting `-t %5001` on the SAME line (per-line, not
+  // send-keys / paste-buffer targeting `-t %5003` on the SAME line (per-line, not
   // merely both-present-somewhere) — proves the inject hit the chosen pane.
-  expect(/^(send-keys|paste-buffer)\b.*-t %5001\b/m.test(log)).toBe(true);
+  expect(/^(send-keys|paste-buffer)\b.*-t %5003\b/m.test(log)).toBe(true);
+  expect(log).toContain('hello selected agent');
   // and NOT into a sibling pane
+  expect(log).not.toContain('%5001');
   expect(log).not.toContain('%5002');
-  expect(log).not.toContain('%5003');
 }, 25_000);

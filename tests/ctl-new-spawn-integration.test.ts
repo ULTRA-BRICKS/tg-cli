@@ -110,7 +110,10 @@ function makeCfgDir(topics: boolean): { cfgDir: string; spawnLog: string } {
   cfgDirs.push(cfgDir);
   const spawnLog = join(cfgDir, 'spawn.log');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
-  writeFileSync(join(cfgDir, 'config.yaml'), `control:\n  enabled: true\n  topics: ${topics}\n`);
+  writeFileSync(
+    join(cfgDir, 'config.yaml'),
+    `control:\n  enabled: true\n  topics: ${topics}\n  private_topics: false\n`,
+  );
   writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ paneId: '%1', cwd: cfgDir }));
   mkdirSync(join(cfgDir, 'bin'));
   writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmux(cfgDir, spawnLog), { mode: 0o755 });
@@ -314,7 +317,7 @@ test('/new <name> whose slug collides with a live window WARNS but still proceed
   cfgDirs.push(cfgDir);
   const spawnLog = join(cfgDir, 'spawn.log');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
-  writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n  topics: false\n');
+  writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n  topics: false\n  private_topics: false\n');
   writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ paneId: '%1', cwd: cfgDir }));
   mkdirSync(join(cfgDir, 'bin'));
   writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmuxWithWindow(cfgDir, spawnLog, 'myproj'), { mode: 0o755 });
@@ -385,7 +388,7 @@ test('a spawn FAILURE leaves the session retryable and re-posts the model keyboa
   const failFlag = join(cfgDir, 'FAIL_SPAWN');
   writeFileSync(failFlag, '1'); // arm the failure
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
-  writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n  topics: false\n');
+  writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n  topics: false\n  private_topics: false\n');
   writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ paneId: '%1', cwd: cfgDir }));
   mkdirSync(join(cfgDir, 'bin'));
   writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmuxFailable(cfgDir, spawnLog, failFlag), { mode: 0o755 });
@@ -410,6 +413,7 @@ test('a spawn FAILURE leaves the session retryable and re-posts the model keyboa
   queue.push([modelTap(112, 'n1', 'claude-default')]);
   await waitFor(() => spawnArgvLog(spawnLog).length > 0);
   expect(spawnArgvLog(spawnLog).length).toBe(1);
+  await waitFor(() => sent(sends, 'spawned `claude-default`'));
   expect(sent(sends, 'spawned `claude-default`')).toBe(true);
   daemon.kill();
 });

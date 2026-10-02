@@ -7,14 +7,14 @@ import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon
 import { parseTopics } from '../features/tg-ctl/topics';
 
 // End-to-end private-chat forum topics (Bot API 9.4): the REAL daemon + a fake Telegram server.
-// Exercises the `control.private_topics: true` path where a flat `/new` spawn calls
+// Exercises the default-on private topic path where a flat `/new` spawn calls
 // `createForumTopic`, writes a `bound` TopicBinding, and spawns with TG_TOPIC stamped.
 //
 // Two main scenarios:
 //   1. createForumTopic SUCCEEDS → daemon spawns via spawnTopicWindow (TG_TOPIC in argv),
 //      writes a `bound` binding in the topics store, and the forum_topic_created echo is
 //      silently swallowed (no re-flow started).
-//   2. createForumTopic FAILS (Threaded Mode off, API error) → graceful fallback to plain
+//   2. createForumTopic FAILS (API error / unsupported account) → graceful fallback to plain
 //      spawnNewWindow (no TG_TOPIC, no binding written, same success message).
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
@@ -30,8 +30,9 @@ afterEach(async () => {
   for (const d of cfgDirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
-function fakeTmux(cwd: string, spawnLog: string): string {
+function fakeTmux(cwd: string, spawnLog: string, injectLog: string, failFlag = ''): string {
   return `#!/bin/sh
+fail_flag='${failFlag}'
 sub="$1"; shift
 case "$sub" in
   list-panes)
@@ -39,12 +40,24 @@ case "$sub" in
     ;;
   display-message) printf 'main\\n' ;;
   new-window)
+    if [ -n "$fail_flag" ] && [ -f "$fail_flag" ]; then
+      rm -f "$fail_flag"
+      echo 'no current session' >&2
+      exit 1
+    fi
     printf 'new-window %s\\n' "$*" >> '${spawnLog}'
     printf '%s\\n' '${SPAWNED_PANE}'
     ;;
   set-option) : ;;
-  send-keys) : ;;
-  load-buffer) cat > /dev/null ;;
+  send-keys)
+    pane=''
+    while [ $# -gt 0 ]; do
+      if [ "$1" = "-t" ]; then pane="$2"; fi
+      if [ "$1" = "-l" ]; then printf '%s\\t%s\\n' "$pane" "$2" >> '${injectLog}'; break; fi
+      shift
+    done
+    ;;
+  load-buffer) cat >> '${injectLog}'; printf '\\n' >> '${injectLog}' ;;
 esac
 exit 0
 `;
@@ -57,23 +70,24 @@ exit 0
 `;
 }
 
-function makeCfgDir(privateTopics: boolean): { cfgDir: string; spawnLog: string } {
+function makeCfgDir(privateTopics?: boolean): { cfgDir: string; spawnLog: string; injectLog: string; failFlag: string } {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-pt-'));
   cfgDirs.push(cfgDir);
   const spawnLog = join(cfgDir, 'spawn.log');
+  const injectLog = join(cfgDir, 'inject.log');
+  const failFlag = join(cfgDir, 'FAIL_SPAWN');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
-  writeFileSync(
-    join(cfgDir, 'config.yaml'),
-    `control:\n  enabled: true\n  private_topics: ${privateTopics}\n`,
-  );
+  const privateTopicsLine =
+    privateTopics === undefined ? '' : `  private_topics: ${privateTopics}\n`;
+  writeFileSync(join(cfgDir, 'config.yaml'), `control:\n  enabled: true\n${privateTopicsLine}`);
   writeFileSync(
     join(cfgDir, 'tg-ctl.123.registration.json'),
     JSON.stringify({ paneId: '%1', cwd: cfgDir }),
   );
   mkdirSync(join(cfgDir, 'bin'));
-  writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmux(cfgDir, spawnLog), { mode: 0o755 });
+  writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmux(cfgDir, spawnLog, injectLog, failFlag), { mode: 0o755 });
   writeFileSync(join(cfgDir, 'bin', 'ps'), fakePs(), { mode: 0o755 });
-  return { cfgDir, spawnLog };
+  return { cfgDir, spawnLog, injectLog, failFlag };
 }
 
 function spawnArgvLog(spawnLog: string): string[] {
@@ -93,6 +107,21 @@ function textMsg(id: number, text: string): unknown {
       from: { id: 1, first_name: 'Alex' },
       chat: { id: 1 },
       date: nowSec(),
+      text,
+    },
+  };
+}
+
+function topicTextMsg(id: number, threadId: number, text: string): unknown {
+  return {
+    update_id: id,
+    message: {
+      message_id: id,
+      from: { id: 1, first_name: 'Alex' },
+      chat: { id: 1 },
+      date: nowSec(),
+      message_thread_id: threadId,
+      is_topic_message: true,
       text,
     },
   };
@@ -134,16 +163,19 @@ async function waitFor(pred: () => boolean, ms = 8000): Promise<void> {
 const sent = (sends: Array<Record<string, unknown>>, needle: string): boolean =>
   sends.some((s) => String(s.text ?? '').includes(needle));
 
+const injected = (injectLog: string): string =>
+  existsSync(injectLog) ? readFileSync(injectLog, 'utf8') : '';
+
 // --- Scenario 1: createForumTopic SUCCEEDS ---
 
 test(
   'private_topics: createForumTopic succeeds → spawns with TG_TOPIC env, writes bound binding',
   async () => {
-    const { cfgDir, spawnLog } = makeCfgDir(true);
+    const { cfgDir, spawnLog } = makeCfgDir();
     const topicsFile = join(cfgDir, 'tg-ctl.123.topics.json');
 
     // The server returns threadId=42 for createForumTopic; normal endpoints for spawn flow.
-    const queue: unknown[][] = [[textMsg(10, `/new claude-default ${cfgDir} myproj`)]];
+    const queue: unknown[][] = [[textMsg(10, `/new claude-default ${cfgDir} myproj --continue please`)]];
     const creates: Array<Record<string, unknown>> = [];
     const sends: Array<Record<string, unknown>> = [];
     const server = Bun.serve({
@@ -197,6 +229,7 @@ test(
     expect(argv[0]).toContain(`-e TG_TOPIC=42`);
     expect(argv[0]).toContain('-n myproj');
     expect(argv[0]).toContain(`-c ${cfgDir}`);
+    expect(argv[0]).toContain('-- --continue please');
 
     // The `createForumTopic` call must have been made with the right chat_id + name.
     expect(creates.length).toBe(1);
@@ -216,6 +249,139 @@ test(
     // Confirmation message sent.
     await waitFor(() => sent(sends, 'spawned `claude-default`'));
     expect(sent(sends, 'spawned `claude-default`')).toBe(true);
+    expect(sent(sends, 'with task: --continue please')).toBe(true);
+
+    daemon.kill();
+  },
+);
+
+test(
+  'private_topics default: untracked forum-topic prose falls through to the flat pane',
+  async () => {
+    const { cfgDir, spawnLog, injectLog } = makeCfgDir();
+    const queue: unknown[][] = [[topicTextMsg(15, 501, 'legacy forum text')]];
+    const creates: Array<Record<string, unknown>> = [];
+    const sends: Array<Record<string, unknown>> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname.endsWith('/getUpdates')) {
+          const batch = queue.shift();
+          if (batch) return Response.json({ ok: true, result: batch });
+          await Bun.sleep(60);
+          return Response.json({ ok: true, result: [] });
+        }
+        if (url.pathname.endsWith('/createForumTopic')) {
+          creates.push((await req.json()) as Record<string, unknown>);
+          return Response.json({ ok: true, result: { message_thread_id: 99 } });
+        }
+        if (url.pathname.endsWith('/sendMessage')) {
+          sends.push((await req.json()) as Record<string, unknown>);
+          return Response.json({ ok: true, result: { message_id: 900 + sends.length } });
+        }
+        if (url.pathname.endsWith('/answerCallbackQuery')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/editMessageReplyMarkup')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMessageReaction')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMyCommands')) return Response.json({ ok: true, result: true });
+        return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+      },
+    });
+    servers.push(server);
+
+    const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
+    const daemon: Subprocess = await spawnDaemon(reg, {
+      tgCtlPath: TG_CTL,
+      cfgDir,
+      env: {
+        PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
+        HOME: cfgDir,
+        TG_CTL_CONFIG_DIR: cfgDir,
+        TG_API_BASE: `http://127.0.0.1:${server.port}`,
+      },
+      logFd,
+    });
+    closeSync(logFd);
+
+    await waitFor(() => injected(injectLog).includes('[TG from Alex tg#15] legacy forum text'));
+    expect(injected(injectLog)).toContain('[TG from Alex tg#15] legacy forum text');
+    expect(spawnArgvLog(spawnLog)).toEqual([]);
+    expect(creates.length).toBe(0);
+
+    daemon.kill();
+  },
+);
+
+test(
+  'private_topics: spawn failure retry reuses the created topic instead of creating another',
+  async () => {
+    const { cfgDir, spawnLog, failFlag } = makeCfgDir();
+    const topicsFile = join(cfgDir, 'tg-ctl.123.topics.json');
+    writeFileSync(failFlag, '1');
+
+    const queue: unknown[][] = [
+      [textMsg(16, `/new claude-default ${cfgDir} retryproj`)],
+      [modelTap(17, 'n1', 'claude-default')],
+    ];
+    let nextThreadId = 42;
+    const creates: Array<Record<string, unknown>> = [];
+    const sends: Array<Record<string, unknown>> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname.endsWith('/getUpdates')) {
+          const batch = queue.shift();
+          if (batch) return Response.json({ ok: true, result: batch });
+          await Bun.sleep(60);
+          return Response.json({ ok: true, result: [] });
+        }
+        if (url.pathname.endsWith('/createForumTopic')) {
+          const body = (await req.json()) as Record<string, unknown>;
+          creates.push(body);
+          return Response.json({ ok: true, result: { message_thread_id: nextThreadId++, name: body.name } });
+        }
+        if (url.pathname.endsWith('/sendMessage')) {
+          sends.push((await req.json()) as Record<string, unknown>);
+          return Response.json({ ok: true, result: { message_id: 900 + sends.length } });
+        }
+        if (url.pathname.endsWith('/answerCallbackQuery')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/editMessageReplyMarkup')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMessageReaction')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMyCommands')) return Response.json({ ok: true, result: true });
+        return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+      },
+    });
+    servers.push(server);
+
+    const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
+    const daemon: Subprocess = await spawnDaemon(reg, {
+      tgCtlPath: TG_CTL,
+      cfgDir,
+      env: {
+        PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
+        HOME: cfgDir,
+        TG_CTL_CONFIG_DIR: cfgDir,
+        TG_API_BASE: `http://127.0.0.1:${server.port}`,
+      },
+      logFd,
+    });
+    closeSync(logFd);
+
+    await waitFor(() => sent(sends, "couldn't start the agent"));
+    await waitFor(() => spawnArgvLog(spawnLog).length === 1);
+
+    expect(creates).toHaveLength(1);
+    expect(spawnArgvLog(spawnLog)[0]).toContain('TG_TOPIC=42');
+    const bindings = parseTopics(existsSync(topicsFile) ? readFileSync(topicsFile, 'utf8') : null);
+    expect(bindings).toHaveLength(1);
+    expect(bindings[0]).toMatchObject({
+      threadId: 42,
+      status: 'bound',
+      paneId: SPAWNED_PANE,
+      model: 'claude-default',
+      name: 'retryproj',
+    });
 
     daemon.kill();
   },
@@ -226,10 +392,10 @@ test(
 test(
   'private_topics: createForumTopic fails → falls back to flat spawn, NO topic binding written',
   async () => {
-    const { cfgDir, spawnLog } = makeCfgDir(true);
+    const { cfgDir, spawnLog } = makeCfgDir();
     const topicsFile = join(cfgDir, 'tg-ctl.123.topics.json');
 
-    // The server returns an API error for createForumTopic (Threaded Mode off).
+    // The server returns an API error for createForumTopic.
     const queue: unknown[][] = [[textMsg(20, `/new claude-default ${cfgDir} flatproj`)]];
     const sends: Array<Record<string, unknown>> = [];
     const server = Bun.serve({
@@ -243,7 +409,7 @@ test(
           return Response.json({ ok: true, result: [] });
         }
         if (url.pathname.endsWith('/createForumTopic')) {
-          // Simulate Threaded Mode not enabled → API error
+          // Simulate Telegram rejecting createForumTopic → API error.
           return Response.json(
             { ok: false, description: 'FORUM_NOT_ENABLED' },
             { status: 400 },
@@ -307,7 +473,7 @@ test(
 test(
   'private_topics: forum_topic_created echo after createForumTopic does NOT restart /new flow',
   async () => {
-    const { cfgDir, spawnLog } = makeCfgDir(true);
+    const { cfgDir, spawnLog } = makeCfgDir();
 
     // First: /new + immediate spawn; then: the Telegram echo arrives.
     const queue: unknown[][] = [
@@ -376,6 +542,63 @@ test(
   },
 );
 
+test(
+  'private_topics: explicit false opts out of createForumTopic and keeps flat /new',
+  async () => {
+    const { cfgDir, spawnLog } = makeCfgDir(false);
+
+    const queue: unknown[][] = [[textMsg(40, `/new claude-default ${cfgDir} explicitflat`)]];
+    const creates: Array<Record<string, unknown>> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname.endsWith('/getUpdates')) {
+          const batch = queue.shift();
+          if (batch) return Response.json({ ok: true, result: batch });
+          await Bun.sleep(60);
+          return Response.json({ ok: true, result: [] });
+        }
+        if (url.pathname.endsWith('/createForumTopic')) {
+          creates.push((await req.json()) as Record<string, unknown>);
+          return Response.json({ ok: true, result: { message_thread_id: 42 } });
+        }
+        if (url.pathname.endsWith('/sendMessage')) {
+          return Response.json({ ok: true, result: { message_id: 900 } });
+        }
+        if (url.pathname.endsWith('/answerCallbackQuery')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/editMessageReplyMarkup')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMessageReaction')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMyCommands')) return Response.json({ ok: true, result: true });
+        return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+      },
+    });
+    servers.push(server);
+
+    const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
+    const daemon: Subprocess = await spawnDaemon(reg, {
+      tgCtlPath: TG_CTL,
+      cfgDir,
+      env: {
+        PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
+        HOME: cfgDir,
+        TG_CTL_CONFIG_DIR: cfgDir,
+        TG_API_BASE: `http://127.0.0.1:${server.port}`,
+      },
+      logFd,
+    });
+    closeSync(logFd);
+
+    await waitFor(() => spawnArgvLog(spawnLog).length > 0);
+    const argv = spawnArgvLog(spawnLog);
+    expect(argv.length).toBe(1);
+    expect(argv[0]).not.toContain('TG_TOPIC');
+    expect(creates.length).toBe(0);
+
+    daemon.kill();
+  },
+);
+
 // --- Unit-level: parseControlConfig + resolveControlConfig handles private_topics ---
 
 import { parseControlConfig, resolveControlConfig } from '../features/tg-ctl/config';
@@ -395,11 +618,12 @@ test('parseControlConfig parses private_topics flag with the same token sets as 
   expect(parseControlConfig('control:\n  private_topics: maybe\n')).toEqual({}); // unrecognized → ignore
 });
 
-test('resolveControlConfig: privateTopics defaults OFF and an explicit true flows through', () => {
-  expect(resolveControlConfig({}).privateTopics).toBe(false);
+test('resolveControlConfig: privateTopics defaults ON and an explicit false opts out', () => {
+  expect(resolveControlConfig({}).privateTopics).toBe(true);
   expect(resolveControlConfig({ privateTopics: true }).privateTopics).toBe(true);
+  expect(resolveControlConfig({ privateTopics: false }).privateTopics).toBe(false);
 });
 
-test('resolveControlConfig of an empty partial includes privateTopics: false', () => {
+test('resolveControlConfig of an empty partial includes privateTopics: true', () => {
   expect(resolveControlConfig({})).toEqual(DEFAULT_CONTROL);
 });

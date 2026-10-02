@@ -340,6 +340,7 @@ export function dedupeCandidates(candidates: AgentCandidate[]): AgentCandidate[]
 // --- selection button payload ---
 
 const AGENT_CALLBACK_PREFIX = 'tga';
+const AGENT_CANCEL_CALLBACK_PREFIX = 'tgc';
 
 export interface AgentSelectPayload {
   text: string;
@@ -407,6 +408,14 @@ export interface ParsedAgentCallback {
   index: number;
 }
 
+export interface ParsedAgentCancelCallback {
+  token: string;
+}
+
+export function buildAgentCancelKeyboard(token: string, label: string): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
+  return { inline_keyboard: [[{ text: label, callback_data: `${AGENT_CANCEL_CALLBACK_PREFIX}:${token}` }]] };
+}
+
 // Parse `tga:<token>:<index>` callback data. Returns null on any mismatch.
 export function parseAgentCallback(data: string | undefined): ParsedAgentCallback | null {
   if (!data) return null;
@@ -415,6 +424,13 @@ export function parseAgentCallback(data: string | undefined): ParsedAgentCallbac
   const index = Number(parts[2]);
   if (!Number.isInteger(index) || index < 0) return null;
   return { token: parts[1], index };
+}
+
+export function parseAgentCancelCallback(data: string | undefined): ParsedAgentCancelCallback | null {
+  if (!data) return null;
+  const parts = data.split(':');
+  if (parts.length !== 2 || parts[0] !== AGENT_CANCEL_CALLBACK_PREFIX || !parts[1]) return null;
+  return { token: parts[1] };
 }
 
 function truncate(s: string, max: number): string {

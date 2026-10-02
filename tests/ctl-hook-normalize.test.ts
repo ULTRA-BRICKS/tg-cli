@@ -31,6 +31,27 @@ test('Claude AskUserQuestion (single, options) → question request', () => {
   expect(req!.requestId).toMatch(/^claude-/);
 });
 
+test('normalizeHookPayload preserves an explicit subagent label from normalized requests', () => {
+  const req = normalizeHookPayload(
+    {
+      requestId: 'q_subagent',
+      agent: 'claude',
+      kind: 'question',
+      question: 'Proceed?',
+      options: [{ label: 'Yes' }],
+      subagent: 'planner',
+    },
+    env,
+  );
+
+  expect(req).toMatchObject({
+    requestId: 'q_subagent',
+    subagent: 'planner',
+    paneId: '%5',
+    sessionName: 'work',
+  });
+});
+
 test('AskUserQuestion with multiple questions → null from the SINGLE-request contract (normalizeHookPayload)', () => {
   const req = normalizeHookPayload(
     { tool_name: 'AskUserQuestion', tool_input: { questions: [{ question: 'a', options: [{ label: 'x' }] }, { question: 'b', options: [{ label: 'y' }] }] } },

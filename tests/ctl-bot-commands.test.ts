@@ -83,7 +83,7 @@ test('the menu and textAction never drift apart', () => {
   const body = nextDecl === -1 ? after : after.slice(0, nextDecl);
 
   const handled = new Set<string>();
-  for (const m of body.matchAll(/cmd === '\/([a-z0-9_]+)'/g)) handled.add(m[1]);
+  for (const m of body.matchAll(/cmd === ['"]\/([a-z0-9_]+)['"]/g)) handled.add(m[1]);
   expect(handled.size).toBeGreaterThan(0); // sanity: we actually parsed branches
 
   const published = new Set(botCommandNames());

@@ -4,8 +4,10 @@ import {
   phoneticKey,
   matchWindows,
   groupBySession,
+  buildAgentCancelKeyboard,
   buildAgentSelectMessage,
   parseAgentCallback,
+  parseAgentCancelCallback,
   distinctLabels,
   dedupeCandidates,
   suggestSelector,
@@ -273,6 +275,15 @@ test('parseAgentCallback: rejects malformed data', () => {
   expect(parseAgentCallback('tga:tok')).toBeNull();
   expect(parseAgentCallback('tga::1')).toBeNull();
   expect(parseAgentCallback(undefined)).toBeNull();
+});
+
+test('cancel button: builds and parses the bare-/agent cancel callback', () => {
+  expect(buildAgentCancelKeyboard('tok9', 'Cancel')).toEqual({
+    inline_keyboard: [[{ text: 'Cancel', callback_data: 'tgc:tok9' }]],
+  });
+  expect(parseAgentCancelCallback('tgc:tok9')).toEqual({ token: 'tok9' });
+  expect(parseAgentCancelCallback('tgc:')).toBeNull();
+  expect(parseAgentCancelCallback('tga:tok9:0')).toBeNull();
 });
 
 // --- distinct labels (THE BUG: three "4 · claude" rows) ---

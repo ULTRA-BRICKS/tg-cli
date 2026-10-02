@@ -255,6 +255,9 @@ export interface NewSession {
   dir?: string;
   // Chosen catalog model id (set just before spawn).
   model?: string;
+  // Private-chat topic created for this `/new` session. It survives a spawn failure so a retry
+  // reuses the same Telegram thread instead of creating duplicate private topics.
+  privateThreadId?: number;
   // The initial task to inject once the agent is up (from the `/new … name <task>` tail). Empty
   // when none was given.
   task: string;

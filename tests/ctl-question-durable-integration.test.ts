@@ -90,6 +90,15 @@ function injected(cfgDir: string): string[] {
   return readFileSync(p, 'utf8').split('\n').filter((l) => l.length > 0);
 }
 
+function isProductionAnsweredEdit(text: string): boolean {
+  return text.includes('Question answered') &&
+    text.includes('Agent: claude') &&
+    text.includes(`Subagent: pane ${PANE_ID}`) &&
+    text.includes('Asked:\nWhere should I deploy?') &&
+    text.includes('Selected:\nProduction') &&
+    text !== 'answered: Production';
+}
+
 function daemonLog(cfgDir: string): string {
   const p = join(cfgDir, 'daemon.log');
   return existsSync(p) ? readFileSync(p, 'utf8') : '';
@@ -294,7 +303,7 @@ test('LATE-DELIVER: a tap after the hook socket closed injects the chosen option
   tg.push([tap(productionData!, 700, 1)]);
   expect(await until(() => injected(cfgDir).some((l) => l.includes('Production')), 6000)).toBe(true);
   expect(await until(() => tg.answeredCbs().some((c) => c.text === '✓ sent to the agent'), 4000)).toBe(true);
-  expect(await until(() => tg.edits().some((e) => e === 'answered: Production'), 4000)).toBe(true);
+  expect(await until(() => tg.edits().some(isProductionAnsweredEdit), 4000)).toBe(true);
   expect(daemonLog(cfgDir)).toContain('ask-late-delivered');
   // Once delivered the card stops being tappable — the keyboard is cleared, so a re-tap
   // in the 5–30 min answered/retention gap can't show a misleading "expired".
@@ -319,7 +328,7 @@ test('LATE-DELIVER failure: an unreachable pane keeps the entry retained for a r
   tg.push([tap(productionData, 710, 1)]);
   expect(await until(() => daemonLog(cfgDir).includes('ask-late-deliver-failed'), 6000)).toBe(true);
   expect(tg.answeredCbs().some((c) => c.text.includes('tap again'))).toBe(true);
-  expect(tg.edits().some((e) => e === 'answered: Production')).toBe(false); // NOT marked answered
+  expect(tg.edits().some(isProductionAnsweredEdit)).toBe(false); // NOT marked answered
   // The retained entry is still on disk (recoverable by a re-tap).
   const state = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.questions.json'), 'utf8'));
   expect(state.questions.some((q: { req: { requestId: string } }) => q.req.requestId === 'q_durable')).toBe(true);
@@ -329,7 +338,7 @@ test('LATE-DELIVER failure: an unreachable pane keeps the entry retained for a r
   unlinkSync(join(cfgDir, 'pane-gone'));
   tg.push([tap(productionData, 711, 1)]);
   expect(await until(() => injected(cfgDir).some((l) => l.includes('Production')), 6000)).toBe(true);
-  expect(await until(() => tg.edits().some((e) => e === 'answered: Production'), 4000)).toBe(true);
+  expect(await until(() => tg.edits().some(isProductionAnsweredEdit), 4000)).toBe(true);
 }, 25_000);
 
 test('SINGLE-DELIVERY: after a late pane-delivery, a hook re-fire returns null (no replay) — answer not delivered twice', async () => {
@@ -476,7 +485,7 @@ test('LATE-DELIVER busy pane: a tap while another question is live is NOT falsel
   tg.push([tap(q1Data, 730, 1)]);
   expect(await until(() => tg.answeredCbs().some((c) => c.text.includes('busy')), 6000)).toBe(true);
   expect(injected(cfgDir).some((l) => l.includes('Production'))).toBe(false); // NOT delivered
-  expect(tg.edits().some((e) => e === 'answered: Production')).toBe(false);
+  expect(tg.edits().some(isProductionAnsweredEdit)).toBe(false);
   // Q1 still retained on disk (recoverable).
   const state = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.questions.json'), 'utf8'));
   expect(state.questions.some((q: { req: { requestId: string } }) => q.req.requestId === 'q_durable')).toBe(true);
@@ -749,7 +758,7 @@ test('MID-SEND scoped backfill: a socket closing WHILE the card sends still reco
   // A late tap late-delivers and edits the RIGHT card (message_id 1) to answered.
   tg.push([tap(productionData, 820, 1)]);
   expect(await until(() => injected(cfgDir).some((l) => l.includes('Production')), 6000)).toBe(true);
-  expect(await until(() => tg.edits().some((e) => e === 'answered: Production'), 4000)).toBe(true);
+  expect(await until(() => tg.edits().some(isProductionAnsweredEdit), 4000)).toBe(true);
 }, 25_000);
 
 test('EXPIRY clears the keyboard for a genuinely-dead unscoped card', async () => {

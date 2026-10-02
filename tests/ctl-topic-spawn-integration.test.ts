@@ -116,7 +116,10 @@ function makeCfgDir(opts: { topics: boolean; seedTopics?: unknown[] }): CfgPaths
   const injectLog = join(cfgDir, 'inject.log');
   const failFlag = join(cfgDir, 'FAIL_SPAWN');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
-  writeFileSync(join(cfgDir, 'config.yaml'), `control:\n  enabled: true\n  topics: ${opts.topics}\n`);
+  writeFileSync(
+    join(cfgDir, 'config.yaml'),
+    `control:\n  enabled: true\n  topics: ${opts.topics}\n  private_topics: false\n`,
+  );
   writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ paneId: '%1', cwd: cfgDir }));
   if (opts.seedTopics) writeFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), JSON.stringify(opts.seedTopics));
   mkdirSync(join(cfgDir, 'bin'));
@@ -908,6 +911,55 @@ test('increment 4: crash-orphan reconcile — a slug-window orphan with an await
   await daemon.exited;
 }, 30_000);
 
+test('private_topics ON with topics OFF: startup reconcile adopts a private-topic spawnPending orphan', async () => {
+  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-private-orphan-'));
+  const spawnLog = join(cfgDir, 'spawn.log');
+  const injectLog = join(cfgDir, 'inject.log');
+  writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
+  writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n  topics: false\n  private_topics: true\n');
+  writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ paneId: '%1', cwd: cfgDir }));
+  writeFileSync(
+    join(cfgDir, 'tg-ctl.123.topics.json'),
+    JSON.stringify([
+      {
+        threadId: 271,
+        name: 'privorphan',
+        status: 'awaiting-model',
+        path: cfgDir,
+        model: 'claude-opus',
+        spawnPending: true,
+        spawnToken: '271-1-1',
+        ts: 1,
+      },
+    ]),
+  );
+  mkdirSync(join(cfgDir, 'bin'));
+  writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmuxWithWindow(cfgDir, 'privorphan', '%5', spawnLog, injectLog, '271-1-1'), { mode: 0o755 });
+  writeFileSync(join(cfgDir, 'bin', 'ps'), fakePsWith([4241, 4299]), { mode: 0o755 });
+
+  const updateQueue: unknown[][] = [];
+  const { server } = makeServer(updateQueue);
+  servers.push(server);
+  const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
+  const daemon = await spawnDaemon(reg, {
+    tgCtlPath: TG_CTL,
+    cfgDir,
+    env: { PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`, HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: `http://127.0.0.1:${server.port}` },
+    logFd,
+  });
+  closeSync(logFd);
+
+  await waitFor(() => topicsStore(cfgDir).some((b) => b.threadId === 271 && b.status === 'bound'));
+  expect(topicsStore(cfgDir).find((x) => x.threadId === 271)).toMatchObject({
+    status: 'bound',
+    paneId: '%5',
+  });
+  expect(existsSync(spawnLog) ? readFileSync(spawnLog, 'utf8') : '').toBe('');
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
 test('increment 4: crash-orphan reconcile — a BOUND binding whose pane vanished while down is marked CLOSED on startup', async () => {
   // The other half of reconcile: a `bound` binding to %9 (gone) must flip to closed on startup so
   // the next message offers re-spawn instead of injecting into nothing.
@@ -1013,7 +1065,7 @@ test('increment 4: reconcile is a NO-OP on a flaky empty-procs read — a bound 
   closeSync(logFd);
 
   // Give the startup reconcile time to run, then assert the binding is STILL bound (not closed).
-  await Bun.sleep(700);
+  await waitFor(() => topicsStore(cfgDir).some((x) => x.threadId === 260 && x.status === 'bound'));
   const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
   expect(store.find((b) => b.threadId === 121)?.status).toBe('bound'); // NOT falsely closed
 
@@ -1054,7 +1106,11 @@ test('increment 4: reconcile slug-collision — two same-slug orphan bindings do
   });
   closeSync(logFd);
 
-  await Bun.sleep(700);
+  await waitFor(() => {
+    const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
+    const bound = store.filter((b) => (b.threadId === 122 || b.threadId === 123) && b.status === 'bound' && b.paneId === '%6');
+    return bound.length === 1;
+  });
   const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
   const bound = store.filter((b) => (b.threadId === 122 || b.threadId === 123) && b.status === 'bound' && b.paneId === '%6');
   expect(bound).toHaveLength(1); // exactly ONE binding adopted %6 — never two on the same pane
@@ -1123,7 +1179,10 @@ test('increment 4: reconcile does NOT adopt a same-slug window in a DIFFERENT pr
   });
   closeSync(logFd);
 
-  await Bun.sleep(700);
+  await waitFor(() => {
+    const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
+    return store.find((x) => x.threadId === 211)?.status === 'bound';
+  });
   const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
   const b = store.find((x) => x.threadId === 131);
   expect(b?.status).toBe('awaiting-model'); // NOT adopted — wrong project
@@ -1161,7 +1220,10 @@ test('increment 4: reconcile does NOT re-bind a deliberately CLOSED topic with a
   });
   closeSync(logFd);
 
-  await Bun.sleep(700);
+  await waitFor(() => {
+    const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
+    return store.find((x) => x.threadId === 260)?.status === 'bound';
+  });
   const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
   expect(store.find((x) => x.threadId === 140)?.status).toBe('closed'); // stays closed — NOT resurrected
 
@@ -1503,6 +1565,7 @@ test('increment 4: a message to a closed topic whose retained dir VANISHED resta
   await waitFor(() => topicsStore(cfgDir).some((t) => t.threadId === 190 && t.status === 'awaiting-path'));
   expect(topicsStore(cfgDir).find((t) => t.threadId === 190)?.status).toBe('awaiting-path'); // restarted, not dead-button
   // No re-spawn (tgr) button was offered; the "set it up again" notice was posted instead.
+  await waitFor(() => sends.some((s) => s.message_thread_id === 190 && String(s.text).includes('set it up again')));
   const tgrOffered = sends.some(
     (s) =>
       s.message_thread_id === 190 &&
@@ -1548,7 +1611,7 @@ test('increment 4: a reused-pane bound binding does NOT block a real spawnPendin
   });
   closeSync(logFd);
 
-  await Bun.sleep(700);
+  await waitFor(() => topicsStore(cfgDir).some((x) => x.threadId === 211 && x.status === 'bound'));
   const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
   // B2 adopted %5 (its claim wasn't blocked by B1's stale reused-pane claim).
   expect(store.find((x) => x.threadId === 211)?.status).toBe('bound');
@@ -2083,7 +2146,10 @@ test('increment 4: a multi-pane window with an AMBIGUOUS token (no recorded pane
     logFd: fdB,
   });
   closeSync(fdB);
-  await Bun.sleep(700);
+  await waitFor(() => {
+    const storeB = JSON.parse(readFileSync(join(cfgB, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
+    return storeB.find((x) => x.threadId === 401)?.status === 'bound';
+  });
   const storeB = JSON.parse(readFileSync(join(cfgB, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
   expect(storeB.find((x) => x.threadId === 401)?.status).toBe('bound'); // adopted via the recorded paneId
   expect(storeB.find((x) => x.threadId === 401)?.paneId).toBe('%6'); // the EXACT recorded pane, not %5
@@ -2271,6 +2337,7 @@ test('increment 4: a spawnPending binding whose model is GONE from the catalog r
   await waitFor(() => topicsStore(cfgDir).some((t) => t.threadId === 440 && t.status === 'awaiting-path'));
   expect(topicsStore(cfgDir).find((t) => t.threadId === 440)?.status).toBe('awaiting-path'); // recovered
   expect(spawnArgvLog(paths.spawnLog)).toEqual([]); // no spawn with the gone model
+  await waitFor(() => sends.some((s) => s.message_thread_id === 440));
   expect(sends.some((s) => s.message_thread_id === 440)).toBe(true); // a fresh path prompt posted
 
   daemon.kill('SIGTERM');

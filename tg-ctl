@@ -16,6 +16,7 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, re
 import { createConnection, createServer, type Server, type Socket } from "net"
 import { dirname, isAbsolute, join, resolve } from "path"
 import {
+  buildAgentCancelKeyboard,
   buildAgentSelectMessage,
   dedupeCandidates,
   distinctLabels,
@@ -92,6 +93,7 @@ import {
   callbackRequestId,
   collectQuestionAnswers,
   formatAgentHookOutput,
+  formatAnsweredButtonMessage,
   questionCapability,
   registrationSetAllowsHook,
   repairClaudeQuestionReply,
@@ -1508,6 +1510,12 @@ function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     rec.toolInput && typeof rec.toolInput === "object" && !Array.isArray(rec.toolInput)
       ? (rec.toolInput as Record<string, unknown>)
       : undefined
+  const subagent =
+    typeof rec.subagent === "string" && rec.subagent.trim()
+      ? rec.subagent.trim()
+      : typeof rec.subagentLabel === "string" && rec.subagentLabel.trim()
+        ? rec.subagentLabel.trim()
+        : undefined
 
   return {
     requestId,
@@ -1515,6 +1523,7 @@ function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     paneId: typeof rec.paneId === "string" ? rec.paneId : undefined,
     cwd: typeof rec.cwd === "string" ? rec.cwd : undefined,
     sessionName: typeof rec.sessionName === "string" ? rec.sessionName : undefined,
+    subagent,
     agent: agent as ButtonRequest["agent"],
     kind,
     question,
@@ -1603,6 +1612,15 @@ const ABANDONED_PERMISSION_TEXT = "hook disconnected — tap after the agent rec
 // a tap without a live socket answers "expired".
 const ABANDONED_MULTI_TEXT = "window closed — answer all questions in the terminal"
 
+function finalButtonTextKeepsKeyboard(text: string): boolean {
+  return text === ABANDONED_TAP_TEXT || text === ABANDONED_PERMISSION_TEXT || text === ABANDONED_MULTI_TEXT
+}
+
+async function finalizeButtonMessage(ctx: Ctx, messageId: number, text: string): Promise<void> {
+  if (!finalButtonTextKeepsKeyboard(text)) await clearMessageKeyboard(ctx, messageId)
+  await editMessageText(ctx, messageId, text)
+}
+
 // A SCOPED question (with options) or a SCOPED permission can survive socket close:
 // a question still injects into its pane (late-delivery); a permission re-attaches
 // when the hook reconnects. Retain both when paneId is set. Returns true when
@@ -1621,8 +1639,7 @@ function retainAbandonedQuestion(rt: QuestionRuntime, entry: PendingButton, pend
 // stash the text so the post-send reconciliation applies it.
 function expireDeadCard(ctx: Ctx, entry: PendingButton): void {
   if (entry.messageId !== null) {
-    void clearMessageKeyboard(ctx, entry.messageId)
-    void editMessageText(ctx, entry.messageId, EXPIRED_TERMINAL_TEXT)
+    void finalizeButtonMessage(ctx, entry.messageId, EXPIRED_TERMINAL_TEXT)
   } else {
     entry.finalText = EXPIRED_TERMINAL_TEXT
   }
@@ -1736,15 +1753,12 @@ async function forwardAndPostQuestion(
   // full closure would need a write-ahead marker BEFORE the send, not worth it for a
   // sub-ms window on a crash-relaunch.
   rt.persist() // the card id is now known — persist so a restart can late-deliver/reattach
-  // The socket (or unscoped timer) closed DURING the send: the close handler set
-  // finalText but, with messageId still null, couldn't touch the card. Apply it now —
-  // and for a genuinely-dead card (EXPIRED_TERMINAL_TEXT) clear the keyboard too, so
-  // the "dead card → not tappable" guarantee holds even on this race (a scoped
-  // ABANDONED_TAP_TEXT card deliberately keeps its keyboard for late-delivery).
+  // The socket (or unscoped timer/callback) finished DURING the send: the handler set
+  // finalText but, with messageId still null, couldn't touch the card. Apply it now.
+  // Final answered/expired cards clear the keyboard first; abandoned/reconnect cards keep it.
   if (rt.pending.get(pendingKey) !== entry || entry.finalText) {
     const finalText = entry.finalText ?? EXPIRED_TERMINAL_TEXT
-    if (finalText === EXPIRED_TERMINAL_TEXT) void clearMessageKeyboard(ctx, messageId)
-    void editMessageText(ctx, messageId, finalText)
+    void finalizeButtonMessage(ctx, messageId, finalText)
   }
 }
 
@@ -2548,6 +2562,51 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       selectOnly?: boolean
     }
   >()
+  type AgentSelectionLanguage = "ru" | "en"
+  type PendingAgentSelection = {
+    target: AgentCandidate
+    label: string
+    messageId: number | null
+    timer: ReturnType<typeof setTimeout>
+    language: AgentSelectionLanguage
+  }
+  const pendingAgentSelection = new Map<string, PendingAgentSelection>()
+  const agentSelectionLanguage = (languageCode: string | null | undefined): AgentSelectionLanguage =>
+    languageCode?.toLowerCase().startsWith("ru") ? "ru" : "en"
+  const cancelAgentSelectionLabel = (language: AgentSelectionLanguage): string =>
+    language === "ru" ? "Отмена" : "Cancel"
+  const selectedAgentToast = (language: AgentSelectionLanguage): string =>
+    language === "ru" ? "выбрано" : "selected"
+  const canceledAgentToast = (language: AgentSelectionLanguage): string =>
+    language === "ru" ? "отменено" : "canceled"
+  const agentSelectionInstruction = (
+    label: string,
+    selector: string,
+    language: AgentSelectionLanguage,
+  ): string =>
+    language === "ru"
+      ? `Выбран ${label}. Отправьте следующее сообщение — оно уйдет этому агенту.\nТакже можно сразу: /agent ${selector} <сообщение>`
+      : `Selected ${label}. Send the next message and it will go to this agent.\nYou can also use: /agent ${selector} <message>`
+  const agentSelectionCanceledText = (language: AgentSelectionLanguage): string =>
+    language === "ru" ? "Выбор отменен." : "Selection canceled."
+  const clearPendingAgentSelection = (token: string): PendingAgentSelection | null => {
+    const selection = pendingAgentSelection.get(token)
+    if (!selection) return null
+    pendingAgentSelection.delete(token)
+    clearTimeout(selection.timer)
+    return selection
+  }
+  const clearAllPendingAgentSelections = (): void => {
+    for (const [token] of pendingAgentSelection) clearPendingAgentSelection(token)
+  }
+  const takePendingAgentSelection = (): [string, PendingAgentSelection] | null => {
+    const latest = [...pendingAgentSelection.entries()].at(-1)
+    if (!latest) return null
+    const [token, selection] = latest
+    pendingAgentSelection.delete(token)
+    clearTimeout(selection.timer)
+    return [token, selection]
+  }
   let agentTokenSeq = 0
   // Flat-chat `/new` sessions in flight (issue #27), keyed by an opaque token. IN-MEMORY only:
   // a `/new` interrupted by a daemon restart is simply abandoned (the user re-runs it) — far
@@ -3033,6 +3092,21 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return res.ok ? { ok: true } : { ok: false, error: res.error }
   }
 
+  const injectPrewrappedToPane = async (
+    paneId: string,
+    text: string,
+    sourceMessageId: number | null,
+    deferReactionViaAck = false,
+  ): Promise<{ ok: boolean; error?: string; deferred?: boolean; deferredItem?: DeferredInbound }> => {
+    if (shouldDeferInbound(paneId)) {
+      const item = enqueueDeferred(paneId, text, sourceMessageId)
+      if (deferReactionViaAck) markDeferredForAck(item)
+      return { ok: true, deferred: true, deferredItem: item }
+    }
+    const res = await executeInjectSteps(buildTextInjectPlan(paneId, text))
+    return res.ok ? { ok: true } : { ok: false, error: res.error }
+  }
+
   // `label` identifies the chosen agent: `<window> · <agent>` for a direct/
   // confident route, or the picker's DISTINCT label (cwd-derived) when several
   // agents shared a bare window name — so the confirmation never reads an
@@ -3133,6 +3207,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // direct inject; ambiguous → the same session-grouped picker carrying the pending
   // message; named selector with NO match → error reply, never silent fallback.
   const handleAgentRoute = async (action: Extract<Action, { kind: "agent-route" }>): Promise<boolean> => {
+    clearAllPendingAgentSelections()
     const candidates = listAgentCandidates()
     const msgPreview = action.all.slice(0, 60).replace(/\n/g, " ")
     if (candidates.length === 0) {
@@ -3222,7 +3297,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // selector matchWindows keys on is the window name (its cwd basename when the
     // window name is bare/numeric, which still phonetically matches that pane).
     if (pending.selectOnly) {
-      await answerCallbackQuery(ctx, action.callbackQueryId, "selected")
+      const language = agentSelectionLanguage(action.languageCode)
+      await answerCallbackQuery(ctx, action.callbackQueryId, selectedAgentToast(language))
       if (pending.messageId !== null) {
         // Verify the suggested selector against the FULL live fleet, not the
         // pending subset: an ambiguous `/agent <sel>` (no message) narrows
@@ -3239,7 +3315,20 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // Show the DISTINCT label (not the ambiguous "4 · claude") so the user
         // sees which agent they picked, then the exact command to address it.
         const label = labelFor(liveTarget, fleet)
-        void editMessageText(ctx, pending.messageId, `selected ${label} — send: /agent ${selector} <message>`)
+        const selectionTimer = setTimeout(() => pendingAgentSelection.delete(action.token), 10 * 60_000)
+        pendingAgentSelection.set(action.token, {
+          target: liveTarget,
+          label,
+          messageId: pending.messageId,
+          timer: selectionTimer,
+          language,
+        })
+        void editMessageText(
+          ctx,
+          pending.messageId,
+          agentSelectionInstruction(label, selector, language),
+          buildAgentCancelKeyboard(action.token, cancelAgentSelectionLabel(language)),
+        )
       }
       return true
     }
@@ -3277,6 +3366,46 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         ctx,
         pending.messageId,
         res.ok ? routedReply(labelFor(target, pending.candidates), res.deferred) : `inject failed: ${res.error ?? ""}`,
+      )
+    }
+    return res.ok
+  }
+
+  const handleAgentCancel = async (action: Extract<Action, { kind: "agent-cancel" }>): Promise<boolean> => {
+    const selection = pendingAgentSelection.get(action.token)
+    if (!selection) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+      return true
+    }
+    if (selection.messageId !== null && action.messageId !== null && selection.messageId !== action.messageId) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+      return true
+    }
+    clearPendingAgentSelection(action.token)
+    await answerCallbackQuery(ctx, action.callbackQueryId, canceledAgentToast(selection.language))
+    if (selection.messageId !== null) {
+      void editMessageText(ctx, selection.messageId, agentSelectionCanceledText(selection.language))
+    }
+    return true
+  }
+
+  const routePendingAgentSelection = async (
+    text: string,
+    sourceMessageId: number,
+  ): Promise<boolean | null> => {
+    const taken = takePendingAgentSelection()
+    if (!taken) return null
+    const [, selection] = taken
+    const liveTarget = listAgentCandidates().find((c) => c.paneId === selection.target.paneId) ?? selection.target
+    const res = await injectPrewrappedToPane(liveTarget.paneId, text, sourceMessageId, true)
+    if (!res.ok) {
+      await sendMessage(ctx, res.error ?? "inject failed")
+    }
+    if (selection.messageId !== null) {
+      void editMessageText(
+        ctx,
+        selection.messageId,
+        res.ok ? routedReply(selection.label, res.deferred) : `inject failed: ${res.error ?? ""}`,
       )
     }
     return res.ok
@@ -3610,9 +3739,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     windowSlug: string,
     path: string,
     model: string,
+    task = "",
   ): { ok: true; paneId: string } | { ok: false; error: string } => {
-    const argv = spawnArgv(model, path)
-    if (!argv) return { ok: false, error: `unknown model \`${model}\` — pick a model again` }
+    const baseArgv = spawnArgv(model, path)
+    if (!baseArgv) return { ok: false, error: `unknown model \`${model}\` — pick a model again` }
+    const argv = task.trim().length > 0 ? [...baseArgv, "--", task.trim()] : baseArgv
     try {
       // sessionForSpawn() runs snapshot() (tmux list-panes / ps), which CAN throw if a binary is
       // missing — it MUST be inside this try, else the throw escapes the local guard, past
@@ -4241,14 +4372,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
 
   // Create a private-chat forum topic via Bot API 9.4 `createForumTopic` and return the new
   // `message_thread_id`, or null on any failure (the daemon falls back to flat-chat behaviour).
-  // Graceful: a failure is logged once with a BotFather hint and NEVER thrown — the caller
-  // continues with the flat /new path. No retry: a flaky network gets a second chance on the
-  // NEXT /new; a misconfigured bot (Threaded Mode off) gets the log hint.
+  // Graceful: a failure is logged and NEVER thrown — the caller continues with the flat /new
+  // path. No retry: a flaky network gets a second chance on the NEXT /new. BotFather is not
+  // a hard prerequisite for our path; this code asks Telegram to create the private topic
+  // directly and only falls back if that API call is unavailable/rejected.
   const createPrivateTopic = async (name: string): Promise<number | null> => {
     const json = await botPost(ctx, "createForumTopic", { chat_id: ctx.chatId, name })
     const result = json?.result
     if (!result || typeof result !== "object") {
-      log("Private chat topics not enabled — enable Threaded Mode in BotFather.")
+      log("Private chat topic creation failed — falling back to flat /new.")
       return null
     }
     const threadId = (result as { message_thread_id?: unknown }).message_thread_id
@@ -4347,9 +4479,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const slug = slugifyTopicName(session.name, 0)
     const spawnToken = `new-${session.token}-${Math.floor(Date.now() / 1000)}`
     // Private-chat topic: try to create a per-session topic BEFORE spawning so the window is born
-    // with TG_TOPIC already set. Failure (Threaded Mode off, API error) → graceful flat fallback.
-    const threadId = ctx.cfg.privateTopics ? await createPrivateTopic(session.name) : null
+    // with TG_TOPIC already set. Any createForumTopic failure → graceful flat fallback.
+    const threadId = session.privateThreadId ?? (ctx.cfg.privateTopics ? await createPrivateTopic(session.name) : null)
     if (threadId !== null) {
+      session.privateThreadId = threadId
       return spawnNewSessionWithTopic(session, modelId, threadId, slug, promptMessageId)
     }
     // Flat spawn path (no private topic, or createForumTopic failed gracefully).
@@ -4378,8 +4511,6 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   //     (already in flight from Telegram) is silently absorbed whether the spawn succeeds or fails.
   //   - On spawn FAILURE: the preliminary binding stays → echo is absorbed, user retries via model tap.
   //   - On spawn SUCCESS: upgrade to a `bound` binding; call stampSpawnToken for log greppability.
-  // NOTE: spawnTopicWindow has no `task` param (same as the supergroup topic flow). The confirmation
-  // message suppresses the task note so the user is not misled about whether the task was applied.
   const spawnNewSessionWithTopic = async (
     session: NewSession,
     modelId: string,
@@ -4391,24 +4522,27 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // Write a preliminary binding BEFORE spawn so the forum_topic_created echo is absorbed even if
     // the spawn fails (no dangling untracked threadId that triggers the /new flow from a Telegram echo).
     const preliminary = { threadId, name: session.name, status: "awaiting-model" as const, path: session.dir, model: modelId, ts }
-    persistTopics(appendTopic(loadTopics(), preliminary))
     const spawnToken = `topic-${session.token}-${ts}`
-    const spawned = spawnTopicWindow(threadId, slug, session.dir, modelId)
+    const pending = markSpawnPending(preliminary, spawnToken, ts)
+    persistTopics(appendTopic(loadTopics(), pending))
+    const spawned = spawnTopicWindow(threadId, slug, session.dir, modelId, session.task)
     if (!spawned.ok) {
+      persistTopics(appendTopic(loadTopics(), clearSpawnPending(pending, Math.floor(Date.now() / 1000))))
       if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
       await sendMessage(ctx, spawned.error)
       await askNewModel(session)
       return false
     }
+    stampSpawnToken(spawned.paneId, spawnToken)
+    const pendingWithPane = { ...markSpawnPending(preliminary, spawnToken, Math.floor(Date.now() / 1000)), paneId: spawned.paneId }
+    persistTopics(appendTopic(loadTopics(), pendingWithPane))
     // Upgrade the preliminary binding to `bound` now that the pane exists.
     const boundTs = Math.floor(Date.now() / 1000)
     persistTopics(appendTopic(loadTopics(), markBound(preliminary, spawned.paneId, boundTs)))
-    stampSpawnToken(spawned.paneId, spawnToken)
     pendingNew.delete(session.token)
     if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
-    // NOTE: task is not applied via spawnTopicWindow (no task argv support) — suppress the task note
-    // so the user is not told a task was started that wasn't.
-    await sendMessage(ctx, `spawned \`${modelId}\` in \`${session.dir}\` (window \`${slug}\`) — use \`/agent ${slug}\` to talk to it`)
+    const taskNote = session.task.trim().length > 0 ? ` with task: ${session.task.trim()}` : ""
+    await sendMessage(ctx, `spawned \`${modelId}\` in \`${session.dir}\` (window \`${slug}\`)${taskNote} — use \`/agent ${slug}\` to talk to it`)
     return true
   }
 
@@ -4559,7 +4693,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // the daemon was down) so the next message offers a re-spawn instead of injecting into nothing.
   // Runs ONCE at startup, gated behind ctx.cfg.topics, fully guarded (never aborts startup).
   const reconcileTopicsOnStartup = (): void => {
-    if (!ctx.cfg.topics) return
+    if (!ctx.cfg.topics && !ctx.cfg.privateTopics) return
     try {
       const topics = loadTopics()
       if (topics.length === 0) return
@@ -4883,8 +5017,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       persistQuestions()
       const staleCardId = retained.messageId ?? action.messageId
       if (staleCardId !== null) {
-        void clearMessageKeyboard(ctx, staleCardId)
-        void editMessageText(ctx, staleCardId, EXPIRED_TERMINAL_TEXT)
+        void finalizeButtonMessage(ctx, staleCardId, EXPIRED_TERMINAL_TEXT)
       }
       log(`ask-late-deliver-expired: ${describeAskRequest(retained.req)} key=${action.requestId} ageMs=${Date.now() - retained.at}`)
       return false
@@ -4964,17 +5097,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
     log(`ask-late-delivered: ${describeAskRequest(retained.req)} key=${action.requestId} label=${answer.label} pane=${paneId}`)
     await answerCallbackQuery(ctx, action.callbackQueryId, "✓ sent to the agent")
-    const cardId = retained.messageId ?? action.messageId
-    if (cardId !== null) {
+      const cardId = retained.messageId ?? action.messageId
+      if (cardId !== null) {
       // Clear the keyboard now the answer landed: this card explicitly invited a tap
       // ("window closed — tap still delivers …"), so once delivered it must stop being
       // tappable. Otherwise a re-tap in the gap between the answered-replay window
       // (ANSWERED_REPLAY_MS, 5 min) and the abandoned-retention window
       // (ABANDONED_RETAIN_MS, 30 min) finds neither entry and shows a misleading
       // "expired" on a card that WAS answered.
-      void clearMessageKeyboard(ctx, cardId)
-      void editMessageText(ctx, cardId, `answered: ${answer.label}`)
-    }
+      void finalizeButtonMessage(ctx, cardId, formatAnsweredButtonMessage(retained.req, answer))
+      }
     return true
   }
 
@@ -5061,7 +5193,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // (no duplicate card) instead of re-forwarding the now-answered question.
         persistQuestions()
         clearTimeout(pending.timer)
-        const finalText = `answered: ${answer.label}`
+        const finalText = formatAnsweredButtonMessage(pending.req, answer)
         if (pending.messageId === null) pending.finalText = finalText
         const output = formatAgentHookOutput(pending.req, answer)
         pending.socket.end(output === null ? "null\n" : `${JSON.stringify(output)}\n`)
@@ -5069,7 +5201,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // making the duplicate-card report impossible to confirm from logs.
         log(`ask-answered: ${describeAskRequest(pending.req)} key=${action.requestId} label=${answer.label} messageId=${pending.messageId ?? "-"}`)
         void answerCallbackQuery(ctx, action.callbackQueryId, "✓ sent to the agent")
-        if (pending.messageId !== null) void editMessageText(ctx, pending.messageId, finalText)
+        if (pending.messageId !== null) void finalizeButtonMessage(ctx, pending.messageId, finalText)
         // The agent is unblocked → deliver anything queued behind this question.
         // Fire-and-forget, but guard the promise: an error here must never become
         // an unhandled rejection that takes down the daemon.
@@ -5090,9 +5222,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return handleAgentRoute(action)
       case "agent-callback":
         return handleAgentCallback(action)
-      case "inject-text":
+      case "agent-cancel":
+        return handleAgentCancel(action)
+      case "inject-text": {
+        const selectedRoute = await routePendingAgentSelection(action.text, action.messageId)
+        if (selectedRoute !== null) return selectedRoute
         // A plain non-reply message → opt into the no-reply auto-bind (fix B).
         return injectViaTarget((paneId) => buildTextInjectPlan(paneId, action.text), action.text, true, action.messageId)
+      }
       case "reply-route":
         return handleReplyRoute(action)
       case "inject-key":
@@ -5250,7 +5387,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // topicStatusOf reads the binding store so topic messages route per-topic.
         // privateTopics also uses the same TopicBinding store and the same routing — enabling
         // either flag arms the topic router so private-chat topic messages reach their agent pane.
+        // Only forum-supergroup mode may start a NEW flow from an untracked forum_topic_created;
+        // private-chat topics are created by flat /new first, then routed once tracked.
         topicsEnabled: ctx.cfg.topics || ctx.cfg.privateTopics,
+        topicCreateFlowEnabled: ctx.cfg.topics,
         topicStatusOf: (ctx.cfg.topics || ctx.cfg.privateTopics) ? topicStatusOf : undefined,
         // Flat /new (issue #27): always wired (not gated by topics) — a plain message while a
         // /new awaits its dir is the typed path. When no /new is in flight this is false and the

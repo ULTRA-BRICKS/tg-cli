@@ -2,21 +2,26 @@
 
 Status: **DRAFT design** (CTO 2026-06-19 "делай"). Implemented incrementally — see
 §9 Increment plan. Supersedes the flat `/agent` phonetic selector as the primary
-addressing model when the bot chat is a **forum** (a supergroup with topics enabled).
+addressing model when Telegram topics are available. Forum-supergroup routing stays
+opt-in; private-chat `/new` topics are attempted by default through Bot API
+`createForumTopic`.
 
 ## 1. Goal
 
 Each background agent lives in its **own Telegram forum topic** (`message_thread_id`).
 The topic IS the address — no phonetic disambiguation. Concretely:
 
-- **Creating a topic spins up an agent.** A `forum_topic_created` service message starts
-  a per-topic `/new` flow that asks the working **PATH** and the **MODEL**, then launches a
-  fresh agent (`claude --model <model>` in `<path>`, in its own tmux window) bound to that
-  topic.
+- **Creating a topic spins up an agent.** In a forum supergroup, a `forum_topic_created`
+  service message starts a per-topic `/new` flow that asks the working **PATH** and the
+  **MODEL**, then launches a fresh agent (`claude --model <model>` in `<path>`, in its own
+  tmux window) bound to that topic. In a private chat, the flat `/new` flow asks Telegram to
+  create the topic via `createForumTopic` before spawning, then binds the returned
+  `message_thread_id`.
 - **Routing is per-topic.** An inbound message carrying `message_thread_id = T` injects into
   topic `T`'s bound pane; that agent's `tg` replies post back **into the same topic** T.
 - The legacy flat-chat behaviour (`/agent`, reply-routing, `/status`, …) is unchanged for
-  non-forum chats and for the forum's General topic (`message_thread_id` absent).
+  messages without `message_thread_id`; `/new` only upgrades to a private topic when
+  `createForumTopic` succeeds.
 
 ## 2. Why forum topics (vs the flat `/agent` picker)
 
@@ -27,15 +32,20 @@ never disambiguates. It also gives each agent an isolated transcript.
 
 ## 3. Telegram surface used
 
-- **Forum topics** require the chat to be a **forum** (supergroup, `Topics` enabled). The bot
-  must be an admin with `can_manage_topics` to create/close topics; it can always *post into*
-  an existing topic with `message_thread_id`.
+- **Forum-supergroup topics** require the chat to be a **forum** (supergroup, `Topics`
+  enabled). The bot must be an admin with `can_manage_topics` to create/close topics; it can
+  always *post into* an existing topic with `message_thread_id`.
+- **Private-chat topics** use Bot API 9.4 `createForumTopic(chat_id, name)` in the normal
+  user-bot chat. No special forum supergroup is required for this path, and BotFather is not
+  a hard prerequisite for creation; if Telegram rejects the API call, the daemon falls back to
+  a flat `/new` spawn.
 - **Service messages** (read-only, delivered as `message`): `forum_topic_created`
   (`{ name, icon_color?, icon_custom_emoji_id? }`), `forum_topic_edited`, `forum_topic_closed`,
   `forum_topic_reopened`. Each carries `message_thread_id` = the topic's id (== the id of the
   topic's first message).
-- **Posting into a topic**: `sendMessage(..., { message_thread_id: T })`. All bot replies for a
-  topic-bound agent MUST carry `message_thread_id: T` or they land in General.
+- **Posting into a topic**: `sendMessage(..., { message_thread_id: T })`. Replies emitted by
+  topic-bound agent actions MUST carry `message_thread_id: T` or they land in General; daemon-global
+  command replies follow their own daemon action contract.
 - **Inbound**: a user message in topic T arrives as a normal `message` with
   `message_thread_id: T` and `is_topic_message: true`.
 
@@ -127,8 +137,10 @@ mirroring how `routes.cwd` already flows).
    topic updates and emitting the new Actions, full unit tests. The pure layer only — the entrypoint
    did not yet consume the Actions (dead-wired behind a not-yet-existent `control.topics` flag).
 3. **Per-topic routing + outbound threading (routing half)** — LANDED: the `control.topics` config
-   flag (default OFF) + the `topics` state file (`CtlPaths.topics`); the poll loop passes
-   `topicsEnabled`/`topicStatusOf` into `stepUpdates`; `executeAction` handles `topic-route` (map
+   flag (default OFF for forum-supergroup routing), default-on `control.private_topics`, and the
+   `topics` state file (`CtlPaths.topics`); the poll loop passes
+   `topicsEnabled = topics || privateTopics` plus `topicStatusOf` into `stepUpdates`;
+   `executeAction` handles `topic-route` (map
    `threadId → paneId` from the store, re-verify the pane still hosts an agent, inject the wrapped
    text with the flat path's defer-guard — a dead/missing pane marks the binding `closed` and posts
    an error INTO the topic, never leaking to a flat agent) and `topic-close`/`topic-reopen` (persist
@@ -158,8 +170,10 @@ mirroring how `routes.cwd` already flows).
    spawn step is exception-guarded so a bad path / missing tmux / spawn error never throws into the poll
    loop — it posts a human-readable error into the topic and leaves the binding mid-flow for a retry;
    an already-`bound` topic refuses a second spawn (a duplicate `forum_topic_created` is already filtered
-   in `stepUpdates`, so a restart/dup can't double-spawn); the whole path only runs when `control.topics`
-   is on (default OFF → 1:1 byte-identical). Tests: `tests/ctl-topic-spawn-integration.test.ts` (valid
+   in `stepUpdates`, so a restart/dup can't double-spawn); forum-supergroup spawn flow only runs when
+   `control.topics` is on (default OFF → 1:1 byte-identical), while private-chat `/new` attempts
+   `createForumTopic` by default and falls back flat if it is rejected. Tests:
+   `tests/ctl-topic-spawn-integration.test.ts` (valid
    spawn, malformed path, spawn failure survives, no double-spawn, flag-off no-op) + the pure
    parser/keyboard/callback-emission units in `tests/ctl-topics.test.ts`. (The recent-repo path
    buttons and re-spawn-on-dead-pane were deferred to increment 4 — now LANDED, see below.)
@@ -208,17 +222,14 @@ mirroring how `routes.cwd` already flows).
 - **Security**: spawning runs `claude` in a user-chosen path — same trust boundary as the human
   starting it; the sender allow-list still gates who can drive the bot.
 
-## 11. Known deferrals (vs the flat path) — to close in later increments
+## 11. Closed parity items
 
-- **Reply quote-anchor (increment 3).** The flat path builds a `↩ «…»` quote anchor from
-  `reply_to_message`/`quote`; `topic-route` currently wraps prose plainly. A reply to a specific
-  message INSIDE a topic therefore loses the quoted context the flat mode shows. Bring the
-  anchor into `topic-route` when threaded replies land for topics.
-- **Daemon-level slash commands inside a topic (increment 2).** In a bound topic every slash
-  command is injected verbatim into the topic's agent (so `/compact`, `/stop` reach it). That is
-  intentional — the topic IS the address — but the DAEMON-level verbs (`/status`, `/agent`,
-  `/new`) thus reach the agent as literal text instead of being handled by the daemon. A
-  per-topic command filter (or routing `/status`/`/new` to the daemon) is an increment-2 polish.
-- **Topic rename name persistence (increment 2).** `forum_topic_edited` is swallowed (no
-  mis-route) but the new name is not yet persisted into `TopicBinding.name`, so the tmux-window
-  slug can go stale after a rename — the entrypoint should update it.
+- **Reply quote-anchor.** Closed: topic replies use the same quote anchor as the flat path when
+  the message is prose. Agent-local slash commands such as `/stop`, `/kill`, and `/compact` still
+  route verbatim to the topic agent.
+- **Daemon-level slash commands inside a topic.** Closed: daemon-global verbs (`/status`, `/agent`,
+  `/new`, `/tasks`) are intercepted by the daemon even when sent inside a bound topic; they are not
+  injected into the topic's agent. Only agent-local slash commands are injected into the topic's
+  agent.
+- **Topic rename name persistence.** Closed: `forum_topic_edited` emits `topic-rename`; the
+  entrypoint persists `TopicBinding.name` and renames the tmux window.

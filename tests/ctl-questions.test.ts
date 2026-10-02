@@ -5,6 +5,7 @@ import {
   collectQuestionAnswers,
   extractAnswersFromHookReply,
   formatAgentHookOutput,
+  formatAnsweredButtonMessage,
   parseButtonCallback,
   questionCapability,
   registrationAllowsHook,
@@ -72,6 +73,56 @@ test('buildButtonMessage renders a question as Telegram inline keyboard payload'
       [{ text: 'Production', callback_data: 'tgq:q_123:o1' }],
     ],
   });
+});
+
+test('formatAnsweredButtonMessage keeps the original question, answer, agent, and subagent context', () => {
+  const text = formatAnsweredButtonMessage(
+    {
+      ...QUESTION,
+      paneId: '%7',
+      cwd: '/work/project-a',
+      sessionName: 'topic-ext',
+      subagent: 'planner',
+    },
+    {
+      status: 'answered',
+      requestId: 'q_123',
+      label: 'Production',
+      value: 'Production',
+    },
+  );
+
+  expect(text).toContain('Question answered');
+  expect(text).toContain('Agent: claude');
+  expect(text).toContain('Subagent: planner');
+  expect(text).toContain('Context: session topic-ext, pane %7, project project-a');
+  expect(text).toContain('Asked:\nWhere should I deploy?');
+  expect(text).toContain('Selected:\nProduction');
+  expect(text).not.toBe('answered: Production');
+});
+
+test('formatAnsweredButtonMessage stays under the Telegram edit limit for long prompts', () => {
+  const text = formatAnsweredButtonMessage(
+    {
+      ...QUESTION,
+      title: 'T'.repeat(1200),
+      question: 'Q'.repeat(5000),
+      subagent: 'planner',
+    },
+    {
+      status: 'answered',
+      requestId: 'q_123',
+      label: 'Approve',
+      value: 'Approve',
+    },
+  );
+
+  expect(text.length).toBeLessThanOrEqual(3900);
+  expect(text).toContain('Question answered');
+  expect(text).toContain('Agent: claude');
+  expect(text).toContain('Subagent: planner');
+  expect(text).toContain('Asked:\n');
+  expect(text).toContain('Selected:\nApprove');
 });
 
 test('buildButtonMessage uses short buttonId for callback data when requestId is long or opaque', () => {

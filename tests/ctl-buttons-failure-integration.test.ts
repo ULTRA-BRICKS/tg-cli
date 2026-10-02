@@ -272,6 +272,8 @@ test('daemon resolves a callback that arrives before sendMessage returns', async
   let callbackData: string | null = null;
   let callbackServed = false;
   const edited: unknown[] = [];
+  const keyboardClears: unknown[] = [];
+  const editOrder: string[] = [];
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -304,8 +306,14 @@ test('daemon resolves a callback that arrives before sendMessage returns', async
         return Response.json({ ok: true, result: { message_id: 101 } });
       }
       if (url.pathname.endsWith('/answerCallbackQuery')) return Response.json({ ok: true, result: true });
+      if (url.pathname.endsWith('/editMessageReplyMarkup')) {
+        keyboardClears.push(await req.json());
+        editOrder.push('clear');
+        return Response.json({ ok: true, result: true });
+      }
       if (url.pathname.endsWith('/editMessageText')) {
         edited.push(await req.json());
+        editOrder.push('text');
         return Response.json({ ok: true, result: true });
       }
       return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
@@ -334,9 +342,17 @@ test('daemon resolves a callback that arrives before sendMessage returns', async
 
   const t0 = Date.now();
   while (Date.now() - t0 < 5000 && edited.length === 0) await Bun.sleep(50);
-  expect(edited).toEqual([
-    { chat_id: 1, message_id: 101, text: 'answered: A' },
-  ]);
+  expect(edited).toHaveLength(1);
+  expect(keyboardClears).toHaveLength(1);
+  expect(keyboardClears[0]).toMatchObject({ chat_id: 1, message_id: 101 });
+  expect(editOrder).toEqual(['clear', 'text']);
+  expect(edited[0]).toMatchObject({ chat_id: 1, message_id: 101 });
+  const finalText = String(edited[0].text);
+  expect(finalText).toContain('Question answered');
+  expect(finalText).toContain('Agent: claude');
+  expect(finalText).toContain('Asked:\nContinue?');
+  expect(finalText).toContain('Selected:\nA');
+  expect(finalText).not.toBe('answered: A');
 }, 10_000);
 
 test('daemon rejects a stale tap from a different Telegram message and accepts the matching one', async () => {

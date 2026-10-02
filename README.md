@@ -152,10 +152,12 @@ The agent reads it and responds by calling `tg`.
 
 **Reply with a quote (v1.6.0)** — reply to a message (optionally highlighting a
 part of it) and the agent receives a quote anchor identifying what you answered:
-`↩ tg#5975 «[date time] the quoted text…»` above your message. `tg#5975` is the
-replied-to message's own Telegram id (tg-cli#130) — if the preview isn't enough
-to place it (e.g. after the agent's context compacted), it can pull the full
-original back with `tg replies`.
+`↩ tg#5975 «[date time] the quoted text…»` above your message. A highlighted
+partial quote is preserved whole in content, with the standard concluding `…`;
+only the fallback preview for replying to the entire message is truncated.
+`tg#5975` is the replied-to message's own Telegram id (tg-cli#130) — if a
+fallback preview isn't enough to place it (e.g. after the agent's context
+compacted), it can pull the full original back with `tg replies`.
 
 ### Addressing a specific agent (v1.6.0)
 With several agents running, `/agent <window> <message>` routes to one of them.
@@ -212,19 +214,31 @@ control:
 
 > **One bot token per machine.** Telegram allows a single `getUpdates` consumer per token. Outbound `tg` is unaffected.
 
-### Forum topics — one topic per agent (opt-in, experimental)
+### Topics — one topic per agent
 
-When the bot chat is a **forum supergroup** (Topics enabled), tg-ctl can route per **topic**:
-a message in topic *T* injects into that topic's bound agent pane. Opt in:
+In a normal personal chat, `/new ...` automatically asks Telegram to create a private-chat
+topic for the new agent and spawns the pane with `TG_TOPIC=<id>`, so that agent's plain
+`tg "reply"` messages stay in its topic. No special forum supergroup is required, and this
+path does not require a BotFather setup step. If Telegram rejects `createForumTopic`, `tg-ctl`
+falls back to the flat `/new` spawn. You can opt out:
+
+```yaml
+control:
+  private_topics: false   # default true — try private-chat topics for /new
+```
+
+When the bot chat is a **forum supergroup** (Topics enabled), tg-ctl can also route per
+pre-existing forum topic: a message in topic *T* injects into that topic's bound agent pane.
+Opt in for forum-supergroup topic routing:
 
 ```yaml
 control:
   topics: true   # default false — leave off for normal 1:1 routing
 ```
 
-Default **OFF**: with the flag off, a forum-topic message falls through to the normal flat
-routing, so existing 1:1 behaviour is unchanged. What's wired today is the **routing half** — an
-inbound topic message routes to its bound pane.
+Forum-supergroup routing is default **OFF**: with the flag off, a forum-topic message falls
+through to the normal flat routing, so existing 1:1 behaviour is unchanged. Private-chat topics
+created by `/new` use the same binding store and router.
 
 Caveats while this is experimental:
 

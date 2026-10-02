@@ -17,13 +17,16 @@ injects the reply with a one-line quote anchor:
 
 - **Item 2** — if you highlighted a **partial quote** (Telegram's quote
   selection, `message.quote.text`), that exact selection is the forwarded quote.
+  It is whitespace-collapsed but not length-truncated; the standard anchor
+  format still appends the concluding `…`.
 - **Item 3** — the anchor is `«[<date> <time>] <beginning of the message>…»`:
   the replied-to message's timestamp plus the start of its text and an ellipsis.
 - **Original id (tg-cli#130)** — `tg#<id>` is `reply_to_message.message_id`, the
   Telegram id of the message you're answering (almost always the agent's own
-  prior report). The `head` preview is truncated to 60 chars, so if the agent's
-  context has compacted and the preview isn't enough to place it, it can pull
-  the full original back with `tg replies agent --all-sessions --json | jq
+  prior report). The whole-message fallback preview is truncated to 60 chars,
+  so if the agent's context has compacted and that fallback preview isn't enough
+  to place it, it can pull the full original back with
+  `tg replies agent --all-sessions --json | jq
   '.[] | select(.id == 5975)'` (or `tg replies find <snippet>`) instead of
   guessing. Renders even when the id happens to be `0` in a test fixture — the
   token is never silently dropped for a falsy-but-present id.
@@ -35,8 +38,9 @@ the `[date time]` + `…` framing.
 
 1. `original` = `reply_to_message.text` (or `.caption`), whitespace-collapsed.
 2. `selected` = `m.quote.text` (the partial selection), whitespace-collapsed.
-3. `body` = `selected || original` — item 2 wins when a selection exists.
-4. `head` = first `60` chars of `body` + `…` (always ellipsised — item 3).
+3. If `selected` is non-empty, `head` = `selected + …` with no length cap.
+4. Otherwise `head` = first `60` chars of `original` + `…` (always ellipsised
+   — item 3).
 5. `when` = `opts.fmtTime(reply_to_message.date)`; defaults to a deterministic
    **UTC** `YYYY-MM-DD HH:MM`. The daemon injects a **local-time** formatter so
    the human sees Belgrade time while the pure module + tests stay deterministic.

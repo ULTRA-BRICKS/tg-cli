@@ -44,6 +44,7 @@ const wrap = (name: string, msg: string, id?: number) => `[TG from ${name}${id ?
 function makeOpts(
   over: Partial<{
     topicsEnabled: boolean;
+    topicCreateFlowEnabled: boolean;
     topicStatusOf: (t: number) => TopicStatus | null;
     cfg: ControlConfig;
   }> = {},
@@ -55,6 +56,7 @@ function makeOpts(
     currentOffset: 5,
     wrap,
     topicsEnabled: over.topicsEnabled ?? false,
+    topicCreateFlowEnabled: over.topicCreateFlowEnabled,
     topicStatusOf: over.topicStatusOf,
   };
 }
@@ -189,6 +191,33 @@ test('topics ON: forum_topic_created → topic-new + ack', () => {
   expect(r.actions).toEqual([
     { kind: 'topic-new', threadId: 50, name: 'feature-x', from: 'Alex' },
     { kind: 'ack', messageId: 50 },
+  ]);
+});
+
+test('private-topic routing mode: untracked forum_topic_created is acked, not started as a forum flow', () => {
+  const r = stepUpdates(
+    [upd(52, { message_thread_id: 52, forum_topic_created: { name: 'private-echo' } })],
+    makeOpts({ topicsEnabled: true, topicCreateFlowEnabled: false, topicStatusOf: () => null }),
+  );
+  expect(r.actions).toEqual([{ kind: 'ack', messageId: 52 }]);
+});
+
+test('private-topic routing mode: tracked forum_topic_created echo is swallowed', () => {
+  const r = stepUpdates(
+    [upd(53, { message_thread_id: 53, forum_topic_created: { name: 'private-echo' } })],
+    makeOpts({ topicsEnabled: true, topicCreateFlowEnabled: false, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions).toEqual([{ kind: 'ack', messageId: 53 }]);
+});
+
+test('private-topic routing mode: untracked topic prose falls through to flat injection', () => {
+  const r = stepUpdates(
+    [upd(54, { text: 'legacy forum text', message_thread_id: 54, is_topic_message: true })],
+    makeOpts({ topicsEnabled: true, topicCreateFlowEnabled: false, topicStatusOf: () => null }),
+  );
+  expect(r.actions).toEqual([
+    { kind: 'inject-text', text: '[TG from Alex #54] legacy forum text', messageId: 54 },
+    { kind: 'ack', messageId: 54 },
   ]);
 });
 

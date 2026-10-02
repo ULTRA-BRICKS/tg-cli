@@ -10,18 +10,22 @@
 // EVERY update — rejected senders, stale messages and unsupported kinds
 // included — so nothing is ever replayed into a live agent session.
 
-import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatus } from './types';
-import { parseButtonCallback } from './questions';
-import { parseAgentCallback, parseAgentCommand } from './agent-match';
-import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
-import { parseNewCommand, parseNewDirCallback, parseNewModelCallback } from './new-command';
-import { parseTasksCommand } from './tasks-command';
-import { parseContinueCallback } from './limits';
-import { botCommandNames } from './bot-commands';
+import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatus } from "./types";
+import { parseButtonCallback } from "./questions";
+import { parseAgentCallback, parseAgentCancelCallback, parseAgentCommand } from "./agent-match";
+import {
+  parseTopicModelCallback,
+  parseTopicPathCallback,
+  parseTopicRespawnCallback,
+} from "./topics";
+import { parseNewCommand, parseNewDirCallback, parseNewModelCallback } from "./new-command";
+import { parseTasksCommand } from "./tasks-command";
+import { parseContinueCallback } from "./limits";
+import { botCommandNames } from "./bot-commands";
 
 // Bot API getFile hard limit; larger files cannot be downloaded by bots.
 const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024;
-const TOO_LARGE_REPLY = 'file too large for Bot API (>20 MB)';
+const TOO_LARGE_REPLY = "file too large for Bot API (>20 MB)";
 
 export interface StepOpts {
   cfg: ControlConfig;
@@ -41,6 +45,10 @@ export interface StepOpts {
   // untracked) so stepUpdates can route a topic message purely — bound → inject, awaiting →
   // /new answer — without owning the binding store (the entrypoint owns it, like routes).
   topicsEnabled?: boolean;
+  // Whether untracked forum topics should be captured by the per-topic /new flow.
+  // Forum-supergroup topics use this; private-chat topics are created by the flat
+  // /new path first and should only route once already present in the binding store.
+  topicCreateFlowEnabled?: boolean;
   topicStatusOf?: (threadId: number) => TopicStatus | null;
   // Flat-chat `/new` command (issue #27). The `/new` slash is ALWAYS recognized (it's a real bot
   // command, not gated by topics mode). `newSessionAwaitingDir` is injected by the entrypoint and
@@ -54,12 +62,12 @@ export interface StepOpts {
 // Default quote-anchor time format: deterministic UTC `YYYY-MM-DD HH:MM`.
 function fmtQuoteTimeUtc(unixSec: number): string {
   const d = new Date(unixSec * 1000);
-  const p = (n: number): string => String(n).padStart(2, '0');
+  const p = (n: number): string => String(n).padStart(2, "0");
   return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
 }
 
-// First chars of the quote-anchor body, separators collapsed, with a trailing
-// ellipsis (item 3: «… начало сообщения и многоточие …»).
+// First chars of the whole-message fallback body, separators collapsed, with a
+// trailing ellipsis (item 3: «… начало сообщения и многоточие …»).
 const QUOTE_HEAD_MAX = 60;
 
 // The quote anchor for a REPLY (items 2, 3): `↩ tg#<id> «[date time] <quote>…»`.
@@ -71,15 +79,20 @@ const QUOTE_HEAD_MAX = 60;
 // convention as the `{id}` substitution in wrapInbound (tg-cli#28) — so an
 // agent whose context has compacted/forgotten the original can still recover
 // it verbatim via `tg replies --json` (grep the id) instead of relying on the
-// truncated `head` preview below (tg-cli#130).
+// one-line anchor preview below (tg-cli#130). Only whole-message fallback
+// previews are length-truncated; explicit partial selections are preserved
+// whole in content after whitespace collapse.
 export function buildReplyAnchor(m: TgMessage, opts: StepOpts): string {
   const rtm = m.reply_to_message;
-  const original = (rtm?.text ?? rtm?.caption ?? '').replace(/\s+/g, ' ').trim();
-  const selected = m.quote?.text?.replace(/\s+/g, ' ').trim();
-  const body = selected || original;
-  const head = body.length > QUOTE_HEAD_MAX ? `${body.slice(0, QUOTE_HEAD_MAX)}…` : `${body}…`;
-  const when = rtm ? (opts.fmtTime ?? fmtQuoteTimeUtc)(rtm.date) : '';
-  const origId = rtm ? `tg#${rtm.message_id} ` : '';
+  const original = (rtm?.text ?? rtm?.caption ?? "").replace(/\s+/g, " ").trim();
+  const selected = m.quote?.text?.replace(/\s+/g, " ").trim();
+  const head = selected
+    ? `${selected}…`
+    : original.length > QUOTE_HEAD_MAX
+      ? `${original.slice(0, QUOTE_HEAD_MAX)}…`
+      : `${original}…`;
+  const when = rtm ? (opts.fmtTime ?? fmtQuoteTimeUtc)(rtm.date) : "";
+  const origId = rtm ? `tg#${rtm.message_id} ` : "";
   return `↩ ${origId}«[${when}] ${head}»`;
 }
 
@@ -88,7 +101,7 @@ export function buildReplyAnchor(m: TgMessage, opts: StepOpts): string {
 // carries THIS reply's own message_id (`#<id>`) so the agent can in turn thread
 // its answer under the reply with `tg --reply-to <id>`.
 export function buildReplyInject(m: TgMessage, name: string, opts: StepOpts): string {
-  return `${buildReplyAnchor(m, opts)}\n${opts.wrap(name, m.text ?? '', m.message_id)}`;
+  return `${buildReplyAnchor(m, opts)}\n${opts.wrap(name, m.text ?? "", m.message_id)}`;
 }
 
 export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
@@ -128,7 +141,11 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
     const cb = u.callback_query;
     if (cb) {
       if (!senderAllowed(cb.from?.id, opts)) {
-        callbackActions.push({ kind: 'answer-callback', callbackQueryId: cb.id, text: 'not allowed' });
+        callbackActions.push({
+          kind: "answer-callback",
+          callbackQueryId: cb.id,
+          text: "not allowed",
+        });
         continue;
       }
       // Forum-topic /new-flow taps (tgm: model, tgp: recent-path, tgr: re-spawn) route the spawn
@@ -141,9 +158,13 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         if (modelCb) {
           callbackActions.push(
             lifecycleInBatch.has(modelCb.threadId)
-              ? { kind: 'answer-callback', callbackQueryId: cb.id, text: 'topic changed — try again' }
+              ? {
+                  kind: "answer-callback",
+                  callbackQueryId: cb.id,
+                  text: "topic changed — try again",
+                }
               : {
-                  kind: 'topic-model',
+                  kind: "topic-model",
                   callbackQueryId: cb.id,
                   threadId: modelCb.threadId,
                   modelId: modelCb.modelId,
@@ -156,9 +177,13 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         if (pathCb) {
           callbackActions.push(
             lifecycleInBatch.has(pathCb.threadId)
-              ? { kind: 'answer-callback', callbackQueryId: cb.id, text: 'topic changed — try again' }
+              ? {
+                  kind: "answer-callback",
+                  callbackQueryId: cb.id,
+                  text: "topic changed — try again",
+                }
               : {
-                  kind: 'topic-path',
+                  kind: "topic-path",
                   callbackQueryId: cb.id,
                   threadId: pathCb.threadId,
                   index: pathCb.index,
@@ -172,9 +197,13 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         if (respawnThreadId !== null) {
           callbackActions.push(
             lifecycleInBatch.has(respawnThreadId)
-              ? { kind: 'answer-callback', callbackQueryId: cb.id, text: 'topic changed — try again' }
+              ? {
+                  kind: "answer-callback",
+                  callbackQueryId: cb.id,
+                  text: "topic changed — try again",
+                }
               : {
-                  kind: 'topic-respawn',
+                  kind: "topic-respawn",
                   callbackQueryId: cb.id,
                   threadId: respawnThreadId,
                   messageId: cb.message?.message_id ?? null,
@@ -189,7 +218,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
       const newModelCb = parseNewModelCallback(cb.data);
       if (newModelCb) {
         callbackActions.push({
-          kind: 'new-model',
+          kind: "new-model",
           callbackQueryId: cb.id,
           token: newModelCb.token,
           modelId: newModelCb.modelId,
@@ -200,7 +229,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
       const newDirCb = parseNewDirCallback(cb.data);
       if (newDirCb) {
         callbackActions.push({
-          kind: 'new-dir',
+          kind: "new-dir",
           callbackQueryId: cb.id,
           token: newDirCb.token,
           index: newDirCb.index,
@@ -212,11 +241,22 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
       const agentCb = parseAgentCallback(cb.data);
       if (agentCb) {
         callbackActions.push({
-          kind: 'agent-callback',
+          kind: "agent-callback",
           callbackQueryId: cb.id,
           token: agentCb.token,
           index: agentCb.index,
-          from: cb.from?.first_name || cb.from?.username || 'tg',
+          from: cb.from?.first_name || cb.from?.username || "tg",
+          messageId: cb.message?.message_id ?? null,
+          languageCode: cb.from?.language_code ?? null,
+        });
+        continue;
+      }
+      const agentCancel = parseAgentCancelCallback(cb.data);
+      if (agentCancel) {
+        callbackActions.push({
+          kind: "agent-cancel",
+          callbackQueryId: cb.id,
+          token: agentCancel.token,
           messageId: cb.message?.message_id ?? null,
         });
         continue;
@@ -225,7 +265,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
       const contCb = cb.data ? parseContinueCallback(cb.data) : null;
       if (contCb) {
         callbackActions.push({
-          kind: 'limit-continue',
+          kind: "limit-continue",
           callbackQueryId: cb.id,
           paneId: contCb.paneId,
           resetAt: contCb.resetAt,
@@ -238,13 +278,13 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
       callbackActions.push(
         parsed
           ? {
-              kind: 'answer-question',
+              kind: "answer-question",
               callbackQueryId: cb.id,
               requestId: parsed.requestId,
               value: parsed.value,
               messageId: cb.message?.message_id ?? null,
             }
-          : { kind: 'answer-callback', callbackQueryId: cb.id, text: 'expired' },
+          : { kind: "answer-callback", callbackQueryId: cb.id, text: "expired" },
       );
       continue;
     }
@@ -262,7 +302,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
       continue;
     }
 
-    const name = m.from?.first_name || m.from?.username || 'tg';
+    const name = m.from?.first_name || m.from?.username || "tg";
 
     // Forum-topics mode: a topic service message or a message inside a TRACKED topic is
     // handled here and the flat dispatch is skipped. topicActionFor returns null ONLY when
@@ -285,13 +325,13 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         !m.forum_topic_reopened &&
         !m.forum_topic_created
       ) {
-        actions.push({ kind: 'ack', messageId: m.message_id });
+        actions.push({ kind: "ack", messageId: m.message_id });
         continue;
       }
       const topicActions = topicActionFor(m, name, opts);
       if (topicActions) {
         actions.push(...topicActions);
-        actions.push({ kind: 'ack', messageId: m.message_id });
+        actions.push({ kind: "ack", messageId: m.message_id });
         continue;
       }
     }
@@ -307,17 +347,18 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
       // isLikelySlashCommand test wrongly rejected it. A real /command (`/status`, a second `/new`)
       // or a reply is never consumed as the answer. Topic messages (control.topics on) are already
       // routed + `continue`d by the topics block above, so they never reach this gate. (issue #27)
-      const isDirAnswerCandidate = !m.reply_to_message && m.text.startsWith('/') && !isDaemonSlashCommand(m.text);
+      const isDirAnswerCandidate =
+        !m.reply_to_message && m.text.startsWith("/") && !isDaemonSlashCommand(m.text);
       if (isDirAnswerCandidate && (opts.newSessionAwaitingDir?.() ?? false)) {
-        action = { kind: 'new-answer', text: m.text, from: name, messageId: m.message_id };
+        action = { kind: "new-answer", text: m.text, from: name, messageId: m.message_id };
       } else {
         // A reply carrying prose forwards the quote anchor (items 2,3) via
         // reply-route — the daemon picks the recognized origin pane or a LRU/MRU
         // picker. A reply whose text is a /command still runs the command verbatim.
         action =
-          m.reply_to_message && !m.text.startsWith('/')
+          m.reply_to_message && !m.text.startsWith("/")
             ? {
-                kind: 'reply-route',
+                kind: "reply-route",
                 replyToMessageId: m.reply_to_message.message_id,
                 injectText: buildReplyInject(m, name, opts),
                 from: name,
@@ -334,7 +375,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
       // Delivery receipt (👀 reaction) follows every action that represents
       // handling the message — but NOT a pure error reply (e.g. the too-large
       // verdict): there the reply itself is the "did not land" signal.
-      if (action.kind !== 'reply') actions.push({ kind: 'ack', messageId: m.message_id });
+      if (action.kind !== "reply") actions.push({ kind: "ack", messageId: m.message_id });
     }
   }
 
@@ -346,7 +387,9 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
 }
 
 function senderAllowed(sender: number | undefined, opts: StepOpts): boolean {
-  return sender !== undefined && (sender === opts.chatId || opts.cfg.allowedSenders.includes(sender));
+  return (
+    sender !== undefined && (sender === opts.chatId || opts.cfg.allowedSenders.includes(sender))
+  );
 }
 
 // The daemon's OWN slash-commands (the verbs textAction handles). Used to tell a `/new` dir answer
@@ -360,8 +403,8 @@ function senderAllowed(sender: number | undefined, opts: StepOpts): boolean {
 // command added to BOT_COMMANDS therefore lands here automatically.
 const DAEMON_SLASH_COMMANDS = new Set(botCommandNames().map((c) => `/${c}`));
 function isDaemonSlashCommand(text: string): boolean {
-  if (!text.startsWith('/')) return false;
-  const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, '');
+  if (!text.startsWith("/")) return false;
+  const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, "");
   return DAEMON_SLASH_COMMANDS.has(verb);
 }
 
@@ -369,29 +412,43 @@ function isDaemonSlashCommand(text: string): boolean {
 // token; unknown slash commands pass through VERBATIM so the harness
 // interprets its own (/compact, /clear, …) — no wrap on those.
 function textAction(text: string, name: string, opts: StepOpts, messageId: number): Action {
-  if (text.startsWith('/')) {
+  if (text.startsWith("/")) {
     const verb = text.split(/\s+/, 1)[0];
-    const cmd = verb.replace(/@\w+$/, ''); // tolerate /cmd@botname in groups
-    if (cmd === '/stop') return { kind: 'inject-key', key: 'Escape' };
-    if (cmd === '/kill') return { kind: 'kill-agent' };
-    if (cmd === '/status') return { kind: 'status' };
-    if (cmd === '/tasks') {
+    const cmd = verb.replace(/@\w+$/, ""); // tolerate /cmd@botname in groups
+    if (cmd === "/stop") return { kind: "inject-key", key: "Escape" };
+    if (cmd === "/kill") return { kind: "kill-agent" };
+    if (cmd === "/status") return { kind: "status" };
+    if (cmd === "/tasks") {
       const p = parseTasksCommand(text);
-      return { kind: 'tasks', agent: p.agent, status: p.status };
+      return { kind: "tasks", agent: p.agent, status: p.status };
     }
-    if (cmd === '/agent') {
+    if (cmd === "/agent") {
       const p = parseAgentCommand(text);
-      return { kind: 'agent-route', selector: p.selector, rest: p.rest, all: p.all, from: name, messageId };
+      return {
+        kind: "agent-route",
+        selector: p.selector,
+        rest: p.rest,
+        all: p.all,
+        from: name,
+        messageId,
+      };
     }
-    if (cmd === '/new') {
+    if (cmd === "/new") {
       const p = parseNewCommand(text);
-      return { kind: 'new-command', model: p.model, dir: p.dir, name: p.name, task: p.task, from: name };
+      return {
+        kind: "new-command",
+        model: p.model,
+        dir: p.dir,
+        name: p.name,
+        task: p.task,
+        from: name,
+      };
     }
-    return { kind: 'inject-text', text, messageId };
+    return { kind: "inject-text", text, messageId };
   }
   // A plain inbound message: surface its message_id in the wrap so the agent can
   // thread its answer with `tg --reply-to <id>` (threaded replies).
-  return { kind: 'inject-text', text: opts.wrap(name, text, messageId), messageId };
+  return { kind: "inject-text", text: opts.wrap(name, text, messageId), messageId };
 }
 
 // A harness/daemon slash-command (`/compact`, `/stop now`) vs a path-or-prose message that
@@ -419,16 +476,24 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
     // topic-new would let the entrypoint reset it to awaiting-path (createTopic + upsert) and
     // lose the live pane. Only an untracked or previously-closed topic starts the flow.
     const created = opts.topicStatusOf?.(threadId) ?? null;
-    if (created === 'bound' || created === 'awaiting-path' || created === 'awaiting-model') return [];
-    return [{ kind: 'topic-new', threadId, name: m.forum_topic_created.name, from: name }];
+    if (created === "bound" || created === "awaiting-path" || created === "awaiting-model")
+      return [];
+    if (opts.topicCreateFlowEnabled === false) return [];
+    return [{ kind: "topic-new", threadId, name: m.forum_topic_created.name, from: name }];
   }
   const threadId = m.message_thread_id;
   if (threadId === undefined) return null; // General / non-topic message → flat handling
   // close/reopen are gated on the topic being TRACKED — an untracked topic (created before the
   // bot joined / before topics were enabled) closing is not ours, so don't emit an action the
   // entrypoint has no binding for (keeps the "untracked → not ours" symmetry; review catch).
-  if (m.forum_topic_closed) return (opts.topicStatusOf?.(threadId) ?? null) !== null ? [{ kind: 'topic-close', threadId }] : [];
-  if (m.forum_topic_reopened) return (opts.topicStatusOf?.(threadId) ?? null) !== null ? [{ kind: 'topic-reopen', threadId }] : [];
+  if (m.forum_topic_closed)
+    return (opts.topicStatusOf?.(threadId) ?? null) !== null
+      ? [{ kind: "topic-close", threadId }]
+      : [];
+  if (m.forum_topic_reopened)
+    return (opts.topicStatusOf?.(threadId) ?? null) !== null
+      ? [{ kind: "topic-reopen", threadId }]
+      : [];
   // A topic RENAME (forum_topic_edited) is a recognized service message — never leak to flat.
   // If the edit carries a new name and the topic is tracked, emit topic-rename so the entrypoint
   // can persist the new name and rename the live tmux window slug. An icon-only edit (no name
@@ -436,7 +501,7 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
   if (m.forum_topic_edited) {
     const newName = m.forum_topic_edited.name;
     if (newName && opts.topicStatusOf?.(threadId) != null) {
-      return [{ kind: 'topic-rename', threadId, name: newName }];
+      return [{ kind: "topic-rename", threadId, name: newName }];
     }
     return [];
   }
@@ -445,12 +510,13 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
   // happened to match a tracked topic — so require the flag for non-service messages.
   if (!m.is_topic_message) return null;
   const status = opts.topicStatusOf?.(threadId) ?? null;
-  // A real forum-topic message (is_topic_message) for a topic the daemon hasn't bound yet is still
-  // OURS — acked, not leaked to a flat agent (which would reply in General, out of the topic). The
-  // increment-2 entrypoint binds it (e.g. spawns on first message); until then it is a no-op ack,
-  // never a mis-route (review: untracked must not reply in General, spec §10).
-  if (status === null) return [];
-  if (status === 'bound') {
+  // In full forum-supergroup mode (`control.topics: true`), an untracked real forum-topic message
+  // is still OURS — acked, not leaked to a flat agent (which would reply in General, out of the
+  // topic). In private-topic-only mode (`private_topics: true`, `topics: false`), however, the
+  // router is armed only for bindings created by `/new`; unrelated/untracked topic messages must
+  // preserve legacy flat routing instead of being silently swallowed.
+  if (status === null) return opts.topicCreateFlowEnabled === false ? null : [];
+  if (status === "bound") {
     // A message to the topic's agent. A real slash-command is injected verbatim (so /compact,
     // /stop, … reach the agent); everything else is PROSE — wrapped so the agent gets the
     // sender + message_id and can `tg --reply-to <id>` back into the topic. The command test is
@@ -458,37 +524,51 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
     // `/tmp/foo crashed` — is treated as prose, not mis-read as a command (review catch). A
     // media-only message (no text) is acked but NOT injected here — routing media into the topic
     // is increment 2; the point is it must never leak to a flat agent.
-    const text = m.text ?? '';
+    const text = m.text ?? "";
     if (!text) return [];
     // §11 deferral 2: intercept the 3 daemon-global verbs (/status, /agent, /new) even inside
     // a bound topic — they control the daemon, not the topic agent. /stop and /kill are NOT
     // intercepted: they must still reach the topic's pane (kill/escape the harness session).
     // Using an explicit set (not isDaemonSlashCommand) to avoid over-intercepting.
-    const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks']);
-    const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, '');
+    const TOPIC_GLOBAL_CMDS = new Set(["/status", "/agent", "/new", "/tasks"]);
+    const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, "");
     if (TOPIC_GLOBAL_CMDS.has(verb)) return [textAction(text, name, opts, m.message_id)];
     // §11 deferral 1: a prose reply carries the same ↩ «…» quote-anchor as flat-chat replies.
     // A /command reply still goes verbatim (the startsWith('/') guard above already passed it
     // through to the injectText path below).
-    if (m.reply_to_message && !text.startsWith('/')) {
-      return [{ kind: 'topic-route', threadId, injectText: buildReplyInject(m, name, opts), from: name, messageId: m.message_id }];
+    if (m.reply_to_message && !text.startsWith("/")) {
+      return [
+        {
+          kind: "topic-route",
+          threadId,
+          injectText: buildReplyInject(m, name, opts),
+          from: name,
+          messageId: m.message_id,
+        },
+      ];
     }
     const injectText = isLikelySlashCommand(text) ? text : opts.wrap(name, text, m.message_id);
-    return [{ kind: 'topic-route', threadId, injectText, from: name, messageId: m.message_id }];
+    return [{ kind: "topic-route", threadId, injectText, from: name, messageId: m.message_id }];
   }
-  if (status === 'closed') {
+  if (status === "closed") {
     // The topic's agent died (pane gone). A message here is not lost: emit topic-dead so the
     // entrypoint offers a one-tap re-spawn (increment 4) instead of the old silent dead-end.
     // Carry the wrapped text so a SAME-BATCH re-spawn (which re-binds before this runs) can route
     // it to the now-live pane rather than dropping it (codex r9 #1). Never leaks to a flat agent.
-    const deadText = m.text ?? '';
-    const deadInject = deadText ? (isLikelySlashCommand(deadText) ? deadText : opts.wrap(name, deadText, m.message_id)) : '';
-    return [{ kind: 'topic-dead', threadId, injectText: deadInject, messageId: m.message_id }];
+    const deadText = m.text ?? "";
+    const deadInject = deadText
+      ? isLikelySlashCommand(deadText)
+        ? deadText
+        : opts.wrap(name, deadText, m.message_id)
+      : "";
+    return [{ kind: "topic-dead", threadId, injectText: deadInject, messageId: m.message_id }];
   }
   // awaiting-path / awaiting-model: a text answer to the /new flow. A path message advances the
   // flow (the model is picked by the `tgm:` button callback handled in the callback branch above,
   // NOT as text — an awaiting-model text message just re-shows the buttons in the entrypoint).
-  return [{ kind: 'topic-answer', threadId, text: m.text ?? '', from: name, messageId: m.message_id }];
+  return [
+    { kind: "topic-answer", threadId, text: m.text ?? "", from: name, messageId: m.message_id },
+  ];
 }
 
 function photoAction(updateId: number, m: TgMessage, name: string): Action {
@@ -498,12 +578,12 @@ function photoAction(updateId: number, m: TgMessage, name: string): Action {
   for (const p of m.photo!) {
     if ((p.file_size ?? 0) >= (best.file_size ?? 0)) best = p;
   }
-  if ((best.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return { kind: 'reply', text: TOO_LARGE_REPLY };
+  if ((best.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return { kind: "reply", text: TOO_LARGE_REPLY };
   return {
-    kind: 'download-media',
+    kind: "download-media",
     fileId: best.file_id,
     suggestedName: `${updateId}.jpg`,
-    mediaKind: 'photo',
+    mediaKind: "photo",
     fileSize: best.file_size,
     caption: m.caption,
     from: name,
@@ -519,9 +599,9 @@ function photoAction(updateId: number, m: TgMessage, name: string): Action {
 // fetched by a bot → too-large reply, same as photo/document.
 function voiceAction(updateId: number, m: TgMessage, name: string, opts: StepOpts): Action {
   const v = (m.voice ?? m.audio)!;
-  if ((v.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return { kind: 'reply', text: TOO_LARGE_REPLY };
-  const action: Extract<Action, { kind: 'transcribe-voice' }> = {
-    kind: 'transcribe-voice',
+  if ((v.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return { kind: "reply", text: TOO_LARGE_REPLY };
+  const action: Extract<Action, { kind: "transcribe-voice" }> = {
+    kind: "transcribe-voice",
     fileId: v.file_id,
     suggestedName: `${updateId}.ogg`,
     fileSize: v.file_size,
@@ -537,12 +617,12 @@ function voiceAction(updateId: number, m: TgMessage, name: string, opts: StepOpt
 
 function documentAction(updateId: number, m: TgMessage, name: string): Action {
   const doc = m.document!;
-  if ((doc.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return { kind: 'reply', text: TOO_LARGE_REPLY };
+  if ((doc.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return { kind: "reply", text: TOO_LARGE_REPLY };
   return {
-    kind: 'download-media',
+    kind: "download-media",
     fileId: doc.file_id,
     suggestedName: `${updateId}.${sanitizedExt(doc.file_name)}`,
-    mediaKind: 'document',
+    mediaKind: "document",
     fileSize: doc.file_size,
     caption: m.caption,
     from: name,
@@ -555,11 +635,11 @@ function documentAction(updateId: number, m: TgMessage, name: string): Action {
 // §5.2: never trust the remote basename). Anything longer than 10 chars after
 // sanitization is not a real extension; fall back to bin.
 function sanitizedExt(fileName: string | undefined): string {
-  const dot = fileName ? fileName.lastIndexOf('.') : -1;
-  if (!fileName || dot === -1) return 'bin';
+  const dot = fileName ? fileName.lastIndexOf(".") : -1;
+  if (!fileName || dot === -1) return "bin";
   const ext = fileName
     .slice(dot + 1)
     .toLowerCase()
-    .replace(/[^a-z0-9]/g, '');
-  return ext && ext.length <= 10 ? ext : 'bin';
+    .replace(/[^a-z0-9]/g, "");
+  return ext && ext.length <= 10 ? ext : "bin";
 }

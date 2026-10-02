@@ -34,6 +34,7 @@ export interface ButtonRequest {
   paneId?: string;
   cwd?: string;
   sessionName?: string;
+  subagent?: string;
   agent: AgentKind;
   kind: ButtonRequestKind;
   question: string;
@@ -91,6 +92,10 @@ export type ButtonAnswer =
   | { status: 'unsupported'; requestId: string; reason: string };
 
 const CALLBACK_PREFIX = 'tgq';
+const MAX_ANSWERED_MESSAGE_CHARS = 3900;
+const MAX_ANSWERED_LABEL_CHARS = 500;
+const MAX_ANSWERED_CONTEXT_CHARS = 500;
+const MAX_ANSWERED_QUESTION_CHARS = 2200;
 
 // Registration guard for incoming hook requests. paneId is authoritative: when
 // both sides know the pane, a mismatch REJECTS even if cwd/sessionName agree —
@@ -146,6 +151,31 @@ export function buildButtonMessage(chatId: number, req: ButtonRequest): ButtonMe
       inline_keyboard: buildInlineKeyboard(req),
     },
   };
+}
+
+export function formatAnsweredButtonMessage(
+  req: ButtonRequest,
+  answer: Extract<ButtonAnswer, { status: 'answered' }>,
+): string {
+  const heading = req.kind === 'permission' ? 'Permission answered' : 'Question answered';
+  const parts = [
+    heading,
+    `Agent: ${req.agent}`,
+    `Subagent: ${truncateAnsweredField(answeredSubagentLabel(req), MAX_ANSWERED_LABEL_CHARS)}`,
+  ];
+  const context = answeredContextLabel(req);
+  if (context) parts.push(`Context: ${truncateAnsweredField(context, MAX_ANSWERED_CONTEXT_CHARS)}`);
+  if (req.title) parts.push(`Title:\n${truncateAnsweredField(req.title, MAX_ANSWERED_LABEL_CHARS)}`);
+  parts.push(`Asked:\n${truncateAnsweredField(req.question, MAX_ANSWERED_QUESTION_CHARS)}`);
+  parts.push(`Selected:\n${truncateAnsweredField(answer.label, MAX_ANSWERED_LABEL_CHARS)}`);
+  return truncateAnsweredField(parts.join('\n\n'), MAX_ANSWERED_MESSAGE_CHARS);
+}
+
+function truncateAnsweredField(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  const marker = '\n... [truncated]';
+  if (maxChars <= marker.length) return value.slice(0, maxChars);
+  return `${value.slice(0, maxChars - marker.length).trimEnd()}${marker}`;
 }
 
 export function parseButtonCallback(data: string | undefined): ParsedButtonCallback | null {
@@ -370,6 +400,36 @@ export function callbackRequestId(req: ButtonRequest): string {
   if (req.buttonId && /^[A-Za-z0-9_-]{1,40}$/.test(req.buttonId)) return req.buttonId;
   if (/^[A-Za-z0-9_-]{1,40}$/.test(req.requestId)) return req.requestId;
   return `b${hashId(req.requestId)}`;
+}
+
+function answeredSubagentLabel(req: ButtonRequest): string {
+  const explicit = req.subagent?.trim();
+  if (explicit) return explicit;
+  const session = req.sessionName?.trim();
+  if (session) return `session ${session}`;
+  const pane = req.paneId?.trim();
+  if (pane) return `pane ${pane}`;
+  const project = cwdBasename(req.cwd);
+  if (project) return `project ${project}`;
+  return 'unknown';
+}
+
+function answeredContextLabel(req: ButtonRequest): string | null {
+  const parts: string[] = [];
+  const session = req.sessionName?.trim();
+  if (session) parts.push(`session ${session}`);
+  const pane = req.paneId?.trim();
+  if (pane) parts.push(`pane ${pane}`);
+  const project = cwdBasename(req.cwd);
+  if (project) parts.push(`project ${project}`);
+  return parts.length ? parts.join(', ') : null;
+}
+
+function cwdBasename(path: string | undefined): string | null {
+  const cleaned = path?.trim().replace(/[\\/]+$/, '');
+  if (!cleaned) return null;
+  const parts = cleaned.split(/[\\/]+/);
+  return parts[parts.length - 1] || null;
 }
 
 function callbackData(requestId: string, value: string): string {

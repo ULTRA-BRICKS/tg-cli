@@ -25,6 +25,7 @@ export interface HookEnv {
   paneId?: string; // process.env.TMUX_PANE of the hook process
   cwd?: string; // hook process cwd (payload.cwd wins when present)
   sessionName?: string; // tmux session of the pane
+  subagent?: string; // optional adapter-supplied subagent label for answered cards
 }
 
 // djb2 — a short stable id so a repeated identical prompt reuses its callback key.
@@ -46,6 +47,12 @@ function readDecisionLabels(raw: unknown): DecisionLabels | undefined {
   const allow = typeof rec.allow === 'string' ? rec.allow : '';
   const deny = typeof rec.deny === 'string' ? rec.deny : '';
   return allow && deny ? { allow, deny } : undefined;
+}
+
+function readSubagent(rec: Record<string, unknown>): string | undefined {
+  const direct = typeof rec.subagent === 'string' ? rec.subagent.trim() : '';
+  const label = typeof rec.subagentLabel === 'string' ? rec.subagentLabel.trim() : '';
+  return direct || label || undefined;
 }
 
 function readOptions(raw: unknown): ButtonOption[] | null {
@@ -81,6 +88,7 @@ function build(
     paneId: env.paneId,
     cwd: cwd ?? env.cwd,
     sessionName: env.sessionName,
+    subagent: env.subagent,
   };
 }
 
@@ -109,6 +117,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       paneId: typeof p.paneId === 'string' ? p.paneId : env.paneId,
       cwd: typeof p.cwd === 'string' ? p.cwd : env.cwd,
       sessionName: typeof p.sessionName === 'string' ? p.sessionName : env.sessionName,
+      subagent: readSubagent(p) ?? env.subagent,
     };
   }
 
@@ -150,6 +159,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       paneId: env.paneId,
       cwd: cwd ?? env.cwd,
       sessionName: env.sessionName,
+      subagent: env.subagent,
     };
   }
 
