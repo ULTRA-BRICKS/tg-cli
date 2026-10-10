@@ -137,7 +137,7 @@ export function matchAgentCommand(command: string): AgentKind | null {
   // omp (Oh My Pi) is a compiled Bun binary — its argv0 basename is literally
   // 'omp' (e.g. /opt/homebrew/bin/omp). One row feeds every inbound gate
   // (findAgentInPane BFS, inject verify-pane, reply-route liveness) AND the
-  // outbound ancestry branding (findAgentInAncestry). EXACT basename only:
+  // outbound ancestry branding (findAgentsInAncestry). EXACT basename only:
   // a merely-containing binary ('ompi-info') never matches. Worker helpers
   // (`__omp_worker_daemon_broker`, `__omp_worker_js_eval_process`) share the
   // same argv0 — they are not the user session (243 still matches the TUI).
@@ -280,21 +280,26 @@ export function parsePaneTitles(out: string): Map<string, string> {
   return titles;
 }
 
-// Walk UP the ppid chain from `startPid`, returning the nearest ancestor that
-// matches an agent. This is the outbound mirror of findAgentInPane (which walks
-// DOWN to a pane's children): when `tg` runs, it asks "which agent launched
-// me?" by climbing its own ancestry. Codex/aider/pi/omp export no env marker
-// (only Claude Code sets CLAUDECODE), so the process tree is the reliable signal —
-// and a background ollama daemon is a sibling, never an ancestor, so it is
-// correctly ignored. The visited set guards against pid-reuse cycles in the
-// ps snapshot, matching findAgentInPane's robustness.
-export function findAgentInAncestry(
-  procs: ProcInfo[],
-  startPid: number,
-): { agent: AgentKind; pid: number } | null {
+export interface AgentAncestor {
+  agent: AgentKind;
+  pid: number;
+}
+
+// Walk UP the ppid chain from `startPid`, returning every ancestor that matches
+// an agent, nearest first. This is the outbound mirror of findAgentInPane (which
+// walks DOWN to a pane's children): when `tg` runs, it asks "which agent launched
+// me?" by climbing its own ancestry — the first hit is the sender. Codex/aider/
+// pi/omp export no env marker (only Claude Code sets CLAUDECODE), so the process
+// tree is the reliable signal — and a background ollama daemon is a sibling,
+// never an ancestor, so it is correctly ignored. The hits past the first are the
+// sender's lineage: a nested omp's parent omp is the orchestrator a reply to the
+// exited child goes to (#503). The visited set guards against pid-reuse cycles
+// in the ps snapshot, matching findAgentInPane's robustness.
+export function findAgentsInAncestry(procs: ProcInfo[], startPid: number): AgentAncestor[] {
   const byPid = new Map<number, ProcInfo>();
   for (const p of procs) byPid.set(p.pid, p);
 
+  const found: AgentAncestor[] = [];
   const seen = new Set<number>();
   let pid: number | undefined = startPid;
   while (pid !== undefined && pid > 1 && !seen.has(pid)) {
@@ -302,10 +307,10 @@ export function findAgentInAncestry(
     const proc = byPid.get(pid);
     if (!proc) break;
     const agent = matchAgentCommand(proc.command);
-    if (agent) return { agent, pid: proc.pid };
+    if (agent) found.push({ agent, pid: proc.pid });
     pid = proc.ppid;
   }
-  return null;
+  return found;
 }
 
 // Pick the injection target (spec §10 priority chain):

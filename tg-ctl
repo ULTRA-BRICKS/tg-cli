@@ -156,6 +156,7 @@ import {
   liveOmpPaneId,
   matchLiveOmp,
   matchLiveOmpOrigin,
+  lineageParentCandidate,
   ompReplyOriginMatches,
   mergeLiveOmpCandidates,
   ompSessionFileFromBreadcrumb,
@@ -9196,29 +9197,53 @@ async function runDaemon(ctx: Ctx): Promise<never> {
 
     const msgPreview = action.injectText.slice(0, 60).replace(/\n/g, " ")
 
+    // A reply whose origin is gone. It goes to the origin's recorded process-lineage
+    // parent (route.parentPaneId, #503) when that is live: a disposable nested omp
+    // that sent the replied-to message and exited hands the reply to the omp that
+    // started it. `tg` proved that lineage from the process tree at send time; a
+    // session that only shares the origin's cwd is never chosen (unrelated sessions
+    // share /tmp or a repo root). Otherwise the picker naming the agent they meant,
+    // so a terminated one reads as "that agent is gone" rather than a silent re-ask
+    // (CTO ask, #72) — or the no-agent reply when nothing is live.
+    const replyToGoneOrigin = async (route: NonNullable<typeof recognized>, name: string, why: string): Promise<boolean> => {
+      const replyTo = action.replyToMessageId
+      const candidates = listAgentCandidates()
+      const parentId = route.parentPaneId
+      const parent = parentId === undefined ? null : lineageParentCandidate(parentId, candidates, listLiveOmpAgents())
+      if (parent) {
+        log(`reply-route: replyTo=${replyTo} → ${why}, routing to lineage parent ${parent.paneId} msg="${msgPreview}"`)
+        const delivered = await injectVerbatim(parent.paneId)
+        if (delivered) {
+          if (parent.panePath) recordLastUserTarget(parent.paneId, parent.panePath)
+          // Fire-and-forget, never delaying delivery: the reply did not land where
+          // the CTO replied, so say where it went (#446).
+          void sendMessage(ctx, `↩️ ${name} is gone — routed to ${labelFor(parent, candidates)}, the session that started it`)
+        }
+        return delivered
+      }
+      const lineage = parentId === undefined ? "" : `, lineage parent ${parentId} not live`
+      log(`reply-route: replyTo=${replyTo} → ${why} → picker (${candidates.length} candidates${lineage})`)
+      if (candidates.length > 0) return postReplyPicker(candidates, goneNotice(name))
+      await sendMessage(ctx, noAgentReplyNow())
+      return false
+    }
+
     // Session-keyed reply (spec §2.4–§2.5, tg-cli#459): the reply follows the
     // SESSION that sent the replied-to message to wherever it lives now — a
     // resumed omp keeps its key under a new pid, a moved one under a new pane —
     // re-read by a fresh scan. It never falls back to a same-project guess: a gone
-    // session (or a legacy row the migration could not resolve) gets the picker
-    // with a named notice. null: the route carries no session identity at all
+    // session (or a legacy row the migration could not resolve) goes to
+    // replyToGoneOrigin. null: the route carries no session identity at all
     // (an untracked harness, a pre-registry `tg`) — the pane path below decides.
     const routeReplyBySession = async (route: NonNullable<typeof recognized>): Promise<boolean | null> => {
       const replyTo = action.replyToMessageId
-      const toPicker = async (name: string, why: string): Promise<boolean> => {
-        const candidates = listAgentCandidates()
-        log(`reply-route: replyTo=${replyTo} → ${why} → picker (${candidates.length} candidates)`)
-        if (candidates.length > 0) return postReplyPicker(candidates, goneNotice(name))
-        await sendMessage(ctx, noAgentReplyNow())
-        return false
-      }
-      if (route.legacySince !== undefined) return toPicker(goneOriginLabel(), `legacy route ${route.paneId}`)
+      if (route.legacySince !== undefined) return replyToGoneOrigin(route, goneOriginLabel(), `legacy route ${route.paneId}`)
       // A session a rig wrapper hosts outside tmux: its route origin IS `host:<name>`. The host
       // is re-verified by deliverToHost; a gone one gets the picker, never a same-project guess.
       const originHost = hostNameFromOriginId(route.paneId)
       if (originHost !== null) {
         const host = listLiveHosts(snapshot().procs).find((h) => h.name === originHost)
-        if (!host) return toPicker(goneOriginLabel(), `host ${originHost} gone`)
+        if (!host) return replyToGoneOrigin(route, goneOriginLabel(), `host ${originHost} gone`)
         log(`reply-route: replyTo=${replyTo} → ${route.paneId} (abduco PTY) msg="${msgPreview}"`)
         const delivered = await injectVerbatim(route.paneId)
         if (delivered) recordLastUserTarget(route.paneId, host.cwd ?? route.cwd)
@@ -9236,15 +9261,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // The origin's exact locators name a session that has since left: the
         // picker, never the same-project pane guess below.
         const gone = goneRouteSession(reg, route)
-        if (gone) return toPicker(gone.name.primary, `origin session ${gone.key} gone`)
+        if (gone) return replyToGoneOrigin(route, gone.name.primary, `origin session ${gone.key} gone`)
         return null
       }
       const target = sessionDeliveryTarget(reg, key)
       if (target.kind !== "live") {
-        return toPicker(target.kind === "gone" ? target.name : goneOriginLabel(), `session ${key} ${target.kind}`)
+        return replyToGoneOrigin(route, target.kind === "gone" ? target.name : goneOriginLabel(), `session ${key} ${target.kind}`)
       }
       const paneId = target.paneId ?? (target.pid !== null ? liveOmpPaneId(target.pid) : null)
-      if (paneId === null) return toPicker(target.name, `session ${key} has no locator`)
+      if (paneId === null) return replyToGoneOrigin(route, target.name, `session ${key} has no locator`)
       log(`reply-route: replyTo=${replyTo} → session ${key} at ${paneId} (sent from ${route.paneId}) msg="${msgPreview}"`)
       const delivered = await injectVerbatim(paneId, key)
       if (delivered) recordLastUserTarget(paneId, target.cwd || undefined)
@@ -9305,54 +9330,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // post the PICKER (human disambiguates) instead of the single-candidate
       // auto-inject — never the registration's last-writer pane.
       if (!pane) {
-        const candidates = listAgentCandidates()
-        if (candidates.length === 0) {
-          log(`reply-route: replyTo=${action.replyToMessageId} → origin ${recognized.paneId} invisible, no candidates`)
-          await sendMessage(ctx, noAgentReplyNow())
-          return false
-        }
-        // DEAD-SENDER FALLBACK: the origin was a disposable/one-shot sender —
-        // a subagent process (or a synthetic omp:<pid> from a headless script,
-        // tg-cli#363) dispatched by a live orchestrator, sent once, and exited —
-        // so its pane/pid will NEVER become visible again. routes.json still
-        // names it, but forcing the human to pick every time loses the reply's
-        // content behind a card when the right target is obvious: the live
-        // agent that owns the SAME project directory (recognized.cwd) is that
-        // sender's parent/active session, and the natural place for a reply
-        // meant for its now-gone child. Scoping the auto-route to an EXACT cwd
-        // match keeps this narrower than "trust any single visible candidate"
-        // (the bug this guard replaced, tg-cli#53): a flaky/partial snapshot
-        // that merely drops the origin pane cannot spuriously produce a
-        // DIFFERENT pane sharing the exact recorded cwd, so it cannot resurrect
-        // that regression. Several same-project candidates are still genuinely
-        // ambiguous (which one is "the parent"?) and fall through to the picker.
-        const sameProjectCandidates = recognized.cwd
-          ? candidates.filter((c) => routeMatchesPane({ recognizedCwd: recognized.cwd, panePath: c.panePath }))
-          : []
-        if (sameProjectCandidates.length === 1) {
-          const parent = sameProjectCandidates[0]
-          log(`reply-route: replyTo=${action.replyToMessageId} → origin ${recognized.paneId} gone, routing to live parent ${parent.paneId} (same project ${recognized.cwd}) msg="${msgPreview}"`)
-          const delivered = await injectVerbatim(parent.paneId)
-          if (delivered) {
-            if (parent.panePath) recordLastUserTarget(parent.paneId, parent.panePath)
-            // A same-project match is still a GUESS, not a confirmed identity
-            // match (no pid/session-id proof it's the same conversation) — a
-            // log line alone is invisible on Telegram, so the CTO could never
-            // tell "delivered exactly where I replied" apart from "your
-            // original target died, I redirected this elsewhere" (Alex
-            // escalation point 4: routing must never silently resolve a
-            // guess with zero visible signal). Fire-and-forget: never block
-            // or delay the actual delivery on this notice.
-            void sendMessage(ctx, `↩️ ${goneOriginLabel()} is gone — routed to ${labelFor(parent, candidates)} instead`)
-          }
-          return delivered
-        }
-        // No single live parent for this project (none, or more than one) —
-        // the recognized origin is unconfirmed and ambiguous, so post the
-        // picker rather than guess. Name the agent they meant so a genuinely
-        // terminated one reads as "that agent is gone" rather than a silent re-ask (CTO ask, #72).
-        log(`reply-route: replyTo=${action.replyToMessageId} → origin ${recognized.paneId} NOT visible in snapshot → picker (${candidates.length} candidates, ${sameProjectCandidates.length} same-project)`)
-        return postReplyPicker(candidates, goneNotice())
+        // DEAD SENDER: the origin was a disposable/one-shot sender — a subagent
+        // process (or a synthetic omp:<pid> from a headless script, tg-cli#363)
+        // that sent once and exited, so its pane/pid will NEVER become visible
+        // again. Only its recorded lineage parent may take the reply. A live
+        // agent that merely shares the recorded cwd is NOT its parent: the old
+        // exact-cwd guess (#423) typed replies into unrelated sessions sharing
+        // /tmp or a repository root (#503).
+        return replyToGoneOrigin(recognized, goneOriginLabel(), `origin ${recognized.paneId} NOT visible in snapshot`)
       }
       // origin pane visible but not a same-project agent → genuinely reused/gone;
       // fall through to the normal picker path below (with the gone notice).

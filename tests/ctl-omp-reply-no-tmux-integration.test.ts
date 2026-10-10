@@ -5,6 +5,8 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { serializeRegistry } from '../features/tg-ctl/session-registry-store';
+import type { SessionEntry } from '../features/tg-ctl/session-registry';
 
 // #339 / #450: preserve every no-tmux route, but deliver to the original process.
 
@@ -118,11 +120,16 @@ function fakeOmpScript(spawnLog: string): string {
   return `#!/bin/sh\nprintf 'FORBIDDEN ACP CLONE\\n' >> '${spawnLog}.spawned'\nexit 1\n`;
 }
 
-async function makeHarness(opts: { routes?: unknown[] } = {}) {
+async function makeHarness(opts: { routes?: unknown[]; sessions?: SessionEntry[] } = {}) {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-omp-reply-'));
   writeFileSync(join(cfgDir, '.env'), ['TG_BOT_TOKEN=123:abc', 'TG_CHAT_ID=1', ''].join('\n'));
   writeFileSync(join(cfgDir, 'config.yaml'), ['control:', '  enabled: true', ''].join('\n'));
   writeFileSync(join(cfgDir, 'tg-ctl.123.routes.json'), JSON.stringify(opts.routes ?? []));
+  if (opts.sessions) {
+    const at = '2026-01-01T00:00:00.000Z';
+    const migrated = { routes: at, registration: at, lastUserTarget: at, topics: at };
+    writeFileSync(join(cfgDir, 'tg-ctl.123.sessions.json'), serializeRegistry({ schemaVersion: 2, migrated, sessions: opts.sessions }));
+  }
 
   const binDir = join(cfgDir, 'bin');
   mkdirSync(binDir);
@@ -261,4 +268,55 @@ test('plain inbound with no tmux pane reaches the sole live omp via the original
   tg.pushText(300, 30, 'plain inbound no pane');
   await waitFor(() => acp(h).includes('original-input'));
   assertOriginal(h, 'plain inbound no pane');
+}, 20_000);
+
+// #503: a disposable nested omp (`omp --print` started by this live
+// orchestrator) sent a report from /tmp and exited. `tg` recorded the
+// orchestrator as the route's lineage parent from the process tree; the reply
+// reaches it, and the chat says where it went.
+const DEAD_CHILD = 942424;
+
+test('reply to an exited nested omp reaches its recorded lineage parent, with a visible reroute notice', async () => {
+  const h = await makeHarness({
+    routes: [{ id: 60, paneId: `omp:${DEAD_CHILD}`, cwd: '/tmp', parentPaneId: `omp:${OMP_PID}`, ts: 1 }],
+  });
+  const tg = startFakeTg();
+  await startDaemon(h, tg.port);
+  tg.pushReply(400, 40, 60, 'answer for the dead child');
+  await waitFor(() => acp(h).includes('answer for the dead child'));
+  assertOriginal(h, 'answer for the dead child');
+  await waitFor(() => tg.sends.some((s) => /is gone/.test(s.text) && /routed to/.test(s.text)));
+  expect(tg.sends.some((s) => s.hasMarkup)).toBe(false);
+}, 20_000);
+
+test('reply to a registered nested omp that has since gone reaches its recorded lineage parent, not the picker', async () => {
+  const childKey = 'omp:child-session';
+  const at = new Date().toISOString();
+  const child: SessionEntry = {
+    key: childKey,
+    harness: 'omp',
+    sessionId: 'child-session',
+    sessionFile: null,
+    locators: { pid: DEAD_CHILD, tmux: null, durableSession: null },
+    cwd: '/tmp',
+    name: { primary: 'child', secondary: null },
+    aliases: [],
+    threadId: null,
+    topicMisses: null,
+    state: 'gone',
+    firstSeen: at,
+    lastSeen: at,
+  };
+  const h = await makeHarness({
+    routes: [{ id: 61, paneId: `omp:${DEAD_CHILD}`, cwd: '/tmp', parentPaneId: `omp:${OMP_PID}`, sessionKey: childKey, ts: 1 }],
+    sessions: [child],
+  });
+  const tg = startFakeTg();
+  await startDaemon(h, tg.port);
+  tg.pushReply(401, 41, 61, 'answer for the gone child');
+  await waitFor(() => acp(h).includes('answer for the gone child'));
+  assertOriginal(h, 'answer for the gone child');
+  // The registry knows the child's name, so the notice says which agent left.
+  await waitFor(() => tg.sends.some((s) => /^↩️ child is gone — routed to /.test(s.text)));
+  expect(tg.sends.some((s) => s.hasMarkup)).toBe(false);
 }, 20_000);

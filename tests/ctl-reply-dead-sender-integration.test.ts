@@ -6,18 +6,15 @@ import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 import { PS_NO_AGENTS_SHIM, TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
-// Regression for the "dead sender" reply-routing gap: a one-shot/disposable
+// Regression for the "dead sender" reply-routing path: a one-shot/disposable
 // sender (a subagent process running `tg --tag report`, or any headless
 // script) records an outbound route (routes.json) and then EXITS for good —
-// its paneId/pid will NEVER become visible again. Before this fix, a reply to
-// that message ALWAYS fell to the human-disambiguation picker (or, with zero
-// live agents anywhere, a visible "no agent" reply) — even when the live
-// PARENT/orchestrator session for that exact project directory was sitting
-// right there, unambiguous. The fix: when the recognized origin is confirmed
-// gone, first look for the single live agent that owns the SAME project
-// directory (recognized.cwd) and route straight to it — the natural target
-// for a reply meant for its now-gone child — before ever falling to the
-// picker or a bare "no agent" reply.
+// its paneId/pid will NEVER become visible again. Only a lineage parent `tg`
+// recorded from the process tree at send time (`parentPaneId`, #503) may take
+// such a reply; ctl-omp-reply-no-tmux-integration.test.ts covers that delivery.
+// Without one, a reply gets the picker: a live agent that merely shares the
+// dead sender's cwd is NOT its parent — unrelated sessions share /tmp or a
+// repository root, and the old exact-cwd guess (#423) typed replies into them.
 //
 // This drives the REAL daemon against a fake Telegram + a fake tmux/ps, with
 // routes.json pre-seeded to a synthetic `omp:<deadpid>` origin (tg-cli#363's
@@ -33,19 +30,16 @@ const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 // The disposable sender's synthetic origin — never present in tmux or ps.
 const DEAD_ORIGIN = 'omp:942424';
 
-// The live PARENT agent — same project directory as the dead sender.
+// A live agent in the SAME project directory as the dead sender but with no
+// recorded lineage to it — proves a shared cwd never makes it the parent.
 const PANE_PARENT = '%9';
 const PID_PARENT = 9009;
-// A live agent in a DIFFERENT, unrelated project — proves the auto-route is
-// scoped to an exact cwd match, never "whichever agent happens to be visible".
+// A live agent in a DIFFERENT, unrelated project.
 const PANE_OTHER = '%2';
 const PID_OTHER = 2002;
-// A second live agent in the SAME project as the dead sender — proves that
-// when the parent is itself ambiguous (2+ same-project candidates), the fix
-// still defers to the picker rather than guessing between them.
+// A second live agent in the SAME project as the dead sender.
 const PANE_PARENT_B = '%11';
 const PID_PARENT_B = 1111;
-
 const reg = createDaemonRegistry();
 const servers: Array<{ stop: (c?: boolean) => Promise<void> | void }> = [];
 
@@ -120,6 +114,8 @@ interface Harness {
 interface HarnessOpts {
   includeParentB?: boolean;
   omitParent?: boolean;
+  // The route's lineage parent as `tg` would record it (`omp:<pid>`).
+  parentPaneId?: string;
 }
 
 function makeHarness(opts: HarnessOpts = {}): Harness {
@@ -138,7 +134,15 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
   );
   writeFileSync(
     join(cfgDir, 'tg-ctl.123.routes.json'),
-    JSON.stringify([{ id: 500, paneId: DEAD_ORIGIN, cwd: dirParent, ts: Math.floor(Date.now() / 1000) }]),
+    JSON.stringify([
+      {
+        id: 500,
+        paneId: DEAD_ORIGIN,
+        cwd: dirParent,
+        ...(opts.parentPaneId ? { parentPaneId: opts.parentPaneId } : {}),
+        ts: Math.floor(Date.now() / 1000),
+      },
+    ]),
   );
 
   mkdirSync(join(cfgDir, 'bin'));
@@ -250,29 +254,34 @@ async function waitFor(pred: () => boolean, ms = 8000): Promise<void> {
   }
 }
 
-test('DEAD SENDER: a reply to a since-exited one-shot sender routes to the live parent agent in the same project, no picker, but a visible reroute notice', async () => {
+test('DEAD SENDER with no recorded lineage: the sole live agent sharing its cwd is NOT its parent — picker, nothing typed', async () => {
   const h = makeHarness();
   const tg = startFakeTg();
   const daemon = await startDaemon(h.cfgDir, tg.port);
 
   tg.pushReply(600, 10, 500, 'чек');
 
-  await waitFor(() => injectedLines(h.injectLog).length > 0);
-  // The reroute notice is sent fire-and-forget AFTER delivery — give it a
-  // moment to land before asserting on `tg.sends`.
-  await waitFor(() => tg.sends.length > 0);
-  await Bun.sleep(300);
+  // Picker and delivery are exclusive outcomes of one reply: wait for either.
+  await waitFor(() => tg.sends.some((s) => s.hasMarkup) || injectedLines(h.injectLog).length > 0);
 
-  const lines = injectedLines(h.injectLog);
-  expect(lines.some((l) => l.startsWith(`${PANE_PARENT}\t`))).toBe(true);
-  expect(lines.some((l) => l.startsWith(`${PANE_OTHER}\t`))).toBe(false);
-  // No inline-keyboard picker — this is still the fast, unambiguous path —
-  // but the CTO must SEE that a reroute happened rather than the reply
-  // landing exactly where he replied (Alex escalation point 4: a same-
-  // project guess is still a guess and must never be silent, even when
-  // it's the only candidate).
-  expect(tg.sends.some((s) => s.hasMarkup)).toBe(false);
-  expect(tg.sends.some((s) => /is gone/i.test(s.text) && /routed to/i.test(s.text))).toBe(true);
+  // Same cwd is project affinity, not parentage: an unrelated session in
+  // /tmp or the same repository root must never receive this reply.
+  expect(injectedLines(h.injectLog)).toEqual([]);
+  expect(tg.sends.some((s) => s.hasMarkup && /no longer running/.test(s.text))).toBe(true);
+  daemon.kill();
+}, 15_000);
+
+test('DEAD SENDER whose recorded lineage parent has exited too: picker, never the same-cwd agent', async () => {
+  const h = makeHarness({ parentPaneId: 'omp:31337' });
+  const tg = startFakeTg();
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushReply(604, 14, 500, 'чек');
+
+  await waitFor(() => tg.sends.some((s) => s.hasMarkup) || injectedLines(h.injectLog).length > 0);
+
+  expect(injectedLines(h.injectLog)).toEqual([]);
+  expect(tg.sends.some((s) => s.hasMarkup)).toBe(true);
   daemon.kill();
 }, 15_000);
 

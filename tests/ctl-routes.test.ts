@@ -48,6 +48,15 @@ test('serialize → parse round-trips', () => {
   ]);
 });
 
+test('a nested omp route keeps its lineage parent through serialize → parse; junk is dropped', () => {
+  const nested = { id: 3, paneId: 'omp:720', cwd: '/tmp', ts: 30, parentPaneId: 'omp:700' };
+  expect(parseRoutes(serializeRoutes([nested]))).toEqual([nested]);
+  const junk = JSON.stringify(
+    [7, '', '%5', 'omp:'].map((parentPaneId, i) => ({ id: 4 + i, paneId: 'omp:720', ts: 40, parentPaneId })),
+  );
+  expect(parseRoutes(junk).map((r) => 'parentPaneId' in r)).toEqual([false, false, false, false]);
+});
+
 test('recognizeRoute: last matching id wins, else null', () => {
   const routes = [R(1, '%1', 10), R(2, '%2', 20)];
   expect(recognizeRoute(routes, 2)?.paneId).toBe('%2');

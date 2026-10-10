@@ -90,7 +90,18 @@ last 300). The daemon's `handleReplyRoute`:
   inject the reply (with its anchor) straight into that origin pane. This is the
   multi-agent fan-in: replying to agent X's report reaches X, not the last
   sender.
-- **Unrecognized** (id not in the map, or the pane is gone) → show the
+- **Recognized, origin gone** (a disposable one-shot sender that exited — a nested
+  `omp --print`, a headless script) → the reply goes to the route's **lineage
+  parent** when `tg` recorded one and it is still a live candidate, with a visible
+  `↩️ <origin> is gone — routed to <label>, the session that started it` notice.
+  `tg` records `parentPaneId` (`omp:<pid>`) only from the process tree: running
+  outside tmux, the nearest agent ancestor is an omp (the route origin) and a
+  further omp ancestor started it. A live agent that merely shares the dead
+  sender's cwd is **never** its parent — unrelated sessions share `/tmp` or a
+  repository root, and the old exact-cwd guess (#423) typed replies into them
+  (#503). No recorded or live parent → the picker below, with a named
+  "that agent is no longer running" notice.
+- **Unrecognized** (id not in the map) → show the
   session-grouped **window picker** ordered by **LRU+MRU**: most-recently-messaged
   panes first, send-frequency as the tiebreaker, panes with no history last. Both
   signals are derived from the same routes map (`aggregateUsage` + `orderByLruMru`)
