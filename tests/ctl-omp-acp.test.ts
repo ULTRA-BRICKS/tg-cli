@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { distinctLabels } from '../features/tg-ctl/agent-match';
 import { questionCapability } from '../features/tg-ctl/questions';
-import { findAgentInPane, matchAgentCommand } from '../features/tg-ctl/discover';
+import { findAgentInPane, matchAgentCommand, type AgentAncestor } from '../features/tg-ctl/discover';
 import type { PaneInfo, ProcInfo } from '../features/tg-ctl/types';
 import {
   describeLiveOmp,
@@ -14,6 +14,8 @@ import {
   matchLiveOmpOrigin,
   ompReplyOriginMatches,
   outboundOriginPaneId,
+  lineageParentOriginId,
+  lineageParentCandidate,
   findLiveOmpAgents,
   isPrimaryOmpSessionFile,
   isOmpLiveSessionCommand,
@@ -596,6 +598,30 @@ test('outboundOriginPaneId: a session a rig wrapper hosts outside tmux stamps ho
   expect(outboundOriginPaneId({ tmuxPane: '%4', hostName: 'claude-3f9a0c1d2e4b' })).toBe('%4');
   expect(outboundOriginPaneId({ ompAncestorPid: 7103, hostName: 'omp-6a830edb351d' })).toBe('omp:7103');
   expect(outboundOriginPaneId({ hostName: '' })).toBeNull();
+});
+
+test('lineageParentOriginId: a nested out-of-tmux omp names the omp that started it; nothing else is lineage', () => {
+  const nested: AgentAncestor[] = [{ agent: 'omp', pid: 720 }, { agent: 'omp', pid: 700 }];
+  expect(lineageParentOriginId({ tmuxPane: null, ancestry: nested })).toBe('omp:700');
+  // An agent between the two omps does not break the lineage.
+  expect(lineageParentOriginId({ ancestry: [{ agent: 'omp', pid: 720 }, { agent: 'claude', pid: 710 }, { agent: 'omp', pid: 700 }] })).toBe('omp:700');
+  // A lone omp has no parent; in tmux the route origin is the pane itself.
+  expect(lineageParentOriginId({ ancestry: [{ agent: 'omp', pid: 720 }] })).toBeNull();
+  expect(lineageParentOriginId({ tmuxPane: '%4', ancestry: nested })).toBeNull();
+  // The route origin is only omp:<pid> when the NEAREST agent is omp.
+  expect(lineageParentOriginId({ ancestry: [{ agent: 'claude', pid: 730 }, { agent: 'omp', pid: 700 }] })).toBeNull();
+  expect(lineageParentOriginId({ ancestry: [] })).toBeNull();
+});
+
+test('lineageParentCandidate: the recorded omp:<pid> parent is its own row out of tmux, or the tmux pane it lives in', () => {
+  const omp = (paneId: string) => ({ paneId, sessionName: 'main', windowIndex: 1, windowName: 'orch', agent: 'omp' as const, panePath: '/w/orch' });
+  const agent = (pid: number, paneId: string | null): LiveOmpAgent => ({ pid, cwd: '/w/orch', sessionFile: null, sessionId: null, title: null, paneId, tty: null });
+  // Out of tmux: the candidate row IS omp:<pid>.
+  expect(lineageParentCandidate('omp:700', [omp('%2'), omp('omp:700')], [agent(700, null)])?.paneId).toBe('omp:700');
+  // In a tmux pane: the omp rides that pane's row, found through its live process.
+  expect(lineageParentCandidate('omp:700', [omp('%2'), omp('%4')], [agent(700, '%4')])?.paneId).toBe('%4');
+  // Gone: no live process with that pid, so never another candidate.
+  expect(lineageParentCandidate('omp:700', [omp('%2'), omp('omp:701')], [agent(701, null)])).toBeNull();
 });
 
 test('isLiveOmpOriginId / liveOmpPidFromOriginId parse the synthetic origin', () => {

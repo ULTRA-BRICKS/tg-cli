@@ -70,8 +70,8 @@ import { buildOutboundHistoryRecords, outboundHistoryText } from "./features/rep
 import { runReplies } from "./features/replies/cli"
 import { resolveWindowPanes } from "./features/replies/window"
 import { agentNameFromDisplayLine } from "./features/tg-ctl/agent-name"
-import { detectAgentViaAncestry, detectAncestorAgent, isProcessRunning } from "./features/branding/detect"
-import { outboundOriginPaneId, parseLsofJsonlPaths, parseOmpSessionMeta, pickPrimaryOmpSessionFile } from "./features/tg-ctl/omp"
+import { detectAgentAncestry, detectAgentViaAncestry, isProcessRunning } from "./features/branding/detect"
+import { lineageParentOriginId, outboundOriginPaneId, parseLsofJsonlPaths, parseOmpSessionMeta, pickPrimaryOmpSessionFile } from "./features/tg-ctl/omp"
 import { hostDisplayName } from "./features/tg-ctl/host-registry"
 import { readOwnHostRecord } from "./features/tg-ctl/host-registry-fs"
 import { parseLsofCwd } from "./features/tg-ctl/unreachable"
@@ -602,7 +602,7 @@ if (import.meta.main) {
         if (reg.sessions.length === 0) return null
         return {
           sessions: reg.sessions.map((e) => ({ key: e.key, name: e.name.primary, aliases: e.aliases })),
-          current: ownSessionKey(reg, detectAncestorAgent()),
+          current: ownSessionKey(reg, detectAgentAncestry()[0] ?? null),
         }
       },
       // `--session ext` → the pane ids of every tmux window named exactly "ext".
@@ -1002,7 +1002,10 @@ if (import.meta.main) {
   // Resolve the window label only from here on: the `--detect-agent` info action
   // and the real send need it, but the emoji/model info flags above must NOT
   // pay for ps/lsof/tmux subprocesses they never read.
-  const ancestor = detectAncestorAgent()
+  // Agent ancestors of this `tg`, nearest first: the nearest is the sender, the
+  // rest its process lineage (the route's parent, #503). One ps read for both.
+  const ancestry = detectAgentAncestry()
+  const ancestor = ancestry[0] ?? null
   const ompAncestorPid = ancestor?.agent === "omp" ? ancestor.pid : null
   const tmuxPane = getTmuxPane()
   const ompSession = getOmpSession(ompAncestorPid)
@@ -1648,6 +1651,10 @@ if (import.meta.main) {
     ompAncestorPid,
     hostName: ownHost?.name,
   })
+  // A nested out-of-tmux omp (a disposable `omp --print` child) names the omp that
+  // started it: once the child exits, a reply goes there (#503). Process ancestry
+  // only — a live session that merely shares this cwd is never recorded.
+  const parentPaneId = lineageParentOriginId({ tmuxPane: TMUX_PANE, ancestry })
   const ROUTES_PATH = originPaneId
     ? ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).routes
     : null
@@ -1755,6 +1762,7 @@ if (import.meta.main) {
         ts: Math.floor(Date.now() / 1000),
         ...origin.locators,
         ...(origin.sessionKey ? { sessionKey: origin.sessionKey } : {}),
+        ...(parentPaneId ? { parentPaneId } : {}),
       }
       // Serialize the read-modify-write across concurrent agents: two `tg` sends
       // racing this RMW would last-writer-wins-clobber each other's route entries,

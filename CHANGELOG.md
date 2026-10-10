@@ -3,6 +3,30 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.14
+
+- **A reply to an exited one-shot sender no longer goes to whichever live agent shares its
+  working directory (#503, replaces the #423 heuristic).** The dead-sender fallback picked the
+  only live agent whose cwd equalled the dead sender's recorded cwd — but unrelated sessions
+  routinely share `/tmp` or a repository root, so replies were typed into the wrong session
+  (tg#17659). Parentage is now proven at send time: `tg` running outside tmux under a nested omp
+  (a disposable `omp --print` child of a live orchestrator) records the omp that started it as the
+  route's `parentPaneId` (`omp:<pid>`), read from the process tree. When the child is gone — never
+  seen by the registry, or registered and since exited — the reply goes to that parent if it is
+  live (its own `omp:<pid>` row, or the tmux pane it runs in), with a `↩️ <origin> is gone —
+  routed to <label>, the session that started it` notice; otherwise the picker with the named
+  "no longer running" notice. A shared cwd alone never routes. `parseRoutes` keeps
+  `parentPaneId` only in the `omp:<pid>` shape `tg` writes.
+- `findAgentInAncestry` → `findAgentsInAncestry` (every agent ancestor, nearest first) and
+  `detectAncestorAgent` → `detectAgentAncestry`; one `ps` read serves both the sender and its
+  lineage parent.
+- Tests: `ctl-reply-dead-sender-integration` (a sole same-cwd agent and a dead recorded parent
+  both get the picker, nothing typed), `ctl-omp-reply-no-tmux-integration` (an unregistered and
+  a registered-then-gone nested omp both reach their live parent through its original-process
+  bridge), `cli-omp-route-notmux` (a nested omp records `parentPaneId`, a lone one does not),
+  plus unit tests for the ancestry chain, `lineageParentOriginId`, `lineageParentCandidate` and
+  the route round-trip.
+
 ## 1.55.12
 
 - **`tg-ctl audit-delivery --since/--until` and `tg replies --since/--until` accept standard ISO

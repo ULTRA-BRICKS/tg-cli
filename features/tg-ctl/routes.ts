@@ -10,6 +10,7 @@
 
 import { closeSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
+import { isLiveOmpOriginId } from './omp';
 
 export interface Route {
   id: number; // Telegram message_id of an outbound message
@@ -27,6 +28,11 @@ export interface Route {
   agentPid?: number;
   serverPid?: number;
   panePid?: number;
+  // The origin's process-lineage parent (`omp:<pid>`), recorded by `tg` at send
+  // time when it runs under a nested out-of-tmux omp (#503): the omp that started
+  // that child. A reply to the child after it exits goes here, and only here —
+  // never to a session inferred from a shared cwd.
+  parentPaneId?: string;
   // Unix seconds the migration found this row unresolvable. A legacy row is kept
   // only for "that session is gone" answers and dropped LEGACY_ROUTE_TTL_SEC later.
   legacySince?: number;
@@ -61,6 +67,8 @@ export function parseRoutes(raw: string | null): Route[] {
       ...(posInt(rec.agentPid) ? { agentPid: rec.agentPid } : {}),
       ...(posInt(rec.serverPid) ? { serverPid: rec.serverPid } : {}),
       ...(posInt(rec.panePid) ? { panePid: rec.panePid } : {}),
+      // Only the shape `tg` writes: a pane-shaped value would name a tmux row.
+      ...(typeof rec.parentPaneId === 'string' && isLiveOmpOriginId(rec.parentPaneId) ? { parentPaneId: rec.parentPaneId } : {}),
       ...(typeof rec.legacySince === 'number' && Number.isFinite(rec.legacySince) ? { legacySince: rec.legacySince } : {}),
     });
   }

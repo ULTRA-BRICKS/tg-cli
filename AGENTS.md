@@ -238,7 +238,11 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
   the rig wrapper's host label leads when the session has one, else the title leads (the title
   is secondary under a label); cwd basename is the fallback tier. Shared by the `tg` header, the `/agent`
   picker, `tg-ctl status`, the history label and question cards; never a `no tmux` placeholder),
-  `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker),
+  `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker; a route from a
+  nested out-of-tmux omp also records `parentPaneId` = `omp:<pid>` of the omp that started it,
+  read from the process tree at send time — a reply to that child after it exits goes to this
+  live parent, else the picker; a live agent that only shares the dead sender's cwd never gets
+  it, #503),
   `unreachable.ts` + `inbox.ts` (tg-cli#306, tg-cli#456: agents OUTSIDE tmux — a `ps pid,tty`
   scan + lsof cwd finds interactive agent processes in no pane and in no rig-wrapper host; they
   are listed as `unreachable: not in tmux`. `/agent <name> …` to one gets a one-line refusal

@@ -4,7 +4,7 @@ import {
   parseProcList,
   matchAgentCommand,
   findAgentInPane,
-  findAgentInAncestry,
+  findAgentsInAncestry,
   pickTargetPane,
   pickTargetPaneFromSet,
   panesWithRetry,
@@ -182,7 +182,7 @@ test('matches pi by argv0 basename', () => {
 // omp (Oh My Pi) is a compiled Bun binary at /opt/homebrew/bin/omp — its argv0
 // basename is literally 'omp'. The one matchAgentCommand row feeds BOTH
 // directions: inbound pane discovery (findAgentInPane) and outbound branding
-// (findAgentInAncestry).
+// (findAgentsInAncestry).
 test('matchAgentCommand classifies the omp binary by argv0 basename', () => {
   expect(matchAgentCommand('omp')).toBe('omp');
   expect(matchAgentCommand('/opt/homebrew/bin/omp')).toBe('omp');
@@ -233,10 +233,11 @@ test('survives a ppid cycle in the snapshot without hanging', () => {
   expect(findAgentInPane(p, procs)).toBeNull();
 });
 
-// --- findAgentInAncestry ---
+// --- findAgentsInAncestry ---
 // Mirror of findAgentInPane but walking UP the ppid chain from a start pid.
 // Used by outbound `tg` to learn which agent launched it as a subprocess
-// (codex/aider/pi/omp export no env marker, unlike Claude Code's CLAUDECODE).
+// (codex/aider/pi/omp export no env marker, unlike Claude Code's CLAUDECODE),
+// and which omp started THAT one (the lineage parent of a nested omp, #503).
 
 test('finds codex as the direct parent of tg (codex launched the shell command)', () => {
   // Real shape verified live: `codex exec` is the immediate parent of the shell
@@ -245,7 +246,7 @@ test('finds codex as the direct parent of tg (codex launched the shell command)'
     proc(900, 800, '/opt/homebrew/bin/codex exec --json'),
     proc(950, 900, 'tg some report'),
   ];
-  expect(findAgentInAncestry(procs, 900)).toEqual({ agent: 'codex', pid: 900 });
+  expect(findAgentsInAncestry(procs, 900)).toEqual([{ agent: 'codex', pid: 900 }]);
 });
 
 test('finds codex through an intermediate shell (codex → bash -lc → tg)', () => {
@@ -255,7 +256,7 @@ test('finds codex through an intermediate shell (codex → bash -lc → tg)', ()
     proc(720, 710, 'bun run tg'),
   ];
   // tg's process.ppid is 710 (the shell); walk up past it to codex.
-  expect(findAgentInAncestry(procs, 710)).toEqual({ agent: 'codex', pid: 700 });
+  expect(findAgentsInAncestry(procs, 710)).toEqual([{ agent: 'codex', pid: 700 }]);
 });
 
 test('finds omp through an intermediate shell (omp → bash -lc → tg)', () => {
@@ -266,7 +267,7 @@ test('finds omp through an intermediate shell (omp → bash -lc → tg)', () => 
     proc(760, 750, 'bash -lc tg "status"'),
     proc(770, 760, 'tg status'),
   ];
-  expect(findAgentInAncestry(procs, 760)).toEqual({ agent: 'omp', pid: 750 });
+  expect(findAgentsInAncestry(procs, 760)).toEqual([{ agent: 'omp', pid: 750 }]);
 });
 
 test('finds omp run from source via bun --preload through an intermediate shell (tg-cli#413 follow-up)', () => {
@@ -282,7 +283,7 @@ test('finds omp run from source via bun --preload through an intermediate shell 
     proc(760, 750, 'bash -lc tg "status"'),
     proc(770, 760, 'tg status'),
   ];
-  expect(findAgentInAncestry(procs, 760)).toEqual({ agent: 'omp', pid: 750 });
+  expect(findAgentsInAncestry(procs, 760)).toEqual([{ agent: 'omp', pid: 750 }]);
 });
 
 test('a background ollama daemon is NOT in the ancestry, so it never matches', () => {
@@ -293,27 +294,43 @@ test('a background ollama daemon is NOT in the ancestry, so it never matches', (
     proc(800, 1, '-zsh'),
     proc(850, 800, 'bun run tg report'),
   ];
-  expect(findAgentInAncestry(procs, 800)).toBeNull();
+  expect(findAgentsInAncestry(procs, 800)).toEqual([]);
 });
 
-test('returns the shallowest agent ancestor (nearest parent wins)', () => {
+test('lists agent ancestors nearest first (the nearest parent is the sender)', () => {
   const procs = [
     proc(100, 1, 'codex exec'),
     proc(110, 100, 'aider --model x'), // nearer to tg than codex
     proc(120, 110, 'tg ...'),
   ];
-  expect(findAgentInAncestry(procs, 110)).toEqual({ agent: 'aider', pid: 110 });
+  expect(findAgentsInAncestry(procs, 110)).toEqual([
+    { agent: 'aider', pid: 110 },
+    { agent: 'codex', pid: 100 },
+  ]);
+});
+
+test('a nested omp keeps its whole lineage: the child omp, then the omp that started it', () => {
+  const procs = [
+    proc(700, 1, '/opt/homebrew/bin/omp'),
+    proc(710, 700, 'bash -lc omp --print child'),
+    proc(720, 710, '/opt/homebrew/bin/omp --print child'),
+    proc(730, 720, 'bash -lc tg report'),
+  ];
+  expect(findAgentsInAncestry(procs, 730)).toEqual([
+    { agent: 'omp', pid: 720 },
+    { agent: 'omp', pid: 700 },
+  ]);
 });
 
 test('survives a ppid cycle in the ancestry snapshot without hanging', () => {
   const procs = [proc(50, 60, '-zsh'), proc(60, 50, 'bash')];
-  expect(findAgentInAncestry(procs, 50)).toBeNull();
+  expect(findAgentsInAncestry(procs, 50)).toEqual([]);
 });
 
 test('stops cleanly at pid 1 / missing parent', () => {
   const procs = [proc(300, 1, '-zsh')];
-  expect(findAgentInAncestry(procs, 300)).toBeNull();
-  expect(findAgentInAncestry(procs, 999999)).toBeNull(); // unknown start pid
+  expect(findAgentsInAncestry(procs, 300)).toEqual([]);
+  expect(findAgentsInAncestry(procs, 999999)).toEqual([]); // unknown start pid
 });
 
 // --- pickTargetPane ---

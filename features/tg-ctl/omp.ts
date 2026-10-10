@@ -6,7 +6,7 @@
 
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { matchAgentCommand, paneIdByPid } from './discover';
+import { matchAgentCommand, paneIdByPid, type AgentAncestor } from './discover';
 import type { AgentKind, PaneInfo, ProcInfo } from './types';
 import { uniqueProjectSelectorHits, type AgentCandidate } from './agent-match';
 import { hostOriginId } from './host-registry';
@@ -260,11 +260,45 @@ export function outboundOriginPaneId(opts: {
   return opts.hostName ? hostOriginId(opts.hostName) : null;
 }
 
+/**
+ * Lineage parent `tg` stamps on an outbound route (#503): the omp that started the
+ * nearest one, when `tg` runs outside tmux under a nested omp (a disposable
+ * `omp --print` child of a live orchestrator). `ancestry` is the agent ancestors of
+ * `tg`, nearest first; the nearest omp is the route origin itself. A reply to the
+ * child after it exits goes to this parent. A session that only shares the child's
+ * cwd is never lineage: unrelated sessions share /tmp or a repository root.
+ */
+export function lineageParentOriginId(opts: {
+  tmuxPane?: string | null;
+  ancestry: AgentAncestor[];
+}): string | null {
+  if (opts.tmuxPane?.trim()) return null;
+  const [nearest, ...above] = opts.ancestry;
+  if (nearest?.agent !== 'omp') return null;
+  const parent = above.find((a) => a.agent === 'omp');
+  return parent ? liveOmpPaneId(parent.pid) : null;
+}
+
 /** Live omp process that owns this origin — synthetic omp:<pid> or a tmux pane id. */
 export function matchLiveOmpOrigin(originPaneId: string, agents: LiveOmpAgent[]): LiveOmpAgent | null {
   const pid = liveOmpPidFromOriginId(originPaneId);
   if (pid !== null) return agents.find((a) => a.pid === pid) ?? null;
   return agents.find((a) => a.paneId === originPaneId) ?? null;
+}
+
+/**
+ * The live picker candidate a route's lineage parent (`omp:<pid>`, #503) is now. An
+ * out-of-tmux parent is the `omp:<pid>` row itself; a parent shown in a tmux pane
+ * rides that pane's row (mergeLiveOmpCandidates), found through its live process.
+ * The parent is named by pid, the same identity an `omp:<pid>` route origin has.
+ */
+export function lineageParentCandidate(
+  parentId: string,
+  candidates: AgentCandidate[],
+  live: LiveOmpAgent[],
+): AgentCandidate | null {
+  const paneId = matchLiveOmpOrigin(parentId, live)?.paneId ?? null;
+  return candidates.find((c) => c.paneId === parentId || (paneId !== null && c.paneId === paneId)) ?? null;
 }
 
 /**
