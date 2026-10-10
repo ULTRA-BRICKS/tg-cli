@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
@@ -910,6 +910,132 @@ test('tg#30: an UNSCOPED question (hook had no TMUX_PANE) still DEFERS inbound, 
   }
   expect(injected(cfgDir)).toEqual([]); // NOT send-keys'd into the open prompt (the fail-open bug)
   expect(reactions.at(-1)).toMatchObject({ message_id: 21, reaction: [{ type: 'emoji', emoji: '✍️' }] });
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+// tg-cli#127: answering an UNSCOPED question (no paneId) must release the inbound it
+// deferred. The answer path only flushed `pending.req.paneId`, so a paneless answer
+// released nothing and the CTO's text stayed ✍️ forever.
+test('tg-cli#127: answering an UNSCOPED question delivers the inbound deferred behind it', async () => {
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const edits: string[] = [];
+  const server = recordingServer(updateQueue, reactions, edits);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const ask = startAsk(
+    cfgDir,
+    server.port,
+    { requestId: 'q_unscoped_answer', agent: 'claude', kind: 'question', question: 'Proceed?', options: [{ label: 'Yes' }] },
+    { unscoped: true },
+  );
+  trackProc(reg, ask);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
+    expect(server.cb()).not.toBe('');
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([
+    { update_id: 60, message: { message_id: 61, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'release me' } },
+  ]);
+  await waitForTelegramReaction(reactions, 61, '✍️', 8000);
+  expect(injected(cfgDir)).toEqual([]);
+
+  updateQueue.push([
+    {
+      update_id: 62,
+      callback_query: {
+        id: 'cb127',
+        from: { id: 1, first_name: 'Alex' },
+        message: { message_id: 1, chat: { id: 1 }, date: nowSec },
+        data: server.cb(),
+      },
+    },
+  ]);
+  await ask.exited;
+
+  await waitForInjected(cfgDir, 'release me', 8000);
+  await waitForTelegramReaction(reactions, 61, '👀', 4000);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+// tg-cli#127: a deferred message whose flush fails is dead-lettered — the CTO is told to
+// resend it — so its ✍️ ("noted, queued") must be cleared, not left claiming it still waits.
+test('tg-cli#127: a deferred message whose flush fails loses its ✍️ and the CTO is told', async () => {
+  const cfgDir = makeCfgDir();
+  // Wrap the fake tmux so typing or pasting the marked text fails, like a dead pane.
+  const bin = join(cfgDir, 'bin');
+  renameSync(join(bin, 'tmux'), join(bin, 'tmux-real'));
+  writeFileSync(
+    join(bin, 'tmux'),
+    `#!/bin/sh
+real="$(dirname "$0")/tmux-real"
+if [ "$1" = send-keys ]; then for a in "$@"; do case "$a" in *undeliverable*) exit 1;; esac; done; fi
+if [ "$1" = load-buffer ]; then buf=$(cat); case "$buf" in *undeliverable*) exit 1;; esac; printf '%s' "$buf" | exec "$real" "$@"; fi
+exec "$real" "$@"
+`,
+    { mode: 0o755 },
+  );
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const edits: string[] = [];
+  const plainMessages: string[] = [];
+  const server = recordingServer(updateQueue, reactions, edits, plainMessages);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const ask = startAsk(
+    cfgDir,
+    server.port,
+    { requestId: 'q_dead_letter', agent: 'claude', kind: 'question', question: 'Proceed?', options: [{ label: 'Yes' }] },
+    { unscoped: true },
+  );
+  trackProc(reg, ask);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
+    expect(server.cb()).not.toBe('');
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([
+    { update_id: 90, message: { message_id: 91, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'undeliverable text' } },
+  ]);
+  await waitForTelegramReaction(reactions, 91, '✍️', 8000);
+
+  updateQueue.push([
+    {
+      update_id: 92,
+      callback_query: {
+        id: 'cb127dead',
+        from: { id: 1, first_name: 'Alex' },
+        message: { message_id: 1, chat: { id: 1 }, date: nowSec },
+        data: server.cb(),
+      },
+    },
+  ]);
+  await ask.exited;
+
+  const notified = (): boolean => plainMessages.some((m) => m.includes('tg#91 was not delivered'));
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && !notified()) await Bun.sleep(50);
+  }
+  expect(notified()).toBe(true);
+  expect(injected(cfgDir).some((l) => l.includes('undeliverable'))).toBe(false);
+  // ✍️ then the cleared reaction (an empty list); never 👀.
+  expect(reactions.filter((r) => r.message_id === 91).map((r) => r.reaction)).toEqual([
+    [{ type: 'emoji', emoji: '✍️' }],
+    [],
+  ]);
 
   daemon.kill('SIGTERM');
   await daemon.exited;

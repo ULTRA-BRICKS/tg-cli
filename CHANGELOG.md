@@ -3,6 +3,15 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.7
+
+- **Answering a question that had no tmux pane now delivers the messages queued behind it (#127).**
+  An unscoped question defers inbound for every pane, but its answer only flushed a pane when the
+  question carried one, so the CTO's text stayed ✍️ forever. The answer now releases every pane's
+  backlog via the same path the unscoped abandon/expiry already used. A deferred message whose
+  delivery fails no longer keeps its ✍️: the reaction is cleared next to the "was not delivered"
+  reply, so nothing claims it is still queued.
+
 ## 1.55.6
 
 - **The test suite no longer reads the machine it runs on, and no longer parks the daemon under test

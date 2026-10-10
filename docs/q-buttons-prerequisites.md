@@ -145,7 +145,9 @@ the source Telegram message with **✍️** ("noted, queued") — Telegram's all
 reaction set has no ⏳, so ✍️ is the closest. When the question is answered, or
 released without an inline Telegram answer and no other live question owns that
 pane, the queue is **flushed** into the pane (after a short settle delay). After
-successful delivery the source reaction flips from **✍️** to **👀**. Control
+successful delivery the source reaction flips from **✍️** to **👀**; a message
+whose delivery fails loses its ✍️ and the daemon replies that it was not
+delivered (resend it). Control
 verbs (`/stop` = Escape) are never deferred — they go through to interrupt the
 prompt.
 

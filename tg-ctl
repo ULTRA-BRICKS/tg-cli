@@ -7604,7 +7604,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // The session the pane hosted when this was queued (spec §2.6): the flush
     // delivers it only while the pane still hosts that session.
     sessionKey?: string
-    delivered: boolean
+    // queued → ✍️ is true; delivered → 👀; dead-lettered (the flush failed and the CTO was
+    // told to resend) → no reaction, since ✍️ would claim it is still waiting (#127).
+    state: "queued" | "delivered" | "dead-lettered"
   }
   // Inbound queued behind an agent's outstanding question (defer-while-waiting):
   // pane → already-wrapped texts plus their Telegram source message id, flushed
@@ -7681,7 +7683,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // silently drop the human's queued messages (graceful-reload). Best-effort like
   // routes/questions: a persist failure must never break the hot enqueue/flush
   // path — the backlog simply isn't durable until the next mutation. The runtime
-  // `delivered` flag is dropped; a restored item is re-created with delivered:false.
+  // `state` is dropped; a restored item is re-created as state "queued".
   const persistDeferred = (): void => {
     try {
       atomicWrite(
@@ -7719,7 +7721,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
               sourceMessageId: i.sourceMessageId,
               relatedReactionMessageId: i.relatedReactionMessageId,
               ...(i.sessionKey ? { sessionKey: i.sessionKey } : {}),
-              delivered: false,
+              state: "queued",
             })),
           ],
         ),
@@ -7742,14 +7744,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   ): DeferredInbound => {
     const reg = sessionKey === undefined ? currentSessionRegistry() : null
     const key = sessionKey ?? (reg ? sessionAtPane(reg, paneId)?.key : undefined)
-    const item: DeferredInbound = { text: wrappedText, sourceMessageId, relatedReactionMessageId, delivered: false, ...(key ? { sessionKey: key } : {}) }
+    const item: DeferredInbound = { text: wrappedText, sourceMessageId, relatedReactionMessageId, state: "queued", ...(key ? { sessionKey: key } : {}) }
     deferred.enqueue(paneId, item)
     persistDeferred()
     recordHeld(sourceMessageId, paneId, "deferred")
     return item
   }
   const markDeferredForAck = (item: DeferredInbound): void => {
-    queueAckReaction(item.sourceMessageId, DEFER_REACTION, () => !item.delivered)
+    queueAckReaction(item.sourceMessageId, DEFER_REACTION, () => item.state === "queued")
   }
   const injectDeferredOne = async (paneId: string, item: DeferredInbound): Promise<boolean> => {
     // Must NEVER throw: a throw here rejects driveFlush, which (a) loses the
@@ -7764,7 +7766,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const res = await (deliverHostPane(paneId, item.text, item.sourceMessageId) ??
         injectInbound(item.sourceMessageId, paneId, buildTextInjectPlan(paneId, item.text, { sessionKey: item.sessionKey })))
       if (res.ok) {
-        item.delivered = true
+        item.state = "delivered"
         await setSeenReactions(item.sourceMessageId, item.relatedReactionMessageId)
         return true
       }
@@ -7787,7 +7789,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       log(`deferred flush into ${paneId} threw: ${err}`)
       error = err instanceof Error ? err.message : String(err)
     }
-    if (item.sourceMessageId !== null) await tellUndelivered(item.sourceMessageId, `was not delivered to ${paneId}: ${error}. Resend it if it still matters.`)
+    item.state = "dead-lettered"
+    if (item.sourceMessageId !== null) {
+      await Promise.all([
+        clearReaction(item.sourceMessageId),
+        tellUndelivered(item.sourceMessageId, `was not delivered to ${paneId}: ${error}. Resend it if it still matters.`),
+      ])
+    }
     return false
   }
   const flushDeferred = async (paneId: string): Promise<void> => {
@@ -8906,8 +8914,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // today — `res.deferred` is included explicitly anyway (Opus review finding)
     // so this stays correct even if a future refactor ever decouples the two.
     if (res.ok || res.deferred) recordLastUserTarget(target.paneId, target.panePath)
-    if (res.deferred && pending.sourceMessageId !== null && !res.deferredItem?.delivered) {
-      await setReaction(pending.sourceMessageId, DEFER_REACTION)
+    const deferredState = res.deferredItem?.state ?? "queued"
+    if (res.deferred && pending.sourceMessageId !== null && deferredState !== "delivered") {
+      if (deferredState === "queued") await setReaction(pending.sourceMessageId, DEFER_REACTION)
     } else if (res.ok) {
       await setSeenReactions(pending.sourceMessageId, pending.relatedReactionMessageId)
     }
@@ -10668,16 +10677,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // Best-effort delivery receipt (spec §10): 👀 on the source message. A
   // failed reaction is logged and otherwise ignored — receipts must never
   // break the poll loop (e.g. a Bot API fake without the endpoint).
-  const setReaction = async (messageId: number, emoji: string): Promise<void> => {
+  const postReaction = async (messageId: number, reaction: Array<{ type: "emoji"; emoji: string }>): Promise<void> => {
     try {
       const resp = await fetch(`${api(ctx)}/setMessageReaction`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: ctx.chatId,
-          message_id: messageId,
-          reaction: [{ type: "emoji", emoji }],
-        }),
+        body: JSON.stringify({ chat_id: ctx.chatId, message_id: messageId, reaction }),
         signal: AbortSignal.timeout(15_000),
       })
       if (!resp.ok) log(`setMessageReaction failed: ${resp.status}`)
@@ -10685,6 +10690,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       log(`setMessageReaction failed: ${err}`)
     }
   }
+  const setReaction = (messageId: number, emoji: string): Promise<void> => postReaction(messageId, [{ type: "emoji", emoji }])
+  // An empty list removes the bot's reaction.
+  const clearReaction = (messageId: number): Promise<void> => postReaction(messageId, [])
   const setSeenReaction = (messageId: number): Promise<void> => setReaction(messageId, "👀")
   const setSeenReactions = async (
     primaryMessageId: number | null,
@@ -11641,9 +11649,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // The agent is unblocked → deliver anything queued behind this question.
         // Fire-and-forget, but guard the promise: an error here must never become
         // an unhandled rejection that takes down the daemon.
+        // A paneless (unscoped) question deferred EVERY pane, so its answer must
+        // release them all — the entry is already out of pendingButtons above, as
+        // onUnscopedRelease's caller contract requires (tg-cli#127).
         if (pending.req.paneId) {
           flushDeferred(pending.req.paneId).catch((err) => log(`flushDeferred error: ${err}`))
-        }
+        } else onUnscopedRelease()
         return true
       }
       case "status":

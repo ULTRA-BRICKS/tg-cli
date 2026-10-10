@@ -14,10 +14,10 @@
 // answered — so a graceful reload loses no queued message.
 //
 // The item shape mirrors the daemon's DeferredInbound MINUS its runtime-only
-// `delivered` flag (always false for a still-queued item): the durable fields
+// `state` (always "queued" for a still-queued item): the durable fields
 // are the wrapped text and the two Telegram message ids used for ack reactions
 // on delivery. `req`-style re-validation is not needed — these are plain strings
-// and ids the daemon re-wraps into DeferredInbound (delivered:false) on restore.
+// and ids the daemon re-wraps into DeferredInbound (state "queued") on restore.
 
 // One queued inbound message, durable fields only.
 export interface DeferredStoreItem {
