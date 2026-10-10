@@ -8,7 +8,7 @@
 // Runs against a LOCAL fake Telegram server (Bun.serve, token `123:abc`,
 // chat 1) — nothing ever reaches a real chat.
 import { afterAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
@@ -90,6 +90,7 @@ afterAll(async () => {
     }
   }
   server.stop(true);
+  rmSync(cfgDir, { recursive: true, force: true });
 });
 
 async function waitFor(cond: () => boolean, ms: number): Promise<boolean> {

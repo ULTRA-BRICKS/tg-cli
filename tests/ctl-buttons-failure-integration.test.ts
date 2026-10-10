@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, writeFileSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
@@ -10,10 +10,12 @@ const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
 const reg = createDaemonRegistry();
 const servers: Array<{ stop: (closeActiveConnections?: boolean) => void }> = [];
+const tempDirs: string[] = [];
 
 afterEach(async () => {
   await reapDaemons(reg);
   for (const s of servers.splice(0)) s.stop(true);
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 test('tg-ctl ask returns no decision immediately when the Telegram prompt cannot be sent', async () => {
@@ -46,6 +48,7 @@ test('tg-ctl ask returns no decision immediately when the Telegram prompt cannot
 
 test('tg-ctl ask exits 0 with no output when credentials are absent', async () => {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-buttons-nocreds-'));
+  tempDirs.push(cfgDir);
   const ask = Bun.spawn([process.execPath, TG_CTL, 'ask'], {
     env: {
       HOME: cfgDir,
@@ -101,8 +104,7 @@ test('tg-ctl ask does not create inline buttons for unsupported Codex question h
   const stdout = await new Response(ask.stdout).text();
   await ask.exited;
 
-  const t0 = Date.now();
-  while (Date.now() - t0 < 5000 && sentMessages.length === 0) await Bun.sleep(50);
+  await waitForEvent(() => sentMessages.length > 0);
   expect(stdout).toBe('');
   expect(sentMessages).toEqual([
     {
@@ -114,39 +116,38 @@ test('tg-ctl ask does not create inline buttons for unsupported Codex question h
 
 test('tg-ctl ask fast-passes unsupported hooks before slow Telegram notices finish', async () => {
   const cfgDir = makeCfgDir();
-  let noticeDone = false;
+  // The notice's sendMessage response is held until the ask has exited: an ask that waited for
+  // the notice could never exit, so the test needs no wall-clock budget to tell the two apart.
+  const noticeResponse = Promise.withResolvers<void>();
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
       const url = new URL(req.url);
       if (url.pathname.endsWith('/getUpdates')) return Response.json({ ok: true, result: [] });
       if (url.pathname.endsWith('/sendMessage')) {
-        // The notice send is deliberately slow. The ask MUST return before it
-        // resolves — `noticeDone` flips only after this 3s block completes, so
-        // asserting it's still false at ask-exit is a deterministic proof the
-        // ask did not wait for the send (no wall-clock budget to flake under load).
-        await Bun.sleep(3000);
-        noticeDone = true;
+        await noticeResponse.promise;
         return Response.json({ ok: true, result: { message_id: 92 } });
       }
       return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
     },
   });
   servers.push(server);
-  const daemon = await startDaemon(cfgDir, server.port);
+  try {
+    await startDaemon(cfgDir, server.port);
 
-  const ask = startAsk(cfgDir, server.port, {
-    requestId: 'codex_question_slow_notice',
-    agent: 'codex',
-    kind: 'question',
-    question: 'Pick a value',
-    options: [{ label: 'A' }],
-  });
-  const stdout = await new Response(ask.stdout).text();
-  await ask.exited;
-
-  expect(noticeDone).toBe(false);
-  expect(stdout).toBe('');
+    const ask = startAsk(cfgDir, server.port, {
+      requestId: 'codex_question_slow_notice',
+      agent: 'codex',
+      kind: 'question',
+      question: 'Pick a value',
+      options: [{ label: 'A' }],
+    });
+    const stdout = await new Response(ask.stdout).text();
+    await ask.exited;
+    expect(stdout).toBe('');
+  } finally {
+    noticeResponse.resolve();
+  }
 }, 10_000);
 
 test('tg-ctl ask fast-passes when the hook cwd does not match the active registration', async () => {
@@ -240,8 +241,7 @@ esac
     },
   );
 
-  const t0 = Date.now();
-  while (Date.now() - t0 < 5000 && sentMessages.length === 0) await Bun.sleep(50);
+  await waitForEvent(() => sentMessages.length > 0);
   if (ask.exitCode === null) {
     ask.kill(9);
     await ask.exited;
@@ -275,10 +275,10 @@ test('tg-ctl ask rejects duplicate active callback ids without replacing the fir
     kind: 'question',
     question: 'Continue?',
   });
-  const t0 = Date.now();
-  while (Date.now() - t0 < 5000 && sendCount === 0) await Bun.sleep(50);
+  // The first card is ACTIVE once the daemon accepted the sendMessage response — not when the
+  // fake API merely received the request (the in-flight case is the next test).
+  await waitForEvent(() => daemonLog(cfgDir).includes('ask-forward posted: agent=claude kind=question req=q_duplicate '));
   expect(sendCount).toBe(1);
-  await Bun.sleep(50);
 
   const second = startAsk(cfgDir, server.port, {
     requestId: 'q_duplicate',
@@ -296,7 +296,9 @@ test('tg-ctl ask rejects duplicate active callback ids without replacing the fir
 test('tg-ctl ask reserves callback ids while sendMessage is still in flight', async () => {
   const cfgDir = makeCfgDir();
   let sendCount = 0;
-  let firstSendStarted = false;
+  // The first card's sendMessage response is held until the duplicate was turned away, so the
+  // duplicate provably arrives while the first send is still in flight.
+  const sendResponse = Promise.withResolvers<void>();
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -304,37 +306,42 @@ test('tg-ctl ask reserves callback ids while sendMessage is still in flight', as
       if (url.pathname.endsWith('/getUpdates')) return Response.json({ ok: true, result: [] });
       if (url.pathname.endsWith('/sendMessage')) {
         sendCount += 1;
-        firstSendStarted = true;
-        await Bun.sleep(300);
+        await sendResponse.promise;
         return Response.json({ ok: true, result: { message_id: 100 + sendCount } });
       }
       return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
     },
   });
   servers.push(server);
-  const daemon = await startDaemon(cfgDir, server.port);
+  try {
+    await startDaemon(cfgDir, server.port);
 
-  const first = startAsk(cfgDir, server.port, {
-    requestId: 'q_duplicate_inflight',
-    agent: 'claude',
-    kind: 'question',
-    question: 'Continue?',
-  });
-  const t0 = Date.now();
-  while (Date.now() - t0 < 5000 && !firstSendStarted) await Bun.sleep(25);
-  expect(firstSendStarted).toBe(true);
+    startAsk(cfgDir, server.port, {
+      requestId: 'q_duplicate_inflight',
+      agent: 'claude',
+      kind: 'question',
+      question: 'Continue?',
+    });
+    await waitForEvent(() => sendCount === 1);
 
-  const second = startAsk(cfgDir, server.port, {
-    requestId: 'q_duplicate_inflight',
-    agent: 'claude',
-    kind: 'question',
-    question: 'Continue again?',
-  });
-  const stdout = await new Response(second.stdout).text();
-  await second.exited;
+    const second = startAsk(cfgDir, server.port, {
+      requestId: 'q_duplicate_inflight',
+      agent: 'claude',
+      kind: 'question',
+      question: 'Continue again?',
+    });
+    const stdout = await new Response(second.stdout).text();
+    await second.exited;
 
-  expect(stdout).toBe('');
-  expect(sendCount).toBe(1);
+    expect(stdout).toBe('');
+    expect(sendCount).toBe(1);
+    await waitForEvent(() =>
+      daemonLog(cfgDir).includes('ask-forward dropped: reason=duplicate-in-flight agent=claude kind=question req=q_duplicate_inflight '),
+    );
+    expect(daemonLog(cfgDir)).not.toContain('ask-forward posted: agent=claude kind=question req=q_duplicate_inflight ');
+  } finally {
+    sendResponse.resolve();
+  }
 }, 10_000);
 
 test('daemon resolves a callback that arrives before sendMessage returns', async () => {
@@ -342,6 +349,9 @@ test('daemon resolves a callback that arrives before sendMessage returns', async
   let callbackData: string | null = null;
   let callbackServed = false;
   const edited: unknown[] = [];
+  // The card's sendMessage response is held until the hook has its answer, so the tap is
+  // provably handled while the send is still in flight.
+  const sendResponse = Promise.withResolvers<void>();
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -370,7 +380,7 @@ test('daemon resolves a callback that arrives before sendMessage returns', async
       if (url.pathname.endsWith('/sendMessage')) {
         const body = await req.json();
         callbackData = body.reply_markup.inline_keyboard[0][0].callback_data;
-        await Bun.sleep(300);
+        await sendResponse.promise;
         return Response.json({ ok: true, result: { message_id: 101 } });
       }
       if (url.pathname.endsWith('/answerCallbackQuery')) return Response.json({ ok: true, result: true });
@@ -382,31 +392,36 @@ test('daemon resolves a callback that arrives before sendMessage returns', async
     },
   });
   servers.push(server);
-  const daemon = await startDaemon(cfgDir, server.port);
+  try {
+    await startDaemon(cfgDir, server.port);
 
-  const ask = startAsk(cfgDir, server.port, {
-    requestId: 'q_fast_callback',
-    agent: 'claude',
-    kind: 'question',
-    question: 'Continue?',
-    options: [{ label: 'A' }],
-  });
-  const stdout = await new Response(ask.stdout).text();
-  await ask.exited;
+    const ask = startAsk(cfgDir, server.port, {
+      requestId: 'q_fast_callback',
+      agent: 'claude',
+      kind: 'question',
+      question: 'Continue?',
+      options: [{ label: 'A' }],
+    });
+    const stdout = await new Response(ask.stdout).text();
+    await ask.exited;
 
-  expect(JSON.parse(stdout)).toMatchObject({
-    hookSpecificOutput: {
-      updatedInput: {
-        answers: { 'Continue?': 'A' },
+    expect(JSON.parse(stdout)).toMatchObject({
+      hookSpecificOutput: {
+        updatedInput: {
+          answers: { 'Continue?': 'A' },
+        },
       },
-    },
-  });
-
-  const t0 = Date.now();
-  while (Date.now() - t0 < 5000 && edited.length === 0) await Bun.sleep(50);
-  expect(edited).toEqual([
-    { chat_id: 1, message_id: 101, text: `Question from claude\n\nSource: agent=claude\nCwd: ${cfgDir}\n\nContinue?\n\nSelected answer: A` },
-  ]);
+    });
+    // The answered text needs the message id, which only the send's response carries.
+    expect(edited).toEqual([]);
+    sendResponse.resolve();
+    await waitForEvent(() => edited.length > 0);
+    expect(edited).toEqual([
+      { chat_id: 1, message_id: 101, text: `Question from claude\n\nSource: agent=claude\nCwd: ${cfgDir}\n\nContinue?\n\nSelected answer: A` },
+    ]);
+  } finally {
+    sendResponse.resolve();
+  }
 }, 10_000);
 
 test('daemon rejects a stale tap from a different Telegram message and accepts the matching one', async () => {
@@ -494,6 +509,9 @@ test('daemon rejects a stale tap from a different Telegram message and accepts t
       },
     },
   });
+  // The hook's answer goes down the socket before the tap is acknowledged, so the ack of the
+  // matching tap can land after the ask has exited.
+  await waitForEvent(() => answered.length >= 2);
   expect(answered).toEqual([
     { callback_query_id: 'cb_stale', text: 'expired' },
     { callback_query_id: 'cb_fresh', text: '✓ sent to the agent' },
@@ -504,7 +522,10 @@ test('daemon returns hook output before slow Telegram callback cleanup finishes'
   const cfgDir = makeCfgDir();
   let callbackData: string | null = null;
   let callbackServed = false;
-  let cleanupDone = false;
+  let cleanupStarted = false;
+  // The tap's acknowledgement (the callback cleanup) is held until the ask has exited: an ask
+  // that waited for the cleanup could never exit, whatever the host's load.
+  const cleanupResponse = Promise.withResolvers<void>();
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -536,12 +557,8 @@ test('daemon returns hook output before slow Telegram callback cleanup finishes'
         return Response.json({ ok: true, result: { message_id: 102 } });
       }
       if (url.pathname.endsWith('/answerCallbackQuery')) {
-        // The callback cleanup (acking the tap) is deliberately slow. The ask
-        // MUST return the hook answer before this resolves — `cleanupDone` flips
-        // only after the 3s block, so asserting it's still false at ask-exit is a
-        // deterministic proof the ask did not block on cleanup (no flaky budget).
-        await Bun.sleep(3000);
-        cleanupDone = true;
+        cleanupStarted = true;
+        await cleanupResponse.promise;
         return Response.json({ ok: true, result: true });
       }
       if (url.pathname.endsWith('/editMessageText')) return Response.json({ ok: true, result: true });
@@ -549,117 +566,122 @@ test('daemon returns hook output before slow Telegram callback cleanup finishes'
     },
   });
   servers.push(server);
-  const daemon = await startDaemon(cfgDir, server.port);
+  try {
+    await startDaemon(cfgDir, server.port);
 
-  const ask = startAsk(cfgDir, server.port, {
-    requestId: 'q_slow_cleanup',
-    agent: 'claude',
-    kind: 'question',
-    question: 'Continue?',
-    options: [{ label: 'A' }],
-  });
-  const stdout = await new Response(ask.stdout).text();
-  await ask.exited;
-
-  expect(cleanupDone).toBe(false);
-  expect(JSON.parse(stdout)).toMatchObject({
-    hookSpecificOutput: {
-      updatedInput: {
-        answers: { 'Continue?': 'A' },
+    const ask = startAsk(cfgDir, server.port, {
+      requestId: 'q_slow_cleanup',
+      agent: 'claude',
+      kind: 'question',
+      question: 'Continue?',
+      options: [{ label: 'A' }],
+    });
+    const stdout = await new Response(ask.stdout).text();
+    await ask.exited;
+    expect(JSON.parse(stdout)).toMatchObject({
+      hookSpecificOutput: {
+        updatedInput: {
+          answers: { 'Continue?': 'A' },
+        },
       },
-    },
-  });
+    });
+    // The cleanup was issued; it is just not on the hook's path.
+    await waitForEvent(() => cleanupStarted);
+  } finally {
+    cleanupResponse.resolve();
+  }
 }, 10_000);
 
-test('daemon edits the Telegram prompt when the hook client disconnects before answering', async () => {
-  const cfgDir = makeCfgDir();
-  const edited: unknown[] = [];
-  let sent = false;
-  const server = Bun.serve({
-    port: 0,
-    async fetch(req) {
-      const url = new URL(req.url);
-      if (url.pathname.endsWith('/getUpdates')) return Response.json({ ok: true, result: [] });
-      if (url.pathname.endsWith('/sendMessage')) {
-        sent = true;
-        return Response.json({ ok: true, result: { message_id: 77 } });
+// The real daemon owns send completion and socket retirement. HTTP receipt alone
+// cannot distinguish a posted card from an in-flight send.
+for (const phase of ['posted', 'in-flight'] as const) {
+  test(`daemon expires the Telegram prompt when the hook disconnects (${phase})`, async () => {
+    const cfgDir = makeCfgDir();
+    const edited: unknown[] = [];
+    const keyboards: unknown[] = [];
+    const sendResponse = Promise.withResolvers<void>();
+    let sendStarted = false;
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname.endsWith('/getUpdates')) return Response.json({ ok: true, result: [] });
+        if (url.pathname.endsWith('/sendMessage')) {
+          sendStarted = true;
+          if (phase === 'in-flight') await sendResponse.promise;
+          return Response.json({ ok: true, result: { message_id: 77 } });
+        }
+        if (url.pathname.endsWith('/editMessageText')) {
+          edited.push(await req.json());
+          return Response.json({ ok: true, result: true });
+        }
+        if (url.pathname.endsWith('/editMessageReplyMarkup')) {
+          keyboards.push(await req.json());
+          return Response.json({ ok: true, result: true });
+        }
+        return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+      },
+    });
+    servers.push(server);
+    try {
+      await startDaemon(cfgDir, server.port);
+      const ask = startAsk(cfgDir, server.port, {
+        requestId: 'q_disconnect',
+        agent: 'claude',
+        kind: 'question',
+        question: 'Continue?',
+      });
+      const posted = () => readFileSync(join(cfgDir, 'daemon.log'), 'utf8')
+        .includes('ask-forward posted: agent=claude kind=question req=q_disconnect');
+      const questionsFile = join(cfgDir, 'tg-ctl.123.questions.json');
+
+      if (phase === 'posted') {
+        // This acknowledgement is emitted only after the daemon accepts the API response.
+        await waitForEvent(posted);
+      } else {
+        await waitForEvent(() => sendStarted);
+        expect(posted()).toBe(false);
+        expect(existsSync(questionsFile)).toBe(false);
       }
-      if (url.pathname.endsWith('/editMessageText')) {
-        edited.push(await req.json());
-        return Response.json({ ok: true, result: true });
+      ask.kill(9);
+      await ask.exited;
+      expect(ask.signalCode).toBe('SIGKILL');
+
+      if (phase === 'in-flight') {
+        // Retirement persists the question store even for an unscoped dead card.
+        // Observe it before releasing HTTP so this exercises post-send reconciliation.
+        await waitForEvent(() => existsSync(questionsFile));
+        expect(posted()).toBe(false);
+        expect(edited).toEqual([]);
+        sendResponse.resolve();
       }
-      return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
-    },
-  });
-  servers.push(server);
-  const daemon = await startDaemon(cfgDir, server.port);
+      await waitForEvent(() => edited.length > 0 && keyboards.length > 0);
+      expect(edited).toEqual([
+        { chat_id: 1, message_id: 77, text: 'expired — answer in terminal' },
+      ]);
+      expect(keyboards).toEqual([
+        { chat_id: 1, message_id: 77 },
+      ]);
+    } finally {
+      sendResponse.resolve();
+    }
+  }, 10_000);
+}
 
-  const ask = startAsk(cfgDir, server.port, {
-    requestId: 'q_disconnect',
-    agent: 'claude',
-    kind: 'question',
-    question: 'Continue?',
-  });
+async function waitForEvent(observed: () => boolean): Promise<void> {
+  const started = Date.now();
+  while (!observed() && Date.now() - started < 5000) await Bun.sleep(25);
+  expect(observed()).toBe(true);
+}
 
-  const t0 = Date.now();
-  while (Date.now() - t0 < 5000 && !sent) await Bun.sleep(50);
-  expect(sent).toBe(true);
-  ask.kill(9);
-  await ask.exited;
-
-  const t1 = Date.now();
-  while (Date.now() - t1 < 5000 && edited.length === 0) await Bun.sleep(50);
-  expect(edited).toEqual([
-    { chat_id: 1, message_id: 77, text: 'expired — answer in terminal' },
-  ]);
-}, 10_000);
-
-test('daemon expires the Telegram prompt when hook disconnects while sendMessage is in flight', async () => {
-  const cfgDir = makeCfgDir();
-  const edited: unknown[] = [];
-  let sendStarted = false;
-  const server = Bun.serve({
-    port: 0,
-    async fetch(req) {
-      const url = new URL(req.url);
-      if (url.pathname.endsWith('/getUpdates')) return Response.json({ ok: true, result: [] });
-      if (url.pathname.endsWith('/sendMessage')) {
-        sendStarted = true;
-        await Bun.sleep(300);
-        return Response.json({ ok: true, result: { message_id: 88 } });
-      }
-      if (url.pathname.endsWith('/editMessageText')) {
-        edited.push(await req.json());
-        return Response.json({ ok: true, result: true });
-      }
-      return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
-    },
-  });
-  servers.push(server);
-  const daemon = await startDaemon(cfgDir, server.port);
-
-  const ask = startAsk(cfgDir, server.port, {
-    requestId: 'q_race',
-    agent: 'claude',
-    kind: 'question',
-    question: 'Continue?',
-  });
-
-  const t0 = Date.now();
-  while (Date.now() - t0 < 5000 && !sendStarted) await Bun.sleep(25);
-  expect(sendStarted).toBe(true);
-  ask.kill(9);
-  await ask.exited;
-
-  const t1 = Date.now();
-  while (Date.now() - t1 < 5000 && edited.length === 0) await Bun.sleep(50);
-  expect(edited).toEqual([
-    { chat_id: 1, message_id: 88, text: 'expired — answer in terminal' },
-  ]);
-}, 10_000);
+function daemonLog(cfgDir: string): string {
+  return readFileSync(join(cfgDir, 'daemon.log'), 'utf8');
+}
 
 function makeCfgDir(): string {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-buttons-fail-'));
+  tempDirs.push(cfgDir);
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ cwd: cfgDir }));

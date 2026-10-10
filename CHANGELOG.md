@@ -3,6 +3,24 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.57.1
+
+- **Daemon integration tests no longer depend on host load or the host's processes (#375, #550,
+  #545).** Test-only; no product change.
+  1. **Children spawned without an env, or with an env lacking `PATH`, escaped the hermetic host.**
+     `tests/hermetic-env.ts` now wraps `Bun.spawn`/`spawnSync`: such children get the suite's
+     `PATH` and `TMUX_TMPDIR` (a `PATH` the test sets itself still wins). Before, `tg-ctl
+     harness-event` ran the real `ps` and one `lsof` per live omp on the machine — ~0.5 s per
+     spawn idle, ~2 s loaded — so the harness-event tests hit their 5 s timeout under load (0/10).
+     `pgrep` is shimmed too (`pgrep -x bun` used to match the test runner).
+  2. **Guessed delays replaced by observed events.** The hook-disconnect tests (from #585) kill
+     the hook only after the daemon logs `ask-forward posted`, or hold `sendMessage` open until
+     the retired question is persisted. The buttons-failure, voice-picker and persist-before-ack
+     tests hold fake Bot API responses until the event they assert on instead of sleeping, and
+     the stale-tap and ✍️ assertions wait for the later request that carries them.
+  3. **Leftovers.** `abduco-client` tests now stop the abduco servers they start (removing the
+     socket dir left them running), and the touched tests remove their temp dirs.
+
 ## 1.57.0
 
 - **`tg` now works as YOUR Telegram account and can place voice calls (Refs #562).**

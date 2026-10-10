@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
@@ -17,6 +17,7 @@ const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
 const procs: Subprocess[] = [];
 const servers: ReturnType<typeof Bun.serve>[] = [];
+const tempDirs: string[] = [];
 
 afterAll(async () => {
   for (const p of procs) {
@@ -26,10 +27,12 @@ afterAll(async () => {
     }
   }
   for (const s of servers) s.stop(true);
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
 });
 
 function makeCfgDir(): string {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-replay-'));
+  tempDirs.push(cfgDir);
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ cwd: cfgDir }));

@@ -1,16 +1,17 @@
 import { afterAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { tmuxNoServerShim } from './helpers/hermetic-host';
 import { NO_AGENT_REPLY } from '../tg-ctl';
 import { withClaudeHooks, withClaudeStatusLineTelemetry, withHarnessHooks } from '../features/tg-ctl/hook-install';
 
 // Full daemon round-trip against a local Bot-API fake (spec §11: "the daemon
 // is spawned as a real subprocess against the fake"). tmux is PATH-shimmed to
-// an argv-logging stub that prints an EMPTY pane list, so (1) the user's real
-// tmux server is never touched and (2) every inject degrades to the no-agent
-// guard reply — capturable via the fake's sendMessage endpoint.
+// an argv-logging stub with no server running, so (1) the user's real tmux
+// server is never touched and (2) every inject degrades to the no-agent guard
+// reply — capturable via the fake's sendMessage endpoint.
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -100,12 +101,14 @@ writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 const pidFile = join(cfgDir, 'tg-ctl.123.pid');
 const statusProject = mkdtempSync(join(tmpdir(), 'tgctl-status-project-'));
 
-// tmux PATH shim: log argv, print NOTHING — parsePaneList('') = no panes, so
-// discovery yields no-agent and the daemon must answer with the guard text.
+// tmux PATH shim: log argv, then answer as a host with no tmux server — no panes, so
+// discovery yields no-agent and the daemon must answer with the guard text. (An "exit 0,
+// print nothing" shim reads as the transient launchd flake instead, which the daemon retries
+// with a 120 ms sleep per snapshot.)
 const shimDir = join(cfgDir, 'bin');
 const shimLog = join(cfgDir, 'tmux-calls.log');
 mkdirSync(shimDir);
-writeFileSync(join(shimDir, 'tmux'), `#!/bin/sh\necho "$@" >> '${shimLog}'\nexit 0\n`, { mode: 0o755 });
+writeFileSync(join(shimDir, 'tmux'), tmuxNoServerShim(`echo "$@" >> '${shimLog}'`), { mode: 0o755 });
 // ps PATH shim: the legacy 3-column `pid ppid command` shape regardless of argv, with no
 // agent process on the fake table (only launchd) — the process-table scan for agents
 // OUTSIDE tmux (tg-cli#306) always runs now (tg-cli#413 follow-up removed the
@@ -130,6 +133,8 @@ afterAll(async () => {
     expect(() => process.kill(pid, 0)).toThrow();
   }
   server.stop(true);
+  rmSync(cfgDir, { recursive: true, force: true });
+  rmSync(statusProject, { recursive: true, force: true });
 });
 
 test('daemon round-trip: old owner message still delivered, guard replies, /status, allowlist drop, media download', async () => {

@@ -1,10 +1,11 @@
 import { appendFileSync } from 'node:fs';
 import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { afterAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { TMUX_NO_SERVER_SHIM, tmuxNoServerShim } from './helpers/hermetic-host';
 import { NO_AGENT_REPLY } from '../tg-ctl';
 import { parsePendingBatch, serializePendingBatch } from '../features/tg-ctl/updates';
 
@@ -54,7 +55,7 @@ writeFileSync(join(sigkillCfgDir, 'config.yaml'), 'control:\n  enabled: true\n')
 
 const sigkillShimDir = join(sigkillCfgDir, 'bin');
 mkdirSync(sigkillShimDir);
-writeFileSync(join(sigkillShimDir, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+writeFileSync(join(sigkillShimDir, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
 writeFileSync(
   join(sigkillShimDir, 'ps'),
   '#!/bin/sh\nprintf \'    1     0 /sbin/launchd\\n\'\nexit 0\n',
@@ -63,6 +64,12 @@ writeFileSync(
 
 const sigkillSent: { chat_id: number; text: string }[] = [];
 let sigkillServeCount = 0;
+// The first daemon's no-agent reply is held open: its batch stays journaled and unprocessed
+// (the daemon unlinks the journal only after every action of the batch finished), so the
+// SIGKILL lands inside that window by construction, however fast or slow the host is.
+const heldReply = Promise.withResolvers<void>();
+let holdReply = true;
+let replyHeld = false;
 
 const sigkillServer = Bun.serve({
   port: 0,
@@ -82,7 +89,13 @@ const sigkillServer = Bun.serve({
       return Response.json({ ok: true, result: [] });
     }
     if (url.pathname.endsWith('/sendMessage')) {
-      sigkillSent.push((await req.json()) as { chat_id: number; text: string });
+      const body = (await req.json()) as { chat_id: number; text: string };
+      if (holdReply && body.text === NO_AGENT_REPLY) {
+        replyHeld = true;
+        await heldReply.promise;
+        return Response.json({ ok: true, result: { message_id: 1 } });
+      }
+      sigkillSent.push(body);
       return Response.json({ ok: true, result: { message_id: 1 } });
     }
     return Response.json({ ok: true, result: {} });
@@ -90,8 +103,10 @@ const sigkillServer = Bun.serve({
 });
 
 afterAll(async () => {
+  heldReply.resolve();
   await reapDaemons(sigkillReg);
   sigkillServer.stop(true);
+  rmSync(sigkillCfgDir, { recursive: true, force: true });
 });
 
 test('SIGKILL after pending-batch write recovers on respawn — message not lost', async () => {
@@ -109,16 +124,15 @@ test('SIGKILL after pending-batch write recovers on respawn — message not lost
   });
   closeSync(logFd);
 
+  // Killed while its reply is in flight: the batch is journaled and not yet processed.
   const t0 = Date.now();
-  while (Date.now() - t0 < 5000) {
-    if (existsSync(pendingBatchPath) && readFileSync(pendingBatchPath, 'utf8').trim().length > 0) break;
-    await Bun.sleep(50);
-  }
-  expect(existsSync(pendingBatchPath)).toBe(true);
+  while (Date.now() - t0 < 5000 && !replyHeld) await Bun.sleep(50);
+  expect(replyHeld).toBe(true);
   expect(readFileSync(pendingBatchPath, 'utf8').trim().length).toBeGreaterThan(0);
 
   daemon1.kill('SIGKILL');
   await daemon1.exited;
+  holdReply = false;
 
   const sentBeforeRespawn = sigkillSent.length;
 
@@ -170,14 +184,7 @@ const ffBinDir = join(ffCfgDir, 'bin');
 mkdirSync(ffBinDir);
 const ffTmuxLog = join(ffCfgDir, 'tmux.log');
 writeFileSync(ffTmuxLog, '');
-writeFileSync(
-  join(ffBinDir, 'tmux'),
-  `#!/bin/sh
-echo "$0 $*" >> ${JSON.stringify(ffTmuxLog).slice(1, -1)}
-exit 0
-`,
-  { mode: 0o755 },
-);
+writeFileSync(join(ffBinDir, 'tmux'), tmuxNoServerShim(`echo "$0 $*" >> ${JSON.stringify(ffTmuxLog).slice(1, -1)}`), { mode: 0o755 });
 
 const ffSessionDir = join(ffCfgDir, 'sessions');
 mkdirSync(ffSessionDir);
@@ -270,6 +277,7 @@ afterAll(async () => {
   await reapDaemons(ffReg);
   ffServer.stop(true);
   await ffEndpoint.close();
+  rmSync(ffCfgDir, { recursive: true, force: true });
 });
 
 test('original OMP acknowledgement does not wait for the busy model to finish a turn', async () => {

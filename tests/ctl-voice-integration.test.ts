@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from 'bun:test';
-import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { createConnection } from 'net';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -187,6 +187,7 @@ function makeCfgDir(opts: {
 } {
   const withFfmpeg = opts.withFfmpeg ?? true;
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-voice-'));
+  tempDirs.push(cfgDir);
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 
   const shimDir = join(cfgDir, 'bin');
@@ -285,10 +286,12 @@ function makeCfgDir(opts: {
 
 const reg = createDaemonRegistry();
 const servers: { stop: (force?: boolean) => void }[] = [];
+const tempDirs: string[] = [];
 
 afterAll(async () => {
   await reapDaemons(reg);
   for (const s of servers) s.stop(true);
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
 });
 
 async function runDaemon(
@@ -460,11 +463,14 @@ test('configured voice reply through picker marks the replied-to message only af
   );
   const daemon = await runDaemon(cfgDir, shimDir, `http://127.0.0.1:${server.port}`);
 
-  const t0 = Date.now();
-  while (Date.now() - t0 < 12_000) {
-    if (state.sent.some((m) => m.reply_markup)) break;
-    await Bun.sleep(100);
-  }
+  // The daemon sends the transcript confirmation, the picker and the ✍️ "waiting for a target"
+  // mark as separate requests; wait until all three arrived.
+  await waitFor(
+    () =>
+      state.sent.some((m) => m.reply_markup) &&
+      state.sent.some((m) => m.reply_to_message_id === 11 && m.text === `${CONFIRMATION_PREFIX}${TRANSCRIPT}`) &&
+      hasReaction(state.reactions, 11, '✍️'),
+  );
 
   const picker = state.sent.find((m) => m.reply_markup);
   expect(picker).toBeDefined();
@@ -677,9 +683,9 @@ test('voice config written AFTER the daemon started is reloaded per note (no res
   const { cfgDir, shimDir, tmuxLog, whisperBin, modelPath } = makeCfgDir({ voiceMode: 'absent' });
   const daemon = await runDaemon(cfgDir, shimDir, `http://127.0.0.1:${server.port}`);
 
-  // Give the daemon a moment to boot with the empty config, THEN configure +
-  // release the note (so it is delivered only after voice is set up on disk).
-  await Bun.sleep(800);
+  // Configure only once the daemon is polling with the empty config: the note must find it
+  // already running, so only the per-note reload can pick the voice block up.
+  await waitFor(() => state.offsets.length > 0);
   writeFileSync(
     join(cfgDir, 'config.yaml'),
     [
@@ -823,6 +829,7 @@ test('daemon stays responsive (socket accepts) DURING a slow transcription — a
 // PATH are caller-controlled.
 function fakeWhisperHome(): { home: string; binDir: string } {
   const home = mkdtempSync(join(tmpdir(), 'tgctl-vsetup-'));
+  tempDirs.push(home);
   const wc = join(home, 'xp', 'whisper.cpp');
   mkdirSync(join(wc, 'build', 'bin'), { recursive: true });
   mkdirSync(join(wc, 'models'), { recursive: true });

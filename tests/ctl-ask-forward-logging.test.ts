@@ -9,7 +9,7 @@
 // ask` per case against a mock Telegram (TG_API_BASE) and read that log back.
 
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
@@ -101,6 +101,7 @@ afterAll(async () => {
     }
   }
   server.stop(true);
+  rmSync(cfgDir, { recursive: true, force: true });
 });
 
 // Fire one `tg-ctl ask` with the given normalized request payload. A DROPPED

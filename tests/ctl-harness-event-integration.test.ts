@@ -42,6 +42,7 @@ const server = Bun.serve({
 afterAll(() => {
   killOverloadRetryChildren();
   server.stop(true);
+  rmSync(cfgDir, { recursive: true, force: true });
 });
 
 afterEach(() => {
@@ -138,11 +139,10 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+// Bounded by the test's own timeout: a SIGTERMed retry child on a loaded host can take longer
+// than any fixed poll count to exit.
 async function waitForPidExit(pid: number): Promise<void> {
-  for (let i = 0; i < 20; i++) {
-    if (!pidAlive(pid)) return;
-    await Bun.sleep(50);
-  }
+  while (pidAlive(pid)) await Bun.sleep(50);
 }
 
 test('a session-limit with a parseable reset → notification + auto-continue button + stalled reaction', async () => {

@@ -45,3 +45,9 @@ export const PS_NO_AGENTS_SHIM = [
 
 /** `launchctl list` with no jobs; `status` otherwise spawns one `launchctl print` per loaded host job. */
 export const LAUNCHCTL_NO_JOBS_SHIM = `#!/bin/sh\n[ "$1" = list ] && printf 'PID\\tStatus\\tLabel\\n'\nexit 0\n`;
+
+/**
+ * `pgrep` that matches no process. features/branding/detect.ts asks `pgrep -x <name>` whether a
+ * local model server is running; a developer's own ollama or agent must never answer for the test.
+ */
+export const PGREP_NO_MATCH_SHIM = '#!/bin/sh\nexit 1\n';

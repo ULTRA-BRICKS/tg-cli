@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { connectAbducoSocket } from '../features/tg-ctl/abduco-client';
@@ -11,10 +11,30 @@ import { MSG_ATTACH, MSG_CONTENT, MSG_DETACH, attachPacket, contentPackets, deta
 
 const dirs: string[] = [];
 const stops: Array<() => void> = [];
-afterEach(() => {
+// A real abduco server daemonizes away from the test and outlives its command: it waits for a
+// client to collect the exit status, and removing its socket dir does not stop it (tg-cli#550).
+// Each session records its server pid (the command's parent) so teardown can end it.
+const abducoServerPidFiles: string[] = [];
+
+afterEach(async () => {
   for (const s of stops.splice(0)) s();
+  for (const pidFile of abducoServerPidFiles.splice(0)) {
+    if (!existsSync(pidFile)) continue; // the session never started
+    const pid = Number(readFileSync(pidFile, 'utf8'));
+    if (alive(pid)) process.kill(pid, 'SIGTERM');
+    while (alive(pid)) await Bun.sleep(20);
+  }
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function sockPath(): string {
   const dir = mkdtempSync(join(tmpdir(), 'tg-abc-'));
@@ -103,7 +123,9 @@ test.skipIf(abduco === null)('real abduco: the text reaches the session PTY inta
   const dir = mkdtempSync('/tmp/tg-abd-');
   dirs.push(dir);
   const out = join(dir, 'typed.txt');
-  const script = `IFS= read -r a; printf '%s\\n' "$a" >> '${out}'; if IFS= read -r -t 1 b; then printf '%s\\n' "$b" >> '${out}'; fi`;
+  const serverPid = join(dir, 'server.pid');
+  abducoServerPidFiles.push(serverPid);
+  const script = `printf %s "$PPID" > '${serverPid}'; IFS= read -r a; printf '%s\\n' "$a" >> '${out}'; if IFS= read -r -t 1 b; then printf '%s\\n' "$b" >> '${out}'; fi`;
   const env = { ...process.env, ABDUCO_SOCKET_DIR: dir };
   const created = Bun.spawnSync([abduco!, '-n', 'tgtest-pty', 'bash', '-c', script], { env });
   expect(created.exitCode).toBe(0);
@@ -126,8 +148,10 @@ test.skipIf(abduco === null)('real abduco: a multi-packet multi-line message arr
   const dir = mkdtempSync('/tmp/tg-abd-');
   dirs.push(dir);
   const out = join(dir, 'typed.txt');
+  const serverPid = join(dir, 'server.pid');
+  abducoServerPidFiles.push(serverPid);
   const env = { ...process.env, ABDUCO_SOCKET_DIR: dir };
-  const created = Bun.spawnSync([abduco!, '-n', 'tgtest-long', 'bash', '-c', `while IFS= read -r l; do printf '%s\\n' "$l" >> '${out}'; done`], { env });
+  const created = Bun.spawnSync([abduco!, '-n', 'tgtest-long', 'bash', '-c', `printf %s "$PPID" > '${serverPid}'; while IFS= read -r l; do printf '%s\\n' "$l" >> '${out}'; done`], { env });
   expect(created.exitCode).toBe(0);
   const socketDir = join(dir, 'abduco', process.env.USER ?? 'ultra');
   const findSocket = (): string | undefined => Bun.spawnSync(['ls', socketDir]).stdout.toString().split('\n').find((n) => n.startsWith('tgtest-long'));

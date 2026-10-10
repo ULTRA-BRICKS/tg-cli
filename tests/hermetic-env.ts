@@ -10,17 +10,13 @@
 //   * a daemon test without its own `ps` shim enumerates every live omp each tick (lsof twice
 //     and a jsonl read per omp), starving the hook socket its asks and taps arrive on.
 // Per-test shims prepend their own dir to PATH, so they still win over what is set up here.
-//
-// Children read `process.env.PATH` at spawn time through the tests' explicit `env:` objects;
-// Bun.spawn with NO `env` option sees only the environment bun started with, which this cannot
-// change — every test that needs isolation passes its env explicitly, as they all already do.
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { LAUNCHCTL_NO_JOBS_SHIM, PS_NO_AGENTS_SHIM } from './helpers/hermetic-host';
+import { LAUNCHCTL_NO_JOBS_SHIM, PGREP_NO_MATCH_SHIM, PS_NO_AGENTS_SHIM } from './helpers/hermetic-host';
 
 const shimDir = mkdtempSync(join(tmpdir(), 'tg-hermetic-bin-'));
-for (const [name, body] of Object.entries({ ps: PS_NO_AGENTS_SHIM, launchctl: LAUNCHCTL_NO_JOBS_SHIM })) {
+for (const [name, body] of Object.entries({ ps: PS_NO_AGENTS_SHIM, launchctl: LAUNCHCTL_NO_JOBS_SHIM, pgrep: PGREP_NO_MATCH_SHIM })) {
   const path = join(shimDir, name);
   writeFileSync(path, body);
   chmodSync(path, 0o755);
@@ -37,6 +33,33 @@ const tmuxTmpDir = mkdtempSync('/tmp/tg-hermetic-');
 process.env.TMUX_TMPDIR = tmuxTmpDir;
 delete process.env.TMUX;
 delete process.env.TMUX_PANE;
+
+// Bun gives a child spawned with NO `env` the environment bun STARTED with — the PATH,
+// TMUX_TMPDIR and TMUX changes above are invisible to it — and a child whose `env` names no PATH
+// a built-in default (/usr/bin:/bin). Either way the child ran the real `ps` and then lsof'd every
+// live omp on the host: a `tg-ctl harness-event --pane %3` took ~500 ms unloaded and over 5 s
+// under suite load (tg-cli#550). A hook always runs with a PATH in production, so such a child
+// gets the suite's PATH and private tmux dir; a value the test sets itself still wins.
+type SpawnEnv = Record<string, string | undefined>;
+
+function hermeticEnv(env: SpawnEnv | undefined): SpawnEnv {
+  if (env === undefined) return { ...process.env };
+  const out = { ...env };
+  for (const key of ['PATH', 'TMUX_TMPDIR']) out[key] ??= process.env[key];
+  return out;
+}
+
+function hermeticSpawn<Spawn extends typeof Bun.spawn | typeof Bun.spawnSync>(spawn: Spawn): Spawn {
+  type Options = { env?: SpawnEnv };
+  const wrapped = (cmdOrOptions: string[] | (Options & { cmd: string[] }), options?: Options) =>
+    Array.isArray(cmdOrOptions)
+      ? spawn(cmdOrOptions, { ...options, env: hermeticEnv(options?.env) })
+      : spawn({ ...cmdOrOptions, env: hermeticEnv(cmdOrOptions.env) });
+  return wrapped as Spawn;
+}
+
+Bun.spawn = hermeticSpawn(Bun.spawn);
+Bun.spawnSync = hermeticSpawn(Bun.spawnSync);
 
 process.on('exit', () => {
   rmSync(shimDir, { recursive: true, force: true });
