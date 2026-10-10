@@ -3,6 +3,32 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.60.3
+
+- **Six outbound `tg` bugs, found by a new wire-contract suite that runs the real `tg` against a
+  recording fake Bot API (#613).** `tests/helpers/fake-bot-api.ts` records every call (JSON and
+  multipart), hands out sequential message ids and answers a chosen call with an error;
+  `tests/cli-outbound-*.test.ts` pin splitting, captions, rich routing, threading, topics,
+  attachments, history and exit codes against the specs.
+  1. **A long HTML message was cut inside an entity.** The >4096 splitter backed off tags and
+     surrogate pairs but not `&amp;`/`&#…;`: a chunk ending `&am` and the next starting `p;` are both
+     refused by Telegram ("character '&' is reserved"), failing the whole send. Hit by any long
+     escaped body — every plain message is escaped once a Cyrillic `[window]` forces HTML.
+  2. **A `--reply-to` answer whose caption rode a photo, document or album was not threaded.**
+     Only `sendMessage`/`sendRichMessage` took the anchor, so `tg --tag answer --reply-to N --photo
+     shot.png "…"` landed unanchored. The first message of the send now takes it, whatever carries it.
+  3. **A send whose attachments had all vanished delivered a header-only message with exit 0.**
+     With no body, the `📁 [window]` header existed only as their caption; it is now dropped with
+     them and the send is refused like any empty one (#207).
+  4. **A chunk refused mid-send lost the history of the chunks already delivered.** The transport
+     exited the process on the error before `tg` wrote history; it now throws `TelegramSendError`,
+     and `tg` records every delivered message id (and removes its PDF temp dirs) before exiting 1.
+  5. **A 429 flood wait killed the send.** A `retry_after` of up to 30 s is now waited out and the
+     refused message resent once (a 429 delivered nothing, so no duplicate); a longer wait fails
+     with Telegram's "retry after N".
+  6. **An unreachable Telegram printed a stack trace carrying the bot token** (the request URL). It
+     is now one line naming the method and the error code.
+
 ## 1.60.2
 
 - **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on

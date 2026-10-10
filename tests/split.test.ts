@@ -90,3 +90,26 @@ test('HTML: never splits inside a tag', () => {
     if (lastOpen !== -1) expect(lastClose).toBeGreaterThan(lastOpen);
   }
 });
+
+// Telegram's HTML parser refuses an `&` that does not start a complete entity, so a cut inside
+// `&amp;` fails the whole send. Every cut offset 1..len-1 of the entity must be pulled back.
+test('HTML: never cuts inside an entity, wherever the hard cut lands (named, decimal, hex)', () => {
+  for (const entity of ['&amp;', '&quot;', '&#128512;', '&#x1F600;']) {
+    for (let shift = 0; shift <= entity.length; shift++) {
+      const text = 'z'.repeat(LIMIT - shift) + entity + 'z'.repeat(50);
+      const chunks = splitMessage(text, LIMIT, 'html');
+      expect(chunks.join('')).toBe(text);
+      for (const c of chunks) {
+        expect(c.length).toBeLessThanOrEqual(LIMIT);
+        expect(c.replace(/&(?:[a-zA-Z]+|#\d+|#x[0-9a-fA-F]+);/g, '')).not.toContain('&');
+      }
+    }
+  }
+});
+
+test('plain mode leaves `&` literal: a cut right after it is not pulled back', () => {
+  const text = 'z'.repeat(LIMIT - 2) + '&amp;' + 'z'.repeat(50);
+  const chunks = splitMessage(text, LIMIT, 'plain');
+  expect(chunks[0]).toHaveLength(LIMIT);
+  expect(chunks.join('')).toBe(text);
+});

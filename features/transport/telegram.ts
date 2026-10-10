@@ -106,21 +106,40 @@ export function isTopicDeletedError(description: string): boolean {
   return d.includes('topic_id_invalid') || d.includes('topic_deleted');
 }
 
-// Exit-on-error response check, shared by every send. A non-2xx response or an
-// { ok:false } body prints to stderr and exits 1; otherwise the `result`
-// payload is returned (a Message or an array of Messages).
+// A send that failed: Telegram refused it, or it never reached Telegram. Thrown, not exited, so
+// the caller still records the messages of the same send that WERE delivered before it.
+export class TelegramSendError extends Error {}
+
+// Response check shared by every send. A non-2xx response or an { ok:false } body throws a
+// TelegramSendError naming the method and Telegram's answer; otherwise the `result` payload is
+// returned (a Message or an array of Messages).
 export async function checkResponse(resp: Response, method: string): Promise<unknown> {
   if (!resp.ok) {
     const body = await resp.text();
-    console.error(`Telegram API error (${method}): ${resp.status} ${body}`);
-    process.exit(1);
+    throw new TelegramSendError(`Telegram API error (${method}): ${resp.status} ${body}`);
   }
   const json = (await resp.json()) as { ok: boolean; description?: string; result?: unknown };
   if (!json.ok) {
-    console.error(`Telegram API error (${method}): ${json.description ?? 'unknown error'}`);
-    process.exit(1);
+    throw new TelegramSendError(`Telegram API error (${method}): ${json.description ?? 'unknown error'}`);
   }
   return json.result;
+}
+
+// The longest 429 flood wait a send blocks for, and how many waits one message gets. A longer
+// wait fails the send with Telegram's own "retry after N" instead of hanging the agent.
+const FLOOD_WAIT_MAX_S = 30;
+const FLOOD_WAIT_ATTEMPTS = 2;
+
+// The `retry_after` of a 429 answer when it is worth waiting for, else null. A 429 means the
+// message was NOT delivered, so sending it again cannot duplicate it.
+async function floodWaitSeconds(resp: Response): Promise<number | null> {
+  if (resp.status !== 429) return null;
+  const json: unknown = await resp.clone().json().catch(() => null);
+  if (!json || typeof json !== 'object' || !('parameters' in json)) return null;
+  const params = json.parameters;
+  if (!params || typeof params !== 'object' || !('retry_after' in params)) return null;
+  const wait = params.retry_after;
+  return typeof wait === 'number' && wait >= 0 && wait <= FLOOD_WAIT_MAX_S ? wait : null;
 }
 
 // Read a file into memory ONLY when it is at most `maxBytes`, using a single
@@ -194,10 +213,15 @@ function blobFor(item: SendItem): { body: Blob | ReturnType<typeof Bun.file>; na
 // a media group) routes back to the producing pane.
 export function createTelegramTransport(ctx: TelegramCtx): Transport {
   const { api, chatId, recordRoute, replyToMessageId, messageThreadId, threadIdAdvisory, threadRetryDelayMs, onThreadFallback } = ctx;
-  // A reply threads under ONE anchor: consume the target on the first
-  // sendMessage so split-continuation chunks (and any later sends) do not each
-  // re-reply to the same inbound message.
+  // A reply threads under ONE anchor: the FIRST send of this message takes it — whatever carries
+  // it first (a photo with its caption, an album, a text chunk) — so split-continuation chunks and
+  // later attachments do not each re-reply to the same inbound message.
   let pendingReplyTo = replyToMessageId;
+  const takeReplyTo = (): number | undefined => {
+    const replyTo = pendingReplyTo;
+    pendingReplyTo = undefined;
+    return replyTo;
+  };
   // Set once an advisory thread fell back to General: the remaining parts of this
   // send (split chunks, attachments) go straight to General instead of each paying
   // for another rejected attempt and retry delay.
@@ -210,13 +234,30 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
   // before (the daily-critical 1:1 path).
   type BuildBody = (opts: { thread: boolean; anchor: boolean }) => Record<string, unknown> | FormData;
 
-  const post = (method: string, body: Record<string, unknown> | FormData): Promise<Response> =>
-    fetch(
-      `${api}/${method}`,
-      body instanceof FormData
-        ? { method: 'POST', body }
-        : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
-    );
+  // POST one send, waiting out a short 429 flood wait. `body` builds a fresh request body per
+  // attempt. A network failure becomes a TelegramSendError naming the method and the error code
+  // only: the request URL carries the bot token and must not reach the terminal.
+  const post = async (method: string, body: () => Record<string, unknown> | FormData): Promise<Response> => {
+    for (let attempt = 1; ; attempt++) {
+      const payload = body();
+      let resp: Response;
+      try {
+        resp = await fetch(
+          `${api}/${method}`,
+          payload instanceof FormData
+            ? { method: 'POST', body: payload }
+            : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) },
+        );
+      } catch (e) {
+        const code = e instanceof Error && 'code' in e ? String(e.code) : e instanceof Error ? e.name : 'error';
+        throw new TelegramSendError(`tg: could not reach Telegram (${method}): ${code}`);
+      }
+      const wait = attempt < FLOOD_WAIT_ATTEMPTS ? await floodWaitSeconds(resp) : null;
+      if (wait === null) return resp;
+      console.error(`tg: Telegram rate limit — retrying ${method} in ${wait}s`);
+      await Bun.sleep(wait * 1000);
+    }
+  };
 
   // Is this response a rejection BECAUSE of the thread id? Peeked on a CLONE so
   // checkResponse can still read the original. A thread rejection arrives EITHER as
@@ -233,17 +274,17 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
   // of killing a daily-critical send. With `threadRetryDelayMs` it first retries the
   // topic once after that delay (fresh private-chat topics reject bot writes for a
   // moment, telegram-bot-api #905). Every other failure path is unchanged —
-  // checkResponse still exits on a real error, and an explicit --topic
+  // checkResponse still throws on a real error, and an explicit --topic
   // (threadIdAdvisory false) stays strict.
   const send = async (method: string, build: BuildBody): Promise<unknown> => {
     const threaded = messageThreadId !== undefined && !threadDropped;
-    let resp = await post(method, build({ thread: threaded, anchor: true }));
+    let resp = await post(method, () => build({ thread: threaded, anchor: true }));
     if (!threaded || !threadIdAdvisory) return checkResponse(resp, method);
     let description = await threadRejection(resp);
     if (description === null) return checkResponse(resp, method);
     if (threadRetryDelayMs !== undefined && !isTopicDeletedError(description)) {
       await Bun.sleep(threadRetryDelayMs);
-      resp = await post(method, build({ thread: true, anchor: true }));
+      resp = await post(method, () => build({ thread: true, anchor: true }));
       description = await threadRejection(resp);
       if (description === null) return checkResponse(resp, method);
     }
@@ -257,14 +298,15 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
     // pointing at a message INSIDE the rejected topic would otherwise make Telegram
     // re-bind the resend to that topic's thread (un-doing the fallback) or fail again
     // on a deleted/closed anchor (message to reply not found).
-    return checkResponse(await post(method, build({ thread: false, anchor: false })), method);
+    return checkResponse(await post(method, () => build({ thread: false, anchor: false })), method);
   };
 
   // The multipart upload body shared by photo/document/album sends.
-  const form = (thread: boolean, fields: (f: FormData) => void): FormData => {
+  const form = (opts: { thread: boolean; anchor: boolean }, replyTo: number | undefined, fields: (f: FormData) => void): FormData => {
     const f = new FormData();
     f.append('chat_id', chatId);
-    if (thread && messageThreadId !== undefined) f.append('message_thread_id', String(messageThreadId));
+    if (opts.thread && messageThreadId !== undefined) f.append('message_thread_id', String(messageThreadId));
+    if (opts.anchor && replyTo !== undefined) f.append('reply_to_message_id', String(replyTo));
     fields(f);
     return f;
   };
@@ -289,10 +331,9 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
     if (parseMode && entities.length > 0) {
       outText = convertEntitiesToHtml(text, entities);
     }
-    // Thread the FIRST message under the reply target, then clear it so
-    // continuation chunks aren't all re-replied to the same anchor.
-    const replyTo = pendingReplyTo;
-    pendingReplyTo = undefined;
+    // Thread the FIRST message under the reply target (consumed, so continuation chunks aren't
+    // all re-replied to the same anchor).
+    const replyTo = takeReplyTo();
     const build: BuildBody = ({ thread, anchor }) => {
       const body: Record<string, unknown> = {
         chat_id: chatId,
@@ -317,16 +358,12 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
   // the documented limits locally, so a bad body fails with a clear message
   // instead of an opaque API 400. Threading uses `reply_parameters`
   // (sendRichMessage has no reply_to_message_id field); the first send consumes
-  // the anchor, same as sendMessage.
+  // the anchor, same as every other primitive.
   const sendRich = async (rawHtml: string): Promise<void> => {
     const html = normalizeRichHtml(rawHtml);
     const check = validateRichHtml(html);
-    if (!check.ok) {
-      console.error(`tg: ${check.error}`);
-      process.exit(1);
-    }
-    const replyTo = pendingReplyTo;
-    pendingReplyTo = undefined;
+    if (!check.ok) throw new TelegramSendError(`tg: ${check.error}`);
+    const replyTo = takeReplyTo();
     const build: BuildBody = ({ thread, anchor }) => {
       const body: Record<string, unknown> = {
         chat_id: chatId,
@@ -344,8 +381,9 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
     sendRich,
     sendPhoto: async (item, cap, fmt) => {
       const parseMode = parseModeFor(fmt);
-      const build: BuildBody = ({ thread }) =>
-        form(thread, (f) => {
+      const replyTo = takeReplyTo();
+      const build: BuildBody = (opts) =>
+        form(opts, replyTo, (f) => {
           const { body, name } = blobFor(item);
           if (name) f.append('photo', body, name);
           else f.append('photo', body);
@@ -356,8 +394,9 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
     },
     sendDocument: async (item, cap, fmt) => {
       const parseMode = parseModeFor(fmt);
-      const build: BuildBody = ({ thread }) =>
-        form(thread, (f) => {
+      const replyTo = takeReplyTo();
+      const build: BuildBody = (opts) =>
+        form(opts, replyTo, (f) => {
           const { body, name } = blobFor(item);
           if (name) f.append('document', body, name);
           else f.append('document', body);
@@ -372,8 +411,9 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
     // InputMedia item — Telegram shows it as the album caption.
     sendMediaGroup: async (kind, mediaItems, cap, fmt) => {
       const parseMode = parseModeFor(fmt);
-      const build: BuildBody = ({ thread }) =>
-        form(thread, (f) => {
+      const replyTo = takeReplyTo();
+      const build: BuildBody = (opts) =>
+        form(opts, replyTo, (f) => {
           const media = mediaItems.map((item, i) => {
             const { body, name } = blobFor(item);
             const field = `file${i}`;

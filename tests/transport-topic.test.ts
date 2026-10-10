@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { createTelegramTransport, isThreadRejection } from '../features/transport/telegram';
+import { createTelegramTransport, isThreadRejection, TelegramSendError } from '../features/transport/telegram';
 
 // createTelegramTransport hits the Bot API via global fetch. Stub fetch to
 // capture the request bodies (JSON sends) and FormData (multipart sends) so we
@@ -188,7 +188,7 @@ test('an ADVISORY rich send also falls back to General on a thread rejection', a
 
 test('advisory mode still FAILS LOUD on a non-thread error (rate-limit / blocked) — no silent General retry', async () => {
   // The whole safety of threadIdAdvisory rests on isThreadRejection being NARROW:
-  // a NON-thread error in advisory mode must reach checkResponse and exit, NOT be
+  // a NON-thread error in advisory mode must reach checkResponse and fail the send, NOT be
   // swallowed into a General retry. This pins that — a regression that widens
   // isThreadRejection would make this go red.
   globalThis.fetch = (async (_url: string, init?: { body?: unknown }) => {
@@ -197,23 +197,11 @@ test('advisory mode still FAILS LOUD on a non-thread error (rate-limit / blocked
     // A non-thread failure regardless of the thread id (e.g. flood wait).
     return mockResponse(false, { ok: false, description: 'Too Many Requests: retry after 5' });
   }) as unknown as typeof fetch;
-  const realExit = process.exit;
-  let exited = false;
-  // @ts-expect-error test stub
-  process.exit = ((code?: number) => {
-    exited = true;
-    throw new Error(`exit ${code}`);
-  }) as typeof process.exit;
-  try {
-    const t = createTelegramTransport({ ...CTX, messageThreadId: 99, threadIdAdvisory: true });
-    await expect(t.sendMessage('rate limited in a topic', 'plain')).rejects.toThrow('exit 1');
-    expect(exited).toBe(true);
-    // Exactly ONE POST — the non-thread error is NOT retried to General.
-    expect(bodies).toHaveLength(1);
-    expect(bodies[0].message_thread_id).toBe(99);
-  } finally {
-    process.exit = realExit;
-  }
+  const t = createTelegramTransport({ ...CTX, messageThreadId: 99, threadIdAdvisory: true });
+  await expect(t.sendMessage('rate limited in a topic', 'plain')).rejects.toThrow(TelegramSendError);
+  // Exactly ONE POST — the non-thread error is NOT retried to General.
+  expect(bodies).toHaveLength(1);
+  expect(bodies[0].message_thread_id).toBe(99);
 });
 
 test('the advisory General retry drops the reply anchor too (no re-bind to the rejected topic)', async () => {
@@ -236,26 +224,14 @@ test('the advisory General retry drops the reply anchor too (no re-bind to the r
 });
 
 test('a NON-advisory (explicit --topic) thread rejection does NOT fall back — it fails loud', async () => {
-  // checkResponse calls process.exit(1) on an { ok:false } body. Stub process.exit
-  // to throw so the test can assert the strict path fires (no silent General retry).
+  // checkResponse throws a TelegramSendError on an { ok:false } body: the strict path fails
+  // the send (no silent General retry).
   installThreadRejectingFetch();
-  const realExit = process.exit;
-  let exited = false;
-  // @ts-expect-error test stub
-  process.exit = ((code?: number) => {
-    exited = true;
-    throw new Error(`exit ${code}`);
-  }) as typeof process.exit;
-  try {
-    const t = createTelegramTransport({ ...CTX, messageThreadId: 99 }); // advisory false
-    await expect(t.sendMessage('explicit topic must not silently retry', 'plain')).rejects.toThrow('exit 1');
-    expect(exited).toBe(true);
-    // Exactly ONE POST — the strict path does not retry to General.
-    expect(bodies).toHaveLength(1);
-    expect(bodies[0].message_thread_id).toBe(99);
-  } finally {
-    process.exit = realExit;
-  }
+  const t = createTelegramTransport({ ...CTX, messageThreadId: 99 }); // advisory false
+  await expect(t.sendMessage('explicit topic must not silently retry', 'plain')).rejects.toThrow(TelegramSendError);
+  // Exactly ONE POST — the strict path does not retry to General.
+  expect(bodies).toHaveLength(1);
+  expect(bodies[0].message_thread_id).toBe(99);
 });
 
 test('the advisory rich (sendRich) General retry also drops reply_parameters', async () => {

@@ -55,13 +55,13 @@ function insideTag(text: string, pos: number): boolean {
   return close !== -1 && pos <= close;
 }
 
-// Pull a surrogate-pair / tag-boundary back so we never cut mid-multibyte or
-// mid-tag. Returns an adjusted cut index in [start+1, hardCut]. Same invariant as
+// Pull a surrogate-pair / tag / entity boundary back so we never cut mid-multibyte, mid-tag or
+// mid-entity. Returns an adjusted cut index in [start+1, hardCut]. Same invariant as
 // `features/tg-ctl/text-util.ts`'s `safeSliceEnd` (also guards a Telegram-bound cut
 // against orphaning a UTF-16 surrogate half), independently evolved here for this
 // splitter's own tag-boundary concern — see that module's header for the shared
 // "why" (tg#17245: an orphaned surrogate 400s the whole Bot API send).
-function safeCut(text: string, start: number, hardCut: number): number {
+function safeCut(text: string, start: number, hardCut: number, html: boolean): number {
   let cut = hardCut;
   // Don't sit on the low half of a surrogate pair.
   while (cut > start + 1 && /[\uDC00-\uDFFF]/.test(text[cut])) cut--;
@@ -70,8 +70,21 @@ function safeCut(text: string, start: number, hardCut: number): number {
     const lastOpen = text.lastIndexOf('<', cut - 1);
     if (lastOpen > start) cut = lastOpen;
   }
+  // Don't cut inside an entity: a chunk ending `…&am` and one starting `p;…` are both refused
+  // by Telegram's HTML parser ("character '&' is reserved"), failing the whole send. Plain
+  // text has no entities — its `&` is a literal.
+  if (!html) return cut;
+  const amp = text.lastIndexOf('&', cut - 1);
+  if (amp > start) {
+    const entity = ENTITY_RE.exec(text.slice(amp, amp + ENTITY_MAX));
+    if (entity && amp + entity[0].length > cut) cut = amp;
+  }
   return cut;
 }
+
+// A named, decimal or hex character reference, anchored at an `&`; ENTITY_MAX bounds the scan.
+const ENTITY_RE = /^&(?:[a-zA-Z][a-zA-Z0-9]*|#[0-9]+|#[xX][0-9a-fA-F]+);/;
+const ENTITY_MAX = 32;
 
 // When `format` is "plain", `<...>` are literal text, not tags: skip ALL tag
 // logic so a plain message containing `a<b>c` isn't mangled into balanced HTML.
@@ -105,8 +118,8 @@ export function splitMessage(text: string, limit: number, format: 'plain' | 'htm
       if (budget <= 0) {
         // Pathological: reopened tags alone fill the limit. Hard-cut at 1 char.
         stillOpen = [];
-        assembled = reopen + rest.slice(0, Math.max(1, safeCut(rest, 0, 1)));
-        rest = rest.slice(Math.max(1, safeCut(rest, 0, 1)));
+        assembled = reopen + rest.slice(0, Math.max(1, safeCut(rest, 0, 1, htmlAware)));
+        rest = rest.slice(Math.max(1, safeCut(rest, 0, 1, htmlAware)));
         break;
       }
       let cut = budget;
@@ -119,8 +132,8 @@ export function splitMessage(text: string, limit: number, format: 'plain' | 'htm
       else if (sp > budget * 0.5) cut = sp + 1;
       else cut = budget; // hard split
 
-      cut = safeCut(rest, 0, cut);
-      if (cut <= 0) cut = Math.max(1, safeCut(rest, 0, budget));
+      cut = safeCut(rest, 0, cut, htmlAware);
+      if (cut <= 0) cut = Math.max(1, safeCut(rest, 0, budget, htmlAware));
 
       const piece = rest.slice(0, cut);
       // The open-tag stack must be computed over reopen+piece, NOT piece alone:

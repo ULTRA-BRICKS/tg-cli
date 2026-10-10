@@ -31,6 +31,9 @@ export interface SendItem {
 export interface TextMessage {
   text: string;
   format: Format;
+  // The rendered header alone — the sender typed no body. It exists only to ride an attachment
+  // as its caption; with every attachment gone it is not a message (tg-cli#207).
+  headerOnly?: true;
 }
 
 // The fully-normalized, ordered plan. The transmitter sends in the order

@@ -469,6 +469,29 @@ test('tg-cli#207: everything filtered out and no text left → refuses loudly in
   }
 });
 
+test('tg-cli#207: a header-only caption whose attachments are all gone is not sent alone — refused', async () => {
+  const { t, calls } = fakeTransport();
+  const capture = captureExitAndErrors();
+  try {
+    const p = plan({ photos: [photo('/gone.png')], textMessages: [{ text: '📁 [w]\n', format: 'plain', headerOnly: true }] });
+    await expect(transmit(p, t, { checkFile: () => 'missing', warn: () => {} })).rejects.toThrow('__exit__');
+    expect(capture.getExitCode()).toBe(1);
+    expect(calls).toHaveLength(0);
+  } finally {
+    capture.restore();
+  }
+});
+
+test('tg-cli#207: a header-only caption still rides a surviving attachment', async () => {
+  const { t, calls } = fakeTransport();
+  const p = plan({
+    photos: [photo('/gone.png'), photo('/ok.png')],
+    textMessages: [{ text: '📁 [w]\n', format: 'plain', headerOnly: true }],
+  });
+  await transmit(p, t, { checkFile: (path) => (path === '/gone.png' ? 'missing' : 'ok'), warn: () => {} });
+  expect(calls.map((c) => [c.method, c.args.caption])).toEqual([['sendPhoto', '📁 [w]\n']]);
+});
+
 // --- tg-cli#208: a body large enough to fragment into more than the flood
 // cap must be REFUSED before anything is sent (same preflight posture as the
 // invalid-rich-HTML case above), unless the caller opts in via

@@ -18,11 +18,19 @@ test('empty caption → no text message', () => {
 
 test('empty prose but a non-empty prefix (renderText) → prefix rides as caption', () => {
   // Mirrors tg: even when the user's prose is empty, the AI-emoji/tmux prefix
-  // produced by renderText survives as the (caption) text message.
+  // produced by renderText survives as the (caption) text message — marked header-only, so the
+  // transmitter drops it if every attachment it captions is gone (tg-cli#207).
   const plan = buildSendPlan([photo('/a.png')], '', 'plain', {
     renderText: (t) => ({ text: '\u{1F681}\n' + t, format: 'plain' }),
   });
-  expect(plan.textMessages).toEqual([{ text: '\u{1F681}\n', format: 'plain' }]);
+  expect(plan.textMessages).toEqual([{ text: '\u{1F681}\n', format: 'plain', headerOnly: true }]);
+});
+
+test('a header with no attachments is the message itself, not a header-only caption', () => {
+  const plan = buildSendPlan([], '', 'plain', {
+    renderText: (t) => ({ text: '\u{1F681} [w] Deploy done\n' + t, format: 'plain' }),
+  });
+  expect(plan.textMessages).toEqual([{ text: '\u{1F681} [w] Deploy done\n', format: 'plain' }]);
 });
 
 test('truly empty render (no prefix, no prose) → no text message', () => {

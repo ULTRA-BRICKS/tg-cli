@@ -97,6 +97,11 @@ export function buildSendPlan(items: ParsedItem[], rawText: string, format: Form
   // R4 fragments go at the end of the documents section.
   documents.push(...fragments);
 
-  const textMessages: TextMessage[] = rendered.text ? [{ text: rendered.text, format: rendered.format }] : [];
+  // No body, only the rendered header: it is there to caption the attachments (a send with no
+  // attachment keeps it as its message — `tg --title …` alone).
+  const headerOnly = strippedText === '' && photos.length + documents.length > 0;
+  const textMessages: TextMessage[] = rendered.text
+    ? [{ text: rendered.text, format: rendered.format, ...(headerOnly ? { headerOnly: true as const } : {}) }]
+    : [];
   return { photos, textMessages, documents };
 }

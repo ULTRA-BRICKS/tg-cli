@@ -86,7 +86,8 @@ message (handled under the hood).
 ## Message splitting (answer 3 / B)
 Any TEXT message (original, or split-off from a caption) exceeding Telegram's 4096 limit →
 split into multiple messages on SAFE boundaries: prefer newline/paragraph, never split
-mid-HTML-tag (close+reopen formatting per chunk so each chunk is valid HTML) and never
+mid-HTML-tag (close+reopen formatting per chunk so each chunk is valid HTML), never inside an
+HTML entity (`&amp;` cut in two makes Telegram refuse the chunk) and never
 mid-multibyte. The splitter is GENERIC: it runs LAST and knows nothing about excerpts.
 Excerpt→file conversion (R4) happens earlier; whatever text remains, if > 4096, gets split.
 
@@ -120,6 +121,8 @@ corrupted send" use case to opt into):
   and the reason, and the rest of the plan (including the primary text) still goes out. If
   filtering leaves the WHOLE plan empty (every attachment was bad and there is no text either),
   `transmit()` refuses loudly (non-zero exit) instead of a silent `OK` that delivered nothing.
+  A send with no body whose header was only the caption of those attachments counts as empty:
+  the plan marks such a text `headerOnly`, and it is dropped once no attachment survives.
   `features/auto-attach/file-check.ts` is the pure decision function (`checkAttachmentFile`)
   with injected `stat`/`canRead` — the module stays disk-free per the repo's pure-feature-module
   convention; the `tg` entrypoint wires the real `statSync`/`accessSync` check inline, and reuses

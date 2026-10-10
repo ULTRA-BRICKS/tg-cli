@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { createTelegramTransport } from '../features/transport/telegram';
+import { createTelegramTransport, TelegramSendError } from '../features/transport/telegram';
 
 // Transport-level tests for the new sendRichMessage call (the riskiest
 // integration boundary). They stub globalThis.fetch and assert the exact
@@ -76,15 +76,8 @@ test('sendRich threads via reply_parameters and consumes the anchor once', async
   }
 });
 
-test('sendRich rejects an over-limit body locally (no fetch, process.exit(1))', async () => {
+test('sendRich rejects an over-limit body locally (no fetch; fails the send with a TelegramSendError)', async () => {
   const { calls, restore } = stubFetch();
-  const origExit = process.exit;
-  let exitCode: number | undefined;
-  // Capture the exit code and throw to unwind (validateRichHtml fail → exit).
-  process.exit = ((code?: number) => {
-    exitCode = code ?? 0;
-    throw new Error('__exit__');
-  }) as typeof process.exit;
   try {
     const t = createTelegramTransport({
       api: 'https://example.invalid/botTEST',
@@ -93,12 +86,10 @@ test('sendRich rejects an over-limit body locally (no fetch, process.exit(1))', 
     });
     // 21 columns in one row → over the 20-column limit → local rejection.
     const over = '<table><tr>' + '<td>c</td>'.repeat(21) + '</tr></table>';
-    await expect(t.sendRich(over)).rejects.toThrow('__exit__');
-    expect(exitCode).toBe(1);
+    await expect(t.sendRich(over)).rejects.toThrow(TelegramSendError);
     // It failed BEFORE hitting the network.
     expect(calls).toHaveLength(0);
   } finally {
-    process.exit = origExit;
     restore();
   }
 });

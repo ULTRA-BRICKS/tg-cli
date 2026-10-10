@@ -113,7 +113,7 @@ import { buildPrefix } from "./features/render/prefix"
 import { toTablePre, detectTableKind, pipeTableToHtml } from "./features/render/table"
 import { formatHelp } from "./features/render/format-help"
 import { colorizeHelp, shouldColorize } from "./features/render/help-color"
-import { createTelegramTransport } from "./features/transport/telegram"
+import { createTelegramTransport, TelegramSendError } from "./features/transport/telegram"
 import { doneReactionForSend } from "./features/tg-ctl/reactions"
 import { isEscalationTag } from "./features/render/tag"
 // How long `tg` waits for the daemon's session-topic answer (or its result ack) before
@@ -190,7 +190,10 @@ Readable long messages:
 Send output:
   Successful sends print OK first. When Telegram returns message ids, the same
   line includes reusable refs: OK tg#123, or OK tg#123 tg#124 for a multi-message
-  send. Failed sends do not print refs.
+  send. Failed sends do not print refs and exit 1; messages of the send that
+  went out before the failure are still kept in the "tg replies" history. A
+  Telegram rate limit (429) of up to 30 s is waited out and the message resent
+  once; a longer one fails the send with Telegram's "retry after N".
 
 Options:
   --format plain|html  message format (default: plain). A global modifier on
@@ -2373,10 +2376,41 @@ if (import.meta.main) {
   })
   // fileCheckDeps: defined earlier (before code-as-pdf/md-as-pdf), reused here
   // unchanged so the pre- and post-conversion checks agree on what "ok" means.
-  await transmit(plan, transport, {
-    checkFile: (path) => checkAttachmentFile(path, fileCheckDeps),
-    allowFlood: !floodCapOn,
-  })
+  // A send that fails part-way (a refused chunk, Telegram unreachable) still records what
+  // went out before it: those messages are in the chat, and a reply to one must find it.
+  let sendError: TelegramSendError | null = null
+  try {
+    await transmit(plan, transport, {
+      checkFile: (path) => checkAttachmentFile(path, fileCheckDeps),
+      allowFlood: !floodCapOn,
+    })
+  } catch (e) {
+    if (!(e instanceof TelegramSendError)) throw e
+    sendError = e
+  }
+
+  // Outbound history for `tg replies` recall — one `agent` record per
+  // outbound message_id (now known; see buildOutboundHistoryRecords). The
+  // body is the raw user-typed message (caption), so recall shows what the
+  // agent meant to say, not the branded envelope. Best-effort; never blocks
+  // the (already-sent) send. A failed send records only the messages it delivered.
+  if (!sendError || outboundIds.length > 0) recordOutboundHistory(caption)
+
+  // Generated code→pdf / md→pdf artifacts are uploaded by now — drop their temp
+  // dirs so repeated reports don't pile up in the OS tmp (codex review finding).
+  for (const dir of pdfTempDirs) {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {
+      // best-effort cleanup
+    }
+  }
+
+  if (sendError) {
+    console.error(sendError.message)
+    process.exit(1)
+  }
+
   // Tell the daemon how the threaded send went (§4.5): a success clears the session's miss
   // counter; a General fallback counts a miss, and the daemon posts the notice and, once
   // the topic is proven gone, recreates it. Best-effort, bounded like the lookup.
@@ -2412,23 +2446,6 @@ if (import.meta.main) {
     }
   }
 
-  // Outbound history for `tg replies` recall — one `agent` record per
-  // outbound message_id (now known; see buildOutboundHistoryRecords). The
-  // body is the raw user-typed message (caption), so recall shows what the
-  // agent meant to say, not the branded envelope. Best-effort; never blocks
-  // the (already-sent) send.
-  recordOutboundHistory(caption)
-
-  // Generated code→pdf / md→pdf artifacts are uploaded by now — drop their temp
-  // dirs so repeated reports don't pile up in the OS tmp (codex review finding).
-  for (const dir of pdfTempDirs) {
-    try {
-      rmSync(dir, { recursive: true, force: true })
-    } catch {
-      // best-effort cleanup
-    }
-  }
-
   // --- tg-ctl lazy auto-start (control spec §7): fires only AFTER a fully
   // successful send, only inside tmux with a DETECTED AI AGENT (MODEL — the
   // same in-session detection that brands the message) AND control.enabled.
@@ -2452,7 +2469,6 @@ if (import.meta.main) {
     // best-effort — auto-start failures are invisible by design
   }
 
-  // Reaching here means every send actually went through (checkResponse exits
-  // the process on any API failure).
+  // Reaching here means every send actually went through (a failed one exited above).
   console.log(formatSendOk(outboundIds))
 }

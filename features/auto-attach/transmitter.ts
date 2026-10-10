@@ -221,10 +221,14 @@ export async function transmit(plan: SendPlan, t: Transport, opts: TransmitOptio
 
   preflightRichHtml(plan);
 
+  const photos = filterSendableItems(plan.photos, checkFile, warn);
+  const documents = filterSendableItems(plan.documents, checkFile, warn);
   const filteredPlan: SendPlan = {
-    ...plan,
-    photos: filterSendableItems(plan.photos, checkFile, warn),
-    documents: filterSendableItems(plan.documents, checkFile, warn),
+    photos,
+    documents,
+    // A header-only text was the caption of attachments that are all gone now: the sender
+    // wrote nothing else to deliver.
+    textMessages: photos.length + documents.length > 0 ? plan.textMessages : plan.textMessages.filter((m) => !m.headerOnly),
   };
 
   if (

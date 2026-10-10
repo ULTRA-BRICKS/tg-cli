@@ -68,7 +68,8 @@ I/O, fetch, signals, `bun:ffi`):
   alias `--agent`; `--detect-agent` prints the resolved `[window]` label (+ `title: <secondary>`, and
   `subagent: <label>` when the shell's env marks a subagent); NOT the same flag as `tg-ctl`'s own `--agent`),
   `--reply-to <message_id>` (thread the message UNDER an inbound one — `reply_to_message_id`
-  on sendMessage, `reply_parameters` on sendRichMessage; the `answer` tag requires it. The send
+  on sendMessage/sendPhoto/sendDocument/sendMediaGroup, `reply_parameters` on sendRichMessage,
+  on the FIRST message of the send only; the `answer` tag requires it. The send
   also posts INTO the topic the anchor message sits in: Telegram does not infer a topic from the
   reply anchor in a private chat with topics, so `tg` reads the anchor's thread from its history
   row (`threadId`: topic id, `null` = General; written by the daemon for inbound and by `tg` for
