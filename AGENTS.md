@@ -237,8 +237,9 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
   unless `allowFlood`/`--no-feature flood-cap` (tg-cli#208).
 - `features/autolink-tasks/` — detects Linear ticket codes in messages, resolves titles via the
   `linear` CLI, and rewrites text with hyperlinks.
-- `features/autolink-prs/` — detects GitHub `#N` refs, resolves them against the cwd repo via
-  `gh` (issues merge into the tickets block, PRs get their own block), repo-keyed 1 h cache.
+- `features/autolink-prs/` — detects `#N` refs, resolves them against the cwd repo's Forgejo origin
+  via the REST API (`features/forgejo/client.ts`, token from fj's key store; issues merge into the
+  tickets block, PRs get their own block), host+repo-keyed 1 h cache.
 - `features/autolink-msgrefs/` — links `tg#<id>` inbound-message references (the convention the
   inbound inject wrap renders, distinct from a GitHub `#<id>`). Pure detection runs FIRST in the
   outbound transform — before the `#N` PR pass — so a `tg#3715` is never mis-resolved as issue/PR

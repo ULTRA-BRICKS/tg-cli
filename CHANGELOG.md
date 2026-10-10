@@ -3,6 +3,30 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.60.3
+
+- **`#N` autolinks and the `/tasks` board read Forgejo instead of GitHub (#440).** Both still called
+  `gh` (`gh repo view` + `gh api graphql` for autolinks, `gh pr list` for the board), so on our
+  Forgejo repos every send printed "the gh CLI is not authenticated" and the board's PR, CI and
+  Review columns were always `—`. fj 0.6.0 prints only human-readable text, so both now call the
+  Forgejo REST API directly (`features/forgejo/client.ts`): the repo is the cwd's `origin` remote
+  (SSH remotes map through fj's `aliases`), authenticated with the token `fj auth login` stores in
+  fj's key store (an expired OAuth token is refreshed once by running `fj -H <host> whoami`), with
+  an explicit User-Agent; the token goes only to the origin host and redirects are not followed.
+  - Autolinks: one `GET /repos/{o}/{r}/issues/{n}` per cache miss (the endpoint covers PRs), 6 in
+    flight, the batch capped at 8 s; links use the forge's own `html_url`. HTTP 404 is a cached
+    verified absence; the first other failure, or the cap, stops the batch (lookups in flight are
+    aborted, none further start), so a partial lookup is never cached as "absent" and `tg` never
+    lingers after the send. A GitHub origin leaves `#N` plain and silent. Cache:
+    `~/.cache/tg-cli/forgejo-cache.json`, keyed by host + repo.
+  - `/tasks`: the repo's 100 most recently updated PRs in two list calls (bodies included — no
+    per-PR call); for ticket-matched PRs only, CI is the head commit's combined status and Review is
+    each reviewer's latest decisive review (dismissed reviews dropped; draft dominates and skips
+    the lookup; requested reviewers with no verdict → review required; reviews without a user stay
+    distinct), 4 PRs in flight, the stage capped at 10 s (past it, lookups are aborted). Anything
+    the forge cannot report stays `—`.
+  - `tg report`'s `owner/repo#N` field links to `git.hyperide.ai/<owner>/<repo>/pulls/N`.
+
 ## 1.60.2
 
 - **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on

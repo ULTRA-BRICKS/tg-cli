@@ -86,7 +86,7 @@ ref list contains.
 
 ## Non-goals
 
-- No new write ops; verification is still the existing linear/gh probes (interior
+- No new write ops; verification is still the existing linear/Forgejo probes (interior
   numbers are probed too, so an absent one stays plain — never invented).
 - Lists/ranges across whitespace (`HYP-1 / HYP-2`) are not compound — they are
   separate single tokens by the existing rules.

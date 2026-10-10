@@ -198,7 +198,7 @@ export type Action =
   | { kind: 'daily-report'; threadId?: number | null } // /daily — `rig daily`'s categorized what-shipped report over merged PRs
   | { kind: 'usage-report'; period: 'day' | 'week' | 'month' | null; threadId?: number | null } // /spend [day|week|month] — `rig usage`'s token/cost report (named /spend, not /usage/cost/stats — those are reserved by Codex and/or Claude Code, tg-cli#290)
   // /tasks [<agent>] [<status>] and task-board callbacks — entrypoint resolves
-  // the agent→project scope, spawns task-cli + gh, composes a rich-HTML board
+  // the agent→project scope, runs task-cli + reads Forgejo, composes a rich-HTML board
   // with filters/pagination, sends it (#115/#178).
   | {
       kind: 'tasks';

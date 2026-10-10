@@ -2,11 +2,11 @@
 //
 // Alex (tg#5698) wants the task board on his phone: a table of tickets with
 // lifecycle status, filterable by agent window and status, composed from
-// `task list --json` plus the PR/CI state `gh pr list --json` carries. This
-// module owns arg parsing, status normalization, PR↔ticket matching, CI
-// rollup, and the rich-HTML table composition. The daemon owns the spawns
-// (task-cli, gh), the fuzzy agent→project scope (agent-match.ts), and the
-// sendRichMessage call.
+// `task list --json` plus the PRs, commit statuses and reviews the Forgejo REST
+// API reports. This module owns arg parsing, status normalization, PR↔ticket
+// matching, the CI/review rollups, and the rich-HTML table composition. The
+// daemon owns the I/O (task-cli, Forgejo via features/forgejo/client.ts), the
+// fuzzy agent→project scope (agent-match.ts), and the sendRichMessage call.
 //
 // Missing data (no PR, no CI, no due date) renders as an explicit em dash — it
 // is NEVER fabricated (a fabricated "passing" CI would be worse than a blank).
@@ -81,9 +81,10 @@ export interface TaskItem {
   agent?: string;
 }
 
-// A PR as `gh pr list --json number,title,url,body,statusCheckRollup,reviewDecision,isDraft`
-// emits it, after the daemon normalizes the CI rollup to a verdict and the review
-// decision to a lifecycle verdict.
+// A PR as the board renders it, normalized from one `GET /repos/{o}/{r}/pulls` item. `ci` and
+// `review` start null and are filled for ticket-matched PRs only, from the head commit's
+// combined status and the PR's reviews (rollupForgejoStatus / rollupForgejoReviews). There is
+// no `state` field: the board never shows open/merged — it shows CI and review.
 export interface PrRef {
   number: number;
   url: string;
@@ -94,6 +95,11 @@ export interface PrRef {
   // module's no-fabrication rule, so a caller that has no review data need not synthesize one.
   review?: ReviewState;
   project?: string;
+  /** Head commit, the key for the CI lookup. */
+  headSha?: string;
+  draft?: boolean;
+  /** Reviewers asked and not yet answered — "review required" when nobody has decided. */
+  requestedReviewers?: number;
 }
 
 export type CiState = 'pass' | 'fail' | 'pending' | null;
@@ -101,21 +107,127 @@ export type CiState = 'pass' | 'fail' | 'pending' | null;
 // The PR review lifecycle for the message→acceptance→CI→review board (tg-cli#117, Alex tg#5698).
 export type ReviewState = 'approved' | 'changes' | 'review-required' | 'draft' | null;
 
-// Reduce gh's `reviewDecision` string + `isDraft` boolean to one review verdict. A draft PR
-// dominates (it is explicitly not ready for review). Never fabricates an "approved" — an
-// unrecognized/empty decision is null (a dash), same posture as rollupCiState.
-export function rollupReviewState(reviewDecision: unknown, isDraft: unknown): ReviewState {
-  if (isDraft === true) return 'draft';
-  switch (String(reviewDecision ?? '').toUpperCase()) {
-    case 'APPROVED':
-      return 'approved';
-    case 'CHANGES_REQUESTED':
-      return 'changes';
-    case 'REVIEW_REQUIRED':
-      return 'review-required';
+/**
+ * Parse one page of `GET /repos/{o}/{r}/pulls` into board PRs; malformed items are skipped.
+ * `items` is the page's raw length — the pagination signal, since skipped items still count.
+ */
+export function parseForgejoPulls(raw: string, project: string): { prs: PrRef[]; items: number } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { prs: [], items: 0 };
+  }
+  if (!Array.isArray(parsed)) return { prs: [], items: 0 };
+  const out: PrRef[] = [];
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object') continue;
+    const pr = item as {
+      number?: unknown;
+      title?: unknown;
+      html_url?: unknown;
+      body?: unknown;
+      draft?: unknown;
+      head?: { sha?: unknown } | null;
+      requested_reviewers?: unknown;
+    };
+    if (typeof pr.number !== 'number' || !Number.isSafeInteger(pr.number) || pr.number <= 0) continue;
+    if (typeof pr.title !== 'string' || typeof pr.html_url !== 'string' || !/^https?:\/\//.test(pr.html_url)) continue;
+    const ref: PrRef = {
+      number: pr.number,
+      url: pr.html_url,
+      title: pr.title,
+      body: typeof pr.body === 'string' ? pr.body : '',
+      ci: null,
+      review: null,
+      project,
+      draft: pr.draft === true,
+      requestedReviewers: Array.isArray(pr.requested_reviewers) ? pr.requested_reviewers.length : 0,
+    };
+    if (typeof pr.head?.sha === 'string' && pr.head.sha) ref.headSha = pr.head.sha;
+    out.push(ref);
+  }
+  return { prs: out, items: parsed.length };
+}
+
+// Bounds the Forgejo request fan-out of one /tasks board: PR_PAGES list pages of PR_PAGE_SIZE
+// (Forgejo's default max page size), STATUS_CONCURRENCY status/review GETs in flight.
+export const PR_PAGE_SIZE = 50;
+export const PR_PAGES = 2;
+export const STATUS_CONCURRENCY = 4;
+// Ceilings on the PR-list stage and on the CI/review lookup stage of one board render.
+export const PR_LIST_BUDGET_MS = 10_000;
+export const STATUS_BUDGET_MS = 10_000;
+
+/**
+ * Reduce `GET /repos/{o}/{r}/commits/{sha}/status` (Forgejo's combined status) to a verdict.
+ * No statuses, or a state outside success/failure/error/pending (e.g. `warning`), is null — a
+ * dash, never a fabricated pass.
+ */
+export function rollupForgejoStatus(raw: string): CiState {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const combined = parsed as { state?: unknown; total_count?: unknown; statuses?: unknown };
+  const count = typeof combined.total_count === 'number' ? combined.total_count : Array.isArray(combined.statuses) ? combined.statuses.length : 0;
+  if (count === 0) return null;
+  switch (combined.state) {
+    case 'success':
+      return 'pass';
+    case 'failure':
+    case 'error':
+      return 'fail';
+    case 'pending':
+      return 'pending';
     default:
       return null;
   }
+}
+
+/**
+ * Reduce `GET /repos/{o}/{r}/pulls/{n}/reviews` to one verdict. Each reviewer's latest decisive
+ * review counts (comments and pending drafts decide nothing; dismissed reviews are dropped). A
+ * draft PR dominates — it is explicitly not ready. Any outstanding change request → changes;
+ * else any approval → approved; else requested reviewers (or a REQUEST_REVIEW) → review-required;
+ * else null. Never fabricates an approval; `raw` null (the reviews could not be read) is null.
+ */
+export function rollupForgejoReviews(raw: string | null, draft: boolean, requestedReviewers: number): ReviewState {
+  if (draft) return 'draft';
+  if (raw === null) return null;
+  let reviews: unknown;
+  try {
+    reviews = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(reviews)) return null;
+  type Review = { id?: unknown; state?: unknown; dismissed?: unknown; user?: { login?: unknown } | null };
+  // Review ids grow with submission, so ascending id order lets a reviewer's later verdict
+  // replace their earlier one regardless of the order the API lists them in.
+  const ordered = (reviews.filter((r) => r && typeof r === 'object') as Review[]).sort(
+    (a, b) => (typeof a.id === 'number' ? a.id : 0) - (typeof b.id === 'number' ? b.id : 0),
+  );
+  const latest = new Map<string, string>();
+  let reviewRequested = requestedReviewers > 0;
+  for (const r of ordered) {
+    if (r.dismissed === true || typeof r.state !== 'string') continue;
+    if (r.state === 'REQUEST_REVIEW') {
+      reviewRequested = true;
+      continue;
+    }
+    if (r.state !== 'APPROVED' && r.state !== 'REQUEST_CHANGES') continue;
+    // A review without a user (e.g. a team review) is its own reviewer: collapsing all of them
+    // onto one key would let one's approval overwrite another's change request.
+    latest.set(typeof r.user?.login === 'string' && r.user.login ? `user:${r.user.login}` : `review:${String(r.id)}`, r.state);
+  }
+  const verdicts = [...latest.values()];
+  if (verdicts.includes('REQUEST_CHANGES')) return 'changes';
+  if (verdicts.includes('APPROVED')) return 'approved';
+  return reviewRequested ? 'review-required' : null;
 }
 
 export const TASK_VIEW_FILTERS = ['attention', 'active', 'ready', 'done', 'all'] as const;
@@ -150,29 +262,6 @@ export interface TasksReplyMarkup {
 }
 
 export type TasksCallbackKind = 'filter' | 'page';
-
-// Reduce a gh statusCheckRollup array to one verdict. Any failure → fail; any
-// still-running/queued → pending; all successful/neutral/skipped → pass; empty
-// or unknown → null (rendered as a dash, never a fabricated "pass").
-export function rollupCiState(rollup: unknown): CiState {
-  if (!Array.isArray(rollup) || rollup.length === 0) return null;
-  let sawPending = false;
-  let sawPass = false;
-  for (const check of rollup) {
-    const c = check as { status?: string; conclusion?: string; state?: string };
-    const status = (c.status ?? '').toUpperCase();
-    const verdict = (c.conclusion ?? c.state ?? '').toUpperCase();
-    if (status && status !== 'COMPLETED') {
-      sawPending = true;
-      continue;
-    }
-    if (['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE'].includes(verdict)) return 'fail';
-    if (['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(verdict)) sawPass = true;
-    else if (verdict === '' || ['PENDING', 'QUEUED', 'IN_PROGRESS', 'EXPECTED'].includes(verdict)) sawPending = true;
-  }
-  if (sawPending) return 'pending';
-  return sawPass ? 'pass' : null;
-}
 
 export function taskKey(task: Pick<TaskItem, 'id' | 'project'>): string {
   return task.project ? `${task.project}:${task.id}` : task.id;

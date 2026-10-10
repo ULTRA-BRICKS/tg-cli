@@ -40,11 +40,12 @@ import {
   extractBaseModel,
 } from "./features/branding/emoji"
 import {
-  mergeIntoCache as mergeGhCache,
-  splitByCache as splitGhCache,
+  mergeIntoCache as mergeForgeCache,
+  splitByCache as splitForgeCache,
 } from "./features/autolink-prs/cache"
 import { detectRefsExpanded } from "./features/autolink-prs/detect"
-import { probeRefsInRepo, probeRepo, type GhRef } from "./features/autolink-prs/resolve"
+import { probeRefsInRepo, type ForgeRef } from "./features/autolink-prs/resolve"
+import { repoSlug, resolveForgejo } from "./features/forgejo/client"
 import { buildEntries, linkifyRefsCompound } from "./features/autolink-prs/render"
 import { detectMsgRefs } from "./features/autolink-msgrefs/detect"
 import { detectLinkableMsgRefs, linkifyMsgRefs, msgRefUrl, resolveMsgRefs } from "./features/autolink-msgrefs/render"
@@ -1636,76 +1637,49 @@ if (import.meta.main) {
   }
   const hasTickets = autolinkTickets.length > 0
 
-  // --- autolink-prs: detect #N refs, resolve them via the gh CLI ---
+  // --- autolink-prs: detect #N refs, resolve them via the Forgejo REST API ---
   // (docs/specs/autolink-prs.md). Sibling of autolink-tasks: detect → cache
-  // split → probe → merge. Two gh spawns when refs are found — repo identity
-  // (`gh repo view`) then one batched `gh api graphql`. Issues merge into the
-  // tickets reference block; PRs get their own block (handled in render below).
-  // Every failure mode keeps the send going as plain text. The once-only hints
-  // reuse the autolink-tasks state file (AUTOLINK_STATE_PATH) with gh-* kinds.
-  const runGhReal: Runner = (cliArgs) => {
-    try {
-      const proc = Bun.spawnSync(["gh", ...cliArgs], {
-        stdout: "pipe",
-        stderr: "pipe",
-        timeout: 10_000,
-      })
-      return {
-        exitCode: proc.exitCode ?? 1,
-        stdout: proc.stdout.toString(),
-        stderr: proc.stderr.toString(),
-      }
-    } catch {
-      // spawn itself failed → the gh binary is not installed
-      return null
-    }
-  }
-  const autolinkRefs = new Map<number, GhRef>()
+  // split → probe → merge. The repo is the cwd's `origin` remote; cache misses
+  // cost one issue GET each (the endpoint covers PRs too), authenticated with
+  // the token fj stores. Issues merge into the tickets reference block; PRs get
+  // their own block (handled in render below). Every failure mode keeps the send
+  // going as plain text. The once-only login hint reuses the autolink-tasks state
+  // file (AUTOLINK_STATE_PATH) with a forgejo-* kind.
+  const autolinkRefs = new Map<number, ForgeRef>()
   let autolinkRefOrder: number[] = []
-  const ghInstallHint = (refs: number[]): void =>
-    hintOnce(
-      "gh-install",
-      `autolink-prs: GitHub refs found (${refs.map((n) => `#${n}`).join(", ")}) but the gh CLI is not installed. ` +
-        "Install: brew install gh — or disable with --no-feature autolink-prs. (shown once)",
-    )
-  const ghLoginHint = (): void =>
-    hintOnce("gh-login", "autolink-prs: the gh CLI is not authenticated. Run: gh auth login (shown once)")
   if (features["autolink-prs"] !== false && caption) {
     const refs = detectRefsExpanded(caption)
     if (refs.length > 0) {
       autolinkRefOrder = refs
       // Resolve repo identity first — the cache is keyed by repo (#260 means
       // different things in different repos), so we cannot cache-split before we
-      // know the repo. `gh repo view` is cheap; the batched graphql is the spawn
-      // we want to skip when every ref is already cached.
-      const repoProbe = probeRepo(runGhReal)
-      if (repoProbe.status === "ok") {
-        const repo = repoProbe.repo
-        const GH_CACHE_PATH = join(home, ".cache", "tg-cli", "gh-cache.json")
-        const ghCacheRaw = ((): string | null => {
+      // know the repo.
+      const forge = await resolveForgejo(process.cwd(), { timeoutMs: 5_000 })
+      if (forge.status === "ok") {
+        const repo = `${forge.repo.hostKey}/${repoSlug(forge.repo)}`
+        const FORGEJO_CACHE_PATH = join(home, ".cache", "tg-cli", "forgejo-cache.json")
+        const forgejoCacheRaw = ((): string | null => {
           try {
-            return readFileSync(GH_CACHE_PATH, "utf8")
+            return readFileSync(FORGEJO_CACHE_PATH, "utf8")
           } catch {
             return null
           }
         })()
         const now = Date.now()
-        const { hits, missing } = splitGhCache(repo, refs, ghCacheRaw, now)
-        let probed: Map<number, GhRef> | null = null
+        const { hits, missing } = splitForgeCache(repo, refs, forgejoCacheRaw, now)
+        let probed: Map<number, ForgeRef> | null = null
         if (missing.length > 0) {
-          const probe = probeRefsInRepo(repo, missing, runGhReal)
+          const probe = await probeRefsInRepo(forge.repo, missing, forge.get)
           if (probe.status === "ok") {
             probed = probe.refs
             try {
               mkdirSync(join(home, ".cache", "tg-cli"), { recursive: true })
-              writeFileSync(GH_CACHE_PATH, mergeGhCache(ghCacheRaw, repo, missing, probed, now))
+              writeFileSync(FORGEJO_CACHE_PATH, mergeForgeCache(forgejoCacheRaw, repo, missing, probed, now))
             } catch {
               // best-effort cache; never block a send over bookkeeping
             }
-          } else if (probe.status === "no-cli") {
-            ghInstallHint(refs)
           } else if (probe.status === "no-auth") {
-            ghLoginHint()
+            hintOnce("forgejo-login", `autolink-prs: Forgejo ${forge.repo.hostKey} rejected the fj credential. Run: fj -H ${forge.repo.hostKey} auth login (shown once)`)
           } else {
             console.error(`Warning: autolink-prs: ${probe.message} — sending without links`)
           }
@@ -1716,13 +1690,10 @@ if (import.meta.main) {
           const ref = hits.has(num) ? hits.get(num) : (probed?.get(num) ?? null)
           if (ref) autolinkRefs.set(num, ref)
         }
-      } else if (repoProbe.status === "no-cli") {
-        ghInstallHint(refs)
-      } else if (repoProbe.status === "no-auth") {
-        ghLoginHint()
-      } else {
-        // no-repo: not a GitHub repo / no remote — normal for many cwds. Silent.
+      } else if (forge.status === "no-auth") {
+        hintOnce("forgejo-login", `autolink-prs: no fj credential for ${forge.host}. Run: fj -H ${forge.host} auth login (shown once)`)
       }
+      // no-repo: no origin, a GitHub origin, or not a git checkout — normal for many cwds. Silent.
     }
   }
   const hasRefs = autolinkRefs.size > 0

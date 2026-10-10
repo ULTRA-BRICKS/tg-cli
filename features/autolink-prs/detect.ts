@@ -94,7 +94,7 @@ export function refLeads(token: string): LeadMatch[] {
 
 /**
  * Like detectRefs, but expands compound groups (#100..103, #5/6/7) into every
- * number they denote — unique, first-appearance order. Feeds the gh probe and
+ * number they denote — unique, first-appearance order. Feeds the Forgejo probe and
  * the bottom reference block (decision 2026-06-12: enumerate the whole range
  * below, link only the endpoints in the body). A separator-free token yields
  * exactly its single number, so this is a strict superset of detectRefs.

@@ -1,14 +1,7 @@
 import { expect, test } from 'bun:test';
 import { detectRefs, findRefMatches } from '../features/autolink-prs/detect';
-import {
-  buildRefsQuery,
-  parseRefsResponse,
-  probeRefs,
-  probeRefsInRepo,
-  probeRepo,
-  type GhRef,
-  type RunResult,
-} from '../features/autolink-prs/resolve';
+import { parseIssueResponse, probeRefsInRepo, type ForgeRef } from '../features/autolink-prs/resolve';
+import type { ForgejoGet, ForgejoRepo, HttpResult } from '../features/forgejo/client';
 import { CACHE_TTL_MS, cacheKey, mergeIntoCache, splitByCache } from '../features/autolink-prs/cache';
 import { buildEntries, linkifyRefs, prStateSuffix, refAnchor } from '../features/autolink-prs/render';
 import { applyAutolink, type TicketInfo } from '../features/autolink-tasks/render';
@@ -41,11 +34,11 @@ test('detect: #0 is not a ref (must be [1-9]\\d*)', () => {
 });
 
 test('detect: refs inside URLs are skipped', () => {
-  expect(detectRefs('see https://github.com/o/r/pull/260 for details')).toEqual([]);
+  expect(detectRefs('see https://git.hyperide.ai/o/r/pulls/260 for details')).toEqual([]);
 });
 
 test('detect: URL mention does not shadow a separate plain mention', () => {
-  expect(detectRefs('#260 (https://github.com/o/r/pull/260)')).toEqual([260]);
+  expect(detectRefs('#260 (https://git.hyperide.ai/o/r/pulls/260)')).toEqual([260]);
 });
 
 test('detect: a bare # or #word is not a ref', () => {
@@ -65,131 +58,80 @@ test('findRefMatches: returns start/end/number triples', () => {
   expect(findRefMatches('(#260)')).toEqual([{ start: 1, end: 5, number: 260 }]);
 });
 
-// --- GraphQL query building ---
+// --- Forgejo REST response parsing + probes ---
 
-test('query: aliases each number with issueOrPullRequest fragments', () => {
-  const q = buildRefsQuery('alex-mextner', 'tg-cli', [260, 42]);
-  expect(q).toContain('repository(owner: "alex-mextner", name: "tg-cli")');
-  expect(q).toContain('n260: issueOrPullRequest(number: 260)');
-  expect(q).toContain('n42: issueOrPullRequest(number: 42)');
-  expect(q).toContain('__typename');
-  expect(q).toContain('... on Issue { number title url state }');
-  expect(q).toContain('... on PullRequest { number title url state isDraft }');
-});
+const FORGE: ForgejoRepo = { origin: 'https://git.hyperide.ai', hostKey: 'git.hyperide.ai', owner: 'ultrabricks', name: 'tg-cli' };
 
-test('query: owner/name are JSON-escaped (no injection through quotes)', () => {
-  const q = buildRefsQuery('o"x', 'r', [1]);
-  expect(q).toContain('owner: "o\\"x"');
-});
-
-// --- Response parsing ---
-
-const prNode = (n: number) => ({
-  __typename: 'PullRequest',
-  number: n,
-  title: `PR ${n}`,
-  url: `https://github.com/o/r/pull/${n}`,
-  state: 'MERGED',
-  isDraft: false,
-});
-const issueNode = (n: number) => ({
-  __typename: 'Issue',
-  number: n,
-  title: `Issue ${n}`,
-  url: `https://github.com/o/r/issues/${n}`,
-  state: 'OPEN',
-});
-
-test('parse: resolves issues and PRs with the right kind', () => {
-  const raw = JSON.stringify({ data: { repository: { n260: prNode(260), n42: issueNode(42) } } });
-  const map = parseRefsResponse(raw, [260, 42]);
-  expect(map).not.toBeNull();
-  expect(map!.get(260)?.kind).toBe('pr');
-  expect(map!.get(260)?.isDraft).toBe(false);
-  expect(map!.get(42)?.kind).toBe('issue');
-  expect(map!.get(42)?.title).toBe('Issue 42');
-});
-
-test('parse: partial response (null alias + top-level errors) keeps present refs', () => {
-  // gh returns this for a mix of existing and missing numbers.
-  const raw = JSON.stringify({
-    data: { repository: { n260: prNode(260), n999: null } },
-    errors: [{ type: 'NOT_FOUND', message: 'Could not resolve to a node with number 999' }],
+// Shapes as GET /api/v1/repos/{o}/{r}/issues/{n} returns them (fields tg reads).
+const apiPr = (n: number, opts: { merged?: boolean; draft?: boolean; state?: string } = {}) =>
+  JSON.stringify({
+    number: n,
+    title: `PR ${n}`,
+    state: opts.state ?? (opts.merged ? 'closed' : 'open'),
+    html_url: `https://git.hyperide.ai/ultrabricks/tg-cli/pulls/${n}`,
+    pull_request: { merged: opts.merged ?? false, merged_at: null, draft: opts.draft ?? false, html_url: `https://git.hyperide.ai/ultrabricks/tg-cli/pulls/${n}` },
   });
-  const map = parseRefsResponse(raw, [260, 999]);
-  expect(map).not.toBeNull();
-  expect(map!.has(260)).toBe(true);
-  expect(map!.has(999)).toBe(false);
+const apiIssue = (n: number, state = 'open') =>
+  JSON.stringify({ number: n, title: `Issue ${n}`, state, html_url: `https://git.hyperide.ai/ultrabricks/tg-cli/issues/${n}`, pull_request: null });
+
+const ok = (body: string): HttpResult => ({ status: 200, body });
+
+test('parse issue JSON: a merged PR keeps its html_url and reads as MERGED', () => {
+  expect(parseIssueResponse(apiPr(260, { merged: true }), 260)).toEqual({
+    number: 260,
+    kind: 'pr',
+    title: 'PR 260',
+    url: 'https://git.hyperide.ai/ultrabricks/tg-cli/pulls/260',
+    state: 'MERGED',
+    isDraft: false,
+  });
 });
 
-test('parse: only wanted numbers are kept', () => {
-  const raw = JSON.stringify({ data: { repository: { n260: prNode(260), n5: issueNode(5) } } });
-  const map = parseRefsResponse(raw, [260]);
-  expect(map!.has(260)).toBe(true);
-  expect(map!.has(5)).toBe(false);
+test('parse issue JSON: an issue (pull_request null) is kind issue with its own URL', () => {
+  const ref = parseIssueResponse(apiIssue(42), 42);
+  expect(ref?.kind).toBe('issue');
+  expect(ref?.url).toBe('https://git.hyperide.ai/ultrabricks/tg-cli/issues/42');
+  expect(ref?.state).toBe('OPEN');
+  expect(ref).not.toHaveProperty('isDraft');
 });
 
-test('parse: malformed JSON / repository null → null', () => {
-  expect(parseRefsResponse('not json', [1])).toBeNull();
-  expect(parseRefsResponse('{"data":{"repository":null}}', [1])).toBeNull();
-  expect(parseRefsResponse('{"errors":[{"message":"boom"}],"data":null}', [1])).toBeNull();
+test('parse issue JSON: draft and closed-unmerged PR states', () => {
+  expect(parseIssueResponse(apiPr(7, { draft: true }), 7)).toMatchObject({ kind: 'pr', state: 'OPEN', isDraft: true });
+  expect(parseIssueResponse(apiPr(8, { state: 'closed' }), 8)).toMatchObject({ kind: 'pr', state: 'CLOSED' });
 });
 
-// --- probeRepo / probeRefsInRepo / probeRefs (injected runner) ---
-
-const ok = (stdout: string): RunResult => ({ exitCode: 0, stdout, stderr: '' });
-
-test('probeRepo: spawn failure → no-cli', () => {
-  expect(probeRepo(() => null).status).toBe('no-cli');
+test('parse issue JSON: wrong number, malformed JSON or a non-http URL is rejected', () => {
+  expect(parseIssueResponse(apiIssue(9), 8)).toBeNull();
+  expect(parseIssueResponse('garbage', 8)).toBeNull();
+  expect(parseIssueResponse(JSON.stringify({ number: 8, title: 'x', html_url: 'javascript:alert(1)' }), 8)).toBeNull();
 });
 
-test('probeRepo: success returns owner/name', () => {
-  const p = probeRepo(() => ok('alex-mextner/tg-cli\n'));
-  expect(p).toEqual({ status: 'ok', repo: 'alex-mextner/tg-cli' });
-});
-
-test('probeRepo: auth error → no-auth', () => {
-  const p = probeRepo(() => ({ exitCode: 1, stdout: '', stderr: 'To get started with GitHub CLI, please run: gh auth login' }));
-  expect(p.status).toBe('no-auth');
-});
-
-test('probeRepo: not a git repo → no-repo', () => {
-  const p = probeRepo(() => ({ exitCode: 1, stdout: '', stderr: 'not a git repository' }));
-  expect(p.status).toBe('no-repo');
-});
-
-test('probeRepo: any unclassified failure → no-repo (silent, common case)', () => {
-  const p = probeRepo(() => ({ exitCode: 1, stdout: '', stderr: 'something weird' }));
-  expect(p.status).toBe('no-repo');
-});
-
-test('probeRepo: empty stdout on exit 0 → no-repo', () => {
-  expect(probeRepo(() => ok('')).status).toBe('no-repo');
-});
-
-test('probeRefsInRepo: empty numbers → ok empty, runner never called', () => {
+test('probeRefsInRepo: empty numbers → ok empty, no request', async () => {
   let called = false;
-  const p = probeRefsInRepo('o/r', [], () => {
-    called = true;
-    return ok('');
-  });
+  const p = await probeRefsInRepo(FORGE, [], async () => { called = true; return ok(''); });
   expect(p.status).toBe('ok');
   expect(called).toBe(false);
 });
 
-test('probeRefsInRepo: success returns the refs map', () => {
-  const raw = JSON.stringify({ data: { repository: { n260: prNode(260) } } });
-  const p = probeRefsInRepo('o/r', [260], () => ok(raw));
+test('probeRefsInRepo: one issue GET per cache miss, PRs and issues alike', async () => {
+  const paths: string[] = [];
+  const get: ForgejoGet = async (path) => {
+    paths.push(path);
+    const n = Number(path.split('/').at(-1));
+    return ok(n === 260 ? apiPr(n) : apiIssue(n));
+  };
+  const p = await probeRefsInRepo(FORGE, [260, 42], get);
   expect(p.status).toBe('ok');
-  if (p.status === 'ok') expect(p.refs.get(260)?.kind).toBe('pr');
+  if (p.status === 'ok') {
+    expect(p.refs.get(260)?.kind).toBe('pr');
+    expect(p.refs.get(42)?.kind).toBe('issue');
+  }
+  expect(paths).toEqual(['/repos/ultrabricks/tg-cli/issues/260', '/repos/ultrabricks/tg-cli/issues/42']);
 });
 
-test('probeRefsInRepo: partial errors with non-zero exit still parse → ok', () => {
-  const raw = JSON.stringify({
-    data: { repository: { n260: prNode(260), n999: null } },
-    errors: [{ message: 'missing 999' }],
-  });
-  const p = probeRefsInRepo('o/r', [260, 999], () => ({ exitCode: 1, stdout: raw, stderr: 'gql error' }));
+test('probeRefsInRepo: HTTP 404 is a verified absence, not a whole-probe failure', async () => {
+  const p = await probeRefsInRepo(FORGE, [260, 999], async (path) =>
+    path.endsWith('/260') ? ok(apiPr(260)) : { status: 404, body: '{"message":"not found"}' });
   expect(p.status).toBe('ok');
   if (p.status === 'ok') {
     expect(p.refs.has(260)).toBe(true);
@@ -197,65 +139,29 @@ test('probeRefsInRepo: partial errors with non-zero exit still parse → ok', ()
   }
 });
 
-test('probeRefsInRepo: unparseable body + non-zero exit → error', () => {
-  const p = probeRefsInRepo('o/r', [1], () => ({ exitCode: 1, stdout: 'garbage', stderr: 'boom' }));
-  expect(p.status).toBe('error');
-});
-
-test('probeRefsInRepo: graphql receives the api invocation with the query', () => {
-  let seen: string[] = [];
-  probeRefsInRepo('o/r', [260], (args) => {
-    seen = args;
-    return ok(JSON.stringify({ data: { repository: { n260: prNode(260) } } }));
-  });
-  expect(seen[0]).toBe('api');
-  expect(seen[1]).toBe('graphql');
-  expect(seen[2]).toBe('-f');
-  expect(seen[3]).toContain('query=');
-  expect(seen[3]).toContain('n260');
-});
-
-test('probeRefs: composes repo + refs in two spawns', () => {
-  const calls: string[][] = [];
-  const p = probeRefs([260], (args) => {
-    calls.push(args);
-    if (args[0] === 'repo') return ok('o/r\n');
-    return ok(JSON.stringify({ data: { repository: { n260: prNode(260) } } }));
-  });
-  expect(p.status).toBe('ok');
-  if (p.status === 'ok') {
-    expect(p.repo).toBe('o/r');
-    expect(p.refs.get(260)?.kind).toBe('pr');
-  }
-  expect(calls.length).toBe(2);
-});
-
-test('probeRefs: repo failure short-circuits before graphql', () => {
-  const calls: string[][] = [];
-  const p = probeRefs([260], (args) => {
-    calls.push(args);
-    return { exitCode: 1, stdout: '', stderr: 'not a git repository' };
-  });
-  expect(p.status).toBe('no-repo');
-  expect(calls.length).toBe(1);
+test('probeRefsInRepo: 401/403 → no-auth; other statuses and network failure → error', async () => {
+  expect((await probeRefsInRepo(FORGE, [1], async () => ({ status: 401, body: '' }))).status).toBe('no-auth');
+  expect((await probeRefsInRepo(FORGE, [1], async () => ({ status: 403, body: '' }))).status).toBe('no-auth');
+  expect((await probeRefsInRepo(FORGE, [1], async () => ({ status: 500, body: 'server exploded' }))).status).toBe('error');
+  expect((await probeRefsInRepo(FORGE, [1], async () => null)).status).toBe('error');
 });
 
 // --- Cache (repo-keyed) ---
 
 const T0 = 1_750_000_000_000;
-const REPO = 'alex-mextner/tg-cli';
-const ref = (n: number, kind: 'issue' | 'pr' = 'pr'): GhRef => ({
+const REPO = 'ultrabricks/tg-cli';
+const ref = (n: number, kind: 'issue' | 'pr' = 'pr'): ForgeRef => ({
   number: n,
   kind,
   title: `Title ${n}`,
-  url: `https://github.com/o/r/${kind === 'pr' ? 'pull' : 'issues'}/${n}`,
+  url: `https://git.hyperide.ai/o/r/${kind === 'pr' ? 'pulls' : 'issues'}/${n}`,
   state: kind === 'pr' ? 'MERGED' : 'OPEN',
 });
-const rawWith = (entries: Record<string, { t: number; info: GhRef | null }>): string =>
+const rawWith = (entries: Record<string, { t: number; info: ForgeRef | null }>): string =>
   JSON.stringify({ entries });
 
 test('cache: key includes the repo', () => {
-  expect(cacheKey(REPO, 260)).toBe('alex-mextner/tg-cli#260');
+  expect(cacheKey(REPO, 260)).toBe('ultrabricks/tg-cli#260');
 });
 
 test('cache: same number in a different repo is a different entry (miss)', () => {
@@ -345,11 +251,11 @@ test('cache: a positive entry missing string state is a miss (no render crash)',
 
 // --- linkifyRefs ---
 
-const refsMap = (...refs: GhRef[]): Map<number, GhRef> => new Map(refs.map((r) => [r.number, r]));
+const refsMap = (...refs: ForgeRef[]): Map<number, ForgeRef> => new Map(refs.map((r) => [r.number, r]));
 
 test('linkify: wraps a verified ref in an anchor', () => {
   const out = linkifyRefs('done with #260 today', refsMap(ref(260)));
-  expect(out).toBe('done with <a href="https://github.com/o/r/pull/260">#260</a> today');
+  expect(out).toBe('done with <a href="https://git.hyperide.ai/o/r/pulls/260">#260</a> today');
 });
 
 test('linkify: every occurrence is linked', () => {
@@ -364,7 +270,7 @@ test('linkify: unverified refs stay plain', () => {
 });
 
 test('linkify: skips tokens containing ://', () => {
-  const text = 'https://github.com/o/r/pull/260';
+  const text = 'https://git.hyperide.ai/o/r/pulls/260';
   expect(linkifyRefs(text, refsMap(ref(260)))).toBe(text);
 });
 
@@ -407,7 +313,7 @@ test('buildEntries: splits issues and PRs in first-appearance order', () => {
   const { issues, prs } = buildEntries(map, [260, 42, 7]);
   expect(issues.length).toBe(1);
   expect(issues[0].label).toContain('>#42</a>');
-  expect(prs.map((p) => p.label)).toEqual(['<a href="https://github.com/o/r/pull/260">#260</a>', '<a href="https://github.com/o/r/pull/7">#7</a>']);
+  expect(prs.map((p) => p.label)).toEqual(['<a href="https://git.hyperide.ai/o/r/pulls/260">#260</a>', '<a href="https://git.hyperide.ai/o/r/pulls/7">#7</a>']);
 });
 
 // --- Composition through applyAutolink (the real render path) ---
@@ -418,13 +324,13 @@ const T = (code: string, title = `Title ${code}`): TicketInfo => ({
   url: `https://linear.app/x/issue/${code}/slug`,
 });
 
-const linkifyWith = (map: Map<number, GhRef>) => (html: string): string => linkifyRefs(html, map);
+const linkifyWith = (map: Map<number, ForgeRef>) => (html: string): string => linkifyRefs(html, map);
 
 test('render: a single PR gets its own block even alone', () => {
   const map = refsMap(ref(260, 'pr'));
   const { issues, prs } = buildEntries(map, [260]);
   const out = applyAutolink('shipped #260', [], false, { linkify: linkifyWith(map), issues, prs });
-  expect(out).toContain('<a href="https://github.com/o/r/pull/260">#260</a>');
+  expect(out).toContain('<a href="https://git.hyperide.ai/o/r/pulls/260">#260</a>');
   expect(out).toContain('<blockquote expandable>PRs:\n');
   expect(out).toContain('#260</a> — Title 260 (merged)');
   expect(out.trimEnd().endsWith('</blockquote>')).toBe(true);
@@ -488,16 +394,15 @@ test('render: no refs/tickets returns body unchanged', () => {
   expect(applyAutolink('hello', [], false, {})).toBe('hello');
 });
 
-// --- Hint state backward compat (shared file, gh-* kinds added) ---
+// --- Hint state backward compat (shared file, forgejo-login kind) ---
 
 test('hint state: old {install,login} file still parses', () => {
   expect(parseHintState('{"install":true,"login":true}')).toEqual({ install: true, login: true });
 });
 
-test('hint state: gh kinds roundtrip and coexist with linear kinds', () => {
-  let s = parseHintState('{"install":true}');
-  s = markHint(s, 'gh-install');
-  s = markHint(s, 'gh-login');
-  const round = parseHintState(serializeHintState(s));
-  expect(round).toEqual({ install: true, 'gh-install': true, 'gh-login': true });
+test('hint state: forgejo-login roundtrips beside linear kinds; retired gh-* keys are dropped', () => {
+  let s = parseHintState('{"install":true,"gh-install":true,"gh-login":true}');
+  expect(s).toEqual({ install: true });
+  s = markHint(s, 'forgejo-login');
+  expect(parseHintState(serializeHintState(s))).toEqual({ install: true, 'forgejo-login': true });
 });

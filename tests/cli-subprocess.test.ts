@@ -362,6 +362,6 @@ test('`tg report --dry-run ...` renders the full body through the actual send pi
   expect(out).toContain('No network call was made and nothing was sent');
   expect(out).toContain('<h2>Smoke test</h2>');
   expect(out).toContain('<b>Ticket:</b> HYP-1');
-  expect(out).toContain('<a href="https://github.com/alex-mextner/tg-cli/pull/123">alex-mextner/tg-cli#123</a>');
+  expect(out).toContain('<a href="https://git.hyperide.ai/alex-mextner/tg-cli/pulls/123">alex-mextner/tg-cli#123</a>');
   expect(out).toContain('<pre>bun test tests/cli-subprocess.test.ts</pre>');
 }, 90000);

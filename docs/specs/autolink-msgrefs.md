@@ -12,8 +12,8 @@ id back in an outbound message ("answered tg#1234", "see tg#1234"), it means *th
 message with id 1234* — NOT a GitHub issue/PR `#1234`.
 
 The `tg#` prefix is the whole disambiguation. A bare `#1234` belongs to `autolink-prs`
-(resolved against the cwd GitHub repo). Without the prefix the two namespaces collide:
-`#3715` quoted from a phone would be probed against `gh` and mis-linked as PR/issue #3715.
+(resolved against the cwd Forgejo repo). Without the prefix the two namespaces collide:
+`#3715` quoted from a phone would be probed against the forge and mis-linked as PR/issue #3715.
 The convention fixes that at the source — ids are *written* as `tg#<id>`, and this feature
 links them.
 
@@ -135,7 +135,7 @@ AFTER `applyAutolink`'s ticket/`#N` linkifiers and BEFORE the reference blocks a
 `#42`, `HYP-100` or `tg#999` must not be linkified by a later pass, and text the final pass
 inserts is never re-scanned. Running last is safe because the earlier passes never touch a
 raw `tg#<id>`: the PR and ticket detectors reject a `#`/code preceded by the alphanumeric `g`
-(pinned by the boundary-disjointness tests), so a `tg#3715` is never offered to the gh
+(pinned by the boundary-disjointness tests), so a `tg#3715` is never offered to the forge
 probe. The reference blocks are appended after the pass, so their labels/titles are never
 rewritten into previews.
 

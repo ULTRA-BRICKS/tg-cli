@@ -2,16 +2,17 @@
 
 Repo: `~/.files/repos/tg-cli`. Feature lives in `features/autolink-prs/`, tests in
 `tests/autolink-prs.test.ts`. Sibling of `autolink-tasks` (docs/specs/autolink-tasks.md):
-the same detection → verify → cache → render pipeline, but for GitHub `#N` references
+the same detection → verify → cache → render pipeline, but for Forgejo `#N` references
 instead of Linear ticket codes. The two features compose — a single message can carry
-Linear tickets, GitHub issues, and GitHub PRs at once.
+Linear tickets, Forgejo issues, and Forgejo PRs at once.
 
 ## North star
 
-GitHub-style references in the message text (e.g. `#260`) are verified against the
-GitHub repo the send was launched from (via `gh`) and turned into links. The reference
-title is surfaced in a collapsed reference block at the END of the message. Crucially,
-GitHub `issueOrPullRequest(number:)` resolves a `#N` to EITHER an Issue or a Pull Request:
+Forgejo-style references in the message text (e.g. `#260`) are verified against the
+Forgejo repo the send was launched from (its `origin` remote) and turned into links. The
+reference title is surfaced in a collapsed reference block at the END of the message.
+Forgejo's `GET /repos/{owner}/{repo}/issues/{n}` resolves a `#N` to EITHER an Issue or a
+Pull Request (a PR carries a `pull_request` block):
 
 - **Issues** are merged INTO the `autolink-tasks` ticket reference block (issues and
   tickets are "work items" — they read the same way: `#260 — Title`).
@@ -34,67 +35,56 @@ ON by default, toggled like any feature: `--no-feature autolink-prs` or
 - Detection runs on the decoded caption (after `\n` escapes), BEFORE extraction/render.
   The tmux `[window]` prefix is NOT scanned (metadata, not message text).
 
-## Verification (gh CLI)
+## Verification (Forgejo REST API)
 
-Two `gh` spawns per send, only when detection found references, all via an injected
-`Runner` (tests pass a fake; the tg entrypoint passes a `Bun.spawnSync` wrapper run from
-the send's cwd):
+fj 0.6.0 prints human-readable text only (no JSON mode), so tg calls the Forgejo REST API
+directly (`features/forgejo/client.ts`) with the credential fj stores in its key store
+(`$XDG_DATA_HOME/forgejo-cli/keys.json`; one `fj auth login` covers both tools). Only when
+detection found references:
 
-1. **Repo identity**: `gh repo view --json nameWithOwner -q .nameWithOwner` — the
-   `owner/name` the cwd resolves to. Run first; if it fails there is no repo to query.
-2. **Batch resolve**: ONE `gh api graphql -f query='...'` spawn resolving every detected
-   number at once via aliased fields:
+1. **Repo identity**: `git remote get-url origin` in the send's cwd, parsed into host +
+   `owner/name`. SSH remotes map to the web host through fj's `aliases` table. A
+   github.com origin is not a Forgejo repo. An expired fj OAuth token is refreshed once by
+   running `fj -H <host> whoami` (fj rewrites its key store).
+2. **Per-ref resolve**: one `GET /api/v1/repos/{owner}/{repo}/issues/{n}` per cache miss,
+   with `Authorization` + an explicit `User-Agent` (the forge's CDN front rejects
+   requests without one). The credential goes only to the origin host; redirects are
+   never followed.
 
-```
-query {
-  repository(owner: "OWNER", name: "NAME") {
-    n260: issueOrPullRequest(number: 260) {
-      __typename
-      ... on Issue { number title url state }
-      ... on PullRequest { number title url state isDraft }
-    }
-    n42: issueOrPullRequest(number: 42) { ... }
-  }
-}
-```
-
-- `issueOrPullRequest(number:)` errors per-field for a missing number — GraphQL returns a
-  partial `data` object (the missing alias is `null`) PLUS a top-level `errors` array.
-  This is handled gracefully: present aliases resolve, `null`/errored aliases are negative
-  verdicts (the `#N` stays plain text). A whole-response failure (`data: null`) is an error.
-- Each resolved ref carries its `__typename` (`Issue` | `PullRequest`), title, url, state,
-  and — for PRs — `isDraft`.
-- Spawn timeout 10s; on timeout/any unexpected failure the message is sent UNCHANGED with a
-  one-line stderr warning. Autolink must never block or fail a send.
+- HTTP 404 is a verified absence (the `#N` stays plain text and is cached as absent).
+- Each resolved ref carries its kind (`pull_request` present → PR), title, `html_url`,
+  state (`OPEN` / `CLOSED` / `MERGED` when `pull_request.merged`) and — for PRs — draft.
+- Lookups run 6 at a time, each request bounded at 5s, the whole batch at 8s (a long
+  `#1..100` range on a cold cache cannot hold the send). On timeout/any unexpected failure
+  the message is sent UNCHANGED with a one-line stderr warning. Autolink must never block
+  or fail a send.
 
 ### Degradation (mirrors autolink-tasks linear.ts)
 
 Every failure mode is a distinct status and keeps the send going as plain text:
 
-- **no-cli** — `gh` binary not found (spawn returns null). One-time stderr hint to install:
-  `brew install gh`.
-- **no-auth** — `gh` output mentions authentication (`gh auth login` / `authentication`
-  markers). One-time stderr hint to run `gh auth login`.
-- **no-repo** — `gh repo view` fails because the cwd is not a git repo or has no GitHub
-  remote. Silent (no hint — not actionable, and a non-GitHub cwd is normal); the send
-  proceeds plain.
-- **error** — anything else (network, malformed response): one-line stderr warning.
+- **no-auth** — no fj credential for the origin host, an OAuth token that stays expired
+  after a refresh, or HTTP 401/403. One-time stderr hint to run `fj -H <host> auth login`.
+- **no-repo** — no git checkout, no `origin`, or a non-Forgejo (e.g. github.com) origin.
+  Silent (no hint — not actionable, and such a cwd is normal); the send proceeds plain.
+- **error** — anything else (network, other HTTP status, malformed response): one-line
+  stderr warning. The whole batch is dropped — a partial lookup is never cached as absent.
 
-The one-time hints REUSE the existing `autolink-tasks` hint-state mechanism
-(`features/autolink-tasks/state.ts`, file `~/.config/tg-cli/autolink-tasks.json`). The
-`HintKind` union is extended with `'gh-install'` and `'gh-login'`; the state-file parser
-stays backward-compatible (old `{install,login}` files still parse).
+The one-time hint REUSES the existing `autolink-tasks` hint-state mechanism
+(`features/autolink-tasks/state.ts`, file `~/.config/tg-cli/autolink-tasks.json`) with the
+`'forgejo-login'` kind; the state-file parser stays backward-compatible (old
+`{install,login}` files still parse).
 
 ## Caching (mirrors autolink-tasks cache.ts)
 
-- File: `~/.cache/tg-cli/gh-cache.json` (separate from `linear-cache.json`).
+- File: `~/.cache/tg-cli/forgejo-cache.json` (separate from `linear-cache.json`).
 - TTL: **1 hour** per entry.
 - Both **positive** (resolved ref stored) and **negative** (confirmed-absent) verdicts are
   cached — a missing `#N` is not re-probed every send.
-- **CRITICAL — cache key includes the repo**: the key is `<owner>/<repo>#<number>`. The
-  same `#260` means a different thing in a different repo, so a bare `#260` key would be a
-  correctness bug. The repo identity from step 1 is folded into every key.
-- Cache shape: `{ entries: { "<owner>/<repo>#<N>": { t: <unix ms>, info: GhRef | null } } }`.
+- **CRITICAL — cache key includes the repo**: the key is `<host>/<owner>/<repo>#<number>`.
+  The same `#260` means a different thing in a different repo, so a bare `#260` key would
+  be a correctness bug. The repo identity from step 1 is folded into every key.
+- Cache shape: `{ entries: { "<host>/<owner>/<repo>#<N>": { t: <unix ms>, info: GhRef | null } } }`.
   Expired entries are pruned on write. Read/write failures degrade silently to a live probe.
 
 ## Rendering (post-render transform)
@@ -127,7 +117,7 @@ Both the issue→tickets merge and the PR block are produced by extending the au
 
 ## Non-goals
 
-- No write operations against GitHub, ever (read-only `gh api graphql` / `gh repo view`).
+- No write operations against Forgejo, ever (read-only issue GETs).
 - No scanning of attachments' contents.
 - `#0` and non-numeric `#x` are not references.
 - No cross-repo references — `#N` is always resolved against the send's cwd repo only.

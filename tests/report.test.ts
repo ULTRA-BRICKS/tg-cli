@@ -71,12 +71,12 @@ test('valid input builds --tag report/--format html argv with the body last (no 
 
 test('an http(s) --ticket/--pr value is wrapped in a real <a href> link', () => {
   const result = buildReportSend([
-    '--title', 'x', '--pr', 'https://github.com/alex-mextner/tg-cli/pull/123',
+    '--title', 'x', '--pr', 'https://git.hyperide.ai/ultrabricks/tg-cli/pulls/123',
     '--impact', 'x', '--verify-cmd', 'x', '--verify-result', 'x',
   ]);
   if (isReportError(result) || isReportHelp(result)) throw new Error('expected a send result');
   const body = result.argv[result.argv.length - 1];
-  expect(body).toContain('<a href="https://github.com/alex-mextner/tg-cli/pull/123">https://github.com/alex-mextner/tg-cli/pull/123</a>');
+  expect(body).toContain('<a href="https://git.hyperide.ai/ultrabricks/tg-cli/pulls/123">https://git.hyperide.ai/ultrabricks/tg-cli/pulls/123</a>');
 });
 
 test('a bare-number --pr value (e.g. "123") is normalized to #123 so autolink-prs can resolve it', () => {
@@ -103,7 +103,7 @@ test('repeatable --evidence/--summary/--ticket/--pr all render as separate <li> 
   const body = result.argv[result.argv.length - 1];
   expect(body).toContain('<b>Ticket:</b> HYP-1');
   expect(body).toContain('<b>Ticket:</b> HYP-2');
-  expect(body).toContain('<b>PR:</b> <a href="https://github.com/org/repo/pull/1">org/repo#1</a>');
+  expect(body).toContain('<b>PR:</b> <a href="https://git.hyperide.ai/org/repo/pulls/1">org/repo#1</a>');
   expect(body).toContain('<li>did a</li>');
   expect(body).toContain('<li>did b</li>');
   expect(body).toContain('<li>log line 1</li>');
@@ -202,14 +202,14 @@ test('a legitimate value that merely starts with "--" (not a known flag name) is
   expect(body).toContain('--- 12 passed, 0 fail ---');
 });
 
-test('an "owner/repo#N" --pr value is rendered as a real github.com PR link with the readable text kept as the label', () => {
+test('an "owner/repo#N" --pr value is rendered as a real Forgejo PR link with the readable text kept as the label', () => {
   const result = buildReportSend([
     '--title', 'x', '--pr', 'alex-mextner/tg-cli#456',
     '--impact', 'x', '--verify-cmd', 'x', '--verify-result', 'x',
   ]);
   if (isReportError(result) || isReportHelp(result)) throw new Error('expected a send result');
   const body = result.argv[result.argv.length - 1];
-  expect(body).toContain('<a href="https://github.com/alex-mextner/tg-cli/pull/456">alex-mextner/tg-cli#456</a>');
+  expect(body).toContain('<a href="https://git.hyperide.ai/alex-mextner/tg-cli/pulls/456">alex-mextner/tg-cli#456</a>');
 });
 
 test('-h / --help anywhere in the argument list wins over the rest of the parse (not only as the first token)', () => {

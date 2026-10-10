@@ -1,28 +1,28 @@
-// GitHub response cache for the autolink-prs feature (1h TTL).
+// Forgejo response cache for the autolink-prs feature (1h TTL).
 //
-// Each verified reference is cached as either a positive entry (GhRef) or a
-// NEGATIVE one (info: null — GitHub confirmed the number does not resolve in
-// this repo), so a report repeatedly mentioning the same #N doesn't re-spawn gh
+// Each verified reference is cached as either a positive entry (ForgeRef) or a
+// NEGATIVE one (info: null — Forgejo answered 404 for the number in this repo),
+// so a report repeatedly mentioning the same #N doesn't re-query the forge
 // every send. Pure string→state helpers; the tg entrypoint owns the file I/O
-// (~/.cache/tg-cli/gh-cache.json) and treats every failure as cache-miss /
+// (~/.cache/tg-cli/forgejo-cache.json) and treats every failure as cache-miss /
 // don't-persist. Mirrors features/autolink-tasks/cache.ts.
 //
-// CRITICAL: the cache key is `<owner>/<repo>#<number>`, NOT a bare number — the
-// same #260 resolves to different things in different repos, so a repo-agnostic
-// key would be a correctness bug.
+// CRITICAL: the cache key is `<host>/<owner>/<repo>#<number>`, NOT a bare number —
+// the same #260 resolves to different things in different repos, so a
+// repo-agnostic key would be a correctness bug.
 
-import type { GhRef } from './resolve';
+import type { ForgeRef } from './resolve';
 
 export const CACHE_TTL_MS = 60 * 60 * 1000;
 
 interface CacheEntry {
   t: number; // epoch ms when the entry was written
-  info: GhRef | null; // null = verified-absent in this repo
+  info: ForgeRef | null; // null = verified-absent in this repo
 }
 
 export interface CacheSplit {
-  // number → cached verdict (GhRef or null for verified-absent)
-  hits: Map<number, GhRef | null>;
+  // number → cached verdict (ForgeRef or null for verified-absent)
+  hits: Map<number, ForgeRef | null>;
   // numbers that need a live probe, in input order
   missing: number[];
 }
@@ -42,7 +42,7 @@ function parseEntries(raw: string | null): Record<string, CacheEntry> {
     for (const [key, value] of Object.entries(entries as Record<string, unknown>)) {
       const e = value as { t?: unknown; info?: unknown };
       if (typeof e?.t !== 'number') continue;
-      const info = e.info as GhRef | null;
+      const info = e.info as ForgeRef | null;
       if (info !== null) {
         // `state` must be a string: prStateSuffix() does ref.state.toUpperCase()
         // on the render path, so a corrupt/hand-edited entry missing it would
@@ -72,7 +72,7 @@ function parseEntries(raw: string | null): Record<string, CacheEntry> {
  */
 export function splitByCache(repo: string, numbers: number[], raw: string | null, now: number): CacheSplit {
   const entries = parseEntries(raw);
-  const hits = new Map<number, GhRef | null>();
+  const hits = new Map<number, ForgeRef | null>();
   const missing: number[] = [];
   for (const number of numbers) {
     const entry = repo ? entries[cacheKey(repo, number)] : undefined;
@@ -95,7 +95,7 @@ export function mergeIntoCache(
   raw: string | null,
   repo: string,
   probedNumbers: number[],
-  refs: Map<number, GhRef>,
+  refs: Map<number, ForgeRef>,
   now: number,
 ): string {
   const entries = parseEntries(raw);

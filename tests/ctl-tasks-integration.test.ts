@@ -7,9 +7,11 @@ import { PS_NO_AGENTS_SHIM, TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host'
 import { tempDir } from './helpers/test-temp';
 
 // Integration test for the /tasks bot command (tg-cli#115) against a fake Bot
-// API, with stub `task` and `gh` binaries on PATH. Proves the daemon composes
-// task-cli + gh into a rich-HTML table and sends it via sendRichMessage, with
-// PR/CI columns filled from gh and a dash where a ticket has no PR.
+// API and a fake Forgejo, with a stub `task` binary on PATH. Proves the daemon
+// composes task-cli + Forgejo PR/CI/review data into a rich-HTML table and sends
+// it via sendRichMessage. The scope checkout's `origin` names the fake forge and
+// each candidate dir gets its own repo slug, so the forge's request log proves
+// which directory the board was scoped to.
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const reg = createDaemonRegistry();
@@ -27,6 +29,87 @@ async function waitFor(predicate: () => boolean, timeoutMs = 15_000): Promise<bo
     await Bun.sleep(50);
   }
   return predicate();
+}
+
+
+interface ForgePr {
+  number: number;
+  title: string;
+  body?: string;
+  draft?: boolean;
+  /** Combined commit status state; absent = no statuses on the head commit. */
+  ci?: 'success' | 'failure' | 'pending';
+  reviews?: Array<{ id: number; login: string; state: string }>;
+}
+
+interface FakeForge {
+  port: number;
+  /** `owner/name` of every PR-list request, in order. */
+  pullLists: string[];
+  /** Every API path requested. */
+  requests: string[];
+}
+
+// A Forgejo REST API stand-in serving the endpoints /tasks reads, per `owner/name` slug.
+function startFakeForge(prsBySlug: Record<string, ForgePr[]> = {}): FakeForge {
+  const forge: FakeForge = { port: 0, pullLists: [], requests: [] };
+  const server = Bun.serve({
+    port: 0,
+    fetch(req) {
+      const url = new URL(req.url);
+      forge.requests.push(url.pathname);
+      if (req.headers.get('authorization') !== 'token test-token') return new Response('{}', { status: 401 });
+      const m = url.pathname.match(/^\/api\/v1\/repos\/([^/]+)\/([^/]+)\/(.+)$/);
+      if (!m) return new Response('{}', { status: 404 });
+      const slug = `${m[1]}/${m[2]}`;
+      const prs = prsBySlug[slug] ?? [];
+      const rest = m[3];
+      if (rest === 'pulls') {
+        forge.pullLists.push(slug);
+        const limit = Number(url.searchParams.get('limit') ?? 50);
+        const page = Number(url.searchParams.get('page') ?? 1);
+        return Response.json(
+          prs.slice((page - 1) * limit, page * limit).map((pr) => ({
+            number: pr.number,
+            title: pr.title,
+            body: pr.body ?? '',
+            html_url: `https://git.hyperide.ai/${slug}/pulls/${pr.number}`,
+            state: 'open',
+            draft: pr.draft ?? false,
+            head: { sha: `sha${pr.number}` },
+            requested_reviewers: [],
+          })),
+        );
+      }
+      const status = rest.match(/^commits\/sha(\d+)\/status$/);
+      if (status) {
+        const pr = prs.find((p) => p.number === Number(status[1]));
+        return Response.json(pr?.ci ? { state: pr.ci, total_count: 1, statuses: [{ status: pr.ci }] } : { state: '', total_count: 0, statuses: [] });
+      }
+      const reviews = rest.match(/^pulls\/(\d+)\/reviews$/);
+      if (reviews) {
+        const pr = prs.find((p) => p.number === Number(reviews[1]));
+        return Response.json((pr?.reviews ?? []).map((r) => ({ id: r.id, user: { login: r.login }, state: r.state, dismissed: false })));
+      }
+      return new Response('{}', { status: 404 });
+    },
+  });
+  servers.push(server);
+  forge.port = server.port;
+  return forge;
+}
+
+// Make `dir` a git checkout whose origin is `slug` on the fake forge, and give the daemon's
+// HOME an fj key store for the forge host — what `fj auth login` leaves behind.
+function linkForgejo(dir: string, home: string, forge: FakeForge, slug = 'ultrabricks/tg-cli'): void {
+  Bun.spawnSync(['git', 'init', '-q', dir]);
+  Bun.spawnSync(['git', '-C', dir, 'remote', 'add', 'origin', `http://127.0.0.1:${forge.port}/${slug}.git`]);
+  const keysDir = join(home, '.local', 'share', 'forgejo-cli');
+  mkdirSync(keysDir, { recursive: true });
+  writeFileSync(
+    join(keysDir, 'keys.json'),
+    JSON.stringify({ hosts: { [`127.0.0.1:${forge.port}`]: { type: 'Application', name: 'test', token: 'test-token' } }, aliases: {}, default_ssh: [] }),
+  );
 }
 
 async function startTasksDaemon(cfgDir: string, binDir: string, apiPort: number, logName = 'daemon.log'): Promise<Subprocess> {
@@ -62,24 +145,21 @@ const bin = join(cfgDir, 'bin');
 mkdirSync(bin);
 writeFileSync(join(bin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
 const taskInvocationLog = join(cfgDir, 'task-invocation.txt');
-const ghInvocationLog = join(cfgDir, 'gh-invocation.txt');
 // Stub task-cli: two tickets, one with a due date.
 const tasksJson = JSON.stringify([
-  { id: '#117', title: 'A ticket', state: 'todo', url: 'https://gh/117', due: '' },
-  { id: '#5', title: 'Older ticket', state: 'in-progress', url: 'https://gh/5', due: '2026-07-10', labels: ['blocked'] },
+  { id: '#117', title: 'A ticket', state: 'todo', url: 'https://git.hyperide.ai/ultrabricks/tg-cli/issues/117', due: '' },
+  { id: '#5', title: 'Older ticket', state: 'in-progress', url: 'https://git.hyperide.ai/ultrabricks/tg-cli/issues/5', due: '2026-07-10', labels: ['blocked'] },
 ]);
 writeFileSync(join(bin, 'task'), `#!/bin/sh\nprintf '%s|%s\\n' "$PWD" "$*" >> '${taskInvocationLog}'\ncat <<'JSON'\n${tasksJson}\nJSON\n`, { mode: 0o755 });
-// Stub gh: one PR referencing #117 with a failing check; #5 has none.
-const prsJson = JSON.stringify([
-  {
-    number: 200,
-    title: 'fix thing (#117)',
-    url: 'https://gh/pr/200',
-    body: 'Closes #117',
-    statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'FAILURE' }],
-  },
-]);
-writeFileSync(join(bin, 'gh'), `#!/bin/sh\nprintf '%s|%s\\n' "$PWD" "$*" > '${ghInvocationLog}'\ncat <<'JSON'\n${prsJson}\nJSON\n`, { mode: 0o755 });
+// Fake Forgejo: a PR referencing #117 with green CI and an approval, and a draft PR for #5
+// (a draft's verdict needs no reviews lookup).
+const forge = startFakeForge({
+  'ultrabricks/tg-cli': [
+    { number: 200, title: 'fix thing (#117)', body: 'Closes #117', ci: 'success', reviews: [{ id: 1, login: 'rev', state: 'APPROVED' }] },
+    { number: 201, title: 'wip', body: 'Refs #5', draft: true, ci: 'pending' },
+  ],
+});
+linkForgejo(projectDir, cfgDir, forge);
 
 let served = false;
 const richMessages: any[] = [];
@@ -118,7 +198,7 @@ const server = Bun.serve({
 });
 servers.push(server);
 
-test('/tasks composes task-cli + gh into a rich-HTML table via sendRichMessage', async () => {
+test('/tasks composes task-cli + Forgejo into a rich-HTML table via sendRichMessage', async () => {
   await startTasksDaemon(cfgDir, bin, server.port);
 
   expect(await waitFor(() => richMessages.length === 1)).toBe(true);
@@ -126,11 +206,11 @@ test('/tasks composes task-cli + gh into a rich-HTML table via sendRichMessage',
   const html = richMessages[0].rich_message.html as string;
   expect(html).toContain('<table>');
   // ticket ids linked
-  expect(html).toContain('href="https://gh/117"');
+  expect(html).toContain('href="https://git.hyperide.ai/ultrabricks/tg-cli/issues/117"');
   expect(html).toContain('#117');
-  // PR column filled for #117, CI shows the failing glyph
-  expect(html).toContain('href="https://gh/pr/200"');
-  expect(html).toContain('✗');
+  // PR column filled for #117, with the head commit's CI verdict and the review verdict.
+  expect(html).toContain('href="https://git.hyperide.ai/ultrabricks/tg-cli/pulls/200"');
+  expect(html).toContain('<td>✓</td><td>✅</td>');
   // #5 has a due date and NO pr → an em dash somewhere
   expect(html).toContain('2026-07-10');
   expect(html).toContain('—');
@@ -141,7 +221,14 @@ test('/tasks composes task-cli + gh into a rich-HTML table via sendRichMessage',
     expect(taskInvocation).toContain(`--state ${state}`);
   }
   expect(taskInvocation).not.toContain('--all');
-  expect(readFileSync(ghInvocationLog, 'utf8').split('|')[0]).toBe(realpathSync(projectDir));
+  // The PR list came from the scope checkout's origin; CI/review only for the matched PRs,
+  // and no reviews lookup for the draft.
+  expect(html).toContain('<td>…</td><td>✏️</td>');
+  expect(forge.pullLists).toEqual(['ultrabricks/tg-cli']);
+  expect(forge.requests).toContain('/api/v1/repos/ultrabricks/tg-cli/commits/sha200/status');
+  expect(forge.requests).toContain('/api/v1/repos/ultrabricks/tg-cli/pulls/200/reviews');
+  expect(forge.requests).toContain('/api/v1/repos/ultrabricks/tg-cli/commits/sha201/status');
+  expect(forge.requests).not.toContain('/api/v1/repos/ultrabricks/tg-cli/pulls/201/reviews');
 }, 15_000);
 
 test('/tasks without selector follows the last-user-target anchor, not routes.json (tg-cli#271/#78 anchor fix — review finding)', async () => {
@@ -191,17 +278,14 @@ exit 0
   writeFileSync(join(localBin, 'ps'), "#!/bin/sh\nprintf '111 1 claude\\n222 1 claude\\n'\n", { mode: 0o755 });
 
   const localTaskInvocationLog = join(localCfgDir, 'task-invocation.txt');
-  const localGhInvocationLog = join(localCfgDir, 'gh-invocation.txt');
   writeFileSync(
     join(localBin, 'task'),
     `#!/bin/sh\nprintf '%s|%s\\n' "$PWD" "$*" > '${localTaskInvocationLog}'\nprintf '[{\"id\":\"#9\",\"title\":\"Route task\",\"state\":\"todo\",\"url\":\"\",\"due\":\"\"}]\\n'\n`,
     { mode: 0o755 },
   );
-  writeFileSync(
-    join(localBin, 'gh'),
-    `#!/bin/sh\nprintf '%s|%s\\n' "$PWD" "$*" > '${localGhInvocationLog}'\nprintf '[]\\n'\n`,
-    { mode: 0o755 },
-  );
+  const localForge = startFakeForge();
+  linkForgejo(routedDir, localCfgDir, localForge, 'o/routed-project');
+  linkForgejo(newestDir, localCfgDir, localForge, 'o/newest-registration');
 
   let servedLocal = false;
   const localRichMessages: any[] = [];
@@ -248,7 +332,7 @@ exit 0
     expect(localRichMessages[0].rich_message.html).not.toContain('routed-project');
     expect(readFileSync(localTaskInvocationLog, 'utf8')).toContain(`-C ${routedDir}`);
     expect(readFileSync(localTaskInvocationLog, 'utf8')).not.toContain(`-C ${newestDir}`);
-    expect(readFileSync(localGhInvocationLog, 'utf8').split('|')[0]).toBe(realpathSync(routedDir));
+    expect(localForge.pullLists).toEqual(['o/routed-project']);
   } finally {
     if (daemon && daemon.exitCode === null) {
       daemon.kill(9);
@@ -299,7 +383,9 @@ exit 0
   );
   writeFileSync(join(localBin, 'ps'), "#!/bin/sh\nprintf '111 1 claude\\n222 1 claude\\n'\n", { mode: 0o755 });
   writeFileSync(join(localBin, 'task'), "#!/bin/sh\nprintf '[]\\n'\n", { mode: 0o755 });
-  writeFileSync(join(localBin, 'gh'), "#!/bin/sh\nprintf '[]\\n'\n", { mode: 0o755 });
+  const localForge = startFakeForge();
+  linkForgejo(routedDir, localCfgDir, localForge, 'o/routed-project');
+  linkForgejo(newestDir, localCfgDir, localForge, 'o/newest-registration');
 
   let servedLocal = false;
   const localTextMessages: string[] = [];
@@ -344,6 +430,7 @@ exit 0
 
     expect(await waitFor(() => localTextMessages.length === 1)).toBe(true);
     expect(existsSync(join(localCfgDir, 'task-invocation.txt'))).toBe(false);
+    expect(localForge.requests).toEqual([]);
   } finally {
     if (daemon && daemon.exitCode === null) {
       daemon.kill(9);
@@ -367,26 +454,17 @@ test('/tasks matches duplicate task ids to PRs by repo identity, not worktree ba
   writeFileSync(join(localBin, 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
   const tasksJson = JSON.stringify([
     {
-      project: 'alex-mextner/tg-cli',
-      tickets: [{ id: '#1', title: 'Current repo duplicate', state: 'todo', url: 'https://gh/current-1', due: '' }],
+      project: 'ultrabricks/tg-cli',
+      tickets: [{ id: '#1', title: 'Current repo duplicate', state: 'todo', url: 'https://git.hyperide.ai/ultrabricks/tg-cli/issues/current-1', due: '' }],
     },
     {
       project: 'other/repo',
-      tickets: [{ id: '#1', title: 'Other repo duplicate', state: 'todo', url: 'https://gh/other-1', due: '' }],
+      tickets: [{ id: '#1', title: 'Other repo duplicate', state: 'todo', url: 'https://git.hyperide.ai/ultrabricks/tg-cli/issues/other-1', due: '' }],
     },
   ]);
   writeFileSync(join(localBin, 'task'), `#!/bin/sh\ncat <<'JSON'\n${tasksJson}\nJSON\n`, { mode: 0o755 });
-  const prUrl = 'https://github.com/alex-mextner/tg-cli/pull/700';
-  const prsJson = JSON.stringify([
-    {
-      number: 700,
-      title: 'fix duplicate #1',
-      url: prUrl,
-      body: '',
-      statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'SUCCESS' }],
-    },
-  ]);
-  writeFileSync(join(localBin, 'gh'), `#!/bin/sh\ncat <<'JSON'\n${prsJson}\nJSON\n`, { mode: 0o755 });
+  const prUrl = 'https://git.hyperide.ai/ultrabricks/tg-cli/pulls/700';
+  linkForgejo(worktreeDir, localCfgDir, startFakeForge({ 'ultrabricks/tg-cli': [{ number: 700, title: 'fix duplicate #1', body: '' }] }));
 
   let servedLocal = false;
   const localRichMessages: any[] = [];
@@ -484,17 +562,14 @@ exit 0
   writeFileSync(join(localBin, 'ps'), "#!/bin/sh\nprintf '111 1 claude\\n222 1 claude\\n'\n", { mode: 0o755 });
 
   const localTaskInvocationLog = join(localCfgDir, 'task-invocation.txt');
-  const localGhInvocationLog = join(localCfgDir, 'gh-invocation.txt');
   writeFileSync(
     join(localBin, 'task'),
     `#!/bin/sh\nprintf '%s|%s\\n' "$PWD" "$*" > '${localTaskInvocationLog}'\nprintf '[{\"id\":\"#10\",\"title\":\"Reply task\",\"state\":\"todo\",\"url\":\"\",\"due\":\"\"}]\\n'\n`,
     { mode: 0o755 },
   );
-  writeFileSync(
-    join(localBin, 'gh'),
-    `#!/bin/sh\nprintf '%s|%s\\n' "$PWD" "$*" > '${localGhInvocationLog}'\nprintf '[]\\n'\n`,
-    { mode: 0o755 },
-  );
+  const localForge = startFakeForge();
+  linkForgejo(repliedDir, localCfgDir, localForge, 'o/replied-project');
+  linkForgejo(latestDir, localCfgDir, localForge, 'o/latest-project');
 
   let servedLocal = false;
   const localRichMessages: any[] = [];
@@ -541,7 +616,7 @@ exit 0
     expect(localRichMessages).toHaveLength(1);
     expect(readFileSync(localTaskInvocationLog, 'utf8')).toContain(`-C ${repliedDir}`);
     expect(readFileSync(localTaskInvocationLog, 'utf8')).not.toContain(`-C ${latestDir}`);
-    expect(readFileSync(localGhInvocationLog, 'utf8').split('|')[0]).toBe(realpathSync(repliedDir));
+    expect(localForge.pullLists).toEqual(['o/replied-project']);
   } finally {
     if (daemon && daemon.exitCode === null) {
       daemon.kill(9);
@@ -575,17 +650,13 @@ exit 0
   writeFileSync(join(localBin, 'ps'), "#!/bin/sh\nprintf '111 1 claude\\n'\n", { mode: 0o755 });
 
   const localTaskInvocationLog = join(localCfgDir, 'task-invocation.txt');
-  const localGhInvocationLog = join(localCfgDir, 'gh-invocation.txt');
   writeFileSync(
     join(localBin, 'task'),
     `#!/bin/sh\nprintf '%s|%s\\n' "$PWD" "$*" > '${localTaskInvocationLog}'\nprintf '[{\"id\":\"#11\",\"title\":\"Agent task\",\"state\":\"todo\",\"url\":\"\",\"due\":\"\"}]\\n'\n`,
     { mode: 0o755 },
   );
-  writeFileSync(
-    join(localBin, 'gh'),
-    `#!/bin/sh\nprintf '%s|%s\\n' "$PWD" "$*" > '${localGhInvocationLog}'\nprintf '[]\\n'\n`,
-    { mode: 0o755 },
-  );
+  const localForge = startFakeForge();
+  linkForgejo(agentDir, localCfgDir, localForge, 'o/agent-project');
 
   let servedLocal = false;
   const localRichMessages: any[] = [];
@@ -630,7 +701,7 @@ exit 0
     expect(await waitFor(() => localRichMessages.length === 1)).toBe(true);
     expect(localRichMessages).toHaveLength(1);
     expect(readFileSync(localTaskInvocationLog, 'utf8')).toContain(`-C ${agentDir}`);
-    expect(readFileSync(localGhInvocationLog, 'utf8').split('|')[0]).toBe(realpathSync(agentDir));
+    expect(localForge.pullLists).toEqual(['o/agent-project']);
   } finally {
     if (daemon && daemon.exitCode === null) {
       daemon.kill(9);
@@ -674,11 +745,12 @@ exit 0
   );
   writeFileSync(join(localBin, 'ps'), "#!/bin/sh\nprintf '111 1 claude\\n222 1 claude\\n'\n", { mode: 0o755 });
   const localTaskInvocationLog = join(localCfgDir, 'task-invocation.txt');
-  const localGhInvocationLog = join(localCfgDir, 'gh-invocation.txt');
   writeFileSync(join(localBin, 'task'), `#!/bin/sh\nprintf 'ran\\n' > '${localTaskInvocationLog}'\nprintf '[]\\n'\n`, {
     mode: 0o755,
   });
-  writeFileSync(join(localBin, 'gh'), `#!/bin/sh\nprintf 'ran\\n' > '${localGhInvocationLog}'\nprintf '[]\\n'\n`, { mode: 0o755 });
+  const localForge = startFakeForge();
+  linkForgejo(projectA, localCfgDir, localForge, 'o/project-a');
+  linkForgejo(projectB, localCfgDir, localForge, 'o/project-b');
 
   let servedLocal = false;
   const localTextMessages: any[] = [];
@@ -730,7 +802,7 @@ exit 0
     expect(localTextMessages[0].text).toContain("couldn't resolve a project for /tasks");
     expect(localRichMessages).toHaveLength(0);
     expect(existsSync(localTaskInvocationLog)).toBe(false);
-    expect(existsSync(localGhInvocationLog)).toBe(false);
+    expect(localForge.requests).toEqual([]);
   } finally {
     if (daemon && daemon.exitCode === null) {
       daemon.kill(9);
@@ -757,12 +829,12 @@ test('/tasks pagination callback sends the requested page with a filter keyboard
 
   const allTasks = JSON.stringify([
     {
-      project: 'alex-mextner/tg-cli',
+      project: 'ultrabricks/tg-cli',
       tickets: Array.from({ length: 11 }, (_, i) => ({
         id: `#${i + 1}`,
         title: `Forgotten task ${i + 1}`,
         state: 'todo',
-        url: `https://gh/${i + 1}`,
+        url: `https://git.hyperide.ai/ultrabricks/tg-cli/issues/${i + 1}`,
         labels: [],
         due: '',
       })),
@@ -782,21 +854,10 @@ JSON
 `,
     { mode: 0o755 },
   );
-  const localGhInvocationLog = join(localCfgDir, 'gh-invocation.txt');
-  const prsJson = JSON.stringify([
-    {
-      number: 501,
-      title: 'fix forgotten task #11',
-      url: 'https://gh/pr/501',
-      body: 'Closes #11',
-      statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'FAILURE' }],
-    },
-  ]);
-  writeFileSync(
-    join(localBin, 'gh'),
-    `#!/bin/sh\nprintf '%s\\n' "$PWD" >> '${localGhInvocationLog}'\ncat <<'JSON'\n${prsJson}\nJSON\n`,
-    { mode: 0o755 },
-  );
+  // 54 unrelated PRs first, so the one referencing #11 is only on the second list page.
+  const fillerPrs = Array.from({ length: 54 }, (_, i) => ({ number: 600 + i, title: `unrelated ${i}` }));
+  const localForge = startFakeForge({ 'ultrabricks/tg-cli': [...fillerPrs, { number: 501, title: 'fix forgotten task #11', body: 'Closes #11' }] });
+  linkForgejo(projectDir, localCfgDir, localForge);
 
   let servedCommand = false;
   let servedCallback = false;
@@ -878,11 +939,12 @@ JSON
     expect(localRichMessages[0].rich_message.html).toContain('Forgotten task 1');
     expect(localRichMessages[0].rich_message.html).not.toContain('Forgotten task 11');
     expect(localRichMessages[1].rich_message.html).toContain('Forgotten task 11');
-    expect(localRichMessages[1].rich_message.html).toContain('🔴 Forgotten task 11');
-    expect(localRichMessages[1].rich_message.html).toContain('href="https://gh/pr/501"');
-    expect(localRichMessages[1].rich_message.html).toContain('✗');
+    expect(localRichMessages[1].rich_message.html).toContain('🟢 Forgotten task 11');
+    expect(localRichMessages[1].rich_message.html).toContain('href="https://git.hyperide.ai/ultrabricks/tg-cli/pulls/501"');
+    expect(localRichMessages[1].rich_message.html).toContain('—');
     expect(localRichMessages[1].reply_markup.inline_keyboard.flat().map((b: any) => b.text)).toContain('All');
-    expect(readFileSync(localGhInvocationLog, 'utf8').trim().split('\n')).toEqual([realpathSync(projectDir), realpathSync(projectDir)]);
+    // Two board renders × two list pages each.
+    expect(localForge.pullLists).toEqual(['ultrabricks/tg-cli', 'ultrabricks/tg-cli', 'ultrabricks/tg-cli', 'ultrabricks/tg-cli']);
   } finally {
     if (daemon && daemon.exitCode === null) {
       daemon.kill(9);
@@ -905,10 +967,10 @@ test('/tasks callback state is scoped by Telegram chat id as well as message id'
   writeFileSync(join(localBin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
   writeFileSync(join(localBin, 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
   const localTaskInvocationLog = join(localCfgDir, 'task-invocation.txt');
-  const localGhInvocationLog = join(localCfgDir, 'gh-invocation.txt');
-  const tasksJson = JSON.stringify([{ id: '#60', title: 'Forgotten task', state: 'todo', url: 'https://gh/60' }]);
+  const tasksJson = JSON.stringify([{ id: '#60', title: 'Forgotten task', state: 'todo', url: 'https://git.hyperide.ai/ultrabricks/tg-cli/issues/60' }]);
   writeFileSync(join(localBin, 'task'), `#!/bin/sh\nprintf 'task\\n' >> '${localTaskInvocationLog}'\ncat <<'JSON'\n${tasksJson}\nJSON\n`, { mode: 0o755 });
-  writeFileSync(join(localBin, 'gh'), `#!/bin/sh\nprintf 'gh\\n' >> '${localGhInvocationLog}'\nprintf '[]\\n'\n`, { mode: 0o755 });
+  const localForge = startFakeForge();
+  linkForgejo(projectDir, localCfgDir, localForge);
 
   let servedCommand = false;
   let servedWrongChatCallback = false;
@@ -979,7 +1041,7 @@ test('/tasks callback state is scoped by Telegram chat id as well as message id'
     expect(answeredCallbacks).toEqual([{ callback_query_id: 'cb_wrong_chat', text: 'expired' }]);
     expect(localRichMessages).toHaveLength(1);
     expect(readFileSync(localTaskInvocationLog, 'utf8').trim().split('\n')).toHaveLength(5);
-    expect(readFileSync(localGhInvocationLog, 'utf8').trim().split('\n')).toHaveLength(1);
+    expect(localForge.pullLists).toHaveLength(1);
   } finally {
     if (daemon && daemon.exitCode === null) {
       daemon.kill(9);
@@ -1005,10 +1067,11 @@ test('/tasks in a bound topic keeps the topic thread on the board and callbacks'
   writeFileSync(join(localBin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
   writeFileSync(join(localBin, 'ps'), '#!/bin/sh\nprintf "111 1 claude\\n"\n', { mode: 0o755 });
   const localTaskInvocationLog = join(localCfgDir, 'task-invocation.txt');
-  const localGhInvocationLog = join(localCfgDir, 'gh-invocation.txt');
-  const tasksJson = JSON.stringify([{ id: '#70', title: 'Topic task', state: 'todo', url: 'https://gh/70' }]);
+  const tasksJson = JSON.stringify([{ id: '#70', title: 'Topic task', state: 'todo', url: 'https://git.hyperide.ai/ultrabricks/tg-cli/issues/70' }]);
   writeFileSync(join(localBin, 'task'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${localTaskInvocationLog}'\ncat <<'JSON'\n${tasksJson}\nJSON\n`, { mode: 0o755 });
-  writeFileSync(join(localBin, 'gh'), `#!/bin/sh\nprintf '%s\\n' "$PWD" >> '${localGhInvocationLog}'\nprintf '[]\\n'\n`, { mode: 0o755 });
+  const localForge = startFakeForge();
+  linkForgejo(projectDir, localCfgDir, localForge, 'o/project');
+  linkForgejo(flatDir, localCfgDir, localForge, 'o/flat-project');
 
   let servedCommand = false;
   let servedCallback = false;
@@ -1083,7 +1146,7 @@ test('/tasks in a bound topic keeps the topic thread on the board and callbacks'
     const taskInvocations = readFileSync(localTaskInvocationLog, 'utf8').trim().split('\n');
     expect(taskInvocations).toHaveLength(11);
     for (const invocation of taskInvocations) expect(invocation).toContain(`-C ${projectDir}`);
-    expect(readFileSync(localGhInvocationLog, 'utf8').trim().split('\n')).toEqual([realpathSync(projectDir), realpathSync(projectDir)]);
+    expect(localForge.pullLists).toEqual(['o/project', 'o/project']);
   } finally {
     if (daemon && daemon.exitCode === null) {
       daemon.kill(9);
@@ -1105,9 +1168,9 @@ test('/tasks render failure fallback stays in the bound topic reply context', as
   mkdirSync(localBin);
   writeFileSync(join(localBin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
   writeFileSync(join(localBin, 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
-  const tasksJson = JSON.stringify([{ id: '#71', title: 'Topic task', state: 'todo', url: 'https://gh/71' }]);
+  const tasksJson = JSON.stringify([{ id: '#71', title: 'Topic task', state: 'todo', url: 'https://git.hyperide.ai/ultrabricks/tg-cli/issues/71' }]);
   writeFileSync(join(localBin, 'task'), `#!/bin/sh\ncat <<'JSON'\n${tasksJson}\nJSON\n`, { mode: 0o755 });
-  writeFileSync(join(localBin, 'gh'), '#!/bin/sh\nprintf "[]\\n"\n', { mode: 0o755 });
+  linkForgejo(projectDir, localCfgDir, startFakeForge());
 
   let servedCommand = false;
   const localTextMessages: any[] = [];
@@ -1179,7 +1242,6 @@ test('/tasks in a pathless topic fails closed in the topic reply context', async
   writeFileSync(join(localBin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
   writeFileSync(join(localBin, 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
   writeFileSync(join(localBin, 'task'), '#!/bin/sh\necho task should not run >&2\nexit 42\n', { mode: 0o755 });
-  writeFileSync(join(localBin, 'gh'), '#!/bin/sh\necho gh should not run >&2\nexit 42\n', { mode: 0o755 });
 
   let servedCommand = false;
   const localTextMessages: any[] = [];
@@ -1257,7 +1319,7 @@ test('/tasks status-scoped pagination keeps the status label on page callbacks',
       id: `#${index + 1}`,
       title: `Done task ${index + 1}`,
       state: 'done',
-      url: `https://gh/${index + 1}`,
+      url: `https://git.hyperide.ai/ultrabricks/tg-cli/issues/${index + 1}`,
     })),
   );
   writeFileSync(
@@ -1282,7 +1344,7 @@ esac
 `,
     { mode: 0o755 },
   );
-  writeFileSync(join(localBin, 'gh'), '#!/bin/sh\nprintf "[]\\n"\n', { mode: 0o755 });
+  linkForgejo(projectDir, localCfgDir, startFakeForge());
 
   let servedCommand = false;
   let servedCallback = false;
@@ -1383,9 +1445,9 @@ test('/tasks All quick filter callback unpins an explicit status board', async (
   writeFileSync(join(localBin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
   writeFileSync(join(localBin, 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
   const localTaskInvocationLog = join(localCfgDir, 'task-invocation.txt');
-  const doneTasks = JSON.stringify([{ id: '#40', title: 'Done task', state: 'done', url: 'https://gh/40' }]);
-  const activeTasks = JSON.stringify([{ id: '#41', title: 'Active task', state: 'in-progress', url: 'https://gh/41' }]);
-  const customStateTasks = JSON.stringify([{ id: '#42', title: 'Custom state task', state: 'waiting-for-user', url: 'https://gh/42' }]);
+  const doneTasks = JSON.stringify([{ id: '#40', title: 'Done task', state: 'done', url: 'https://git.hyperide.ai/ultrabricks/tg-cli/issues/40' }]);
+  const activeTasks = JSON.stringify([{ id: '#41', title: 'Active task', state: 'in-progress', url: 'https://git.hyperide.ai/ultrabricks/tg-cli/issues/41' }]);
+  const customStateTasks = JSON.stringify([{ id: '#42', title: 'Custom state task', state: 'waiting-for-user', url: 'https://git.hyperide.ai/ultrabricks/tg-cli/issues/42' }]);
   writeFileSync(
     join(localBin, 'task'),
     `#!/bin/sh
@@ -1416,7 +1478,7 @@ esac
 `,
     { mode: 0o755 },
   );
-  writeFileSync(join(localBin, 'gh'), '#!/bin/sh\nprintf "[]\\n"\n', { mode: 0o755 });
+  linkForgejo(projectDir, localCfgDir, startFakeForge());
 
   let servedCommand = false;
   let servedCallback = false;
@@ -1522,9 +1584,9 @@ test('/tasks stale pagination callback answers expired without guessing a projec
   writeFileSync(join(localBin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
   writeFileSync(join(localBin, 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
   const localTaskInvocationLog = join(localCfgDir, 'task-invocation.txt');
-  const localGhInvocationLog = join(localCfgDir, 'gh-invocation.txt');
   writeFileSync(join(localBin, 'task'), `#!/bin/sh\nprintf 'ran\\n' > '${localTaskInvocationLog}'\nprintf '[]\\n'\n`, { mode: 0o755 });
-  writeFileSync(join(localBin, 'gh'), `#!/bin/sh\nprintf 'ran\\n' > '${localGhInvocationLog}'\nprintf '[]\\n'\n`, { mode: 0o755 });
+  const localForge = startFakeForge();
+  linkForgejo(projectDir, localCfgDir, localForge);
 
   let servedCallback = false;
   const localRichMessages: any[] = [];
@@ -1574,7 +1636,7 @@ test('/tasks stale pagination callback answers expired without guessing a projec
     expect(answeredCallbacks).toEqual([{ callback_query_id: 'cb_stale_page', text: 'expired' }]);
     expect(localRichMessages).toHaveLength(0);
     expect(existsSync(localTaskInvocationLog)).toBe(false);
-    expect(existsSync(localGhInvocationLog)).toBe(false);
+    expect(localForge.requests).toEqual([]);
   } finally {
     if (daemon && daemon.exitCode === null) {
       daemon.kill(9);

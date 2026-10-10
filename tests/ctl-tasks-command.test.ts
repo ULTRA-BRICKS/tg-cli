@@ -9,8 +9,9 @@ import {
   matchPrsToTasks,
   normalizeTaskStatus,
   parseTasksCommand,
-  rollupCiState,
-  rollupReviewState,
+  parseForgejoPulls,
+  rollupForgejoReviews,
+  rollupForgejoStatus,
   statusEmojiForTask,
   taskKey,
   tasksScopeLabel,
@@ -39,24 +40,61 @@ test('parseTasksCommand: bare, status-only, agent-only, both, order-tolerant', (
   expect(parseTasksCommand('/tasks@mybot done')).toEqual({ agent: null, status: 'done' });
 });
 
-test('rollupCiState: fail dominates, else pending, else pass, empty → null', () => {
-  expect(rollupCiState([])).toBeNull();
-  expect(rollupCiState(null)).toBeNull();
-  expect(
-    rollupCiState([
-      { status: 'COMPLETED', conclusion: 'SUCCESS' },
-      { status: 'COMPLETED', conclusion: 'FAILURE' },
-    ]),
-  ).toBe('fail');
-  expect(
-    rollupCiState([
-      { status: 'COMPLETED', conclusion: 'SUCCESS' },
-      { status: 'IN_PROGRESS' },
-    ]),
-  ).toBe('pending');
-  expect(rollupCiState([{ status: 'COMPLETED', conclusion: 'SUCCESS' }])).toBe('pass');
-  // gh sometimes reports a check via `state` instead of conclusion
-  expect(rollupCiState([{ state: 'SUCCESS' }])).toBe('pass');
+// One item of GET /repos/{o}/{r}/pulls, trimmed to the fields the board reads.
+const apiPull = (n: number, extra: Record<string, unknown> = {}) => ({
+  number: n,
+  title: `PR ${n}`,
+  html_url: `https://git.hyperide.ai/ultrabricks/tg-cli/pulls/${n}`,
+  body: `Fixes #${n + 1}`,
+  state: 'open',
+  draft: false,
+  merged: false,
+  head: { sha: `sha${n}`, ref: `feat/${n}` },
+  requested_reviewers: [],
+  ...extra,
+});
+
+test('parseForgejoPulls: maps a pulls page to board PRs with html_url, body and head sha', () => {
+  const raw = JSON.stringify([apiPull(440, { draft: true, requested_reviewers: [{ login: 'a' }] }), apiPull(381)]);
+  expect(parseForgejoPulls(raw, 'ultrabricks/tg-cli').prs).toEqual([
+    {
+      number: 440,
+      url: 'https://git.hyperide.ai/ultrabricks/tg-cli/pulls/440',
+      title: 'PR 440',
+      body: 'Fixes #441',
+      ci: null,
+      review: null,
+      project: 'ultrabricks/tg-cli',
+      draft: true,
+      requestedReviewers: 1,
+      headSha: 'sha440',
+    },
+    expect.objectContaining({ number: 381, draft: false, requestedReviewers: 0, headSha: 'sha381' }),
+  ]);
+});
+
+test('parseForgejoPulls: malformed items are skipped but still count toward the page size; bad JSON → empty', () => {
+  const raw = JSON.stringify([{ number: 'x' }, { number: 3, title: 't' }, null, apiPull(4, { body: null, head: null })]);
+  const page = parseForgejoPulls(raw, 'o/r');
+  expect(page.prs).toEqual([expect.objectContaining({ number: 4, body: '' })]);
+  expect(page.prs[0]).not.toHaveProperty('headSha');
+  // The raw length drives pagination: a full page with a skipped item still means "more pages".
+  expect(page.items).toBe(4);
+  expect(parseForgejoPulls('{"message":"x"}', 'o/r')).toEqual({ prs: [], items: 0 });
+  expect(parseForgejoPulls('garbage', 'o/r')).toEqual({ prs: [], items: 0 });
+});
+
+test('rollupForgejoStatus: combined state → verdict; no statuses or unknown state → null', () => {
+  const combined = (state: string, total_count = 2) => JSON.stringify({ state, total_count, statuses: [] });
+  expect(rollupForgejoStatus(combined('success'))).toBe('pass');
+  expect(rollupForgejoStatus(combined('failure'))).toBe('fail');
+  expect(rollupForgejoStatus(combined('error'))).toBe('fail');
+  expect(rollupForgejoStatus(combined('pending'))).toBe('pending');
+  expect(rollupForgejoStatus(combined('warning'))).toBeNull();
+  // Forgejo reports an empty combined status for a commit nobody checked — never a pass.
+  expect(rollupForgejoStatus(combined('', 0))).toBeNull();
+  expect(rollupForgejoStatus(combined('success', 0))).toBeNull();
+  expect(rollupForgejoStatus('garbage')).toBeNull();
 });
 
 const tasks: TaskItem[] = [
@@ -176,22 +214,34 @@ test('composeTasksTable: a title that would split an emoji surrogate pair at the
   expect(hasUnpairedSurrogate(html)).toBe(false);
 });
 
-test('rollupReviewState: draft dominates, then the gh reviewDecision enum, else null', () => {
-  // A draft PR is not up for review yet, regardless of any decision echo.
-  expect(rollupReviewState('APPROVED', true)).toBe('draft');
-  expect(rollupReviewState(null, true)).toBe('draft');
-  // The three gh reviewDecision values map to lifecycle verdicts.
-  expect(rollupReviewState('APPROVED', false)).toBe('approved');
-  expect(rollupReviewState('CHANGES_REQUESTED', false)).toBe('changes');
-  expect(rollupReviewState('REVIEW_REQUIRED', false)).toBe('review-required');
-  // Case-insensitive — the .toUpperCase() normalization is exercised, not just the canonical form.
-  expect(rollupReviewState('approved', false)).toBe('approved');
-  expect(rollupReviewState('changes_requested', false)).toBe('changes');
-  // No reviewers / no review required / unknown → null (rendered as a dash, never fabricated).
-  expect(rollupReviewState('', false)).toBeNull();
-  expect(rollupReviewState('SOMETHING_ELSE', false)).toBeNull();
-  expect(rollupReviewState(null, false)).toBeNull();
-  expect(rollupReviewState(undefined, undefined)).toBeNull();
+test('rollupForgejoReviews: draft dominates, then each reviewer’s latest decisive review', () => {
+  const reviews = (...rs: Array<[number, string, string, boolean?]>) =>
+    JSON.stringify(rs.map(([id, login, state, dismissed]) => ({ id, user: { login }, state, dismissed: dismissed ?? false })));
+  // A draft PR is not up for review yet, regardless of any approval.
+  expect(rollupForgejoReviews(reviews([1, 'a', 'APPROVED']), true, 0)).toBe('draft');
+  expect(rollupForgejoReviews(null, true, 0)).toBe('draft');
+  expect(rollupForgejoReviews(reviews([1, 'a', 'APPROVED']), false, 0)).toBe('approved');
+  expect(rollupForgejoReviews(reviews([1, 'a', 'APPROVED'], [2, 'b', 'REQUEST_CHANGES']), false, 0)).toBe('changes');
+  // The same reviewer approving after requesting changes clears their change request —
+  // by review id, not by the order the API happened to list them in.
+  expect(rollupForgejoReviews(reviews([5, 'a', 'APPROVED'], [2, 'a', 'REQUEST_CHANGES']), false, 0)).toBe('approved');
+  // Comments decide nothing; dismissed reviews are dropped.
+  expect(rollupForgejoReviews(reviews([1, 'a', 'COMMENT']), false, 0)).toBeNull();
+  expect(rollupForgejoReviews(reviews([1, 'a', 'REQUEST_CHANGES', true]), false, 0)).toBeNull();
+  // Requested reviewers with no verdict yet → review required.
+  expect(rollupForgejoReviews('[]', false, 2)).toBe('review-required');
+  expect(rollupForgejoReviews(reviews([1, 'a', 'REQUEST_REVIEW']), false, 0)).toBe('review-required');
+  // No reviews, unreadable reviews → null (a dash, never fabricated).
+  expect(rollupForgejoReviews('[]', false, 0)).toBeNull();
+  expect(rollupForgejoReviews(null, false, 3)).toBeNull();
+  expect(rollupForgejoReviews('garbage', false, 0)).toBeNull();
+  // Reviews without a user (team reviews) stay distinct — one's approval cannot erase another's
+  // change request.
+  const team = JSON.stringify([
+    { id: 1, user: null, state: 'REQUEST_CHANGES' },
+    { id: 5, user: null, state: 'APPROVED' },
+  ]);
+  expect(rollupForgejoReviews(team, false, 0)).toBe('changes');
 });
 
 test('composeTasksTable: a Review column renders every verdict glyph, em dash when PR/review absent', () => {

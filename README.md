@@ -179,7 +179,7 @@ Alex keeps a machine-readable dictionary of banned words with their replacements
 
 **Linear tickets** (`HYP-576` style) — verified via the `linear` CLI, title inlined or appended. Requires `brew install schpet/tap/linear` + `linear auth login`. Disable: `--no-feature autolink-tasks`.
 
-**GitHub PRs and issues** (`#42` style) — resolved against the cwd repo via `gh`. PRs get a state annotation (`(merged)`/`(open)`/`(draft)`). Disable: `--no-feature autolink-prs`.
+**Forgejo PRs and issues** (`#42` style) — resolved against the cwd's Forgejo `origin` repo through the Forgejo REST API, authenticated with the token `fj auth login` stores (fj itself has no JSON output). PRs get a state annotation (`(merged)`/`(open)`/`(draft)`); a GitHub origin leaves `#42` plain. Disable: `--no-feature autolink-prs`.
 
 Both features are ON by default. Both cache verdicts for 1 hour. Both degrade gracefully to plain text if the CLI is missing or not authenticated.
 
@@ -372,7 +372,11 @@ and the bottom inline keyboard provides quick filters
 (`Needs`, `Active`, `Ready`, `Done`, `All`) plus pagination when there is more
 than one page. Status-specific commands such as `/tasks done` still work; tapping
 a quick filter switches back to the full lifecycle view. Old task-board buttons
-expire after a daemon restart.
+expire after a daemon restart. The PR, CI and Review columns come from the
+project's Forgejo `origin`: a ticket's PR is the newest of the repo's 100 most
+recently updated PRs that mentions it, CI is that PR head commit's combined
+status, Review each reviewer's latest verdict — read through the Forgejo REST API
+with the `fj auth login` token; anything the forge cannot report shows as `—`.
 
 Photos and documents sent from Telegram are downloaded to `~/.cache/tg-cli/inbound/` and the local path is injected for the agent to read.
 

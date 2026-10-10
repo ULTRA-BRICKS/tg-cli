@@ -14,7 +14,7 @@ import { linkifyTicketsCompound } from '../features/autolink-tasks/render';
 import type { TicketInfo } from '../features/autolink-tasks/linear';
 import { detectRefsExpanded } from '../features/autolink-prs/detect';
 import { linkifyRefsCompound } from '../features/autolink-prs/render';
-import type { GhRef } from '../features/autolink-prs/resolve';
+import type { ForgeRef } from '../features/autolink-prs/resolve';
 
 // --- expandGroup ---
 
@@ -139,14 +139,14 @@ test('linkify tickets: never touches inside <a> or <pre>', () => {
 
 // --- linkifyRefsCompound ---
 
-const R = (n: number): GhRef => ({
+const R = (n: number): ForgeRef => ({
   number: n,
   kind: 'pr',
   title: 't',
   url: `https://gh/pull/${n}`,
   state: 'OPEN',
 });
-const rmap = (...nums: number[]): Map<number, GhRef> => new Map(nums.map((n) => [n, R(n)]));
+const rmap = (...nums: number[]): Map<number, ForgeRef> => new Map(nums.map((n) => [n, R(n)]));
 
 test('linkify refs: single ref identical to legacy shape', () => {
   expect(linkifyRefsCompound('see #260', rmap(260))).toBe('see <a href="https://gh/pull/260">#260</a>');

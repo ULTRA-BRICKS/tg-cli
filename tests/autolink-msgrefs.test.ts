@@ -5,7 +5,7 @@ import { MSGREF_EXCERPT_MAX } from '../features/autolink-msgrefs/preview';
 import { applyAutolink } from '../features/autolink-tasks/render';
 import { detectRefs } from '../features/autolink-prs/detect';
 import { linkifyRefs } from '../features/autolink-prs/render';
-import type { GhRef } from '../features/autolink-prs/resolve';
+import type { ForgeRef } from '../features/autolink-prs/resolve';
 import type { HistoryRecord } from '../features/replies/history';
 
 // --- Detection ---
@@ -289,7 +289,7 @@ test('PR linkify never rewrites a tg#<id>, even with that number resolved', () =
   // Simulate a body where #3715 IS a verified PR. The msgref pass links tg#3715
   // FIRST; the PR pass must then leave it alone (it is inside an <a>, and its
   // own boundary rule rejects `tg#3715` anyway). Only the standalone #3715 links.
-  const refs = new Map<number, GhRef>([
+  const refs = new Map<number, ForgeRef>([
     [3715, { number: 3715, title: 'PR', url: 'https://gh/pull/3715', kind: 'pr', state: 'OPEN', isDraft: false }],
   ]);
   const afterMsg = linkifyMsgRefs('reply to tg#3715 about #3715', () => null);

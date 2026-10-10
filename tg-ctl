@@ -267,8 +267,14 @@ import {
   isTaskViewFilter,
   matchPrsToTasks,
   parseTasksCommand,
-  rollupCiState,
-  rollupReviewState,
+  parseForgejoPulls,
+  rollupForgejoReviews,
+  rollupForgejoStatus,
+  PR_LIST_BUDGET_MS,
+  PR_PAGES,
+  PR_PAGE_SIZE,
+  STATUS_BUDGET_MS,
+  STATUS_CONCURRENCY,
   shortProjectName,
   taskKey,
   type TasksReplyMarkup,
@@ -276,6 +282,8 @@ import {
   type PrRef,
   type TaskItem,
 } from "./features/tg-ctl/tasks-command"
+import { repoSlug, resolveForgejo, type ForgejoGet } from "./features/forgejo/client"
+import { mapWithConcurrency, OVER_BUDGET, withinBudget } from "./features/util/concurrency"
 import {
   isDeadReset,
   parseSchedules,
@@ -6329,7 +6337,7 @@ async function readStdinText(): Promise<string> {
   })
 }
 
-// --- /tasks command (#115): compose task-cli + gh into a rich board table ---
+// --- /tasks command (#115): compose task-cli + the Forgejo REST API into a rich board table ---
 
 // The pane of the CTO's OWN last resolved inbound delivery (tg-cli#78 anchor
 // fix) — shared by the daemon's discoverForInject (message routing) AND
@@ -6469,45 +6477,69 @@ function flattenTaskListJson(parsed: unknown): TaskItem[] {
   return out
 }
 
-async function loadPrRefs(scopeDir: string | null): Promise<PrRef[]> {
-  const argv = ["gh", "pr", "list", "--state", "all", "--limit", "100", "--json", "number,title,url,body,statusCheckRollup,reviewDecision,isDraft"]
-  const r = await spawnGuarded(argv, 20_000, scopeDir ? { cwd: scopeDir } : {})
-  if (r.exitCode !== 0) {
-    log(`/tasks: 'gh pr list' failed (${r.exitCode}): ${r.stderr.slice(0, 200)}`)
-    return []
-  }
-  try {
-    const parsed = JSON.parse(r.stdout)
-    if (!Array.isArray(parsed)) return []
-    return parsed
-      .filter((p) => p && typeof p.number === "number")
-      .map((p) => {
-        const url = typeof p.url === "string" ? p.url : ""
-        return {
-          number: p.number,
-          url,
-          title: p.title ?? "",
-          body: p.body ?? "",
-          ci: rollupCiState(p.statusCheckRollup),
-          review: rollupReviewState(p.reviewDecision, p.isDraft),
-          project: projectFromPrUrl(url),
-        }
-      })
-  } catch {
-    return []
-  }
+// The scope repo's PRs (newest-updated first, at most PR_PAGES × PR_PAGE_SIZE) plus the
+// authenticated GET that read them, reused for the CI/review lookups of ticket-matched PRs.
+// No Forgejo origin or no fj credential → no PRs, and the board's PR column stays dashes.
+interface PrBoard {
+  prs: PrRef[]
+  get: ForgejoGet | null
+  apiRepo: string
 }
 
-function projectFromPrUrl(rawUrl: string): string | undefined {
-  try {
-    const url = new URL(rawUrl)
-    const parts = url.pathname.split("/").filter(Boolean)
-    const pullIndex = parts.indexOf("pull")
-    if (pullIndex < 2) return undefined
-    return `${parts[pullIndex - 2]}/${parts[pullIndex - 1]}`
-  } catch {
-    return undefined
-  }
+async function loadPrBoard(scopeDir: string): Promise<PrBoard> {
+  const forge = await resolveForgejo(scopeDir)
+  if (forge.status === "no-auth") log(`/tasks: no usable fj credential for ${forge.host} — run: fj -H ${forge.host} auth login`)
+  if (forge.status !== "ok") return { prs: [], get: null, apiRepo: "" }
+  const apiRepo = `/repos/${encodeURIComponent(forge.repo.owner)}/${encodeURIComponent(forge.repo.name)}`
+  const prs: PrRef[] = []
+  // Capped like the status stage: a forge that accepts connections and then stalls delays the
+  // board by at most PR_LIST_BUDGET_MS here; the pages that arrived are used.
+  const outcome = await withinBudget(async (budget) => {
+    for (let page = 1; page <= PR_PAGES; page++) {
+      const r = await forge.get(`${apiRepo}/pulls?state=all&sort=recentupdate&limit=${PR_PAGE_SIZE}&page=${page}`, budget)
+      if (budget.aborted) return
+      if (!r || r.status !== 200) {
+        log(`/tasks: Forgejo PR list page ${page} failed (${r ? `HTTP ${r.status}` : "unreachable"})`)
+        return
+      }
+      const listed = parseForgejoPulls(r.body, repoSlug(forge.repo))
+      prs.push(...listed.prs)
+      // Assumes the forge's MAX_RESPONSE_ITEMS >= PR_PAGE_SIZE (Forgejo default 50).
+      if (listed.items < PR_PAGE_SIZE) return
+    }
+  }, PR_LIST_BUDGET_MS)
+  if (outcome === OVER_BUDGET) log(`/tasks: Forgejo PR list exceeded ${PR_LIST_BUDGET_MS}ms — using the ${prs.length} PRs that arrived`)
+  return { prs, get: forge.get, apiRepo }
+}
+
+// Fill CI (head commit's combined status) and review verdicts for the PRs the board shows.
+// A failed lookup leaves that leg null — a dash, never a guess. The whole stage is capped at
+// STATUS_BUDGET_MS so a stalling forge delays the board by a bounded amount: past it, no
+// further lookup starts, the ones in flight are aborted, and whatever has not answered
+// renders as a dash.
+async function annotatePrStatuses(board: PrBoard, prs: PrRef[]): Promise<void> {
+  const get = board.get
+  if (!get) return
+  const outcome = await withinBudget(
+    (budget) =>
+      mapWithConcurrency(
+        prs,
+        STATUS_CONCURRENCY,
+        async (pr) => {
+          const [status, reviews] = await Promise.all([
+            pr.headSha ? get(`${board.apiRepo}/commits/${encodeURIComponent(pr.headSha)}/status`, budget) : Promise.resolve(null),
+            // A draft's review verdict is "draft" whatever its reviews say — no lookup needed.
+            pr.draft ? Promise.resolve(null) : get(`${board.apiRepo}/pulls/${pr.number}/reviews`, budget),
+          ])
+          if (budget.aborted) return // past the budget: the board has already been rendered
+          pr.ci = status?.status === 200 ? rollupForgejoStatus(status.body) : null
+          pr.review = rollupForgejoReviews(reviews?.status === 200 ? reviews.body : null, pr.draft === true, pr.requestedReviewers ?? 0)
+        },
+        budget,
+      ),
+    STATUS_BUDGET_MS,
+  )
+  if (outcome === OVER_BUDGET) log(`/tasks: Forgejo CI/review lookups exceeded ${STATUS_BUDGET_MS}ms — rendering what arrived`)
 }
 
 interface TaskBoardState {
@@ -6557,8 +6589,12 @@ async function runTasksCommand(ctx: Ctx, action: Extract<Action, { kind: "tasks"
     return
   }
   const viewOptions = tasksViewOptions(action, status)
-  const [tasks, prs] = await Promise.all([loadTasks(scopeDir, status, viewOptions.view === "all" && status === null), scopeDir ? loadPrRefs(scopeDir) : Promise.resolve([])])
-  const prsByTask = matchPrsToTasks(tasks, prs)
+  const [tasks, board] = await Promise.all([
+    loadTasks(scopeDir, status, viewOptions.view === "all" && status === null),
+    scopeDir ? loadPrBoard(scopeDir) : Promise.resolve<PrBoard>({ prs: [], get: null, apiRepo: "" }),
+  ])
+  const prsByTask = matchPrsToTasks(tasks, board.prs)
+  await annotatePrStatuses(board, [...new Set(prsByTask.values())])
   const view = composeTasksView(annotateTasksWithAgents(tasks, agent), prsByTask, { agent, status }, viewOptions)
   const sent = await sendRich(ctx, view.html, { ...messageContext, reply_markup: view.reply_markup })
   rememberTaskBoardState(ctx.chatId, sent, { scopeDir, agent, status, threadId })

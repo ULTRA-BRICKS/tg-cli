@@ -98,7 +98,7 @@ plain text; it is never attached.
 A --ticket value that already looks like a ticket code (HYP-123) is left as
 plain text so the existing autolink-tasks feature links it. A --pr value is
 rendered as a real link whenever one can be built: an http(s) URL is used
-as-is, an "owner/repo#123" reference becomes a github.com PR link (built
+as-is, an "owner/repo#123" reference becomes a Forgejo PR link (built
 directly here — autolink-prs only ever resolves a bare #N against the
 INVOKING repo, so leaving a cross-repo reference to it could link the wrong
 PR), and a bare number ("123") is rewritten to "#123" for autolink-prs to
@@ -120,7 +120,7 @@ function escapeOrLink(value: string, displayText: string = value): string {
 
 // Normalizes a --pr value into what should actually be rendered:
 //   - an http(s) URL is used as-is;
-//   - "owner/repo#N" is rewritten to a real GitHub PR URL, keeping the
+//   - "owner/repo#N" is rewritten to a real Forgejo PR URL, keeping the
 //     original "owner/repo#N" as the visible label — autolink-prs only ever
 //     resolves a bare #N against the INVOKING repo (features/autolink-prs/
 //     detect.ts), so leaving a cross-repo reference to that pass could link
@@ -133,7 +133,7 @@ function renderPrRef(value: string): string {
   const ownerRepoMatch = value.match(/^([\w.-]+\/[\w.-]+)#([1-9][0-9]*)$/);
   if (ownerRepoMatch) {
     const [, ownerRepo, number] = ownerRepoMatch;
-    return escapeOrLink(`https://github.com/${ownerRepo}/pull/${number}`, value);
+    return escapeOrLink(`https://git.hyperide.ai/${ownerRepo}/pulls/${number}`, value);
   }
   if (/^[1-9][0-9]*$/.test(value)) return escapeOrLink(`#${value}`);
   return escapeOrLink(value);
