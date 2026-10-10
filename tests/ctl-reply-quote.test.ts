@@ -44,6 +44,28 @@ test('partial quote is forwarded as the quote anchor (item 2)', () => {
   expect(out).toBe('↩ tg#42 «[2026-06-12 14:30] migrated the DB…»\n[TG from Alex] fix the bug — reply via tg');
 });
 
+// tg-cli#565 (HYP-907): a partial selection is the exact words the human is answering — cutting it at
+// the 60-char whole-message preview limit dropped the end of what they pointed at. Telegram
+// itself bounds a selection (quote_length_max, 1024), so the anchor stays one bounded line.
+test('long partial quote is kept whole, not cut like a whole-message preview (HYP-907)', () => {
+  const rawSelected = `selected  ${'part '.repeat(12)}\nwith line break`;
+  const out = buildReplyInject(reply('answer this exact part', `prefix ${rawSelected} suffix`, rawSelected), 'Alex', opts);
+  expect(out.split('\n')[0]).toBe(
+    '↩ tg#42 «[2026-06-12 14:30] selected part part part part part part part part part part part part with line break…»',
+  );
+});
+
+test('a selection one char past the preview limit is not cut (the old 60-char edge)', () => {
+  const selected = 'y'.repeat(61);
+  const out = buildReplyInject(reply('ok', `x ${selected} z`, selected), 'Alex', opts);
+  expect(out.split('\n')[0]).toBe(`↩ tg#42 «[2026-06-12 14:30] ${selected}…»`);
+});
+
+test('a whitespace-only partial quote falls back to the replied-to message preview', () => {
+  const out = buildReplyInject(reply('answer this', 'Original message body', ' \n\t '), 'Alex', opts);
+  expect(out.split('\n')[0]).toBe('↩ tg#42 «[2026-06-12 14:30] Original message body…»');
+});
+
 test('no partial quote → beginning of the replied-to message (item 3)', () => {
   const out = buildReplyInject(reply('do it', 'Short original message', undefined), 'Alex', opts);
   expect(out).toBe('↩ tg#42 «[2026-06-12 14:30] Short original message…»\n[TG from Alex] do it — reply via tg');
@@ -163,6 +185,11 @@ test('#461: a partial-quote selection still wins over the rich body', () => {
 
 test('#461: reply to a captionless photo quotes a media label, not an empty preview', () => {
   const anchor = buildReplyAnchor(replyTo({ photo: [{ file_id: 'p1' }] }), opts);
+  expect(anchor).toBe('↩ tg#42 «[2026-06-12 14:30] [photo]»');
+});
+
+test('#461: a whitespace-only selection on a captionless photo falls through to the media label', () => {
+  const anchor = buildReplyAnchor(replyTo({ photo: [{ file_id: 'p1' }] }, ' \n '), opts);
   expect(anchor).toBe('↩ tg#42 «[2026-06-12 14:30] [photo]»');
 });
 

@@ -78,8 +78,9 @@ function fmtQuoteTimeUtc(unixSec: number): string {
   return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
 }
 
-// First chars of the quote-anchor body, separators collapsed, with a trailing
-// ellipsis (item 3: «… начало сообщения и многоточие …»).
+// First chars of the whole-message fallback body, separators collapsed, with a
+// trailing ellipsis (item 3: «… начало сообщения и многоточие …»). A partial
+// selection is never cut (HYP-907): Telegram already bounds it (quote_length_max).
 const QUOTE_HEAD_MAX = 60;
 
 // The quote anchor for a REPLY (items 2, 3): `↩ tg#<id> «[date time] <quote>…»`.
@@ -92,7 +93,7 @@ const QUOTE_HEAD_MAX = 60;
 // convention as the `{id}` substitution in wrapInbound (tg-cli#28) — so an
 // agent whose context has compacted/forgotten the original can still recover
 // it verbatim via `tg replies --json` (grep the id) instead of relying on the
-// truncated `head` preview below (tg-cli#130).
+// truncated whole-message `head` preview below (tg-cli#130).
 //
 // tg-cli#461: the preview is never an empty `«[date] …»`. A message with no text
 // quotes a media label (`«[date] [photo]»`, no ellipsis — nothing was cut); a message
@@ -101,14 +102,21 @@ export function buildReplyAnchor(m: TgMessage, opts: StepOpts): string {
   const rtm = m.reply_to_message;
   const origId = rtm ? ` tg#${rtm.message_id}` : '';
   const selected = m.quote?.text?.replace(/\s+/g, ' ').trim();
-  const body = selected || (rtm ? messagePlainText(rtm) : '');
-  // Deliberately NOT `truncateWithEllipsis`: the anchor ends in `…` UNCONDITIONALLY (even
-  // an untruncated body gets one, per the module comment above) and cuts at the full
+  const original = !selected && rtm ? messagePlainText(rtm) : '';
+  // Precedence: selection → replied-to text → media label. Both text tiers end in `…`
+  // UNCONDITIONALLY (even when nothing was cut) so every text anchor has the same shape;
+  // a media label carries no text to continue, so it gets none.
+  // Deliberately NOT `truncateWithEllipsis` for the fallback: it cuts at the full
   // QUOTE_HEAD_MAX rather than reserving a unit for the ellipsis — a different contract
   // from the reserve-one-unit shape `truncateWithEllipsis` gives everyone else. Still
   // routed through `safeSliceEnd` so the cut itself never splits a surrogate pair.
-  let head = rtm ? mediaLabel(rtm) : '';
-  if (body) head = body.length > QUOTE_HEAD_MAX ? `${body.slice(0, safeSliceEnd(body, QUOTE_HEAD_MAX))}…` : `${body}…`;
+  const head = selected
+    ? `${selected}…`
+    : original
+      ? `${original.length > QUOTE_HEAD_MAX ? original.slice(0, safeSliceEnd(original, QUOTE_HEAD_MAX)) : original}…`
+      : rtm
+        ? mediaLabel(rtm)
+        : '';
   if (!head) return `↩${origId}`;
   const when = rtm ? (opts.fmtTime ?? fmtQuoteTimeUtc)(rtm.date) : '';
   return `↩${origId} «[${when}] ${head}»`;

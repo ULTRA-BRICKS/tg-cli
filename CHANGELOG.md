@@ -3,6 +3,15 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.15
+
+- **A highlighted partial reply quote reaches the agent whole (#565, HYP-907).** `tg-ctl` cut
+  the CTO's Telegram quote selection at the 60-char whole-message preview limit, so the `↩`
+  anchor dropped the end of the very words being answered. A non-empty selection is now
+  forwarded whole (whitespace-collapsed, still ending in `…`; Telegram itself bounds a
+  selection at 1024 chars). A reply without a selection — or with a whitespace-only one — keeps
+  the 60-char, surrogate-safe preview of the replied-to message.
+
 ## 1.55.14
 
 - **A reply to an exited one-shot sender no longer goes to whichever live agent shares its
