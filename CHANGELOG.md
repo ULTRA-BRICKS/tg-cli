@@ -3,6 +3,32 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.19
+
+- **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on
+  Forgejo: it probed GitHub's Dependency Graph, the probe always failed there, and the check went
+  green with no audit. It now runs the trusted base copy of `ci/dependency-review/dep-audit.sh`
+  under `pull_request_target` over the PR head, every time. The script audits the PR's
+  lockfiles as data: it copies only manifests/lockfiles into a staging dir (the PR's
+  `bunfig.toml` / `.npmrc` / `.cargo/audit.toml` can't repoint or silence an auditor), refuses a
+  symlinked manifest, resolves a lockfile-less `package.json` with
+  `bun install --lockfile-only --ignore-scripts` only when every dependency is a plain registry
+  range (a git / URL / file / alias spec fails closed), and gives pip-audit only fully pinned
+  requirements files (`--disable-pip --no-deps`) — an editable / URL / VCS / path / `-r` / `-c` /
+  index-option / unpinned line, including one smuggled behind a `--hash`, fails closed instead of
+  being built. A go module fails closed too (govulncheck builds the source). An auditor that
+  can't reach its advisory database fails the gate, and the message says so rather than
+  claiming advisories.
+- **CodeQL no longer skips a language it should scan.** The detect step piped
+  `git ls-files | grep -q` under `pipefail`; on a large tree the early `grep` exit SIGPIPEd
+  `git ls-files` and the language was reported as absent. The list is materialized first, and a
+  listing or grep error fails the job.
+- **`leftover-grep` fails closed.** An explicit `LEFTOVER_BASE` that doesn't resolve, or a diff
+  that can't be computed, now fails the gate (before: a silent fallback, or a swallowed `git diff`
+  error and a pass). The workflow fetches the PR head with history and checks for a merge-base;
+  a head with none is scanned with a two-dot diff. A bare `=======` line is no longer reported
+  as a merge marker.
+
 ## 1.55.18
 
 - **The live Telegram e2e runs on Linux (#563).** `bun scripts/e2e-telegram.ts` always required
