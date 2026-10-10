@@ -64,6 +64,7 @@ function parseEntry(raw: unknown): SessionEntry | null {
   const misses = typeof v.topicMisses === 'object' && v.topicMisses !== null ? (v.topicMisses as Wire<NonNullable<SessionEntry['topicMisses']>>) : null;
   const missCount = num(misses?.count);
   const missAt = str(misses?.firstAt);
+  const topicRecreatedAt = str(v.topicRecreatedAt);
   return {
     key: key as SessionKey,
     harness,
@@ -75,6 +76,7 @@ function parseEntry(raw: unknown): SessionEntry | null {
     aliases: Array.isArray(v.aliases) ? v.aliases.filter((a): a is string => typeof a === 'string') : [],
     threadId: num(v.threadId),
     topicMisses: missCount !== null && missAt !== null ? { count: missCount, firstAt: missAt } : null,
+    ...(topicRecreatedAt !== null ? { topicRecreatedAt } : {}),
     state: v.state,
     firstSeen,
     lastSeen,

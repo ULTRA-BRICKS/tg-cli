@@ -72,9 +72,16 @@ export function parseTopicResult(raw: unknown): { key: string; threadId: number;
 
 // The live entry `tg` is running in. The harness pid is the most exact locator (it also covers
 // an omp outside tmux), then the omp session file, then the tmux pane — which counts only on
-// the same tmux server, since a restarted server reuses `%N` ids (§2.6). Gone entries never
-// match: a dead session has no outbound.
-export function findSessionForLookup(reg: Registry, q: SessionLookup): SessionEntry | null {
+// the same tmux server, since a restarted server reuses `%N` ids (§2.6), and only while the
+// pane still runs the entry's process: a sender with a harness ancestor that is neither that
+// process nor descended from it (`descends(entryPid, pid)`: a subagent the session spawned) is in
+// a pane whose harness changed since the scan (tg-cli#556), so nothing matches and the daemon
+// rescans. Gone entries never match: a dead session has no outbound.
+export function findSessionForLookup(
+  reg: Registry,
+  q: SessionLookup,
+  descends: (ancestor: number, pid: number) => boolean = () => false,
+): SessionEntry | null {
   const live = reg.sessions.filter((e) => e.state === 'live');
   const byPid = live.find((e) => e.locators.pid !== null && q.ancestorPids.includes(e.locators.pid));
   if (byPid) return byPid;
@@ -86,7 +93,9 @@ export function findSessionForLookup(reg: Registry, q: SessionLookup): SessionEn
     return (
       live.find((e) => {
         const tmux = e.locators.tmux;
-        return !!tmux && tmux.paneId === q.tmuxPane && (q.tmuxServerPid === null || tmux.serverPid === q.tmuxServerPid);
+        if (!tmux || tmux.paneId !== q.tmuxPane || (q.tmuxServerPid !== null && tmux.serverPid !== q.tmuxServerPid)) return false;
+        const pid = e.locators.pid;
+        return pid === null || q.ancestorPids.length === 0 || q.ancestorPids.some((a) => descends(pid, a));
       }) ?? null
     );
   }

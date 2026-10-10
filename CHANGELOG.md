@@ -3,6 +3,27 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.7
+
+- **A session that exits says so in its topic (#498).** The daemon posts `⏹ <name> — exited` with
+  the resume hint into the topic; in a forum supergroup it also closes the topic and reopens it
+  before "reattached" when the session comes back. The 24 h topic-recreate cap is now stored on the
+  session entry, so a daemon restart no longer allows a second recreate. A cc/codex session resumed
+  within ~2 s of a registry scan was never re-adopted: its hook was matched against the older
+  cached process list, which did not show it yet, and dropped. When a gone session is pruned
+  (after 30 days) its closed topic's pane binding goes with it, so the next session in that pane
+  opens its own topic instead of posting into a closed one.
+- **Topic ownership edge cases (#556).** A session no longer adopts a pane-bound topic that another
+  session owns. A resumed cc/codex session whose pane opened a topic before its first hook keeps its
+  earlier topic, and the extra one says it is no longer used. A `tg` in a pane whose harness was
+  replaced is no longer matched to the pane's previous session. `tg` ignores a session topic from
+  another chat, and says on stderr when the daemon did not answer the topic lookup and the post goes
+  to General. `tg` reads `config.yaml` from `TG_CTL_CONFIG_DIR` like the daemon, so both agree on
+  whether topics are on. A `TG_TOPIC` from `/new` still does not follow a recreated topic (#600).
+- **A Retry of a failed `/new` spawn with `control.private_topics` reuses the topic the first
+  attempt created (#185)** instead of opening one per attempt — unless that topic was bound to
+  another session in the meantime; then the Retry opens a new one.
+
 ## 1.55.6
 
 - **A session's limit/overload stall notice, hatch critical reminder and unanswered-question

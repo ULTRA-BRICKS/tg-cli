@@ -129,6 +129,23 @@ test('a cc pane seen before its first hook gets a provisional pane key; the firs
   expect(next.sessions[0]).toMatchObject({ key: 'cc:cc-session-1', sessionId: 'cc-session-1', threadId: 9, firstSeen: '2026-09-30T10:00:00.000Z' });
 });
 
+// tg-cli#556 (2): a resumed session (its entry kept topic 5) is first seen as a fresh provisional
+// pane that already opened topic 9. The promotion keeps the session's own topic and reports the
+// provisional one as dropped, so the daemon can unbind it instead of leaving an orphan bound.
+test('a promotion onto an entry with its own topic keeps that topic and reports the provisional one dropped', () => {
+  const resumed = run(emptyRegistry(), [cc({ sessionId: 'cc-session-1', pid: 150 })]).next;
+  let reg: Registry = { ...resumed, sessions: resumed.sessions.map((s) => ({ ...s, threadId: 5 })) };
+  reg = run(reg, [], T0 + 1_000).next;
+  const provisional = run(reg, [cc()], T0 + 2_000).next;
+  const withTopic: Registry = {
+    ...provisional,
+    sessions: provisional.sessions.map((s) => (s.key === 'cc:pane:7/%3/60' ? { ...s, threadId: 9 } : s)),
+  };
+  const { next, events } = run(withTopic, [cc({ sessionId: 'cc-session-1' })], T0 + 3_000);
+  expect(events.find((e) => e.kind === 'promoted')).toEqual({ kind: 'promoted', from: 'cc:pane:7/%3/60', to: 'cc:cc-session-1', droppedThreadId: 9 });
+  expect(next.sessions.find((s) => s.key === 'cc:cc-session-1')?.threadId).toBe(5);
+});
+
 test('a promoted cc keeps its key on later scans that carry no session id (daemon restart lost the hook map)', () => {
   const promoted = run(run(emptyRegistry(), [cc()]).next, [cc({ sessionId: 'cc-session-1' })], T0 + 1_000).next;
   const { next, events } = run(promoted, [cc()], T0 + 2_000);

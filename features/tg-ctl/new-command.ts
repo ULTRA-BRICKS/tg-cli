@@ -452,6 +452,9 @@ export interface NewSession {
   // Forum/private-topic id of the slash command that opened this flat /new flow. Null/absent keeps
   // the normal flat-chat behavior; a number makes daemon prompts and confirmations stay in topic.
   threadId?: number | null;
+  // The private-chat topic this /new's spawn created (control.private_topics). A Retry after a
+  // failed spawn reuses it instead of creating another per attempt (tg-cli#185).
+  privateThreadId?: number;
   // The chat + message_id of the `/new` that opened this session. Recorded on a private-topic
   // binding so a replayed `/new` (pending-batch recovery after a crash) is not spawned twice.
   sourceChatId: number;

@@ -98,6 +98,21 @@ test('lookup never answers with a pane of another tmux server, a gone entry, or 
   expect(findSessionForLookup(gone, { tmuxPane: '%3', tmuxServerPid: 7, ancestorPids: [200], sessionFile: null })).toBeNull();
 });
 
+// tg-cli#556 (3): the pane fallback must not answer for a pane whose harness process changed —
+// claude replaced by codex in the same pane between two scans. A sender whose nearest harness
+// ancestor is neither the entry's process nor a descendant of it (a subagent the session ran) is
+// not that session; the daemon rescans instead.
+test('lookup does not match a pane whose recorded harness pid is not in the sender\'s ancestry', () => {
+  const reg = fleet();
+  expect(findSessionForLookup(reg, { tmuxPane: '%3', tmuxServerPid: 7, ancestorPids: [777], sessionFile: null })).toBeNull();
+  // A subagent (pid 778) the cc session (pid 200) spawned in its pane still shares its topic.
+  const descends = (ancestor: number, pid: number): boolean => ancestor === 200 && pid === 778;
+  expect(keyOf(findSessionForLookup(reg, { tmuxPane: '%3', tmuxServerPid: 7, ancestorPids: [778], sessionFile: null }, descends))).toBe(`cc:${CC_SID}`);
+  expect(findSessionForLookup(reg, { tmuxPane: '%3', tmuxServerPid: 7, ancestorPids: [777], sessionFile: null }, descends)).toBeNull();
+  // No harness ancestor at all (a plain shell split in that pane): the pane still identifies it.
+  expect(keyOf(findSessionForLookup(reg, { tmuxPane: '%3', tmuxServerPid: 7, ancestorPids: [], sessionFile: null }))).toBe(`cc:${CC_SID}`);
+});
+
 test('a card resolves by its hook session id first, else by its pane', () => {
   const reg = fleet();
   expect(keyOf(findSessionForCard(reg, { agent: 'claude', sessionId: CC_SID, paneId: '%9' }))).toBe(`cc:${CC_SID}`);

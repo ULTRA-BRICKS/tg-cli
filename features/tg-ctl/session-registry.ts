@@ -39,6 +39,9 @@ export interface SessionEntry {
   aliases: string[];
   threadId: number | null;
   topicMisses: { count: number; firstAt: string } | null;
+  // ISO time the daemon last recreated this entry's topic (§4.2's at-most-once-per-24h cap,
+  // persisted so a daemon restart keeps it, tg-cli#498). Absent: never recreated.
+  topicRecreatedAt?: string | null;
   state: 'live' | 'gone';
   firstSeen: string;
   lastSeen: string;
@@ -76,7 +79,9 @@ export type RegistryEvent =
   | { kind: 'readopted'; key: SessionKey; threadId: number | null }
   | { kind: 'gone'; key: SessionKey }
   | { kind: 'pruned'; key: SessionKey }
-  | { kind: 'promoted'; from: SessionKey; to: SessionKey }
+  // `droppedThreadId`: the provisional entry's topic, when the promoted-to entry already had its
+  // own (a resumed session). The entry keeps its own; the daemon unbinds the dropped one.
+  | { kind: 'promoted'; from: SessionKey; to: SessionKey; droppedThreadId?: number }
   | { kind: 'paneReused'; from: SessionKey; to: SessionKey; paneId: string }
   | { kind: 'renamed'; key: SessionKey; from: SessionName; to: SessionName };
 
@@ -208,7 +213,8 @@ export function reconcile(
     let prior = entries.get(key);
     if (provisional) {
       entries.delete(provisional.key);
-      events.push({ kind: 'promoted', from: provisional.key, to: key });
+      const dropped = prior && prior.threadId !== null && provisional.threadId !== null && provisional.threadId !== prior.threadId ? provisional.threadId : null;
+      events.push({ kind: 'promoted', from: provisional.key, to: key, ...(dropped !== null ? { droppedThreadId: dropped } : {}) });
       prior = prior
         ? { ...prior, threadId: prior.threadId ?? provisional.threadId }
         : { ...provisional, key, sessionId: s.sessionId };

@@ -313,6 +313,77 @@ test(
   },
 );
 
+// tg-cli#185: a spawn that fails after its private topic was created offers Retry; the retry
+// reuses that topic instead of creating (and orphaning) another one per attempt — unless the topic
+// was bound to another session in between (the failed spawn unbinds it, so the attach picker can
+// claim it): then the retry opens a new one rather than share it (tg-cli#556).
+for (const takenMeanwhile of [false, true]) test(
+  takenMeanwhile
+    ? 'private_topics: a Retry whose first topic was bound meanwhile opens a new topic'
+    : 'private_topics: a Retry after a failed spawn reuses the topic the first attempt created',
+  async () => {
+    const { cfgDir, spawnLog } = makeCfgDir(true);
+    // The first `tmux new-window` fails; later ones succeed.
+    const failOnce = join(cfgDir, 'fail-once');
+    writeFileSync(failOnce, '');
+    writeFileSync(
+      join(cfgDir, 'bin', 'tmux'),
+      fakeTmux(cfgDir, spawnLog).replace('  new-window)\n', `  new-window)\n    if [ -f '${failOnce}' ]; then rm -f '${failOnce}'; echo 'no space for new window' >&2; exit 1; fi\n`),
+      { mode: 0o755 },
+    );
+    const queue: unknown[][] = [[textMsg(40, `/new claude-default ${cfgDir} retryproj`)]];
+    const creates: Array<Record<string, unknown>> = [];
+    const sends: Array<Record<string, unknown>> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname.endsWith('/getUpdates')) {
+          const batch = queue.shift();
+          if (batch) return Response.json({ ok: true, result: batch });
+          await Bun.sleep(60);
+          return Response.json({ ok: true, result: [] });
+        }
+        if (url.pathname.endsWith('/getMe')) {
+          return Response.json({ ok: true, result: { id: 123, is_bot: true, username: 'bot', has_topics_enabled: true } });
+        }
+        if (url.pathname.endsWith('/createForumTopic')) {
+          const body = (await req.json()) as Record<string, unknown>;
+          creates.push(body);
+          return Response.json({ ok: true, result: { message_thread_id: 60 + creates.length, name: body.name } });
+        }
+        if (url.pathname.endsWith('/sendMessage')) {
+          sends.push((await req.json()) as Record<string, unknown>);
+          return Response.json({ ok: true, result: { message_id: 900 + sends.length } });
+        }
+        return Response.json({ ok: true, result: true });
+      },
+    });
+    servers.push(server);
+    const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
+    const daemon: Subprocess = await spawnDaemon(reg, {
+      tgCtlPath: TG_CTL,
+      cfgDir,
+      env: { PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`, HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: `http://127.0.0.1:${server.port}` },
+      logFd,
+    });
+    closeSync(logFd);
+
+    await waitFor(() => sent(sends, 'tap Retry'), 8000, () => readFileSync(join(cfgDir, 'daemon.log'), 'utf8'));
+    const offer = sends.find((s) => String(s.text ?? '').includes('tap Retry'))!;
+    const retryData = (offer.reply_markup as { inline_keyboard: Array<Array<{ callback_data?: string }>> }).inline_keyboard.flat()[0].callback_data!;
+    if (takenMeanwhile) {
+      writeFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), JSON.stringify([{ threadId: 61, name: 'other', status: 'bound', paneId: '%1', ts: nowSec() }]));
+    }
+    queue.push([callbackTap(41, Number(offer.message_id ?? 0), retryData)]);
+
+    await waitFor(() => spawnArgvLog(spawnLog).length > 0, 8000, () => readFileSync(join(cfgDir, 'daemon.log'), 'utf8'));
+    expect(creates).toHaveLength(takenMeanwhile ? 2 : 1);
+    expect(spawnArgvLog(spawnLog)[0]).toContain(takenMeanwhile ? '-e TG_TOPIC=62' : '-e TG_TOPIC=61');
+    daemon.kill();
+  },
+);
+
 test(
   'private_topics: opencode spawn keeps the initial task via --prompt',
   async () => {

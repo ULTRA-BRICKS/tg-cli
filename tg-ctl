@@ -223,6 +223,7 @@ import {
   type SessionLookup,
 } from "./features/tg-ctl/session-topics"
 import { createTopicRenamer, type TopicRenamer } from "./features/tg-ctl/topic-rename"
+import { createKeyedSerialQueue } from "./features/tg-ctl/keyed-serial"
 import { isThreadRejection, isTopicDeletedError } from "./features/transport/telegram"
 import { installOmpLiveExtension, runOmpLiveCommand } from "./tools/omp-live-cli.mjs"
 import {
@@ -404,6 +405,7 @@ import {
   findHold,
   findTopic,
   findTopicCreatedBy,
+  exitedTopicNotice,
   goneTopicReply,
   holdExpiredReply,
   holdPayload,
@@ -1477,7 +1479,9 @@ function ompBreadcrumbSessionFile(agent: LiveOmpAgent, cwd: string | null): stri
 // session-registry scan reuses it instead of paying for its own ps/lsof pass.
 // `serverPid`: the tmux server of exactly that pane list, read on both sides of it
 // only while a registry scan is wanted (undefined = not read for this snapshot).
-let liveOmpCache: { at: number; agents: LiveOmpAgent[]; panes: PaneInfo[]; procs: ProcInfo[]; serverPid: number | null | undefined } | null = null
+// `seq`: numbers the snapshots, so a hook sighting can tell one taken after it arrived.
+let liveOmpCache: { at: number; seq: number; agents: LiveOmpAgent[]; panes: PaneInfo[]; procs: ProcInfo[]; serverPid: number | null | undefined } | null = null
+let liveOmpSeq = 0
 function listLiveOmpAgents(): LiveOmpAgent[] {
   const now = Date.now()
   if (liveOmpCache && now - liveOmpCache.at < UNREACHABLE_SCAN_TTL_MS) return liveOmpCache.agents
@@ -1508,7 +1512,7 @@ function listLiveOmpAgents(): LiveOmpAgent[] {
       agents.push({ ...host, paneId: null, tty: null })
     }
   }
-  liveOmpCache = { at: now, agents, panes, procs, serverPid }
+  liveOmpCache = { at: now, seq: ++liveOmpSeq, agents, panes, procs, serverPid }
   return agents
 }
 
@@ -1717,8 +1721,11 @@ let sessionRefreshAt = 0
 const SESSION_REFRESH_MIN_MS = 2_000
 // cc/codex `session_id`s seen on the hook socket, by pane. The pid is bound at
 // the next scan (bindHookSessions), so a later process in the same pane never
-// inherits the id.
-let pendingHookSessions: PendingHookSighting[] = []
+// inherits the id. A sighting is bound only against a discovery snapshot taken
+// after it arrived (`afterSeq`): an older one shows the pane before the session
+// (re)started in it and would drop the sighting, so a resume within the snapshot
+// cache's 2 s was never re-adopted (tg-cli#498).
+let pendingHookSessions: Array<PendingHookSighting & { afterSeq: number }> = []
 let hookSessions: HookSessionSighting[] = []
 const MAX_PENDING_HOOK_SESSIONS = 64
 // Names seen but not yet stable for RENAME_DEBOUNCE_MS (spec §3.2); in memory only.
@@ -1772,9 +1779,11 @@ function refreshSessionRegistry(force = false): Registry | null {
 function recordHookSession(req: ButtonRequest): void {
   const sighting = hookSightingOf(req)
   if (!sighting) return
-  pendingHookSessions.push(sighting)
+  pendingHookSessions.push({ ...sighting, afterSeq: liveOmpSeq })
   if (pendingHookSessions.length > MAX_PENDING_HOOK_SESSIONS) pendingHookSessions.shift()
-  sessionScanDue = true // bind it while the asking process is still alive
+  // Bind it while the asking process is still alive, from a fresh snapshot.
+  liveOmpCache = null
+  sessionScanDue = true
 }
 
 // tmux `#{pid}` of the server `list-panes` read — part of every pane locator, so a
@@ -1856,8 +1865,9 @@ function scanSessionRegistry(ctx: Ctx, discovery: NonNullable<typeof liveOmpCach
     sessionRegistry = prev
     const { panes, procs, agents, serverPid } = discovery
     if (!scanIsTrustworthy(prev, { panes, procs, serverPid })) return
-    hookSessions = bindHookSessions(hookSessions, pendingHookSessions, panes, procs)
-    pendingHookSessions = []
+    const ripe = pendingHookSessions.filter((s) => s.afterSeq < discovery.seq)
+    pendingHookSessions = pendingHookSessions.filter((s) => s.afterSeq >= discovery.seq)
+    hookSessions = bindHookSessions(hookSessions, ripe, panes, procs)
     const scan = listLiveSessions({ panes, procs, serverPid, paneTitles: readPaneTitles(), omp: agents, hookSessions })
     const { next, events, pending } = reconcile(prev, scan, now, pendingRenames)
     pendingRenames = pending
@@ -1911,9 +1921,6 @@ const TOPIC_WAIT_MS = 1200
 const TOPIC_THREAD_RETRY_MS = 1000
 // A bot without topic capability (or a failing createForumTopic) is re-asked at most this often.
 const TOPIC_CAPABILITY_TTL_MS = 10 * 60_000
-// Per entry, when its topic was last recreated after a deletion (§4.2's 24 h cap). Held in
-// memory: a daemon restart forgets it, which at worst allows one extra recreate (tg-cli#498).
-const topicRecreatedAt = new Map<SessionKey, number>()
 let topicCapability: { at: number; ok: boolean } | null = null
 let topicEnsurer: ((key: SessionKey) => Promise<number | null>) | null = null
 
@@ -1922,7 +1929,7 @@ function liveEntry(ctx: Ctx, key: string): SessionEntry | null {
 }
 
 // Replace one entry's topic fields and persist (the daemon is sessions.json's only writer).
-function patchSessionEntry(ctx: Ctx, key: SessionKey, patch: Partial<Pick<SessionEntry, "threadId" | "topicMisses">>): SessionEntry | null {
+function patchSessionEntry(ctx: Ctx, key: SessionKey, patch: Partial<Pick<SessionEntry, "threadId" | "topicMisses" | "topicRecreatedAt">>): SessionEntry | null {
   const reg = currentRegistry(ctx)
   const prev = reg.sessions.find((e) => e.key === key)
   if (!prev) return null
@@ -1978,10 +1985,12 @@ async function createSessionTopic(ctx: Ctx, key: SessionKey): Promise<number | n
   if (!entry) return null
   // A topic already bound to this session's pane (the attach picker, a flat /new spawn, a
   // binding from before the registry) is adopted, never duplicated. Its cwd must match: a pane
-  // id is reused freely.
+  // id is reused freely. A topic another registry entry already owns is never adopted — that
+  // entry's resume would put two sessions on one topic (tg-cli#556).
   const locator = paneLocatorOf(entry)
   const own = locator ? topicForPane(parseTopics(readFileOrNull(ctx.paths.topics)), locator) : null
-  if (own && (own.path === undefined || own.path === entry.cwd)) {
+  const ownedElsewhere = own !== null && currentRegistry(ctx).sessions.some((e) => e.key !== key && e.threadId === own.threadId)
+  if (own && !ownedElsewhere && (own.path === undefined || own.path === entry.cwd)) {
     patchSessionEntry(ctx, key, { threadId: own.threadId })
     log(`session topics: ${key} adopted topic ${own.threadId}`)
     return own.threadId
@@ -2025,12 +2034,12 @@ async function noteSessionTopicMiss(ctx: Ctx, key: SessionKey, threadId: number,
   const now = Date.now()
   const { misses, recreate } = noteTopicMiss(entry.topicMisses, now, {
     deleted: isTopicDeletedError(description),
-    lastRecreatedAt: topicRecreatedAt.get(key) ?? null,
+    lastRecreatedAt: entry.topicRecreatedAt ? Date.parse(entry.topicRecreatedAt) : null,
   })
   const name = entry.name.primary || entry.key
   if (recreate) {
-    topicRecreatedAt.set(key, now)
-    patchSessionEntry(ctx, key, { threadId: null, topicMisses: null })
+    // The 24 h cap lives on the entry, so a daemon restart keeps it (tg-cli#498).
+    patchSessionEntry(ctx, key, { threadId: null, topicMisses: null, topicRecreatedAt: new Date(now).toISOString() })
     writeSessionTopics(ctx, parseTopics(readFileOrNull(ctx.paths.topics)).filter((t) => t.threadId !== threadId))
     log(`session topics: topic ${threadId} of ${key} is gone (${description}) — recreating on the next outbound`)
     await sendMessage(ctx, `⚠️ [${name}] its topic is gone — posted here; a new topic opens with its next message`)
@@ -2101,37 +2110,77 @@ function cardSessionOf(ctx: Ctx, req: ButtonRequest): SessionEntry | null {
     ?? findSessionForCard(currentRegistry(ctx), { agent: req.agent, sessionId: req.origin?.sessionId, paneId: req.paneId })
 }
 
-// hook-socket `resolve-session` (§4.3): which live session is this `tg` in, and its topic.
+// hook-socket `resolve-session` (§4.3): which live session is this `tg` in, and its topic. The
+// answer names the daemon's chat: a topic id means nothing in another chat (tg-cli#556), so a
+// `tg` posting elsewhere ignores it.
 async function handleResolveSession(ctx: Ctx, socket: Socket, q: SessionLookup): Promise<void> {
-  let entry = findSessionForLookup(currentRegistry(ctx), q)
-  // A session that started since the last scan: scan now, off the 30 s cadence.
+  // Is `pid` (the sender's harness ancestor) `ancestor` itself or one of its descendants? Read
+  // from one process-table snapshot, taken only when a pane match needs it.
+  let parentOf: Map<number, number> | null = null
+  const descends = (ancestor: number, pid: number): boolean => {
+    parentOf ??= new Map(snapshot().procs.map((p) => [p.pid, p.ppid]))
+    for (let cur: number | undefined = pid, hops = 0; cur !== undefined && cur > 1 && hops < 64; cur = parentOf.get(cur), hops++) {
+      if (cur === ancestor) return true
+    }
+    return false
+  }
+  let entry = findSessionForLookup(currentRegistry(ctx), q, descends)
+  // A session that started since the last scan, or a pane whose harness changed: scan now, off
+  // the 30 s cadence.
   if (!entry) {
     const fresh = refreshSessionRegistry()
-    entry = fresh ? findSessionForLookup(fresh, q) : null
+    entry = fresh ? findSessionForLookup(fresh, q, descends) : null
   }
   const threadId = entry ? await sessionTopic(ctx, entry.key) : null
-  const answer = entry ? { key: entry.key, name: entry.name.primary, threadId } : { key: null, name: null, threadId: null }
+  const answer = entry ? { key: entry.key, name: entry.name.primary, threadId, chatId: ctx.chatId } : { key: null, name: null, threadId: null, chatId: ctx.chatId }
   socket.end(`${JSON.stringify(answer)}\n`)
 }
 
 // Scan follow-up: a session that moved or came back keeps its topic — the binding follows its
 // new pane locator — and a new process of it (resume, restart) posts "reattached" there. A
-// tmux move of the same process says nothing. A committed rename retitles the topic.
+// tmux move of the same process says nothing. A committed rename retitles the topic. A session
+// that exits gets one "⏹ exited" line in its topic, which a forum supergroup also closes;
+// re-adoption reopens it before "reattached" (§2.3, §2.5, tg-cli#498). Private-chat topics
+// cannot be closed, so they stay open.
 function followSessionTopics(ctx: Ctx, prev: Registry, events: RegistryEvent[]): void {
   if (!ctx.cfg.topics && !ctx.cfg.privateTopics) return
-  // Forget the recreate cap of entries the registry has dropped.
-  const sessions = currentRegistry(ctx).sessions
-  for (const key of topicRecreatedAt.keys()) {
-    if (!sessions.some((e) => e.key === key)) topicRecreatedAt.delete(key)
-  }
+  const forum = ctx.chatId < 0
   for (const ev of events) {
+    if (ev.kind === "gone") {
+      const entry = currentRegistry(ctx).sessions.find((e) => e.key === ev.key)
+      if (!entry || entry.threadId === null) continue
+      const threadId = entry.threadId
+      log(`session topics: ${entry.key} exited — topic ${threadId}${forum ? " closed" : ""}`)
+      topicLifecycle.run(threadId, async () => {
+        await sendToSessionTopic(ctx, entry.key, threadId, exitedTopicNotice({ name: entry.name.primary || entry.key, harness: HARNESS_AGENT[entry.harness] }))
+        if (forum) await botPost(ctx, "closeForumTopic", { chat_id: ctx.chatId, message_thread_id: threadId })
+      })
+      continue
+    }
     if (ev.kind === "renamed") {
       retitleSessionTopic(ctx, ev)
       continue
     }
     if (ev.kind === "pruned") {
+      // The pruned session's topic was closed when it exited (forum) and belongs to no session
+      // now: its pane binding goes too, so a later session in that pane opens its own topic
+      // instead of adopting a closed one (tg-cli#498).
       const threadId = prev.sessions.find((e) => e.key === ev.key)?.threadId
-      if (threadId != null) topicRenamer?.forget(threadId)
+      if (threadId == null) continue
+      topicRenamer?.forget(threadId)
+      const topics = parseTopics(readFileOrNull(ctx.paths.topics))
+      if (topics.some((t) => t.threadId === threadId)) writeSessionTopics(ctx, topics.filter((t) => t.threadId !== threadId))
+      continue
+    }
+    if (ev.kind === "promoted" && ev.droppedThreadId !== undefined) {
+      // The provisional pane opened a topic before its first hook said it was a resumed session
+      // that has its own (tg-cli#556): unbind the extra one and point it at the session's topic.
+      const dropped = ev.droppedThreadId
+      topicRenamer?.forget(dropped)
+      writeSessionTopics(ctx, parseTopics(readFileOrNull(ctx.paths.topics)).filter((t) => t.threadId !== dropped))
+      const name = liveEntry(ctx, ev.to)?.name.primary || ev.to
+      log(`session topics: ${ev.to} keeps its own topic — unbound the provisional topic ${dropped}`)
+      void sendMessage(ctx, `➡️ ${name} continues in its earlier topic — this one is no longer used`, { message_thread_id: dropped })
       continue
     }
     if (ev.kind !== "readopted" && ev.kind !== "relocated") continue
@@ -2142,10 +2191,21 @@ function followSessionTopics(ctx: Ctx, prev: Registry, events: RegistryEvent[]):
     const before = prev.sessions.find((e) => e.key === ev.key)
     if (ev.kind === "readopted" || before?.locators.pid !== entry.locators.pid) {
       log(`session topics: ${entry.key} reattached to topic ${threadId}`)
-      void sendToSessionTopic(ctx, entry.key, threadId, `📂 ${entry.name.primary || entry.key} — reattached`)
+      const text = `📂 ${entry.name.primary || entry.key} — reattached`
+      topicLifecycle.run(threadId, async () => {
+        if (forum && ev.kind === "readopted") await botPost(ctx, "reopenForumTopic", { chat_id: ctx.chatId, message_thread_id: threadId })
+        await sendToSessionTopic(ctx, entry.key, threadId, text)
+      })
     }
   }
 }
+
+// A topic's exit (post + close) and re-adoption (reopen + post) run in event order: a session
+// that comes back while its slow "exited" post is in flight must not have its reopened topic
+// closed after it (tg-cli#498).
+const topicLifecycle = createKeyedSerialQueue<number>((threadId, err) =>
+  log(`session topics: topic ${threadId} lifecycle step failed: ${err instanceof Error ? err.message : String(err)}`),
+)
 
 // Rename → editForumTopic (spec §4.7, tg-cli#466): a committed `renamed` event (§3.2, stable for
 // 20 s) retitles the session's topic `primary · secondary`, at most once a minute per topic with
@@ -9303,6 +9363,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const owners = currentSessionRegistry()?.sessions.filter((e) => e.threadId === threadId) ?? []
     return owners.find((e) => e.state === "live") ?? owners[0] ?? null
   }
+  // Whether topic `threadId` is in use: a session owns it, or topics.json binds it.
+  const topicTaken = (threadId: number): boolean => topicOwner(threadId) !== null || loadTopics().some((t) => t.threadId === threadId)
   // The registry session a topic message addresses (§4.4 rows 2–3): the topic's owner, else — a
   // binding the attach picker or a pre-registry spawn made — the ONE live session on the bound
   // pane locator with the binding's cwd. A closed binding is never re-resolved by its pane: that
@@ -10141,9 +10203,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const slug = slugifyTopicName(session.name, 0)
     const spawnToken = `new-${session.token}-${Math.floor(Date.now() / 1000)}`
     // Private-chat topic: try to create a per-session topic BEFORE spawning so the window is born
-    // with TG_TOPIC already set. Failure (capability/API error) → graceful flat fallback.
-    const privateTopic = ctx.cfg.privateTopics ? await createPrivateTopic(session.name) : null
+    // with TG_TOPIC already set. Failure (capability/API error) → graceful flat fallback. A Retry
+    // after a failed spawn reuses the topic the first attempt created (tg-cli#185) while nothing
+    // else has claimed it: the failed spawn unbound it, so the attach picker or a session may have
+    // bound it since, and two sessions must never share a topic (tg-cli#556).
+    const reusable = session.privateThreadId !== undefined && !topicTaken(session.privateThreadId) ? session.privateThreadId : undefined
+    const privateTopic = reusable !== undefined
+      ? { kind: "topic" as const, threadId: reusable }
+      : ctx.cfg.privateTopics ? await createPrivateTopic(session.name) : null
     if (privateTopic?.kind === "topic") {
+      session.privateThreadId = privateTopic.threadId
       return spawnNewSessionWithTopic(session, modelId, privateTopic.threadId, slug, promptMessageId)
     }
     if (privateTopic?.kind === "ask") {

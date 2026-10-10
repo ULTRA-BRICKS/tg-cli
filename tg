@@ -79,7 +79,7 @@ import { parseRegistry } from "./features/tg-ctl/session-registry-store"
 import { resolveRouteSession, type RouteOrigin } from "./features/tg-ctl/session-target"
 import { resolveSessionName, titleFromPaneTitle } from "./features/tg-ctl/session-name"
 import { installSkill } from "./features/install-skill/install"
-import { askDaemon, parseResolvedSession, tmuxServerPidFromEnv, type ResolvedSession } from "./features/cli/session-topic"
+import { askDaemon, parseResolvedSession, sessionTopicInChat, tmuxServerPidFromEnv, type ResolvedSession } from "./features/cli/session-topic"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
 import { planLineSpecs } from "./features/auto-attach/line-spec"
 import { buildSendPlan } from "./features/auto-attach/normalize"
@@ -647,7 +647,7 @@ if (import.meta.main) {
   }
 
   // Resolve feature flags FIRST: pull --feature/--no-feature out of argv, load
-  // ~/.config/tg-cli/config.yaml, and merge (default → config → CLI). The
+  // config.yaml from `configDir`, and merge (default → config → CLI). The
   // result gates auto-attach. The transmitter safety nets (caption overflow +
   // 4096 split) are NOT a feature and always run.
   const flagResult = applyFeatureFlags(rawArgs)
@@ -657,10 +657,12 @@ if (import.meta.main) {
     process.exit(1)
   }
   // config.yaml is read ONCE; the raw text feeds both the features: block
-  // parser here and the control: block parser for tg-ctl auto-start below.
+  // parser here and the control: block parser for tg-ctl auto-start below. It
+  // lives in `configDir`, like the daemon's, so the two agree on control.topics
+  // under TG_CTL_CONFIG_DIR (tg-cli#556).
   const configYamlRaw = (() => {
     try {
-      return readFileSync(join(home, ".config", "tg-cli", "config.yaml"), "utf8")
+      return readFileSync(join(configDir, "config.yaml"), "utf8")
     } catch {
       return ""
     }
@@ -1077,7 +1079,8 @@ if (import.meta.main) {
           ancestorPids: ancestor ? [ancestor.pid] : [],
         }, SESSION_LOOKUP_TIMEOUT_MS),
       )
-      if (answer?.threadId) console.log(String(answer.threadId))
+      const threadId = sessionTopicInChat(answer, currentChatId)
+      if (threadId) console.log(String(threadId))
     }
     process.exit(0)
   }
@@ -2212,20 +2215,23 @@ if (import.meta.main) {
       threadIdAdvisory = true
     }
   } else if (messageThreadId === undefined && hasSessionIdentity && topicsOn) {
-    resolvedSession = parseResolvedSession(
-      await askDaemon(ctlFiles.socket, {
-        kind: "resolve-session",
-        tmuxPane: process.env.TMUX_PANE ?? null,
-        tmuxServerPid: tmuxServerPidFromEnv(process.env.TMUX),
-        ancestorPids: ancestor ? [ancestor.pid] : [],
-      }, SESSION_LOOKUP_TIMEOUT_MS),
-    )
-    if (resolvedSession?.threadId) {
-      messageThreadId = resolvedSession.threadId
+    const answer = await askDaemon(ctlFiles.socket, {
+      kind: "resolve-session",
+      tmuxPane: process.env.TMUX_PANE ?? null,
+      tmuxServerPid: tmuxServerPidFromEnv(process.env.TMUX),
+      ancestorPids: ancestor ? [ancestor.pid] : [],
+    }, SESSION_LOOKUP_TIMEOUT_MS)
+    // No answer at all (daemon down, slow, or broken) is not "no session": this send may belong in
+    // a topic, so say why it goes to General (tg-cli#556).
+    if (answer === null) console.error("tg: session topic lookup got no answer from tg-ctl (daemon down or slow) — posting to General")
+    resolvedSession = parseResolvedSession(answer)
+    const threadId = sessionTopicInChat(resolvedSession, currentChatId)
+    if (threadId) {
+      messageThreadId = threadId
       threadIdAdvisory = true
     }
   }
-  const sessionTopic = resolvedSession?.threadId ? resolvedSession : null
+  const sessionTopic = resolvedSession && sessionTopicInChat(resolvedSession, currentChatId) ? resolvedSession : null
 
   // Build the bot-bound transport (api + chat + the route recorder + an
   // optional --reply-to anchor), then hand it to the transmitter, which applies

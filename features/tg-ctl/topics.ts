@@ -155,6 +155,11 @@ export function goneTopicReply(binding: Pick<TopicBinding, 'name' | 'harness'>):
   return `\`${binding.name || 'this session'}\` is not running — ${resumeHint(binding.harness)}`;
 }
 
+// The one line posted into a session's topic when the session exits (§2.3, tg-cli#498).
+export function exitedTopicNotice(binding: Pick<TopicBinding, 'name' | 'harness'>): string {
+  return `⏹ ${binding.name || 'this session'} — exited · ${resumeHint(binding.harness)}`;
+}
+
 // Only harnesses with a known resume command get one; any other (or an unrecorded) harness gets
 // a generic hint rather than another harness's command.
 function resumeHint(harness: AgentKind | undefined): string {

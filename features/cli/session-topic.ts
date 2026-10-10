@@ -11,6 +11,9 @@ export interface ResolvedSession {
   key: string;
   name: string;
   threadId: number | null;
+  // The daemon's chat, whose topic `threadId` is (null from a daemon older than tg-cli#556). A
+  // topic id means nothing in another chat.
+  chatId: number | null;
 }
 
 // `$TMUX` is `<socket path>,<server pid>,<session index>`; the server pid is part of every
@@ -23,8 +26,18 @@ export function tmuxServerPidFromEnv(tmux: string | undefined): number | null {
 export function parseResolvedSession(raw: unknown): ResolvedSession | null {
   if (!raw || typeof raw !== 'object' || !('key' in raw) || typeof raw.key !== 'string') return null;
   const name = 'name' in raw && typeof raw.name === 'string' ? raw.name : '';
+  const chatId = 'chatId' in raw && typeof raw.chatId === 'number' && Number.isInteger(raw.chatId) ? raw.chatId : null;
   const threadId = 'threadId' in raw && typeof raw.threadId === 'number' && Number.isInteger(raw.threadId) && raw.threadId > 0 ? raw.threadId : null;
-  return { key: raw.key, name, threadId };
+  return { key: raw.key, name, threadId, chatId };
+}
+
+// The session's topic as `tg` may use it: only in the chat the daemon answered for (tg-cli#556) —
+// a `tg` posting to another chat (its own TG_CHAT_ID) gets no topic. An answer from a daemon too
+// old to name its chat is trusted, as before, and so is any answer when `tg`'s own chat is not a
+// number (an `@username` TG_CHAT_ID), which cannot be compared.
+export function sessionTopicInChat(session: ResolvedSession | null, chatId: number | undefined): number | null {
+  if (!session?.threadId) return null;
+  return session.chatId === null || chatId === undefined || session.chatId === chatId ? session.threadId : null;
 }
 
 // One JSON line to the daemon socket; resolves with the parsed first reply line, or null on

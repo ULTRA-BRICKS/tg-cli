@@ -64,7 +64,7 @@ function makeHome(history: HistoryRecord[]): Home {
 }
 
 // A daemon that answers every resolve-session with `answer` and records what it was asked.
-function startDaemon(cfg: string, answer: { key: string; name: string; threadId: number | null }): Array<Record<string, unknown>> {
+function startDaemon(cfg: string, answer: { key: string | null; name: string | null; threadId: number | null; chatId?: number }): Array<Record<string, unknown>> {
   const asked: Array<Record<string, unknown>> = [];
   const server = createServer((socket) => {
     let buf = '';
@@ -174,6 +174,42 @@ test('a legacy row without a thread is an unknown anchor too', async () => {
   expect(sent[0].message_thread_id).toBe(SESSION_TOPIC);
 });
 
+// tg-cli#556 (5): a topic id belongs to the daemon's chat. A `tg` posting to another chat (its own
+// TG_CHAT_ID differs from the daemon's) must not stamp that id on its send.
+test('a session topic from another chat is not stamped on the send', async () => {
+  const h = makeHome([]);
+  startDaemon(h.cfg, { key: 'cc:x', name: 'alpha', threadId: SESSION_TOPIC, chatId: CHAT + 1 });
+  const { exitCode } = await tg(h, ['hello']);
+  expect(exitCode).toBe(0);
+  expect('message_thread_id' in sent[0]).toBe(false);
+});
+
+test('a session topic of the same chat is stamped', async () => {
+  const h = makeHome([]);
+  startDaemon(h.cfg, { key: 'cc:x', name: 'alpha', threadId: SESSION_TOPIC, chatId: CHAT });
+  const { exitCode } = await tg(h, ['hello']);
+  expect(exitCode).toBe(0);
+  expect(sent[0].message_thread_id).toBe(SESSION_TOPIC);
+});
+
+// tg-cli#556 (6): a send from inside a session whose topic lookup got no answer (daemon down or
+// slow) posts to General — and says so on stderr, instead of silently leaving the topic.
+test('a failed session lookup posts to General and says so on stderr', async () => {
+  const h = makeHome([]);
+  const { exitCode, stderr } = await tg(h, ['hello']);
+  expect(exitCode).toBe(0);
+  expect('message_thread_id' in sent[0]).toBe(false);
+  expect(stderr).toContain('session topic lookup got no answer');
+});
+
+test('a lookup that finds no session posts to General without a warning', async () => {
+  const h = makeHome([]);
+  startDaemon(h.cfg, { key: null, name: null, threadId: null, chatId: CHAT });
+  const { exitCode, stderr } = await tg(h, ['hello']);
+  expect(exitCode).toBe(0);
+  expect(stderr).not.toContain('session topic lookup');
+});
+
 test('an unknown anchor with no daemon posts the reply alone, as before', async () => {
   const h = makeHome([]);
   const { exitCode } = await tg(h, ['--reply-to', '123', 'no daemon']);
@@ -211,6 +247,19 @@ test('topics off: a reply stays exactly as before, no thread', async () => {
   writeFileSync(join(h.cfg, 'config.yaml'), 'control:\n  topics: false\n');
   await tg(h, ['--reply-to', '19000', 'topics off']);
   expect('message_thread_id' in sent[0]).toBe(false);
+});
+
+// tg-cli#556 (6): `tg` reads config.yaml from the TG_CTL_CONFIG_DIR the daemon uses, so the two
+// agree on control.topics.
+test('control.topics is read from TG_CTL_CONFIG_DIR, not ~/.config/tg-cli', async () => {
+  const h = makeHome([userRow(19000, TOPIC)]);
+  writeFileSync(join(h.cfg, 'config.yaml'), 'control:\n  topics: false\n');
+  const alt = join(h.home, 'alt');
+  mkdirSync(alt);
+  for (const f of ['.env', 'tg-ctl.123.history.jsonl']) writeFileSync(join(alt, f), readFileSync(join(h.cfg, f)));
+  writeFileSync(join(alt, 'config.yaml'), 'control:\n  topics: true\n');
+  await tg(h, ['--reply-to', '19000', 'topics on in the alt dir'], { TG_CTL_CONFIG_DIR: alt });
+  expect(sent[0].message_thread_id).toBe(TOPIC);
 });
 
 test('a topic that is lost midway through a split reply leaves the chunks already posted labelled with their topic', async () => {

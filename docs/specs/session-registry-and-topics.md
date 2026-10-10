@@ -76,7 +76,11 @@ interface SessionEntry {
   on each hook. A cc/codex pane seen before its first hook gets a **provisional** key,
   `cc:pane:<serverPid>/<paneId>/<panePid>`, or `codex:pane:…` in the same form. The first hook from
   that pane **promotes** the provisional key in place, rewriting every store reference in the same
-  write.
+  write. A hook that names a resumed session whose entry already has a topic keeps that topic: the
+  provisional entry's topic, if it opened one, is unbound and gets one line pointing at the
+  session's earlier topic (tg-cli#556). The hook's `session_id` is bound to the pid its pane hosts
+  in a discovery snapshot taken after the hook arrived, never an older cached one: the older one
+  shows the pane before the session (re)started in it (tg-cli#498).
 - **Not registered**: task subagents (no endpoint, `agentId` set) and cc/codex outside tmux. The
   latter are listed in `tg-ctl status` only and answered by the #456 refusal.
 
@@ -108,7 +112,9 @@ It is pure, and the daemon runs it on the existing snapshot tick (2 s TTL).
 Gone entries are kept for 30 days, so that a later resume re-adopts the topic and history, and are
 then pruned. A gone entry keeps its topic, which is never deleted. The daemon posts one line into it,
 `⏹ <name> — exited`. In a forum supergroup it also closes the topic (`closeForumTopic`); Bot API 9.3
-private-chat topics only support edit and delete, so there the topic stays open.
+private-chat topics only support edit and delete, so there the topic stays open. A pruned entry's
+topic loses its `topics.json` pane binding too, so a later session in that pane opens its own topic
+rather than adopt a closed one (tg-cli#498).
 
 ### 2.4 Persistence and migration
 
@@ -144,7 +150,8 @@ is a new session by design.] The entry turns `live` with new locators and keeps 
 history, aliases and `threadId`. If the entry has a topic, the daemon keeps posting into the same
 `threadId` and posts one line into it: `📂 <name> — reattached`. In a forum supergroup it first
 reopens the topic (`reopenForumTopic`). Private-chat topics were never closed (§2.3), so there is
-nothing to reopen there.
+nothing to reopen there. A topic's exit steps (post, close) and re-adoption steps (reopen, post) run
+one at a time in event order, so a quick resume never ends with its topic closed (tg-cli#498).
 
 ### 2.6 Pane-reuse guard (#354, #100)
 
@@ -200,6 +207,10 @@ live registry entry gets at most one bot-created topic**. The topic is an addres
 session. It never spawns anything. The `forum_topic_created → awaiting-path → awaiting-model →
 spawn` state machine (`topics.ts`, `tg-forum-topics.md` §4) is deleted. `/new` stays the
 flat `/new` command (#186) wherever it is typed; a session it spawns gets its topic like any other.
+With `control.private_topics`, a Retry of a failed `/new` spawn reuses the private topic the first
+attempt created; it never opens one per attempt (tg-cli#185). The failed spawn unbinds that topic,
+so when a session or a `topics.json` binding has claimed it by the time of the Retry, the Retry opens
+a new topic instead (tg-cli#556).
 
 General (no `message_thread_id`) is the **control channel**. The flat path is unchanged there:
 reply routing, `/agent`, last-user-target, daemon verbs.
@@ -217,9 +228,12 @@ not create a topic, so idle sessions do not spam topics.
 
 - The name is the §3.1 topic title.
 - A resumed entry (§2.5) reuses its `threadId`. It never creates a new topic.
+- A pane-bound topic (`topics.json`) is adopted only when no other registry entry owns that
+  `threadId`; else that entry's resume would put two live sessions on one topic (tg-cli#556).
 - A topic that Telegram reports as deleted (`TOPIC_ID_INVALID`, or `message thread not found`
   persisting past §4.5) is recreated once per detected deletion (at most once per 24 h per entry),
-  and the new `threadId` replaces the old one.
+  and the new `threadId` replaces the old one. The time of the last recreate is stored on the entry
+  (`topicRecreatedAt`), so a daemon restart keeps the cap (tg-cli#498).
 - Topics are off (`control.topics: false`, or `getMe.has_topics_enabled=false`): `ensureTopic`
   returns null and everything stays flat.
 
@@ -227,11 +241,21 @@ not create a topic, so idle sessions do not spam topics.
 
 `tg` gets a request type on the existing hook socket, which takes JSON lines:
 `{"kind":"resolve-session","tmuxPane","ancestorPids":[…],"sessionFile"?}` →
-`{"key","name","threadId"}`. The daemon matches locators, calls `ensureTopic`, and answers within
-1.5 s. `tg` then posts with `message_thread_id`.
+`{"key","name","threadId","chatId"}`. The daemon matches locators, calls `ensureTopic`, and answers
+within 1.5 s. `tg` then posts with `message_thread_id`.
 
-- When the daemon is down or times out, `tg` posts to General with the `[name]` header, as today.
-- `--topic` / `TG_TOPIC` still win when set explicitly.
+- A pane locator matches only while the pane still runs the entry's process: when the sender's
+  harness ancestor is neither the entry's pid nor a descendant of it (a subagent), the pane hosts
+  another process, and the daemon rescans before answering (tg-cli#556).
+- `chatId` is the daemon's chat. A `tg` that posts to another chat (its own `TG_CHAT_ID`) ignores the
+  topic; an answer without `chatId` (an older daemon) is trusted (tg-cli#556).
+- When the daemon is down or times out, `tg` posts to General with the `[name]` header, as today,
+  and says so on stderr (tg-cli#556).
+- `--topic` / `TG_TOPIC` still win when set explicitly. Known gap (tg-cli#600): a `TG_TOPIC` stamped
+  by `/new` keeps naming the old topic after the daemon recreates it, so that shell's sends fall back
+  to General until the daemon maps the old id to the new one.
+- `tg` reads `control.topics` from `config.yaml` in the same config dir as the daemon
+  (`TG_CTL_CONFIG_DIR`, default `~/.config/tg-cli`), so the two agree (tg-cli#556).
 - No env stamping is needed for existing sessions.
 - **Detached workers (tg-cli#553).** A one-shot `omp -p --no-session` worker is not a session (§2.1)
   and a `nohup` launch reparents it to pid 1, so the ancestry the daemon matches on is gone: its `tg`
