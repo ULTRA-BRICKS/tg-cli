@@ -425,6 +425,7 @@ import {
   decideDelivery,
   emptyLedgerState,
   ledgerKey,
+  ledgerTornTailRepair,
   lostPickerHolds,
   orphanedClaims,
   parseLedger,
@@ -1587,13 +1588,25 @@ async function refreshOriginalHosts(): Promise<void> {
 let deliveryLedger: { path: string; chat: number; state: LedgerState } | null = null
 
 function openDeliveryLedger(path: string, chat: number): LedgerState {
-  const events = parseLedger(readFileOrNull(path))
+  const raw = readFileOrNull(path)
+  const events = parseLedger(raw)
   const kept = compactLedger(events)
+  let rewritten = false
   if (kept) {
     try {
       atomicWrite(path, serializeLedgerEvents(kept))
+      rewritten = true
     } catch (err) {
       log(`delivery ledger compaction failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  // A torn last line from a killed run: terminate it, or the first append merges into it and is lost.
+  const repair = rewritten ? "" : ledgerTornTailRepair(raw)
+  if (repair) {
+    try {
+      appendFileSync(path, repair)
+    } catch (err) {
+      log(`delivery ledger tail repair failed: ${err instanceof Error ? err.message : String(err)}`)
     }
   }
   const state = applyLedgerEvents(emptyLedgerState(), kept ?? events)

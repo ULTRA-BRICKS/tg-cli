@@ -1297,8 +1297,8 @@ if (import.meta.main) {
     const rendered = toTablePre(stdinRaw)
     if (rendered.hasWide) {
       console.error(
-        "tg: --table: a cell contains a double-width glyph (emoji/CJK) — columns may not align " +
-          "in the monospace block. Keep cells ASCII/Cyrillic for clean alignment.",
+        "tg: --table: a cell contains a double-width glyph (emoji/CJK) or a combining mark — columns may " +
+          "not align in the monospace block. Keep cells ASCII/Cyrillic for clean alignment.",
       )
     }
     // The table is HTML (a <pre> block), so the whole message goes out as HTML.

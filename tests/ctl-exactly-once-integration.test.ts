@@ -13,6 +13,7 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSyn
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { serializeDeferredStore } from '../features/tg-ctl/deferred-store';
+import { parseLedger } from '../features/tg-ctl/delivery-ledger';
 import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
@@ -27,7 +28,8 @@ const cleanups: Array<() => Promise<void> | void> = [];
 
 afterEach(async () => {
   await reapDaemons(reg);
-  for (const c of cleanups.splice(0)) await c();
+  // LIFO: an endpoint or server registered after its config dir is closed before the dir goes.
+  for (const c of cleanups.splice(0).reverse()) await c();
 });
 
 // A claude pane %1; `list-panes` reports no pane while `<cfgDir>/pane-gone` exists.
@@ -194,6 +196,23 @@ test('a delivery interrupted by a kill is reported to the CTO, never typed a sec
   await waitFor('the next message', () => injected(cfgDir).some((l) => l.includes('tg#900122')));
   expect(injected(cfgDir).filter((l) => l.includes('tg#900121'))).toHaveLength(0);
   expect(sentText(api).some((t) => t.includes('tg#900121') && /may not have/.test(t))).toBe(true);
+}, 20_000);
+
+// A daemon killed mid-append leaves a torn last line. The next run must terminate it before
+// appending: an event written straight onto the fragment merges into one unparseable line and
+// is lost — for a claim followed by another kill, that is a message typed twice (tg-cli#606).
+test('after a torn ledger tail every event of the next run is readable', async () => {
+  const cfgDir = makeCfgDir();
+  const api = startApi();
+  const ledgerPath = join(cfgDir, 'tg-ctl.123.delivery.jsonl');
+  writeFileSync(ledgerPath, `${JSON.stringify({ ts: 1, event: 'delivered', chat: 1, msg: 900170, target: PANE_ID })}\n{"ts":2,"event":"cla`);
+  api.batches.push([textUpdate(560, 900171, 'after the tear')]);
+  const daemon = await startDaemon(cfgDir, api);
+  await waitFor('the delivery', () => injected(cfgDir).some((l) => l.includes('tg#900171')));
+  await stopDaemon(daemon);
+  const events = parseLedger(readFileSync(ledgerPath, 'utf8'));
+  expect(events.filter((e) => e.event === 'received').map((e) => e.update)).toContain(560);
+  expect(events.filter((e) => 'msg' in e && e.msg === 900171).map((e) => e.event)).toEqual(expect.arrayContaining(['received', 'claimed', 'delivered']));
 }, 20_000);
 
 // Without a claim on disk a kill right after the send would let a replay type the message again.

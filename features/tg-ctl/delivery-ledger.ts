@@ -130,6 +130,14 @@ export function serializeLedgerEvents(events: LedgerEvent[]): string {
   return events.map((e) => `${JSON.stringify(e)}\n`).join('');
 }
 
+// What the daemon must append once, on open, before its first event: a newline when the
+// file ends in a torn line (the previous run died mid-append). Appending straight onto the
+// fragment would merge the next event into that unparseable line and lose it — a lost claim
+// followed by a kill before its outcome lets a replay type the message again (tg-cli#606).
+export function ledgerTornTailRepair(raw: string | null): string {
+  return raw && !raw.endsWith('\n') ? '\n' : '';
+}
+
 export function emptyLedgerState(): LedgerState {
   return { messages: new Map(), processedUpdates: new Set() };
 }

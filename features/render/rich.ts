@@ -102,9 +102,25 @@ const RICH_TAG_RE = new RegExp(
 //   - a mailto: e-mail link:          `<a href="mailto:user@example.com">…</a>`
 //   - a tel: phone link:              `<a href="tel:+123456789">…</a>`
 // Any of those means the body must go via sendRichMessage (basic HTML only
-// documents http(s) and tg://user links). Matched attribute-aware — the tag name
-// alone can't distinguish these from a normal link.
-const RICH_ANCHOR_RE = /<a\b[^>]*\b(?:name\s*=|href\s*=\s*["']?(?:#|mailto:|tel:))/i;
+// documents http(s) and tg://user links). Matched per ATTRIBUTE — the tag name
+// alone can't distinguish these from a normal link, and a scan of the raw tag
+// text misfires on `name=` inside a value: `<a href="https://x/?name=y">` or
+// `title="name=x"` is a basic link (tg-cli#606). Each attribute's value is
+// consumed whole, quoted or not, so only real attribute names are tested.
+const A_OPEN_RE = /<a\b([^>]*)>/gi;
+const ATTR_RE = /([^\s"'=<>/]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'>]+))?/g;
+
+function hasRichAnchor(text: string): boolean {
+  for (const tag of text.matchAll(A_OPEN_RE)) {
+    for (const [, rawName, rawValue] of tag[1].matchAll(ATTR_RE)) {
+      if (rawValue === undefined) continue;
+      const name = rawName.toLowerCase();
+      if (name === 'name') return true;
+      if (name === 'href' && /^["']?\s*(?:#|mailto:|tel:)/i.test(rawValue)) return true;
+    }
+  }
+  return false;
+}
 
 /**
  * True when the HTML body contains at least one RICH-only tag and therefore
@@ -112,7 +128,7 @@ const RICH_ANCHOR_RE = /<a\b[^>]*\b(?:name\s*=|href\s*=\s*["']?(?:#|mailto:|tel:
  * returns false (it stays on the today sendMessage path). Pure.
  */
 export function isRichHtml(text: string): boolean {
-  return RICH_TAG_RE.test(text) || RICH_ANCHOR_RE.test(text);
+  return RICH_TAG_RE.test(text) || hasRichAnchor(text);
 }
 
 /**

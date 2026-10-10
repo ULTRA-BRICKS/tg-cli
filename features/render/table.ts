@@ -23,22 +23,29 @@ export function escapeCell(s: string): string {
 }
 
 // A double-width glyph (emoji, CJK) is ONE JS string unit wide to padEnd but
-// renders two cells wide in a monospace font, so a row carrying one would push
-// its column out of alignment. We do NOT try to width-correct (Telegram's exact
-// glyph metrics are unknowable); instead we DROP the variation selectors and
-// detect remaining wide glyphs so the caller can warn. This keeps columns
-// aligned for the overwhelmingly-common ASCII/Cyrillic case the CTO sends.
+// renders two cells wide in a monospace font, and a zero-width combining mark is
+// one unit that renders no cell at all, so a row carrying either would push its
+// column out of alignment. We do NOT try to width-correct (Telegram's exact
+// glyph metrics are unknowable); instead we detect such glyphs so the caller can
+// warn. This keeps columns aligned for the overwhelmingly-common ASCII/Cyrillic
+// case the CTO sends. Beyond the emoji/CJK blocks, an emoji-presentation selector
+// (U+FE0F) or keycap (U+20E3) makes the sequence before it wide (`#️⃣`), and the
+// fullwidth forms (`Ａ`, `！`), CJK compatibility ideographs and Hangul jamo are
+// wide too. A combining mark left after NFC (parseTableRows composes `e` + U+0301
+// into `é` first) has no precomposed form — `z̃`, Hebrew and Arabic points
+// (tg-cli#606).
 const WIDE_GLYPH_RE =
-  /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2300}-\u{23FF}\u{1F1E6}-\u{1F1FF}\u{3000}-\u{303F}\u{3040}-\u{30FF}\u{3400}-\u{4DBF}\u{4E00}-\u{9FFF}\u{AC00}-\u{D7AF}]/u;
+  /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2300}-\u{23FF}\u{1F1E6}-\u{1F1FF}\u{3000}-\u{303F}\u{3040}-\u{30FF}\u{3400}-\u{4DBF}\u{4E00}-\u{9FFF}\u{AC00}-\u{D7AF}\u{1100}-\u{115F}\u{3130}-\u{318F}\u{F900}-\u{FAFF}\u{FF00}-\u{FF60}\u{FFE0}-\u{FFE6}\p{Mn}\p{Me}]/u;
 
+// True when a cell holds a glyph whose rendered width is not one cell per string unit.
 export function hasWideGlyph(s: string): boolean {
   return WIDE_GLYPH_RE.test(s);
 }
 
 export interface ParsedTable {
   rows: string[][];
-  // True when any cell carried a double-width glyph that may misalign columns.
-  // The caller surfaces a one-line stderr note; the table still renders.
+  // True when any cell carried a double-width or zero-width glyph that may misalign
+  // columns. The caller surfaces a one-line stderr note; the table still renders.
   hasWide: boolean;
 }
 
@@ -46,6 +53,9 @@ export interface ParsedTable {
 // row is split on the first delimiter that appears in it, preferring a literal
 // tab (TSV) then a pipe (`a | b`). Surrounding whitespace per cell is trimmed.
 // Blank lines are dropped. A line with no delimiter is a single-cell row.
+// Cells are NFC-normalized: a decomposed accent (`e` + U+0301, as macOS file names
+// and some keyboards produce) is two code units but one column, so padding it by
+// length would shift its column left (tg-cli#606).
 //
 // The first row is treated by the caller as the header (renderTable draws a
 // separator under row 0); this function does not special-case it.
@@ -57,7 +67,7 @@ export function parseTableRows(input: string): ParsedTable {
     if (line.trim() === '') continue;
     // TSV wins over pipe: a tab is unambiguous, a pipe might be real content.
     const delim = line.includes('\t') ? '\t' : line.includes('|') ? '|' : null;
-    const cells = (delim === null ? [line] : line.split(delim)).map((c) => c.trim());
+    const cells = (delim === null ? [line] : line.split(delim)).map((c) => c.trim().normalize('NFC'));
     for (const c of cells) {
       if (hasWideGlyph(c)) hasWide = true;
     }

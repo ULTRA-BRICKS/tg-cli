@@ -63,6 +63,10 @@ first-appearance order is the detector's job.
 **Cap:** `RANGE_STEP_CAP = 100` per range step. A fat-fingered `HYP-1..99999`
 drops the interior and keeps only the two endpoints (still linked + listed) — no
 100k-line block. A descending range (`HYP-7-3`) degrades to its two endpoints.
+One group synthesizes at most `RANGE_GROUP_CAP = 500` interior numbers in total: a
+chain of in-cap steps (`#1-101-201-…`) would otherwise enumerate 100 per step; a
+step whose interior no longer fits keeps only its endpoints. A range with an
+endpoint past 2^53 (`Number.MAX_SAFE_INTEGER`) gets no interior either (tg-cli#606).
 
 ## Module API (`features/autolink-refs/compound.ts`)
 

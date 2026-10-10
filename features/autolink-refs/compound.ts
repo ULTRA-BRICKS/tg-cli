@@ -40,6 +40,11 @@ const RANGE_SEPS = new Set<Sep>(['..', '…', '-']);
 // dropped; the two written endpoints still link + list.
 export const RANGE_STEP_CAP = 100;
 
+// Cap on interior numbers synthesized for a whole GROUP: a chain of in-cap steps
+// (#1-101-201-…) would otherwise enumerate 100 × steps entries (tg-cli#606). Once a
+// step's interior would exceed what is left, that step keeps only its endpoints.
+export const RANGE_GROUP_CAP = 500;
+
 // A lead match supplied by the feature (reuses its boundary/path rules):
 // findCodeMatches → {start,end,code}; findRefMatches → {start,end,number}.
 export interface LeadMatch {
@@ -93,23 +98,29 @@ export function groupsFromLeads(token: string, leads: LeadMatch[]): CompoundGrou
 
 // Expand a group to every number it denotes, in order, deduped within the group:
 // list seps add the next written number; range seps fill the inclusive interior
-// (capped). The written endpoints are always present.
+// (capped per step and per group). The written endpoints are always present. A
+// range with an endpoint past 2^53 gets no interior: `n++` stops advancing there
+// (2^53 + 1 === 2^53), which used to spin forever (tg-cli#606).
 export function expandGroup(g: CompoundGroup): number[] {
+  const seen = new Set<number>();
   const out: number[] = [];
   const push = (n: number): void => {
-    if (!out.includes(n)) out.push(n);
+    if (seen.has(n)) return;
+    seen.add(n);
+    out.push(n);
   };
+  let interiorLeft = RANGE_GROUP_CAP;
   push(g.written[0].value);
   for (let i = 1; i < g.written.length; i++) {
     const sep = g.seps[i - 1];
     const prev = g.written[i - 1].value;
     const cur = g.written[i].value;
-    if (RANGE_SEPS.has(sep) && cur > prev) {
-      if (cur - prev <= RANGE_STEP_CAP) {
-        for (let n = prev + 1; n < cur; n++) push(n);
-      }
-      // beyond the cap: drop the interior, keep the endpoint below
+    const interior = cur - prev - 1;
+    if (RANGE_SEPS.has(sep) && Number.isSafeInteger(cur) && interior > 0 && interior < RANGE_STEP_CAP && interior <= interiorLeft) {
+      interiorLeft -= interior;
+      for (let n = prev + 1; n < cur; n++) push(n);
     }
+    // beyond a cap: drop the interior, keep the endpoint below
     push(cur);
   }
   return out;

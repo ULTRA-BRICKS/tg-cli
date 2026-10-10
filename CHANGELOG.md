@@ -3,6 +3,30 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.60.4
+
+- **Property tests for the text paths, and the five bugs they found (#606).** A seeded generator
+  (`tests/helpers/prop.ts`, no new dependency; a failure prints `PROP_SEED=<n>` to replay it) drives
+  property tests of the splitter, the HTML/rich/table renderers, the compound ref parser, the
+  `tg replies` history, the delivery ledger and the input-box reader. Fixed:
+  1. **`tg` hung forever on a ref range past 2^53** (`#1,9007199254740992-9007199254741000`): the
+     range loop's `n++` stops advancing there. Such a range now gets no interior, and one group
+     enumerates at most 500 interior refs (`RANGE_GROUP_CAP`) — a chain of in-cap steps
+     (`#1-101-201-…`) used to list 100k refs in O(n²).
+  2. **The 1.60.3 entity-safe split still cut an entity longer than 32 characters** (a zero-padded
+     `&#x000000000000000000000000001F600;`): its scan stopped at 32. The cut now backs up before
+     the entity whatever its length.
+  3. **A basic link with `name=` in its URL or title went to `sendRichMessage`**
+     (`<a href="https://x/?name=y">`): the rich-anchor check now reads real attributes only.
+  4. **`tg --table` misaligned decomposed accents** (`e` + U+0301, as macOS file names carry) with
+     no warning: cells are NFC-normalized, and the alignment warning now also covers a combining
+     mark with no precomposed form (`z̃`, Hebrew/Arabic points), keycaps and emoji-presentation
+     selectors (`#️⃣`), fullwidth forms (`Ａ`, `！`), CJK compatibility ideographs and Hangul jamo.
+  5. **A delivery-ledger event appended after a torn last line was lost**: a daemon killed
+     mid-append leaves a fragment, and the next run's first event merged into it. For a claim
+     followed by another kill that is a message typed into the agent twice. `tg-ctl` now
+     terminates a torn tail when it opens the ledger.
+
 ## 1.60.3
 
 - **Six outbound `tg` bugs, found by a new wire-contract suite that runs the real `tg` against a
