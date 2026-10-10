@@ -444,3 +444,22 @@ export function panesWithRetry(
   }
   return panes;
 }
+
+// panesWithRetry for the daemon's off-event-loop discovery (tg-cli#547): the same retry policy,
+// with an awaited tmux read and an awaited delay, so a retry never holds the daemon's one thread.
+export async function panesWithRetryAsync(
+  run: () => Promise<{ exitCode: number; stdout: string } | null>,
+  opts: { attempts?: number; delayMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<PaneInfo[]> {
+  const attempts = Math.max(1, opts.attempts ?? 3);
+  const delayMs = Math.max(0, opts.delayMs ?? 120);
+  let panes: PaneInfo[] = [];
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) await opts.sleep?.(delayMs);
+    const r = await run();
+    if (r === null || r.exitCode !== 0) break;
+    panes = parsePaneList(r.stdout);
+    if (panes.length > 0) break;
+  }
+  return panes;
+}

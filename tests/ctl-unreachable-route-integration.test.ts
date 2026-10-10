@@ -292,6 +292,8 @@ test('/agent to a claude/codex outside tmux and the rig wrapper: a one-line refu
   expect(existsSync(join(cfgDir, 'inbox', agentInboxKey(null, '/Users/u/work/api')))).toBe(false);
 
   // A plain message that finds no pane still LISTS the agents outside tmux, with the restart hint.
+  // Its reply comes from a separate, concurrently dispatched action: wait for it too.
+  expect(await until(() => texts().some((t) => t.includes('OUTSIDE tmux')), 10_000)).toBe(true);
   const listing = texts().find((t) => t.includes('OUTSIDE tmux'));
   expect(listing).toContain('landing · claude — unreachable: not in tmux (tty ttys004, cwd /Users/u/work/landing, name landing, pid 7103)');
   expect(listing).toContain('api · codex — unreachable: not in tmux');

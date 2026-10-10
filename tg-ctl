@@ -79,11 +79,13 @@ import { TargetDispatchQueues, groupActionsByAckBoundary } from "./features/tg-c
 import {
   findAgentInPane,
   panesWithRetry,
+  panesWithRetryAsync,
   parsePaneList,
   parsePaneTitles,
   parseProcList,
   pickTargetPaneFromSet,
 } from "./features/tg-ctl/discover"
+import { PidFacts } from "./features/tg-ctl/pid-facts"
 import { isBareWindowName, resolveSessionName } from "./features/tg-ctl/session-name"
 import { buildDigitInjectPlan, buildKeyInjectPlan, buildTextInjectPlan, paneTypingKey, unsubmittedNotice, wrapInbound } from "./features/tg-ctl/inject"
 import { messageStillTyped } from "./features/tg-ctl/input-box"
@@ -1057,6 +1059,42 @@ function snapshot(): { panes: PaneInfo[]; procs: ProcInfo[] } {
   return { panes, procs }
 }
 
+// --- Discovery off the event loop (tg-cli#547, tg-cli#537) ---
+// A sync spawn holds the daemon's one thread until the host answers it: a hook-socket ask, a
+// question-card tap or an omp-live receipt that lands mid-scan waits for the whole scan (6 s
+// claim→delivered was seen with ~10 live omp). The poll tick, inbound routing and the omp
+// delivery path read through these awaited twins instead. A wedged binary is killed after
+// `timeoutMs` and reads as a failed exit; a missing one as null.
+const DISCOVERY_SPAWN_TIMEOUT_MS = 5000
+async function spawnCapture(argv: string[], timeoutMs = DISCOVERY_SPAWN_TIMEOUT_MS): Promise<{ exitCode: number; stdout: string } | null> {
+  try {
+    const proc = Bun.spawn(argv, { stdin: "ignore", stdout: "pipe", stderr: "ignore", env: SUBPROC_ENV, timeout: timeoutMs, killSignal: "SIGKILL" })
+    const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited])
+    return { exitCode, stdout }
+  } catch {
+    return null
+  }
+}
+
+// snapshot(), awaited: the same tmux retry policy and the same empty-ps retry (see snapshot()).
+async function snapshotAsync(): Promise<{ panes: PaneInfo[]; procs: ProcInfo[] }> {
+  const readProcs = async (): Promise<ProcInfo[]> => {
+    for (let i = 0; i < 3; i++) {
+      if (i > 0) await Bun.sleep(120)
+      const ps = await spawnCapture(["ps", "-axo", "pid=,ppid=,command="])
+      if (!ps || ps.exitCode !== 0) return []
+      const procs = parseProcList(ps.stdout)
+      if (procs.length > 0) return procs
+    }
+    return []
+  }
+  const [panes, procs] = await Promise.all([
+    panesWithRetryAsync(() => spawnCapture(["tmux", "list-panes", "-a", "-F", PANE_FORMAT]), { sleep: (ms) => Bun.sleep(ms) }),
+    readProcs(),
+  ])
+  return { panes, procs }
+}
+
 // Raw `#{pane_title}` per pane id — the harness title omp (`π > title`) and Claude Code
 // (`✳ title`) paint into the terminal (secondary name, tg-cli#455). A separate query, not a
 // PANE_FORMAT field: a title is free text and would break that parser's fixed layout. Only
@@ -1127,15 +1165,15 @@ function pruneRegistrationsOnDisk(paths: CtlPaths, livePaneIds: Set<string> | nu
   }
 }
 
-// Fresh discovery on every call — the registration file may have been
+// Discovery over a fresh process snapshot the caller takes (snapshot(), or snapshotAsync() on
+// the daemon's event loop) — the registration file may have been
 // rewritten by a newer `tg`/`tg-ctl start` since the last poll.
 // An explicit `tg-ctl start --session X` (stored in the registration) outranks
 // config.yaml's control.session: it is the fresher, more specific intent, and
 // the auto-start path never sets it (tg passes only --pane/--cwd).
 // Rate-limit the no-agent diagnostic so the per-poll idle check can't spam the log.
 let lastNoAgentLogMs = 0
-function discoverTarget(ctx: Ctx): DiscoverResult {
-  const { panes, procs } = snapshot()
+function discoverTarget(ctx: Ctx, { panes, procs }: { panes: PaneInfo[]; procs: ProcInfo[] }): DiscoverResult {
   // Prune dead-pane entries against the live snapshot, but ONLY when the snapshot
   // actually has panes — an empty/flaky read must not wipe every registration
   // (panesWithRetry already retried the transient empty case).
@@ -1275,6 +1313,11 @@ function readPidTtyMap(): Map<number, string> {
   }
 }
 
+async function readPidTtyMapAsync(): Promise<Map<number, string>> {
+  const ps = await spawnCapture(["ps", "-axo", "pid=,tty="])
+  return ps && ps.exitCode === 0 ? parsePidTtyList(ps.stdout) : new Map()
+}
+
 // #458: when the installed bridge last changed — the managed loader (same agent root
 // ensureOmpLiveExtensionOnStartup installs into) and the files it names (the extension and
 // runtime; the runtime imports only node builtins) — vs when each unbridged omp started:
@@ -1293,6 +1336,11 @@ function readBridgeCodeAge(home: string, pids: number[]): BridgeCodeAge | undefi
 
 const LSOF_TIMEOUT_MS = 2000
 let lsofMissingWarned = false
+function warnNoCwd(pid: number, why: string): void {
+  if (lsofMissingWarned) return
+  lsofMissingWarned = true
+  log(`unreachable scan: cannot resolve the cwd of pid ${pid} — no /proc and lsof failed (${why}); install lsof for cwd-keyed inboxes`)
+}
 // The agent's cwd: `/proc/<pid>/cwd` where it exists (Linux — no external tool),
 // else `lsof` (macOS ships it). On a Linux box with neither the cwd is unknown — said
 // ONCE in the log, never silently — and the agent is still listed, by its --name or
@@ -1314,33 +1362,87 @@ function cwdOfPid(pid: number): string | null {
     if (lsof.exitCode !== 0) return null
     return parseLsofCwd(lsof.stdout.toString())
   } catch (err) {
-    if (!lsofMissingWarned) {
-      lsofMissingWarned = true
-      log(`unreachable scan: cannot resolve the cwd of pid ${pid} — no /proc and lsof failed (${err}); install lsof for cwd-keyed inboxes`)
-    }
+    warnNoCwd(pid, String(err))
     return null
   }
 }
 
-// Memoized for a short window: the scan is sync (ps + one lsof per agent, up to
-// LSOF_TIMEOUT_MS each) and one inbound message can ask for it several times in a row
-// (route attempt, then the no-agent reply); a poll tick asks once more. One scan per
-// ~2s keeps the single-threaded poll loop responsive (review finding).
+async function cwdOfPidAsync(pid: number): Promise<string | null> {
+  try {
+    return readlinkSync(`/proc/${pid}/cwd`)
+  } catch {
+    // no procfs (macOS) or the process is gone — fall through to lsof
+  }
+  const lsof = await spawnCapture(["lsof", "-a", "-p", String(pid), "-d", "cwd", "-Fn", "-n"], LSOF_TIMEOUT_MS)
+  if (lsof === null) warnNoCwd(pid, "lsof could not be started")
+  return lsof && lsof.exitCode === 0 ? parseLsofCwd(lsof.stdout) : null
+}
+
+// What the lsof reads found per process, reused across scans (tg-cli#537, see PidFacts): the cwd
+// of every out-of-tmux agent and unbridged omp, and the session jsonl an unbridged omp holds open.
+const PID_FACT_TTL_MS = 30_000
+const pidCwds = new PidFacts<string | null>(PID_FACT_TTL_MS)
+const ompOpenFiles = new PidFacts<string | null>(PID_FACT_TTL_MS)
+// Called after every process-table read, so a pid's facts end with its process; an empty
+// (flaky) table drops nothing.
+function retainPidFacts(scan: DiscoveryScan): void {
+  if (scan.procs.length === 0) return
+  const live = new Set(scan.procs.map((p) => p.pid))
+  pidCwds.retain(live, scan.at)
+  ompOpenFiles.retain(live, scan.at)
+}
+
+// One discovery pass: the process table, the panes and the ttys every agent list is derived from.
+// `serverPid`: see liveOmpCache.
+interface DiscoveryScan {
+  at: number
+  panes: PaneInfo[]
+  procs: ProcInfo[]
+  ttyByPid: Map<number, string>
+  serverPid: number | null | undefined
+}
+
+// The processes among `agents` whose fact `facts` does not hold for this scan yet.
+function needFacts(facts: PidFacts<string | null>, agents: Array<{ pid: number }>, scan: DiscoveryScan): ProcInfo[] {
+  const out: ProcInfo[] = []
+  for (const a of agents) {
+    const proc = scan.procs.find((p) => p.pid === a.pid)
+    if (proc && facts.get(proc.pid, proc.command, scan.at) === undefined) out.push(proc)
+  }
+  return out
+}
+
+// Agents outside tmux and the rig wrapper, before their cwd is known.
+function unreachableCandidates(scan: DiscoveryScan): UnreachableAgent[] {
+  const hosts = listLiveHosts(scan.procs)
+  return findUnreachableAgents(scan.panes, scan.procs, scan.ttyByPid)
+    .filter((a) => a.agent !== "omp")
+    // A harness a rig wrapper hosts in abduco is reachable through its PTY, not unreachable.
+    .filter((a) => hostOfPid(a.pid, scan.procs, hosts) === null)
+}
+
+// Memoized for a short window: one inbound message can ask for the list several times in a row
+// (route attempt, then the no-agent reply). A scan already newer than `scan` is kept.
 const UNREACHABLE_SCAN_TTL_MS = 2000
 let unreachableCache: { at: number; agents: UnreachableAgent[] } | null = null
+function storeUnreachable(scan: DiscoveryScan, candidates: UnreachableAgent[]): UnreachableAgent[] {
+  const agents = candidates.map((a) => {
+    const command = scan.procs.find((p) => p.pid === a.pid)?.command ?? ""
+    return { ...a, cwd: pidCwds.get(a.pid, command, scan.at) ?? null }
+  })
+  if (!unreachableCache || unreachableCache.at <= scan.at) unreachableCache = { at: scan.at, agents }
+  return agents
+}
+
 function listUnreachableAgents(): UnreachableAgent[] {
   const now = Date.now()
   if (unreachableCache && now - unreachableCache.at < UNREACHABLE_SCAN_TTL_MS) return unreachableCache.agents
   const ttyByPid = readPidTtyMap()
-  const { panes, procs } = snapshot()
-  const hosts = listLiveHosts(procs)
-  const agents = findUnreachableAgents(panes, procs, ttyByPid)
-    .filter((a) => a.agent !== "omp")
-    // A harness a rig wrapper hosts in abduco is reachable through its PTY, not unreachable.
-    .filter((a) => hostOfPid(a.pid, procs, hosts) === null)
-    .map((a) => ({ ...a, cwd: cwdOfPid(a.pid) }))
-  unreachableCache = { at: now, agents }
-  return agents
+  const scan: DiscoveryScan = { at: now, ...snapshot(), ttyByPid, serverPid: undefined }
+  retainPidFacts(scan)
+  const candidates = unreachableCandidates(scan)
+  for (const p of needFacts(pidCwds, candidates, scan)) pidCwds.set(p.pid, p.command, cwdOfPid(p.pid), now)
+  return storeUnreachable(scan, candidates)
 }
 
 // --- Sessions a rig wrapper hosts in abduco OUTSIDE tmux (docs/specs/2026-09-30-harness-agnostic-control.md) ---
@@ -1396,7 +1498,7 @@ function ptyOnlyHosts(panes: PaneInfo[], procs: ProcInfo[]): LiveHost[] {
 // caller owns the claim.
 function typeIntoHost(name: string, text: string, logNote: string, expectPid?: number): Promise<SinkResult> {
   return serializeTyping(`host:${name}`, async (): Promise<SinkResult> => {
-    const host = listLiveHosts(snapshot().procs).find((h) => h.name === name && (expectPid === undefined || h.harnessPid === expectPid))
+    const host = listLiveHosts((await snapshotAsync()).procs).find((h) => h.name === name && (expectPid === undefined || h.harnessPid === expectPid))
     if (!host) return { ok: false, error: `${name} is no longer running under the rig wrapper — message not delivered` }
     log(`host-pty: ${logNote} → ${host.name} (${host.agent} pid ${host.harnessPid}, cwd ${host.cwd ?? "?"})`)
     return typeIntoHostNow(host, text)
@@ -1464,6 +1566,11 @@ function jsonlPathsOfPid(pid: number): string[] {
   }
 }
 
+async function jsonlPathsOfPidAsync(pid: number): Promise<string[]> {
+  const lsof = await spawnCapture(["lsof", "-a", "-p", String(pid), "-Fn", "-n"], LSOF_TIMEOUT_MS)
+  return lsof && lsof.exitCode === 0 ? parseLsofJsonlPaths(lsof.stdout) : []
+}
+
 // omp's own per-terminal record of the session it is running (tg-cli#487): the
 // fallback for an omp holding no session jsonl open at all.
 function ompBreadcrumbSessionFile(agent: LiveOmpAgent, cwd: string | null): string | null {
@@ -1485,20 +1592,17 @@ function ompBreadcrumbSessionFile(agent: LiveOmpAgent, cwd: string | null): stri
 // `serverPid`: the tmux server of exactly that pane list, read on both sides of it
 // only while a registry scan is wanted (undefined = not read for this snapshot).
 let liveOmpCache: { at: number; agents: LiveOmpAgent[]; panes: PaneInfo[]; procs: ProcInfo[]; serverPid: number | null | undefined } | null = null
-function listLiveOmpAgents(): LiveOmpAgent[] {
-  const now = Date.now()
-  if (liveOmpCache && now - liveOmpCache.at < UNREACHABLE_SCAN_TTL_MS) return liveOmpCache.agents
-  const ttyByPid = readPidTtyMap()
-  const wantServerPid = sessionScanWanted()
-  const serverPidBefore = wantServerPid ? readTmuxServerPid() : null
-  const { panes, procs } = snapshot()
-  const serverPid = wantServerPid ? serverPidAcross(serverPidBefore, readTmuxServerPid()) : undefined
-  const agents = findLiveOmpAgents(panes, procs, ttyByPid).map((a) => {
+
+// The live omp of one scan, from the facts the caller already read for its unbridged ones
+// (pidCwds, ompOpenFiles); cached unless a newer scan already is.
+function storeLiveOmp(scan: DiscoveryScan): LiveOmpAgent[] {
+  const agents = findLiveOmpAgents(scan.panes, scan.procs, scan.ttyByPid).map((a) => {
     const host = originalHosts.find(h => h.pid === a.pid)
     if (host) return { ...a, ...host }
-    const cwd = cwdOfPid(a.pid)
+    const command = scan.procs.find((p) => p.pid === a.pid)?.command ?? ""
+    const cwd = pidCwds.get(a.pid, command, scan.at) ?? null
     // A subagent-derived main file is only a name; like the breadcrumb, trust it only if it exists.
-    const openFile = pickPrimaryOmpSessionFile(jsonlPathsOfPid(a.pid))
+    const openFile = ompOpenFiles.get(a.pid, command, scan.at) ?? null
     const sessionFile = (openFile && existsSync(openFile) ? openFile : null) ?? ompBreadcrumbSessionFile(a, cwd)
     let meta = null
     if (sessionFile) {
@@ -1511,12 +1615,80 @@ function listLiveOmpAgents(): LiveOmpAgent[] {
     return withOmpSession(a, { cwd, sessionFile, meta })
   })
   for (const host of originalHosts) {
-    if (!agents.some(a => a.pid === host.pid) && procs.some(p => p.pid === host.pid)) {
+    if (!agents.some(a => a.pid === host.pid) && scan.procs.some(p => p.pid === host.pid)) {
       agents.push({ ...host, paneId: null, tty: null })
     }
   }
-  liveOmpCache = { at: now, agents, panes, procs, serverPid }
+  if (!liveOmpCache || liveOmpCache.at <= scan.at) {
+    liveOmpCache = { at: scan.at, agents, panes: scan.panes, procs: scan.procs, serverPid: scan.serverPid }
+  }
   return agents
+}
+
+function listLiveOmpAgents(): LiveOmpAgent[] {
+  const now = Date.now()
+  if (liveOmpCache && now - liveOmpCache.at < UNREACHABLE_SCAN_TTL_MS) return liveOmpCache.agents
+  const ttyByPid = readPidTtyMap()
+  const wantServerPid = sessionScanWanted()
+  const serverPidBefore = wantServerPid ? readTmuxServerPid() : null
+  const { panes, procs } = snapshot()
+  const serverPid = wantServerPid ? serverPidAcross(serverPidBefore, readTmuxServerPid()) : undefined
+  const scan: DiscoveryScan = { at: now, panes, procs, ttyByPid, serverPid }
+  retainPidFacts(scan)
+  const unbridged = findLiveOmpAgents(panes, procs, ttyByPid).filter((a) => !originalHosts.some((h) => h.pid === a.pid))
+  for (const p of needFacts(pidCwds, unbridged, scan)) pidCwds.set(p.pid, p.command, cwdOfPid(p.pid), now)
+  for (const p of needFacts(ompOpenFiles, unbridged, scan)) ompOpenFiles.set(p.pid, p.command, pickPrimaryOmpSessionFile(jsonlPathsOfPid(p.pid)), now)
+  return storeLiveOmp(scan)
+}
+
+// One discovery pass with every spawn awaited (tg-cli#547): the process table, panes and ttys,
+// then the lsof facts the out-of-tmux agent and unbridged omp lists still lack, read in
+// parallel. Refreshes both agent caches. Single-flight, and a pass younger than
+// UNREACHABLE_SCAN_TTL_MS is reused, so every caller in a burst shares one snapshot.
+let lastDiscovery: DiscoveryScan | null = null
+let discoveryInFlight: Promise<DiscoveryScan> | null = null
+function refreshDiscovery(): Promise<DiscoveryScan> {
+  if (lastDiscovery && Date.now() - lastDiscovery.at < UNREACHABLE_SCAN_TTL_MS) return Promise.resolve(lastDiscovery)
+  discoveryInFlight ??= (async (): Promise<DiscoveryScan> => {
+    const at = Date.now()
+    const wantServerPid = sessionScanWanted()
+    const [ttyByPid, serverPidBefore] = await Promise.all([readPidTtyMapAsync(), wantServerPid ? readTmuxServerPidAsync() : null])
+    const { panes, procs } = await snapshotAsync()
+    const serverPid = wantServerPid ? serverPidAcross(serverPidBefore, await readTmuxServerPidAsync()) : undefined
+    const scan: DiscoveryScan = { at, panes, procs, ttyByPid, serverPid }
+    retainPidFacts(scan)
+    const unreachable = unreachableCandidates(scan)
+    const unbridged = findLiveOmpAgents(panes, procs, ttyByPid).filter((a) => !originalHosts.some((h) => h.pid === a.pid))
+    await Promise.all([
+      ...needFacts(pidCwds, [...unreachable, ...unbridged], scan).map(async (p) => pidCwds.set(p.pid, p.command, await cwdOfPidAsync(p.pid), at)),
+      ...needFacts(ompOpenFiles, unbridged, scan).map(async (p) =>
+        ompOpenFiles.set(p.pid, p.command, pickPrimaryOmpSessionFile(await jsonlPathsOfPidAsync(p.pid)), at),
+      ),
+    ])
+    storeUnreachable(scan, unreachable)
+    storeLiveOmp(scan)
+    lastDiscovery = scan
+    return scan
+  })().finally(() => {
+    discoveryInFlight = null
+  })
+  return discoveryInFlight
+}
+
+// How often the poll tick re-checks that any agent is still running (the idle exit counts
+// minutes, so a per-tick scan bought nothing — tg-cli#547). Env-overridable so the integration
+// tests see a scan start within seconds; production never sets it.
+const LIVENESS_SCAN_INTERVAL_MS = (() => {
+  const raw = Number(process.env.TG_CTL_LIVENESS_SCAN_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 30_000
+})()
+
+// listLiveOmpAgents for a caller that can await: a fresh cache, else one shared async pass.
+async function listLiveOmpAgentsAsync(): Promise<LiveOmpAgent[]> {
+  if (liveOmpCache && Date.now() - liveOmpCache.at < UNREACHABLE_SCAN_TTL_MS) return liveOmpCache.agents
+  const scan = await refreshDiscovery()
+  // A sync scan may have stored a newer list while this one ran; either is fresh.
+  return liveOmpCache?.agents ?? storeLiveOmp(scan)
 }
 
 // The original interactive OMP owns the endpoint. ACP session/load is NOT attach.
@@ -1527,10 +1699,17 @@ async function refreshOriginalHosts(): Promise<void> {
   if (originalProbe) return originalProbe
   if (Date.now() - originalProbeAt < 2000) return
   originalProbe = (async () => {
-    try { originalHosts = await listLiveEndpoints(defaultRegistryRoot()) }
-    catch { originalHosts = [] }
+    let next: OriginalOmpEndpoint[]
+    try { next = await listLiveEndpoints(defaultRegistryRoot()) }
+    catch { next = [] }
     originalProbeAt = Date.now()
-    liveOmpCache = null
+    // The omp lists merge these endpoints in: only a changed endpoint set makes them stale
+    // (tg-cli#547). Dropping them on every probe made each poll tick rescan.
+    if (JSON.stringify(next) !== JSON.stringify(originalHosts)) {
+      liveOmpCache = null
+      lastDiscovery = null
+    }
+    originalHosts = next
   })().finally(() => { originalProbe = null })
   return originalProbe
 }
@@ -1670,7 +1849,7 @@ async function sendOriginalOmp(target: OriginalOmpTarget, text: string, messageI
 }
 // null = the pane no longer hosts exactly this OMP pid; the caller fails closed.
 async function typeIntoOwnOmpPane(paneId: string, pid: number, text: string): Promise<SinkResult | null> {
-  const { panes, procs } = snapshot()
+  const { panes, procs } = await snapshotAsync()
   const pane = panes.find((p) => p.paneId === paneId)
   const hosted = pane ? findAgentInPane(pane, procs) : null
   if (hosted?.agent !== "omp" || hosted.pid !== pid) return null
@@ -1679,7 +1858,7 @@ async function typeIntoOwnOmpPane(paneId: string, pid: number, text: string): Pr
 }
 // null = no live rig-wrapper host runs exactly this omp pid; the caller fails closed.
 async function typeIntoHostOfOmp(pid: number, text: string): Promise<SinkResult | null> {
-  const { procs } = snapshot()
+  const { procs } = await snapshotAsync()
   const host = hostOfPid(pid, procs, listLiveHosts(procs))
   if (!host || host.agent !== "omp" || host.harnessPid !== pid) return null
   log(`omp-live: no endpoint for pid=${pid} — abduco PTY of ${host.name} (original process, no spawn)`)
@@ -1710,10 +1889,10 @@ let sessionScanAt = 0
 let sessionRegistryScanned = false
 let sessionScanDue = true
 let sessionScanInFlight = false
-// Set by the daemon's first kick: CLI one-shots that list omp never scan, so they
+// Set by runDaemon before its poll loop: CLI one-shots that list omp never scan, so they
 // never pay for the server-pid reads.
 let sessionScanEnabled = false
-// The daemon's ctx, set by its first kick: the delivery-time readers below are
+// The daemon's ctx, set with sessionScanEnabled: the delivery-time readers below are
 // module-level (executeInjectSteps, readRegistrations) and CLI one-shots have none.
 let sessionScanCtx: Ctx | null = null
 // Bumped by every scan that ran; a queued tick scan whose discovery is older
@@ -1796,6 +1975,12 @@ function readTmuxServerPid(): number | null {
   }
 }
 
+async function readTmuxServerPidAsync(): Promise<number | null> {
+  const tmux = await spawnCapture(["tmux", "display-message", "-p", "#{pid}"])
+  const pid = Number(tmux?.stdout.trim())
+  return tmux?.exitCode === 0 && Number.isInteger(pid) && pid > 0 ? pid : null
+}
+
 function sessionStoreIo(paths: CtlPaths): MigrationIo {
   const pathOf = (store: MigrationStore): string =>
     store === "routes" ? paths.routes : store === "registration" ? paths.registration : store === "lastUserTarget" ? paths.lastUserTarget : paths.topics
@@ -1832,13 +2017,13 @@ function describeRegistryEvent(ev: RegistryEvent): string {
   }
 }
 
-// Called once per poll tick, right after the tick refreshed listLiveOmpAgents.
+// Called after each tick discovery pass (runDaemon's kickTickDiscovery), whose fresh
+// liveOmpCache the scan reuses: never an older cache, which could miss the pane a hook
+// sighting names (dropping it) or bind it to that pane's previous process.
 // Never awaits: the scan is queued behind the getUpdates request it precedes. A
 // snapshot taken while no scan was wanted carries no server pid; the next
-// discovery refresh (UNREACHABLE_SCAN_TTL_MS) reads one.
+// discovery pass (a scan wanted makes the tick run one) reads one.
 function kickSessionRegistryScan(ctx: Ctx): void {
-  sessionScanEnabled = true
-  sessionScanCtx = ctx
   if (!sessionScanWanted()) return
   const discovery = liveOmpCache
   if (!discovery || discovery.serverPid === undefined) return
@@ -2976,7 +3161,8 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
   // multi-session operator must SEE that all their panes are registered to
   // forward. Prune against the live snapshot so closed panes don't show as ghosts
   // (review finding); a flaky/empty snapshot skips pruning (shows all, fail-safe).
-  const statusPanes = snapshot().panes
+  const statusSnapshot = snapshot()
+  const statusPanes = statusSnapshot.panes
   const statusLive = statusPanes.length > 0 ? new Set(statusPanes.map((p) => p.paneId)) : null
   const regs = readRegistrations(ctx.paths, statusLive)
   if (regs.length === 0) {
@@ -2990,7 +3176,7 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
       )
     }
   }
-  const found = discoverTarget(ctx)
+  const found = discoverTarget(ctx, statusSnapshot)
   const statusScopeCwd = statusCwd ?? (found.ok ? found.target.pane.panePath : newestRegisteredCwd(regs) ?? ctx.cwd)
   lines.push(
     found.ok
@@ -3002,7 +3188,6 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
         : "target: no agent pane found",
   )
   // Sessions a rig wrapper hosts in abduco outside tmux: reachable through their PTY.
-  const statusSnapshot = snapshot()
   const hosted = ptyOnlyHosts(statusSnapshot.panes, statusSnapshot.procs)
   if (hosted.length > 0) {
     lines.push(`hosted (abduco, outside tmux): ${hosted.length}`)
@@ -6063,7 +6248,7 @@ function resolveTasksScopeDir(ctx: Ctx, action: Pick<Extract<Action, { kind: "ta
   // silently disagreeing on "the default target" was the review finding this
   // replaces. No further fallback: an unresolved anchor stays ambiguous here
   // too, exactly mirroring discoverForInject's own picker fallback.
-  const target = discoverTarget(ctx)
+  const target = discoverTarget(ctx, snapshot())
   let routed: DiscoverResult = target
   if (!target.ok && target.reason === "ambiguous") {
     const anchor = resolveLastUserTarget(ctx, target.candidates)
@@ -8098,8 +8283,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // restart) or half-taken by the flush (dropped items). So wait for flushingPanes
   // to empty before cleanExit persists the now-consistent backlog. Bounded: the
   // GRACEFUL_SHUTDOWN_MS backstop timer (beginGracefulShutdown) force-cleanExits a
-  // flush that hangs, and a second SIGTERM gives up immediately.
+  // flush that hangs, and a second SIGTERM gives up immediately. The poll tick's off-loop
+  // discovery job (kickTickDiscovery) is waited for too: it may be typing an awareness nudge,
+  // which ran inside the drained batch before it moved off the loop (tg-cli#547).
+  let tickDiscovery: Promise<void> | null = null
   const cleanExitAfterFlushDrain = async (): Promise<never> => {
+    await tickDiscovery
     while (flushingPanes.size > 0) await Bun.sleep(50)
     return cleanExit(0)
   }
@@ -8260,9 +8449,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // bind. Used by liveness/history paths that must NOT silently pick an agent. The
   // no-reply bind lives ONLY in discoverForInject below, so it can never leak onto
   // the reply path (which uses handleReplyRoute's own #49 fail-closed, not discover())
-  // or the history-attribution path.
-  const discover = (): DiscoverResult => {
-    const result = discoverTarget(ctx)
+  // or the history-attribution path. `snap`: an awaited snapshotAsync(), so the scan never
+  // holds the event loop (tg-cli#547).
+  const discover = (snap: { panes: PaneInfo[]; procs: ProcInfo[] }): DiscoverResult => {
+    const result = discoverTarget(ctx, snap)
     // Agent panes existing — even ambiguous ones — keep the daemon alive.
     if (result.ok || result.candidates.length > 0) lastAgentSeenMs = Date.now()
     return result
@@ -8280,8 +8470,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // never reads the store. This is the ONLY discovery used by the non-reply INJECT
   // paths (injectViaTarget with autoBind). A no-last-target case stays ambiguous →
   // #76's picker (the unscoped fail-closed, #49).
-  const discoverForInject = (): DiscoverResult => {
-    const result = discover()
+  const discoverForInject = (snap: { panes: PaneInfo[]; procs: ProcInfo[] }): DiscoverResult => {
+    const result = discover(snap)
     if (result.ok || result.reason !== "ambiguous") return result
     const hit = resolveLastUserTarget(ctx, result.candidates)
     return hit ? { ok: true, target: hit } : result
@@ -8374,7 +8564,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     autoBind = false,
     sourceMessageId: number | null = null,
   ): Promise<boolean> => {
-    const found = autoBind ? discoverForInject() : discover()
+    const snap = await snapshotAsync()
+    const found = autoBind ? discoverForInject(snap) : discover(snap)
     if (!found.ok) {
       // Routable text present (a real message) → route picker: a tap injects it
       // verbatim. Empty/whitespace deferText is treated as "no text" (same rule as
@@ -8476,7 +8667,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const wrapped = wrapInbound(ctx.cfg.injectWrap, from, msg, sourceMessageId ?? undefined)
     if (paneId.startsWith("omp:")) {
       const pid = Number(paneId.slice("omp:".length))
-      const live = listLiveOmpAgents().find((a) => a.pid === pid)
+      const live = (await listLiveOmpAgentsAsync()).find((a) => a.pid === pid)
       if (!live) return { ok: false, error: `omp ${paneId} is no longer running` }
       const cwd = live.cwd ?? "/"
       log(`injectToPane: omp original-process pane=${paneId} cwd=${cwd} (not tmux send-keys)`)
@@ -8495,7 +8686,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (deferReactionViaAck) markDeferredForAck(item)
       return { ok: true, deferred: true, deferredItem: item }
     }
-    const { panes, procs } = snapshot()
+    const { panes, procs } = await snapshotAsync()
     const pane = panes.find((p) => p.paneId === paneId)
     const hosted = pane ? findAgentInPane(pane, procs) : null
     if (hosted?.agent === "omp") {
@@ -8662,7 +8853,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   ): Promise<boolean> => {
     if (paneId.startsWith("omp:")) {
       const pid = Number(paneId.slice("omp:".length))
-      const live = listLiveOmpAgents().find((a) => a.pid === pid)
+      const live = (await listLiveOmpAgentsAsync()).find((a) => a.pid === pid)
       if (!live) {
         await sendMessage(ctx, `omp ${paneId} is no longer running`, out)
         return false
@@ -8700,7 +8891,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (recordAnchor) recordLastUserTarget(paneId, cwd)
       return true
     }
-    const { panes, procs } = snapshot()
+    const { panes, procs } = await snapshotAsync()
     const pane = panes.find((p) => p.paneId === paneId)
     const hosted = pane ? findAgentInPane(pane, procs) : null
     if (hosted?.agent === "omp") {
@@ -8746,7 +8937,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     messageId: number | null,
     out: Record<string, unknown> = {},
   ): Promise<boolean | null> => {
-    const ompHits = matchLiveOmp(selector, listLiveOmpAgents())
+    const ompHits = matchLiveOmp(selector, await listLiveOmpAgentsAsync())
     if (ompHits.length > 1) {
       const lines = describeOmpLines(ompHits)
       await sendMessage(ctx, `'${selector}' matches several omp sessions:\n${lines.join("\n")}`, out)
@@ -9111,7 +9302,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // `sessionKey`: the session this reply is for, when known — a deferred copy
     // carries it, and the pane is re-verified to host it right before typing (§2.6).
     const injectVerbatim = async (paneId: string, sessionKey?: string): Promise<boolean> => {
-      const live = matchLiveOmpOrigin(paneId, listLiveOmpAgents())
+      const live = matchLiveOmpOrigin(paneId, await listLiveOmpAgentsAsync())
       if (live) {
         // Same defer-while-waiting rule as every tmux pane: never type into an open question.
         if (live.paneId && shouldDeferInbound(live.paneId)) {
@@ -9242,7 +9433,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // is re-verified by deliverToHost; a gone one gets the picker, never a same-project guess.
       const originHost = hostNameFromOriginId(route.paneId)
       if (originHost !== null) {
-        const host = listLiveHosts(snapshot().procs).find((h) => h.name === originHost)
+        const host = listLiveHosts((await snapshotAsync()).procs).find((h) => h.name === originHost)
         if (!host) return replyToGoneOrigin(route, goneOriginLabel(), `host ${originHost} gone`)
         log(`reply-route: replyTo=${replyTo} → ${route.paneId} (abduco PTY) msg="${msgPreview}"`)
         const delivered = await injectVerbatim(route.paneId)
@@ -9279,7 +9470,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (recognized) {
       const bySession = await routeReplyBySession(recognized)
       if (bySession !== null) return bySession
-      const liveHit = matchLiveOmpOrigin(recognized.paneId, listLiveOmpAgents())
+      const liveHit = matchLiveOmpOrigin(recognized.paneId, await listLiveOmpAgentsAsync())
       if (liveHit) {
         // omp:<pid> is the live process (pid identity). Do not require cwd match:
         // tg often runs from /tmp while liveHit.cwd is the session dir (Codex P1 #340).
@@ -9290,7 +9481,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           return delivered
         }
       }
-      const { panes, procs } = snapshot()
+      const { panes, procs } = await snapshotAsync()
       const pane = panes.find((p) => p.paneId === recognized.paneId)
       // Route to the origin pane ONLY if it still hosts an agent AND is still the
       // SAME project: a tmux pane id is reused after kill-pane, so a stale
@@ -11817,7 +12008,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // fleet it asks (the select-picker below) rather than the no-reply auto-bind
         // that resolves a harmless content inject. So this uses the base discover(),
         // not discoverForInject (tg-cli#75 review).
-        const found = discover()
+        const found = discover(await snapshotAsync())
         if (!found.ok) {
           // Ambiguous /kill (several live agents) → show the live agents as a
           // select-only picker (buttons) instead of a plain-text candidate dump;
@@ -11929,6 +12120,86 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
   }
 
+  // The poll tick's discovery work runs OFF the poll loop (tg-cli#547): the loop goes straight
+  // on to getUpdates, so a button tap or a hook-socket ask never waits on ps/tmux/lsof. One
+  // job at a time; one discovery pass (refreshDiscovery) feeds all three consumers:
+  //  - idle liveness (lastAgentSeenMs), at most once per LIVENESS_SCAN_INTERVAL_MS — the idle
+  //    exit counts minutes. An agent running OUTSIDE tmux keeps the daemon alive too
+  //    (tg-cli#306): its question cards and hatch asks still come through the daemon socket,
+  //    and a `/agent` to it must get the tmux-only refusal, not silence;
+  //  - the awareness nudges below;
+  //  - the session-registry scan, which reuses the pass's snapshot (this daemon is its only
+  //    writer, so it turns the scan on here).
+  sessionScanEnabled = true
+  sessionScanCtx = ctx
+  let livenessScanAt = 0
+  const kickTickDiscovery = (): void => {
+    tickDiscovery ??= (async () => {
+      await refreshOriginalHosts()
+      const livenessDue = Date.now() - livenessScanAt >= LIVENESS_SCAN_INTERVAL_MS
+      const nudgesWanted = originalHosts.length > 0 || Object.keys(awarenessNudgeStore).length > 0
+      if (!livenessDue && !nudgesWanted && !sessionScanWanted()) return
+      const scan = await refreshDiscovery()
+      const liveOmp = await listLiveOmpAgentsAsync()
+      kickSessionRegistryScan(ctx)
+      if (livenessDue) {
+        livenessScanAt = Date.now()
+        discover(scan)
+        if ((unreachableCache?.agents.length ?? 0) > 0 || liveOmp.length > 0) lastAgentSeenMs = Date.now()
+      }
+      // Remind only verified original processes. Never spawn an anonymous agent
+      // because a TUI has not published its bridge or its session identity is unknown.
+      const liveOmpAgentsForNudge = liveOmp.filter(a => originalHosts.some(h => h.pid === a.pid))
+      if (liveOmpAgentsForNudge.length > 0 || Object.keys(awarenessNudgeStore).length > 0) {
+        // Nudge state is keyed by the session (`omp:<sessionId>`) when omp has
+        // published one, so a `--resume` into another pane keeps its silence
+        // clock and nudge marker (#459). History rows only carry the pane/pid
+        // locator, so the last-send time is read through the agent's locator.
+        const locatorOf = (a: LiveOmpAgent): string => a.paneId ?? liveOmpPaneId(a.pid)
+        const nudgeKeyOf = (a: LiveOmpAgent): string => (a.sessionId ? sessionKey("omp", a.sessionId) : locatorOf(a))
+        const liveOmpAgentByNudgeKey = new Map(liveOmpAgentsForNudge.map((a) => [nudgeKeyOf(a), a]))
+        const nudgeKeys = [...liveOmpAgentByNudgeKey.keys()]
+        const sessionIdByNudgeKey = new Map([...liveOmpAgentByNudgeKey].map(([key, a]) => [key, a.sessionId]))
+        const sentAtByLocator = lastTgSentAtByKey(parseHistory(readFileOrNull(ctx.paths.history)))
+        const sentAtByKey = new Map<string, number>()
+        for (const [key, a] of liveOmpAgentByNudgeKey) {
+          const locator = locatorOf(a)
+          const sentAt = sentAtByLocator.get(locator)
+          if (sentAt !== undefined) sentAtByKey.set(key, sentAt)
+          // A pre-#459 row keyed by the locator for this same session carries
+          // over, so the cutover does not restart its silence clock.
+          const legacy = awarenessNudgeStore[locator]
+          if (key !== locator && !awarenessNudgeStore[key] && legacy?.sessionId === a.sessionId) {
+            awarenessNudgeStore = { ...awarenessNudgeStore, [key]: legacy }
+          }
+        }
+        const nudgePlan = planAwarenessNudges(nudgeKeys, sentAtByKey, awarenessNudgeStore, Date.now(), sessionIdByNudgeKey)
+        awarenessNudgeStore = nudgePlan.store
+        if (nudgePlan.keysChanged) persistAwarenessNudge()
+        // Only a send that actually SUCCEEDS commits the "nudged" marker
+        // (via markAwarenessNudgeSent, below) — a due key stays due next
+        // sweep on failure/drop instead of silently losing its one shot at
+        // reaching the exact busy/loaded agent this feature targets.
+        const sentKeys: string[] = []
+        for (const key of nudgePlan.due) {
+          const target = liveOmpAgentByNudgeKey.get(key)
+          if (!target) continue
+          const res = await deliverOriginalOmp(target, AWARENESS_NUDGE_TEXT, `awareness:${target.pid}:${target.sessionId}:${Math.floor(Date.now() / 3_600_000)}`)
+          log(res.ok ? `awareness-nudge sent to ${key}` : `awareness-nudge failed for ${key}: ${res.error}`)
+          if (res.ok) sentKeys.push(key)
+        }
+        if (sentKeys.length > 0) {
+          awarenessNudgeStore = markAwarenessNudgeSent(awarenessNudgeStore, sentKeys, Date.now())
+          persistAwarenessNudge()
+        }
+      }
+    })()
+      .catch((err) => log(`tick discovery failed: ${err instanceof Error ? err.message : String(err)}`))
+      .finally(() => {
+        tickDiscovery = null
+      })
+  }
+
   for (;;) {
     // Graceful shutdown lands here BETWEEN batches — after the previous batch's
     // actions fully executed, before the next long-poll — so a reload never drops
@@ -11942,17 +12213,23 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // have been retargeted while no pane was discoverable yet).
       const regMtime = fileMtimeMs(ctx.paths.registration)
       if (regMtime !== null && regMtime > lastAgentSeenMs) lastAgentSeenMs = regMtime
-      discover()
-      // An agent running OUTSIDE tmux keeps the daemon alive too (tg-cli#306): its
-      // question cards and hatch asks still come through the daemon socket, and a
-      // `/agent` to it must get the tmux-only refusal, not silence. The same tick archives
-      // what the omp Stop bridge delivered and, once, reports the stranded cc/codex inbox.
-      if (listUnreachableAgents().length > 0 || listLiveOmpAgents().length > 0) lastAgentSeenMs = Date.now()
+      // Agent liveness, awareness nudges and the registry scan: off this loop (kickTickDiscovery).
+      kickTickDiscovery()
+      // The omp Stop bridge's delivered inboxes are archived and the stranded cc/codex inbox is
+      // reported, once.
       archiveDeliveredInboxes(ctx)
       await reportStrandedInbox(ctx)
       if (Date.now() - lastAgentSeenMs > ctx.cfg.idleExitMin * 60_000) {
-        log(`no agent pane for ${ctx.cfg.idleExitMin} min — idle exit`)
-        cleanExit(0)
+        // The last liveness pass may be up to LIVENESS_SCAN_INTERVAL_MS old: confirm with a
+        // fresh one before exiting under an agent that started since.
+        await tickDiscovery
+        livenessScanAt = 0
+        kickTickDiscovery()
+        await tickDiscovery
+        if (Date.now() - lastAgentSeenMs > ctx.cfg.idleExitMin * 60_000) {
+          log(`no agent pane for ${ctx.cfg.idleExitMin} min — idle exit`)
+          cleanExit(0)
+        }
       }
 
       // Sweep the retention window every loop iteration (roughly once per ~50s
@@ -12114,56 +12391,6 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         if (changed) persistUnansweredReminder()
       }
 
-      // Remind only verified original processes. Never spawn an anonymous agent
-      // because a TUI has not published its bridge or its session identity is unknown.
-      await refreshOriginalHosts()
-      const liveOmpAgentsForNudge = listLiveOmpAgents().filter(a => originalHosts.some(h => h.pid === a.pid))
-      if (liveOmpAgentsForNudge.length > 0 || Object.keys(awarenessNudgeStore).length > 0) {
-        // Nudge state is keyed by the session (`omp:<sessionId>`) when omp has
-        // published one, so a `--resume` into another pane keeps its silence
-        // clock and nudge marker (#459). History rows only carry the pane/pid
-        // locator, so the last-send time is read through the agent's locator.
-        const locatorOf = (a: LiveOmpAgent): string => a.paneId ?? liveOmpPaneId(a.pid)
-        const nudgeKeyOf = (a: LiveOmpAgent): string => (a.sessionId ? sessionKey("omp", a.sessionId) : locatorOf(a))
-        const liveOmpAgentByNudgeKey = new Map(liveOmpAgentsForNudge.map((a) => [nudgeKeyOf(a), a]))
-        const nudgeKeys = [...liveOmpAgentByNudgeKey.keys()]
-        const sessionIdByNudgeKey = new Map([...liveOmpAgentByNudgeKey].map(([key, a]) => [key, a.sessionId]))
-        const sentAtByLocator = lastTgSentAtByKey(parseHistory(readFileOrNull(ctx.paths.history)))
-        const sentAtByKey = new Map<string, number>()
-        for (const [key, a] of liveOmpAgentByNudgeKey) {
-          const locator = locatorOf(a)
-          const sentAt = sentAtByLocator.get(locator)
-          if (sentAt !== undefined) sentAtByKey.set(key, sentAt)
-          // A pre-#459 row keyed by the locator for this same session carries
-          // over, so the cutover does not restart its silence clock.
-          const legacy = awarenessNudgeStore[locator]
-          if (key !== locator && !awarenessNudgeStore[key] && legacy?.sessionId === a.sessionId) {
-            awarenessNudgeStore = { ...awarenessNudgeStore, [key]: legacy }
-          }
-        }
-        const nudgePlan = planAwarenessNudges(nudgeKeys, sentAtByKey, awarenessNudgeStore, Date.now(), sessionIdByNudgeKey)
-        awarenessNudgeStore = nudgePlan.store
-        if (nudgePlan.keysChanged) persistAwarenessNudge()
-        // Only a send that actually SUCCEEDS commits the "nudged" marker
-        // (via markAwarenessNudgeSent, below) — a due key stays due next
-        // sweep on failure/drop instead of silently losing its one shot at
-        // reaching the exact busy/loaded agent this feature targets.
-        const sentKeys: string[] = []
-        for (const key of nudgePlan.due) {
-          const target = liveOmpAgentByNudgeKey.get(key)
-          if (!target) continue
-          const res = await deliverOriginalOmp(target, AWARENESS_NUDGE_TEXT, `awareness:${target.pid}:${target.sessionId}:${Math.floor(Date.now() / 3_600_000)}`)
-          log(res.ok ? `awareness-nudge sent to ${key}` : `awareness-nudge failed for ${key}: ${res.error}`)
-          if (res.ok) sentKeys.push(key)
-        }
-        if (sentKeys.length > 0) {
-          awarenessNudgeStore = markAwarenessNudgeSent(awarenessNudgeStore, sentKeys, Date.now())
-          persistAwarenessNudge()
-        }
-      }
-
-      kickSessionRegistryScan(ctx)
-
       let json: { ok: boolean; result?: TgUpdate[]; description?: string }
       if (recoveryQueue !== null) {
         json = { ok: true, result: recoveryQueue }
@@ -12300,7 +12527,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // sent in this batch. Best-effort, off the inject path: a read/write error
       // here never blocks delivery. Stale + rejected senders are filtered the
       // same way stepUpdates does (inboundHistoryRecords). Only when the batch
-      // carried messages — an empty 50s long-poll skips the walk.
+      // carried messages — an empty 50s long-poll, or a batch of button taps, skips the
+      // walk and its discovery scan: a tap is answered without waiting on ps/tmux (tg-cli#547).
       //
       // Pane stamping must match where the message ACTUALLY routes, else a reply
       // (which routes to its recognized ORIGIN pane, not the default target) would
@@ -12309,8 +12537,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // replied-to id is in the routes map AND still maps to a live same-project
       // agent pane is stamped with that pane; everything else uses the default
       // discovered target.
-      if (updates.length > 0) {
-        const found = discover()
+      if (updates.some((u) => u.message !== undefined)) {
+        const snap = await snapshotAsync()
+        const found = discover(snap)
         const targetPane = found.ok ? found.target.pane.paneId : null
         const histRoutes = parseRoutes(readFileOrNull(ctx.paths.routes))
         // Map a resolved target pane → the human AGENT NAME it belongs to, so
@@ -12321,7 +12550,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // The registry session the pane (or `omp:<pid>` origin) hosts is stamped
         // too (§3.3): the identity `tg replies` scopes on across renames, and the
         // name of an out-of-tmux omp, which has no pane to derive one from.
-        const agentPanes = snapshot().panes
+        const agentPanes = snap.panes
         const registry = sessionRegistry
         const resolveSession = (pane: string | null): string | null =>
           pane !== null && registry ? resolveLocatorToSession(registry, pane, undefined) : null
@@ -12370,7 +12599,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           if (!isRoutedReply) return null
           const recognized = recognizeRoute(histRoutes, replyId)
           if (!recognized) return null
-          const { panes, procs } = snapshot()
+          const { panes, procs } = snap
           const pane = panes.find((p) => p.paneId === recognized.paneId)
           const sameProject = routeMatchesPane({ recognizedCwd: recognized.cwd, panePath: pane?.panePath })
           if (pane && sameProject && findAgentInPane(pane, procs)) return recognized.paneId

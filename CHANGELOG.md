@@ -3,6 +3,22 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.16
+
+- **A hook-socket ask or a tap on a question card no longer waits for the poll tick's agent scan
+  (#547, #537).** Before every `getUpdates` the poll loop ran four uncached discovery passes
+  (tmux, ps, and two `lsof` per out-of-tmux omp) on its only thread, so an ask or a tap that
+  arrived mid-scan queued behind it: 23 s with slow ps/lsof in the new test, and about 6 s from
+  claim to delivered with 10 live omp. The idle-liveness check now runs off the poll loop at most
+  once every 30 s (a fresh pass confirms the idle exit before the daemon leaves), and the
+  awareness nudges and session-registry scan share that one pass. The
+  tick, inbound routing and the omp delivery path spawn tmux/ps/lsof without blocking. An agent's
+  cwd and open session file are read once per process and reused for 30 s. A batch of button taps
+  alone takes no scan. An omp-live endpoint probe drops the cached omp list only when the
+  endpoints changed. The `/agent` picker, the no-agent reply, `/status` and the delivery-time
+  registry re-check still read tmux and ps synchronously (`lsof` only for a process whose cached
+  facts are older than 30 s); #578 tracks moving them too.
+
 ## 1.55.15
 
 - **A highlighted partial reply quote reaches the agent whole (#565, HYP-907).** `tg-ctl` cut

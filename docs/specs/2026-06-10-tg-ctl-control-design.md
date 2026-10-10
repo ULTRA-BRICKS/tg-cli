@@ -574,6 +574,19 @@ a shell-callable human yes/no for callers that are not harness hooks (agent-tool
 - **Idle TTL (review F12):** if no agent pane has existed for
   `control.idle_exit_min` (default 30 min), exit cleanly — lazy auto-start
   resurrects the daemon on the next `tg` call. No stray processes.
+- **Discovery never holds the event loop (tg-cli#547, tg-cli#537):** the liveness
+  check behind the idle TTL (tmux panes, agents outside tmux, live omp) runs off
+  the poll loop at most once every 30 s, not before every `getUpdates`. When the
+  idle threshold passes, a fresh scan confirms it before the daemon exits. The poll
+  tick, inbound routing and the omp delivery path spawn tmux/ps/lsof
+  asynchronously, and one discovery pass is shared by everything that asks
+  within 2 s. Each agent's cwd and open session file (one `lsof` each) are
+  reused for 30 s per pid and command line. A batch of button taps alone takes
+  no scan. A hook-socket ask or a card tap that arrives during a scan is
+  answered at once. The picker listing, the no-agent reply and the
+  delivery-time pane and registry re-checks still scan synchronously (tmux and
+  ps; `lsof` only for a process whose facts are older than 30 s); tg-cli#578
+  moves them off the loop too.
 - **Delivery receipts (user request 2026-06-10):** every inbound message whose
   handling fully succeeded gets a **👀 reaction** (`setMessageReaction`,
   best-effort) — the human sees at a glance that the message landed in the

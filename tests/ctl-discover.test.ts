@@ -8,6 +8,7 @@ import {
   pickTargetPane,
   pickTargetPaneFromSet,
   panesWithRetry,
+  panesWithRetryAsync,
   abducoSessionName,
   paneIdByPid,
   parsePaneTitles,
@@ -575,6 +576,29 @@ test('panesWithRetry: a null run (tmux binary missing) breaks immediately — no
   );
   expect(panes).toEqual([]);
   expect(calls).toBe(1);
+});
+
+test('panesWithRetryAsync: the same policy, awaited — retries exit-0-but-EMPTY, never a non-zero exit or a missing tmux', async () => {
+  const seq = ['', '', ONE_PANE];
+  let i = 0;
+  const slept: number[] = [];
+  const panes = await panesWithRetryAsync(async () => ({ exitCode: 0, stdout: seq[i++] }), {
+    sleep: async (ms) => {
+      slept.push(ms);
+    },
+  });
+  expect(panes.map((p) => p.paneId)).toEqual(['%0']);
+  expect(slept).toEqual([120, 120]);
+
+  let calls = 0;
+  const failed = await panesWithRetryAsync(async () => {
+    calls++;
+    return calls === 1 ? { exitCode: 1, stdout: '' } : { exitCode: 0, stdout: ONE_PANE };
+  });
+  expect(failed).toEqual([]);
+  expect(calls).toBe(1);
+
+  expect(await panesWithRetryAsync(async () => null)).toEqual([]);
 });
 
 // --- abduco-wrapped agents (tg-cli#454) ---
