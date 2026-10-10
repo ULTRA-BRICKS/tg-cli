@@ -140,7 +140,6 @@ import {
   matchUnreachable,
   noAgentReplyText,
   outsideTmuxRefusalText,
-  parseLsofCwd,
   parsePidTtyList,
   UNREACHABLE_HINT,
   type UnreachableAgent,
@@ -157,7 +156,6 @@ import {
   mergeLiveOmpCandidates,
   ompSessionFileFromBreadcrumb,
   ompTerminalId,
-  parseLsofJsonlPaths,
   parseOmpSessionMeta,
   pickPrimaryOmpSessionFile,
   preferOmpApiOverTmux,
@@ -385,6 +383,7 @@ import {
   parseLedger,
   serializeLedgerEvents,
   sinkOutcomeEvent,
+  mayHaveLanded,
   type LedgerEvent,
   type SinkResult,
   type LedgerHold,
@@ -456,6 +455,8 @@ import {
   type VoiceConfig,
 } from "./features/tg-ctl/voice"
 import { probeWhisper } from "./features/tg-ctl/voice-probe"
+import { cwdOfPid as readCwdOfPid, jsonlPathsOfPid as readJsonlPathsOfPid, pidFilesIo } from "./features/tg-ctl/pid-files"
+import { ADMIN_SPAWN, PROBE_SPAWN, TMUX_WRITE_SPAWN } from "./features/util/spawn-timeout"
 import { shouldColorize } from "./features/render/help-color"
 import type {
   Action,
@@ -998,6 +999,18 @@ const SUBPROC_ENV: Record<string, string> = (() => {
   return env
 })()
 
+// Every tmux call tg-ctl makes goes through here (tg-cli#567, #481). Bounded — PROBE_SPAWN for a
+// read, TMUX_WRITE_SPAWN for a command that changes the server — so a wedged tmux server costs a
+// bounded delay on the daemon's single event loop, never a hang; run under SUBPROC_ENV's UTF-8
+// locale; and a timeout is logged with its subcommand, so a wedged server shows up in the log.
+// Throws like Bun.spawnSync when tmux is not installed — callers keep their fail-soft catch.
+function tmuxSync(args: string[], opts: { write?: boolean; stdin?: Uint8Array } = {}) {
+  const bound = opts.write ? TMUX_WRITE_SPAWN : PROBE_SPAWN
+  const proc = Bun.spawnSync(["tmux", ...args], { stdin: opts.stdin, stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV, timeout: bound.timeout, killSignal: bound.killSignal })
+  if (proc.exitedDueToTimeout) log(`tmux ${args[0]}: no answer within ${bound.timeout}ms — killed; the tmux server may be wedged`)
+  return proc
+}
+
 // tmux absent / no server / ps failure → empty snapshot, never a crash:
 // discovery then degrades to the no-agent reply path.
 function snapshot(): { panes: PaneInfo[]; procs: ProcInfo[] } {
@@ -1008,11 +1021,7 @@ function snapshot(): { panes: PaneInfo[]; procs: ProcInfo[] } {
   const panes = panesWithRetry(
     () => {
       try {
-        const tmux = Bun.spawnSync(["tmux", "list-panes", "-a", "-F", PANE_FORMAT], {
-          stdout: "pipe",
-          stderr: "pipe",
-          env: SUBPROC_ENV,
-        })
+        const tmux = tmuxSync(["list-panes", "-a", "-F", PANE_FORMAT])
         return { exitCode: tmux.exitCode ?? 1, stdout: tmux.stdout.toString() }
       } catch {
         return null // tmux binary missing — retrying cannot help
@@ -1028,7 +1037,7 @@ function snapshot(): { panes: PaneInfo[]; procs: ProcInfo[] } {
   for (let i = 0; i < 3; i++) {
     if (i > 0) Bun.sleepSync(120)
     try {
-      const ps = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
+      const ps = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV, ...PROBE_SPAWN })
       if (ps.exitCode !== 0) break // ps failed hard — retrying unlikely to help
       procs = parseProcList(ps.stdout.toString())
       if (procs.length > 0) break
@@ -1045,11 +1054,7 @@ function snapshot(): { panes: PaneInfo[]; procs: ProcInfo[] } {
 // the naming surfaces read it; any failure degrades to "no titles", never to "no panes".
 function readPaneTitles(): Map<string, string> {
   try {
-    const tmux = Bun.spawnSync(["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_title}"], {
-      stdout: "pipe",
-      stderr: "pipe",
-      env: SUBPROC_ENV,
-    })
+    const tmux = tmuxSync(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_title}"])
     return tmux.exitCode === 0 ? parsePaneTitles(tmux.stdout.toString()) : new Map()
   } catch {
     return new Map()
@@ -1153,24 +1158,21 @@ function discoverTarget(ctx: Ctx): DiscoverResult {
 // Git-state-check banner support (git-state.ts): a best-effort, timeout-guarded read of the
 // destination pane's cwd, run right before a silent auto-bind delivery. A stuck `git` (lock
 // contention, a huge repo, a hung network filesystem) must never block the daemon's single-
-// threaded poll loop, so both spawns are killed after GIT_STATE_TIMEOUT_MS; ANY failure — not a
+// threaded poll loop, so both spawns are bounded by PROBE_SPAWN; ANY failure — not a
 // git repo, the git binary missing, a timeout, a non-zero exit — degrades to null (no banner),
 // the same "never breaks delivery" contract every other best-effort read in this file follows.
-const GIT_STATE_TIMEOUT_MS = 2000
 function gitStateForPath(cwd: string): PaneGitState | null {
   try {
     const branchProc = Bun.spawnSync(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], {
       stdout: "pipe",
       stderr: "pipe",
-      timeout: GIT_STATE_TIMEOUT_MS,
-      killSignal: "SIGKILL",
+      ...PROBE_SPAWN,
     })
     if (branchProc.exitCode !== 0) return null // not a git repo, or git errored — undeterminable
     const statusProc = Bun.spawnSync(["git", "-C", cwd, "status", "--porcelain"], {
       stdout: "pipe",
       stderr: "pipe",
-      timeout: GIT_STATE_TIMEOUT_MS,
-      killSignal: "SIGKILL",
+      ...PROBE_SPAWN,
     })
     if (statusProc.exitCode !== 0) return null
     return buildPaneGitState(branchProc.stdout.toString(), statusProc.stdout.toString())
@@ -1249,7 +1251,7 @@ function listAgentCandidates(): AgentCandidate[] {
 // pi/aider/omp/unknown (still tty-gated); claude/codex/opencode are listed either way.
 function readPidTtyMap(): Map<number, string> {
   try {
-    const ps = Bun.spawnSync(["ps", "-axo", "pid=,tty="], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
+    const ps = Bun.spawnSync(["ps", "-axo", "pid=,tty="], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV, ...PROBE_SPAWN })
     if (ps.exitCode !== 0) return new Map()
     return parsePidTtyList(ps.stdout.toString())
   } catch {
@@ -1277,46 +1279,36 @@ function readBridgeCodeAge(home: string, pids: number[]): BridgeCodeAge | undefi
     codeChangedAtMs = latest < 0 ? null : latest
   }
   try {
-    const ps = Bun.spawnSync(["ps", "-o", "pid=,etime=", "-p", pids.join(",")], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
+    const ps = Bun.spawnSync(["ps", "-o", "pid=,etime=", "-p", pids.join(",")], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV, ...PROBE_SPAWN })
     return { codeChangedAtMs, startedAtMs: parsePidStartList(ps.stdout.toString(), Date.now()) }
   } catch {
     return undefined
   }
 }
 
-const LSOF_TIMEOUT_MS = 2000
+const subprocPidFiles = pidFilesIo({ env: SUBPROC_ENV })
 let lsofMissingWarned = false
+// No procfs and no lsof: said ONCE in the log, never silently, whichever lookup hit it first.
+function warnLsofMissing(pid: number, err: unknown): void {
+  if (lsofMissingWarned) return
+  lsofMissingWarned = true
+  log(`cannot read the open files or cwd of pid ${pid} — no /proc and lsof failed (${err}); install lsof for cwd-keyed inboxes and omp session titles`)
+}
 // The agent's cwd: `/proc/<pid>/cwd` where it exists (Linux — no external tool),
-// else `lsof` (macOS ships it). On a Linux box with neither the cwd is unknown — said
-// ONCE in the log, never silently — and the agent is still listed, by its --name or
-// pid, just without a cwd-derived inbox key.
+// else a bounded `lsof` (macOS ships it) — features/tg-ctl/pid-files.ts. With neither the
+// cwd is unknown and the agent is still listed, by its --name or pid, just without a
+// cwd-derived inbox key.
 function cwdOfPid(pid: number): string | null {
   try {
-    return readlinkSync(`/proc/${pid}/cwd`)
-  } catch {
-    // no procfs (macOS) or the process is gone — fall through to lsof
-  }
-  try {
-    const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(pid), "-d", "cwd", "-Fn", "-n"], {
-      stdout: "pipe",
-      stderr: "pipe",
-      env: SUBPROC_ENV,
-      timeout: LSOF_TIMEOUT_MS,
-      killSignal: "SIGKILL",
-    })
-    if (lsof.exitCode !== 0) return null
-    return parseLsofCwd(lsof.stdout.toString())
+    return readCwdOfPid(pid, subprocPidFiles)
   } catch (err) {
-    if (!lsofMissingWarned) {
-      lsofMissingWarned = true
-      log(`unreachable scan: cannot resolve the cwd of pid ${pid} — no /proc and lsof failed (${err}); install lsof for cwd-keyed inboxes`)
-    }
+    warnLsofMissing(pid, err)
     return null
   }
 }
 
-// Memoized for a short window: the scan is sync (ps + one lsof per agent, up to
-// LSOF_TIMEOUT_MS each) and one inbound message can ask for it several times in a row
+// Memoized for a short window: the scan is sync (ps + one lsof per agent, each bounded
+// by PROBE_SPAWN) and one inbound message can ask for it several times in a row
 // (route attempt, then the no-agent reply); a poll tick asks once more. One scan per
 // ~2s keeps the single-threaded poll loop responsive (review finding).
 const UNREACHABLE_SCAN_TTL_MS = 2000
@@ -1440,19 +1432,12 @@ function deliverHostPane(paneId: string, text: string, messageId: number | strin
   return name === null ? null : deliverToHost(name, text, messageId)
 }
 
-// `lsof -Fn` n-paths for a pid — used to find omp's primary session jsonl.
+// The `.jsonl` files a pid holds open — used to find omp's primary session jsonl.
 function jsonlPathsOfPid(pid: number): string[] {
   try {
-    const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(pid), "-Fn", "-n"], {
-      stdout: "pipe",
-      stderr: "pipe",
-      env: SUBPROC_ENV,
-      timeout: LSOF_TIMEOUT_MS,
-      killSignal: "SIGKILL",
-    })
-    if (lsof.exitCode !== 0) return []
-    return parseLsofJsonlPaths(lsof.stdout.toString())
-  } catch {
+    return readJsonlPathsOfPid(pid, subprocPidFiles)
+  } catch (err) {
+    warnLsofMissing(pid, err)
     return []
   }
 }
@@ -1781,7 +1766,7 @@ function recordHookSession(req: ButtonRequest): void {
 // server restart that reuses `%N` ids never looks like the same pane (§2.6).
 function readTmuxServerPid(): number | null {
   try {
-    const tmux = Bun.spawnSync(["tmux", "display-message", "-p", "#{pid}"], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
+    const tmux = tmuxSync(["display-message", "-p", "#{pid}"])
     const pid = Number(tmux.stdout.toString().trim())
     return tmux.exitCode === 0 && Number.isInteger(pid) && pid > 0 ? pid : null
   } catch {
@@ -2207,8 +2192,8 @@ async function routeGrantNotice(ctx: Ctx, req: ButtonRequest, text: string, deli
   if (req.paneId && !ompOrigin) {
     try {
       const res = await executeInjectSteps(buildTextInjectPlan(req.paneId, wrapInbound(ctx.cfg.injectWrap, "tg", text), { sessionKey: req.sessionKey }))
-      // Typed but still in its input box (#463): name the pane and text in the chat.
-      if (!res.ok && res.unsubmitted) await sendMessage(ctx, res.error)
+      // Typed but still in its input box (#463), or maybe typed (uncertain): name the pane and text in the chat.
+      if (!res.ok && mayHaveLanded(res)) await sendMessage(ctx, res.error)
       return res.ok
     } catch (err) {
       log(`grant-notice pane route failed pane=${req.paneId}: ${err instanceof Error ? err.message : String(err)}`)
@@ -2230,9 +2215,9 @@ async function routeGrantNotice(ctx: Ctx, req: ButtonRequest, text: string, deli
   if (target) {
     const res = await deliverOriginalOmp(target, text, deliveryId, req.paneId)
     if (res.ok) return true
-    // Typed into its pane but still unsubmitted (#463): report it and do not queue
-    // it again — the card reports the notice undelivered and names the token path.
-    if (res.unsubmitted) {
+    // Typed into its pane but still unsubmitted (#463), or maybe typed (uncertain): report it
+    // and do not queue it again — the card reports the notice undelivered and names the token path.
+    if (mayHaveLanded(res)) {
       await sendMessage(ctx, res.error)
       return false
     }
@@ -2506,8 +2491,10 @@ function runInboxCommand(ctx: Ctx, argv: string[]): number {
 // A failed plan; `sessionMismatch`: the §2.6 guard refused (the pane hosts a
 // different session now) and `error` is the named reply for the CTO;
 // `unsubmitted`: the text WAS typed but is still in the input box (#463) — never
-// re-type it, report it.
-type InjectFailure = { ok: false; error: string; sessionMismatch?: true; unsubmitted?: true }
+// re-type it, report it; `uncertain`: a tmux step was killed at its bound and the
+// server may still have applied it (tg-cli#481) — the delivery ledger records it
+// `uncertain`, never re-typed.
+type InjectFailure = { ok: false; error: string; sessionMismatch?: true; unsubmitted?: true; uncertain?: true }
 
 // The registry as it describes pane `paneId` NOW (re-scanned first). A scan
 // shared with an earlier delivery of the same burst is trusted only while the
@@ -2645,14 +2632,8 @@ async function runInjectSteps(steps: InjectStep[]): Promise<{ ok: true } | Injec
       const checked = submitCheckStep(step, hosted)
       if (checked !== "retry-enter") return checked
     } else if (step.kind === "tmux") {
-      const proc = Bun.spawnSync(step.argv, {
-        stdin: step.stdin !== undefined ? new TextEncoder().encode(step.stdin) : undefined,
-        stdout: "ignore",
-        stderr: "pipe",
-      })
-      if (proc.exitCode !== 0) {
-        return { ok: false, error: `${step.argv.join(" ")} failed: ${proc.stderr.toString().trim()}` }
-      }
+      const failed = runTmuxStep(step)
+      if (failed) return failed
     } else {
       await Bun.sleep(step.ms)
     }
@@ -2682,14 +2663,8 @@ function runInjectStepsSync(steps: InjectStep[]): { ok: true } | InjectFailure {
       const checked = submitCheckStep(step, hosted)
       if (checked !== "retry-enter") return checked
     } else if (step.kind === "tmux") {
-      const proc = Bun.spawnSync(step.argv, {
-        stdin: step.stdin !== undefined ? new TextEncoder().encode(step.stdin) : undefined,
-        stdout: "ignore",
-        stderr: "pipe",
-      })
-      if (proc.exitCode !== 0) {
-        return { ok: false, error: `${step.argv.join(" ")} failed: ${proc.stderr.toString().trim()}` }
-      }
+      const failed = runTmuxStep(step)
+      if (failed) return failed
     } else {
       Bun.sleepSync(step.ms)
     }
@@ -2697,24 +2672,40 @@ function runInjectStepsSync(steps: InjectStep[]): { ok: true } | InjectFailure {
   return { ok: true }
 }
 
+// One `tmux` step of a plan (send-keys, load-buffer, paste-buffer), shared by both executors. A
+// step killed at its bound may already have reached the pane, so it fails `uncertain`.
+function runTmuxStep(step: Extract<InjectStep, { kind: "tmux" }>): InjectFailure | null {
+  const [, ...args] = step.argv // argv[0] is "tmux" (inject.ts)
+  const proc = tmuxSync(args, { write: true, stdin: step.stdin !== undefined ? new TextEncoder().encode(step.stdin) : undefined })
+  if (proc.exitedDueToTimeout) {
+    return { ok: false, uncertain: true, error: `tmux did not answer within ${TMUX_WRITE_SPAWN.timeout / 1000}s — the message may or may not have reached the pane` }
+  }
+  if (proc.exitCode !== 0) return { ok: false, error: `${step.argv.join(" ")} failed: ${proc.stderr.toString().trim()}` }
+  return null
+}
+
+// Why a tmux command that starts an agent window failed, for the CTO's reply: no answer
+// within TMUX_WRITE_SPAWN (the server may still create the window once it recovers — say so,
+// so a retry is not a blind second spawn), else its stderr, else its exit code.
+function tmuxSpawnFailure(proc: { stderr: { toString(): string }; exitCode: number | null; exitedDueToTimeout?: boolean }): string {
+  if (proc.exitedDueToTimeout) return `no answer within ${TMUX_WRITE_SPAWN.timeout / 1000}s — the window may still appear; check tmux before retrying`
+  return proc.stderr.toString().trim() || `exit ${proc.exitCode}`
+}
+
 // Capture a pane's current visible text (`tmux capture-pane -pJ`), used to
 // re-check whether a Claude Code numbered permission menu is STILL showing
 // before late-delivering a decision into it (see the permission branch of
-// lateDeliverAbandonedQuestion). `-J` joins tmux's internal line-wrap breaks
-// back into logical lines — without it, a long command that hard-wraps
-// mid-token gets a newline (→ a space, after permission-menu.ts's whitespace
+// lateDeliverAbandonedQuestion) and by the submit check (#463). `-J` joins tmux's
+// internal line-wrap breaks back into logical lines — without it, a long command that
+// hard-wraps mid-token gets a newline (→ a space, after permission-menu.ts's whitespace
 // normalization) inserted INSIDE the token, which can turn a real identity
 // match into a false negative for exactly the long commands most likely to
 // hit the 120s hook budget in the first place (review finding). Never
-// throws: a dead pane / missing tmux yields null, same fail-soft posture as
-// the rest of this file's tmux calls.
+// throws: a dead pane / missing tmux / a capture past its bound yields null,
+// same fail-soft posture as the rest of this file's tmux calls.
 function capturePane(paneId: string): string | null {
   try {
-    const proc = Bun.spawnSync(["tmux", "capture-pane", "-p", "-J", "-t", paneId], {
-      stdout: "pipe",
-      stderr: "pipe",
-      env: SUBPROC_ENV,
-    })
+    const proc = tmuxSync(["capture-pane", "-p", "-J", "-t", paneId])
     if (proc.exitCode !== 0) return null
     return proc.stdout.toString()
   } catch {
@@ -3553,7 +3544,7 @@ function restartDaemon(ctx: Ctx, flags: StartFlags, ifStale: boolean): number {
 // Run `git -C dir …`; trimmed stdout, or null when git fails / is missing.
 function gitOutput(dir: string, args: string[]): string | null {
   try {
-    const r = Bun.spawnSync(["git", "-C", dir, ...args], { stdout: "pipe", stderr: "ignore" })
+    const r = Bun.spawnSync(["git", "-C", dir, ...args], { stdout: "pipe", stderr: "ignore", ...PROBE_SPAWN })
     return r.exitCode === 0 ? r.stdout.toString().trim() : null
   } catch {
     return null
@@ -3605,7 +3596,7 @@ function resolveDeployedBin(home: string): string {
 // never calls this (autostartKind short-circuits to launchd before hasSystemd is read).
 function hasUserSystemd(): boolean {
   try {
-    const r = Bun.spawnSync(["systemctl", "--user", "--version"], { stdout: "ignore", stderr: "ignore" })
+    const r = Bun.spawnSync(["systemctl", "--user", "--version"], { stdout: "ignore", stderr: "ignore", ...PROBE_SPAWN })
     return r.exitCode === 0
   } catch {
     return false
@@ -3663,7 +3654,7 @@ function launchdDomain(): string {
 function realLaunchctlProbe(): LaunchctlProbe {
   const domain = launchdDomain()
   const listStdout = (): string | undefined => {
-    const r = Bun.spawnSync(["launchctl", "list"], { stdout: "pipe", stderr: "ignore" })
+    const r = Bun.spawnSync(["launchctl", "list"], { stdout: "pipe", stderr: "ignore", ...PROBE_SPAWN })
     if (r.exitCode !== 0 || !r.stdout) return undefined
     return new TextDecoder().decode(r.stdout)
   }
@@ -3677,7 +3668,7 @@ function realLaunchctlProbe(): LaunchctlProbe {
       return stdout === undefined ? undefined : parseLaunchctlListJobs(stdout)
     },
     printDump(label) {
-      const r = Bun.spawnSync(["launchctl", "print", `${domain}/${label}`], { stdout: "pipe", stderr: "ignore" })
+      const r = Bun.spawnSync(["launchctl", "print", `${domain}/${label}`], { stdout: "pipe", stderr: "ignore", ...PROBE_SPAWN })
       if (r.exitCode !== 0 || !r.stdout) return undefined
       return new TextDecoder().decode(r.stdout)
     },
@@ -3759,7 +3750,7 @@ function detectLaunchdDaemon(
 // inside the daemon, so the holder IS us — that is the pid to report (review finding).
 function lockHolderPid(lockPath: string): number | null {
   try {
-    const r = Bun.spawnSync(["lsof", "-t", lockPath], { stdout: "pipe", stderr: "ignore" })
+    const r = Bun.spawnSync(["lsof", "-t", lockPath], { stdout: "pipe", stderr: "ignore", ...PROBE_SPAWN })
     if (r.exitCode !== 0 || !r.stdout) return null
     for (const tok of new TextDecoder().decode(r.stdout).trim().split(/\s+/)) {
       const pid = Number(tok)
@@ -3827,7 +3818,7 @@ function composeAutostartLine(env: AutostartEnv, kind: AutostartKind): string {
 // failure so the user sees the launchctl/systemctl error.
 function runAutostartCommand(cmd: AutostartCommand): boolean {
   try {
-    const r = Bun.spawnSync(cmd.argv, { stdout: "ignore", stderr: "pipe" })
+    const r = Bun.spawnSync(cmd.argv, { stdout: "ignore", stderr: "pipe", ...ADMIN_SPAWN })
     if (r.exitCode === 0) return true
     if (cmd.optional) return true
     const stderr = r.stderr ? new TextDecoder().decode(r.stderr).trim() : ""
@@ -5452,7 +5443,7 @@ function tmuxWindowName(): string | undefined {
 function tmuxDisplay(format: string): string | undefined {
   if (!process.env.TMUX) return undefined
   try {
-    const r = Bun.spawnSync(["tmux", "display-message", "-p", format], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
+    const r = tmuxSync(["display-message", "-p", format])
     if (r.exitCode === 0) return r.stdout.toString().trim() || undefined
   } catch {}
   return undefined
@@ -6370,7 +6361,7 @@ function overloadRetryChildMatches(pid: number, retryKey: string): boolean {
 
 function overloadRetryChildMatchState(pid: number, retryKey: string): boolean | null {
   if (!kill0(pid)) return false
-  const proc = Bun.spawnSync(["ps", "-ww", "-p", String(pid), "-o", "command="], { stdout: "pipe", stderr: "ignore" })
+  const proc = Bun.spawnSync(["ps", "-ww", "-p", String(pid), "-o", "command="], { stdout: "pipe", stderr: "ignore", ...PROBE_SPAWN })
   if (proc.exitCode !== 0) return null
   const command = new TextDecoder().decode(proc.stdout).trim()
   return command.includes("auto-continue-once") && command.includes("--retry-key") && command.includes(retryKey)
@@ -6927,7 +6918,7 @@ async function runAutoContinueOnce(ctx: Ctx, argv: string[]): Promise<number> {
         const res = executeInjectStepsSync(buildTextInjectPlan(flags.paneId, flags.text))
         if (!res.ok) {
           log(`auto-continue-once inject failed for ${flags.paneId}: ${res.error}`)
-          if (res.unsubmitted) unsubmitted = res.error
+          if (mayHaveLanded(res)) unsubmitted = res.error
           return finish(1)
         }
         log(`auto-continue-once fired for ${flags.paneId} (${flags.text})`)
@@ -7775,9 +7766,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         await postRoutePicker(listAgentCandidates(), item.text, `${res.error} — pick where this goes:`, item.sourceMessageId, item.relatedReactionMessageId)
         return false
       }
-      // Typed but still in the input box after the retry Enter (#463): the CTO
-      // hears exactly that — the "resend it" notice below would type it twice.
-      if (res.unsubmitted) {
+      // Typed but still in the input box after the retry Enter (#463), or maybe typed
+      // (uncertain): the CTO hears exactly that — the "resend it" notice below would type it twice.
+      if (mayHaveLanded(res)) {
         const reply = item.sourceMessageId === null ? {} : { reply_parameters: { message_id: item.sourceMessageId, allow_sending_without_reply: true } }
         await sendMessage(ctx, res.error, reply)
         return false
@@ -9682,8 +9673,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // missing — it MUST be inside this try, else the throw escapes the local guard, past
       // the /new spawn, into the poll loop (exactly the "never throws" guarantee this defends).
       const session = sessionForSpawn()
-      const tmuxArgv = [
-        "tmux",
+      const tmuxArgs = [
         "new-window",
         // `=<session>:` (not a bare name) so a NUMERIC session name isn't misparsed as a window
         // index — a bare `-t 1` fails `create window failed: index 1 in use`. See sessionTargetArgs.
@@ -9701,9 +9691,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         "--",
         ...argv,
       ]
-      const proc = Bun.spawnSync(tmuxArgv, { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
+      const proc = tmuxSync(tmuxArgs, { write: true })
       if (proc.exitCode !== 0) {
-        return { ok: false, error: `couldn't start the agent (tmux: ${proc.stderr.toString().trim() || `exit ${proc.exitCode}`})` }
+        return { ok: false, error: `couldn't start the agent (tmux: ${tmuxSpawnFailure(proc)})` }
       }
       const paneId = proc.stdout.toString().trim()
       if (!paneId) return { ok: false, error: "tmux did not return a pane id — agent not started" }
@@ -9719,11 +9709,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // (the recorded paneId is the fallback proof — codex r12 P1), never the spawn. Never throws.
   const stampSpawnToken = (paneId: string, spawnToken: string): void => {
     try {
-      const proc = Bun.spawnSync(["tmux", "set-option", "-w", "-t", paneId, "@tg_spawn_token", spawnToken], {
-        stdout: "pipe",
-        stderr: "pipe",
-        env: SUBPROC_ENV,
-      })
+      const proc = tmuxSync(["set-option", "-w", "-t", paneId, "@tg_spawn_token", spawnToken], { write: true })
       // LOG a non-zero exit (codex r19 P2): the stamp is best-effort (the recorded paneId is the
       // fallback proof), but a silent failure would quietly weaken token-based orphan adoption — so
       // surface it for observability rather than swallowing it.
@@ -9941,8 +9927,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const argv = applyCodexHookTrustBypass(argvBase, findModel(model)?.kind, process.env)
     try {
       const session = sessionForSpawn()
-      const tmuxArgv = [
-        "tmux",
+      const tmuxArgs = [
         "new-window",
         // `=<session>:` (not a bare name) so a NUMERIC session name isn't misparsed as a window
         // index — a bare `-t 1` fails `create window failed: index 1 in use`. See sessionTargetArgs.
@@ -9961,9 +9946,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         "--",
         ...argv,
       ]
-      const proc = Bun.spawnSync(tmuxArgv, { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
+      const proc = tmuxSync(tmuxArgs, { write: true })
       if (proc.exitCode !== 0) {
-        return { ok: false, error: `couldn't start the agent (tmux: ${proc.stderr.toString().trim() || `exit ${proc.exitCode}`})` }
+        return { ok: false, error: `couldn't start the agent (tmux: ${tmuxSpawnFailure(proc)})` }
       }
       const paneId = proc.stdout.toString().trim()
       if (!paneId) return { ok: false, error: "tmux did not return a pane id — agent not started" }
@@ -10771,8 +10756,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const res = await executeInjectSteps(buildTextInjectPlan(s.paneId, "continue"))
     if (!res.ok) {
       log(`auto-continue inject failed for ${s.paneId}: ${res.error}`)
-      // Typed but still in the input box (#463): the CTO armed this — tell him.
-      if (res.unsubmitted) {
+      // Typed but still in the input box (#463), or maybe typed (uncertain): the CTO armed this — tell him.
+      if (mayHaveLanded(res)) {
         await sendMessage(ctx, res.error, s.sourceMessageId === null ? {} : { reply_parameters: { message_id: s.sourceMessageId, allow_sending_without_reply: true } })
       }
       // The agent did not resume: the source keeps its 😴, never a false 👀.
@@ -11357,11 +11342,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const res = retained.req.agent === "omp"
       ? await deliverOriginalOmp(liveOmpForPane(paneId) ?? { cwd: retained.req.cwd ?? "/" }, wrapInbound(ctx.cfg.injectWrap, "tg", answer.label), `answer:${action.requestId}`, paneId)
       : await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
-    // Typed but still in the input box after the retry Enter (#463): keep the claim
-    // — a re-tap would type the answer a second time — and tell the CTO in the chat.
-    if (!res.ok && res.unsubmitted) {
+    // Typed but still in the input box after the retry Enter (#463), or maybe typed
+    // (uncertain): keep the claim — a re-tap would type the answer a second time — and
+    // tell the CTO in the chat.
+    if (!res.ok && mayHaveLanded(res)) {
       log(`ask-late-deliver-unsubmitted: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId}`)
-      await answerCallbackQuery(ctx, action.callbackQueryId, "typed but not sent — see the chat")
+      await answerCallbackQuery(ctx, action.callbackQueryId, res.unsubmitted ? "typed but not sent — see the chat" : "delivery not confirmed — see the chat")
       await sendMessage(ctx, res.error)
       return true
     }
@@ -11450,9 +11436,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     persistQuestions()
 
     const res = await injectInbound(action.messageId, paneId, buildTextInjectPlan(paneId, answer, { sessionKey: retained.req.sessionKey }))
-    // Typed but still in the input box after the retry Enter (#463): keep the claim
-    // — a second reply would type the answer again — and tell the CTO.
-    if (!res.ok && res.unsubmitted) {
+    // Typed but still in the input box after the retry Enter (#463), or maybe typed
+    // (uncertain): keep the claim — a second reply would type the answer again — and tell the CTO.
+    if (!res.ok && mayHaveLanded(res)) {
       log(`ask-post-timeout-reply-unsubmitted: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId}`)
       await sendMessage(ctx, res.error)
       return false

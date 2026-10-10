@@ -7,6 +7,7 @@
 
 import { existsSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
+import { PROBE_SPAWN } from '../util/spawn-timeout';
 import type { WhisperProbe } from './voice';
 
 function isFile(p: string): boolean {
@@ -29,7 +30,7 @@ function isExecutableFile(p: string): boolean {
 
 function onPath(bin: string): string | undefined {
   try {
-    const proc = Bun.spawnSync(['which', bin], { stdout: 'pipe', stderr: 'ignore' });
+    const proc = Bun.spawnSync(['which', bin], { stdout: 'pipe', stderr: 'ignore', ...PROBE_SPAWN });
     if (proc.exitCode === 0) {
       const out = proc.stdout.toString().trim();
       if (out) return out;

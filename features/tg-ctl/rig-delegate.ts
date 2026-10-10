@@ -25,6 +25,7 @@
 import { existsSync, readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { ADMIN_SPAWN } from '../util/spawn-timeout';
 
 // Mirrors rig-cli's own `_DEFAULT_SOURCE_CANDIDATES` (riglib/catalog.py) so both tools agree on
 // where an agent-tools checkout is expected to live when no override is set.
@@ -70,6 +71,7 @@ export function detectRig(env: Record<string, string | undefined> = process.env)
       env: delegateEnv(env, lib),
       stdout: 'pipe',
       stderr: 'ignore',
+      ...ADMIN_SPAWN,
     });
     if (proc.exitCode === 0) {
       const rigPath = proc.stdout.toString().trim();
@@ -115,6 +117,7 @@ export function runRigDelegate(
       cwd,
       stdout: 'pipe',
       stderr: 'pipe',
+      ...ADMIN_SPAWN,
     });
     return { ran: true, exitCode: proc.exitCode, stderr: proc.stderr.toString() };
   } catch (err) {

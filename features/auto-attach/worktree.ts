@@ -28,6 +28,7 @@
 //   (no `..` traversal escaping the root) — see `resolveAcrossWorktrees`.
 
 import { isAbsolute, resolve, sep } from 'path';
+import { PROBE_SPAWN } from '../util/spawn-timeout';
 
 // One git worktree: its checkout root and the branch it currently has checked
 // out (null for a detached HEAD or a bare entry).
@@ -204,6 +205,7 @@ export const runGitReal: RunGit = (args) => {
     const proc = Bun.spawnSync(['git', ...args], {
       stdout: 'pipe',
       stderr: 'ignore',
+      ...PROBE_SPAWN,
     });
     if (proc.exitCode !== 0) return null;
     return proc.stdout.toString();

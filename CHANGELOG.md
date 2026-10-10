@@ -3,6 +3,23 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.7
+
+- **A slow `lsof` or a wedged tmux server no longer stalls a `tg` send or the `tg-ctl` daemon
+  (#481, #567).** `tg` ran `lsof -p <omp>` on every send from inside an omp with no timeout; on a
+  long-lived omp that took tens of seconds per report. An omp's session files and cwd now come
+  from procfs where it exists (Linux, no subprocess), else from an `lsof` bounded at 2 s, and a
+  timeout just drops the harness title. Every other synchronous subprocess `tg` and `tg-ctl` start
+  is bounded too (`features/util/spawn-timeout.ts`): read-only tmux/ps/lsof/git probes at 2 s,
+  tmux typing and window creation at 5 s, launchctl/systemctl/rig installs at 60 s. Every tmux call
+  of the daemon goes through one helper that logs a timeout with its subcommand. A hung `tmux
+  capture-pane` in the submit check reads as "box not readable" instead of freezing the daemon's
+  poll loop, hook socket and taps; a hung `send-keys` is recorded `uncertain` in the delivery
+  ledger (the keys may have landed), the CTO is told it may or may not have arrived, and no path
+  invites a re-send (late tap, post-timeout reply, deferred flush, auto-continue, grant notice
+  treat it like an unsubmitted message). `tg` stops calling tmux for the rest of a send after one
+  timeout, so a wedged server costs one bound, not one per query.
+
 ## 1.55.6
 
 - **The test suite no longer reads the machine it runs on, and no longer parks the daemon under test

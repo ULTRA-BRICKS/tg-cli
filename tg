@@ -71,10 +71,11 @@ import { runReplies } from "./features/replies/cli"
 import { resolveWindowPanes } from "./features/replies/window"
 import { agentNameFromDisplayLine } from "./features/tg-ctl/agent-name"
 import { detectAgentViaAncestry, detectAncestorAgent, isProcessRunning } from "./features/branding/detect"
-import { outboundOriginPaneId, parseLsofJsonlPaths, parseOmpSessionMeta, pickPrimaryOmpSessionFile } from "./features/tg-ctl/omp"
+import { outboundOriginPaneId, parseOmpSessionMeta, pickPrimaryOmpSessionFile } from "./features/tg-ctl/omp"
 import { hostDisplayName } from "./features/tg-ctl/host-registry"
 import { readOwnHostRecord } from "./features/tg-ctl/host-registry-fs"
-import { parseLsofCwd } from "./features/tg-ctl/unreachable"
+import { cwdOfPid, jsonlPathsOfPid, pidFilesIo } from "./features/tg-ctl/pid-files"
+import { PROBE_SPAWN } from "./features/util/spawn-timeout"
 import { parseRegistry } from "./features/tg-ctl/session-registry-store"
 import { resolveRouteSession, type RouteOrigin } from "./features/tg-ctl/session-target"
 import { resolveSessionName, titleFromPaneTitle } from "./features/tg-ctl/session-name"
@@ -410,6 +411,21 @@ Only those HTML tags are supported. Escape raw <, >, and & outside tags as
 &lt;, &gt;, and &amp;.
 `
 
+// One tmux query for this `tg` run: stdout on exit 0, else null (tmux missing, pane gone,
+// timeout). Bounded by PROBE_SPAWN; after one timeout the server is taken as wedged and no
+// further tmux call is made — every query of the send would hang the same way (tg-cli#481).
+let tmuxWedged = false
+function tmuxQuery(args: string[]): string | null {
+  if (tmuxWedged) return null
+  try {
+    const result = Bun.spawnSync(["tmux", ...args], { stdout: "pipe", stderr: "pipe", ...PROBE_SPAWN })
+    if (result.exitedDueToTimeout) tmuxWedged = true
+    return result.exitCode === 0 ? result.stdout.toString() : null
+  } catch {
+    return null // tmux binary not on PATH
+  }
+}
+
 // The human AGENT NAME for THIS shell's tmux pane — the SAME derivation the
 // daemon stamps on inbound records (resolveSessionName().primary over #{window_name} +
 // #{pane_current_path}). Used by BOTH the `tg replies` read path (its default
@@ -421,19 +437,11 @@ Only those HTML tags are supported. Escape raw <, >, and & outside tags as
 function currentPaneAgentName(): string | null {
   const pane = process.env.TMUX_PANE
   if (!process.env.TMUX || !pane) return null
-  try {
-    const result = Bun.spawnSync(
-      ["tmux", "display-message", "-p", "-t", pane, "#{window_name}\t#{pane_current_path}"],
-      { stdout: "pipe", stderr: "pipe" },
-    )
-    if (result.exitCode !== 0) return null
-    // Parse via the shared helper: it splits on the FIRST tab and strips only the trailing
-    // newline, so an empty window name (a bare/auto-named pane — the cwd-fallback case) keeps
-    // the path in the right slot instead of a blanket .trim() eating the tab delimiter.
-    return agentNameFromDisplayLine(new TextDecoder().decode(result.stdout))
-  } catch {
-    return null // tmux missing / pane gone
-  }
+  const out = tmuxQuery(["display-message", "-p", "-t", pane, "#{window_name}\t#{pane_current_path}"])
+  // Parse via the shared helper: it splits on the FIRST tab and strips only the trailing
+  // newline, so an empty window name (a bare/auto-named pane — the cwd-fallback case) keeps
+  // the path in the right slot instead of a blanket .trim() eating the tab delimiter.
+  return out === null ? null : agentNameFromDisplayLine(out)
 }
 
 // sessions.json (the daemon is its only writer; `tg` only reads it). Absent or
@@ -572,15 +580,8 @@ if (import.meta.main) {
     // and just parses this output. pane_id FIRST + TAB so space-containing window
     // names survive the split.
     const runTmuxListPanes = (): { exitCode: number; stdout: string } | null => {
-      try {
-        const res = Bun.spawnSync(["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{window_name}"], {
-          stdout: "pipe",
-          stderr: "pipe",
-        })
-        return { exitCode: res.exitCode, stdout: new TextDecoder().decode(res.stdout) }
-      } catch {
-        return null // tmux binary not on PATH
-      }
+      const stdout = tmuxQuery(["list-panes", "-a", "-F", "#{pane_id}\t#{window_name}"])
+      return stdout === null ? null : { exitCode: 0, stdout }
     }
     const code = runReplies(rawArgs, {
       readHistory: () => {
@@ -913,23 +914,13 @@ if (import.meta.main) {
   const getTmuxPane = (): { windowName: string; panePath: string } | null => {
     const pane = process.env.TMUX_PANE
     if (!process.env.TMUX || !pane) return null
-    try {
-      const result = Bun.spawnSync(
-        ["tmux", "display-message", "-p", "-t", pane, "#{window_name}\t#{pane_current_path}"], {
-        stdout: "pipe",
-        stderr: "pipe",
-      })
-      if (result.exitCode === 0) {
-        const raw = new TextDecoder().decode(result.stdout).replace(/\r?\n$/, "")
-        const tab = raw.indexOf("\t")
-        const windowName = tab >= 0 ? raw.slice(0, tab) : raw
-        const panePath = tab >= 0 ? raw.slice(tab + 1) : ""
-        if (windowName || panePath) return { windowName, panePath }
-      }
-    } catch {
-      // ignore — tmux not available or not in a pane
-    }
-    return null
+    const out = tmuxQuery(["display-message", "-p", "-t", pane, "#{window_name}\t#{pane_current_path}"])
+    if (out === null) return null
+    const raw = out.replace(/\r?\n$/, "")
+    const tab = raw.indexOf("\t")
+    const windowName = tab >= 0 ? raw.slice(0, tab) : raw
+    const panePath = tab >= 0 ? raw.slice(tab + 1) : ""
+    return windowName || panePath ? { windowName, panePath } : null
   }
 
   // The harness title a non-omp agent (Claude Code: `✳ <title>`) paints into its tmux
@@ -937,34 +928,26 @@ if (import.meta.main) {
   const getPaneTitle = (): string => {
     const pane = process.env.TMUX_PANE
     if (!process.env.TMUX || !pane) return ""
-    try {
-      const result = Bun.spawnSync(["tmux", "display-message", "-p", "-t", pane, "#{pane_title}"], {
-        stdout: "pipe",
-        stderr: "pipe",
-      })
-      return result.exitCode === 0 ? titleFromPaneTitle(new TextDecoder().decode(result.stdout)) : ""
-    } catch {
-      return ""
-    }
+    const out = tmuxQuery(["display-message", "-p", "-t", pane, "#{pane_title}"])
+    return out === null ? "" : titleFromPaneTitle(out)
   }
 
+  // The omp ancestor's open files and cwd: procfs, else a bounded lsof
+  // (features/tg-ctl/pid-files.ts, tg-cli#481). One io for the run, so an lsof that timed
+  // out on that omp is not asked again for its cwd.
+  const ompFilesIo = pidFilesIo({ giveUpAfterTimeout: true })
+
   // The omp session's own title + cwd, from its primary session jsonl (`type:title` /
-  // `session.title`, `session.cwd`) found via lsof on the omp pid.
+  // `session.title`, `session.cwd`) found among the files the omp pid holds open.
   const getOmpSession = (ompPid: number | null): { title: string; cwd: string } => {
     if (ompPid === null) return { title: "", cwd: "" }
     try {
-      const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(ompPid), "-Fn", "-n", "-P"], {
-        stdout: "pipe",
-        stderr: "pipe",
-      })
-      if (lsof.exitCode !== 0) return { title: "", cwd: "" }
-      const paths = parseLsofJsonlPaths(new TextDecoder().decode(lsof.stdout))
-      const sessionFile = pickPrimaryOmpSessionFile(paths)
+      const sessionFile = pickPrimaryOmpSessionFile(jsonlPathsOfPid(ompPid, ompFilesIo))
       if (!sessionFile) return { title: "", cwd: "" }
       const meta = parseOmpSessionMeta(readFileSync(sessionFile, "utf8"))
       return { title: meta.title ?? "", cwd: meta.cwd ?? "" }
     } catch {
-      return { title: "", cwd: "" }
+      return { title: "", cwd: "" } // lsof missing / session file unreadable
     }
   }
 
@@ -1659,18 +1642,10 @@ if (import.meta.main) {
   const queryPanePath = (): string | null => {
     if (!TMUX_PANE && ompAncestorPid) {
       try {
-        const result = Bun.spawnSync(
-          ["lsof", "-a", "-p", String(ompAncestorPid), "-d", "cwd", "-Fn"],
-          { stdout: "pipe", stderr: "pipe" },
-        )
-        if (result.exitCode === 0) {
-          const cwd = parseLsofCwd(new TextDecoder().decode(result.stdout))
-          if (cwd) return cwd
-        }
+        return cwdOfPid(ompAncestorPid, ompFilesIo)
       } catch {
-        // lsof missing — fall back to process.cwd() in resolveRouteCwd
+        return null // lsof missing — fall back to process.cwd() in resolveRouteCwd
       }
-      return null
     }
     if (!TMUX_PANE) return ownHost?.cwd ?? null
     return readOriginPane().path
@@ -1683,25 +1658,19 @@ if (import.meta.main) {
     if (originPane) return originPane
     originPane = { path: null }
     if (!TMUX_PANE) return originPane
-    try {
-      const result = Bun.spawnSync(
-        ["tmux", "display-message", "-p", "-t", TMUX_PANE, "#{pane_current_path}\t#{pid}\t#{pane_pid}"],
-        { stdout: "pipe", stderr: "pipe" },
-      )
-      if (result.exitCode === 0) {
-        // The pids are the LAST two fields: a pane path may itself contain a tab.
-        const fields = new TextDecoder().decode(result.stdout).replace(/\r?\n$/, "").split("\t")
-        const panePid = fields.pop()
-        const serverPid = fields.pop()
-        const path = fields.join("\t")
-        originPane = {
-          path: path || null,
-          ...(Number(serverPid) > 0 ? { serverPid: Number(serverPid) } : {}),
-          ...(Number(panePid) > 0 ? { panePid: Number(panePid) } : {}),
-        }
+    // tmux missing / pane gone / timed out → path null: resolveRouteCwd falls back to process.cwd().
+    const out = tmuxQuery(["display-message", "-p", "-t", TMUX_PANE, "#{pane_current_path}\t#{pid}\t#{pane_pid}"])
+    if (out !== null) {
+      // The pids are the LAST two fields: a pane path may itself contain a tab.
+      const fields = out.replace(/\r?\n$/, "").split("\t")
+      const panePid = fields.pop()
+      const serverPid = fields.pop()
+      const path = fields.join("\t")
+      originPane = {
+        path: path || null,
+        ...(Number(serverPid) > 0 ? { serverPid: Number(serverPid) } : {}),
+        ...(Number(panePid) > 0 ? { panePid: Number(panePid) } : {}),
       }
-    } catch {
-      // tmux missing / pane gone — fall back to process.cwd() in resolveRouteCwd
     }
     return originPane
   }

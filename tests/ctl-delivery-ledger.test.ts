@@ -9,6 +9,7 @@ import {
   emptyLedgerState,
   ledgerKey,
   lostPickerHolds,
+  mayHaveLanded,
   orphanedClaims,
   parseLedger,
   serializeLedgerEvents,
@@ -108,5 +109,17 @@ describe('sinkOutcomeEvent', () => {
     expect(ev).toEqual({ ts: 5, event: 'uncertain', ...base });
     const state = fold([ev]);
     expect(decideDelivery(state.messages.get(ledgerKey(CHAT, 9))).kind).toBe('suppress');
+  });
+});
+
+// tg-cli#481: every caller that would invite a re-send (re-tap, reply again, resend it, queue to
+// the inbox) must hold back when the text may already sit in the pane.
+describe('mayHaveLanded', () => {
+  test('unsubmitted and uncertain may have landed; delivered and a proven failure did not', () => {
+    expect(mayHaveLanded({ ok: false, error: 'still in the box', unsubmitted: true })).toBe(true);
+    expect(mayHaveLanded({ ok: false, error: 'tmux did not answer', uncertain: true })).toBe(true);
+    expect(mayHaveLanded({ ok: false, error: 'pane gone' })).toBe(false);
+    expect(mayHaveLanded({ ok: false, error: 'pane gone', uncertain: false })).toBe(false);
+    expect(mayHaveLanded({ ok: true })).toBe(false);
   });
 });

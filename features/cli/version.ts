@@ -8,6 +8,7 @@
 import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { PROBE_SPAWN } from '../util/spawn-timeout';
 
 /**
  * Read the `version` field from a repo's package.json. `package.json` is the
@@ -49,7 +50,7 @@ export const VERSION = resolveVersion(PACKAGE_ROOT);
  */
 export function gitShortHash(scriptDir: string): string {
   try {
-    const proc = Bun.spawnSync(['git', '-C', scriptDir, 'rev-parse', '--short', 'HEAD']);
+    const proc = Bun.spawnSync(['git', '-C', scriptDir, 'rev-parse', '--short', 'HEAD'], PROBE_SPAWN);
     if (proc.exitCode === 0) {
       const hash = proc.stdout.toString().trim();
       if (hash) return hash;

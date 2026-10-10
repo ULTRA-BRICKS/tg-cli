@@ -174,6 +174,20 @@ captures — add a new harness or version there from a live capture, never a han
 Every plan that types into a pane (text, digit, key) takes the pane's turn (`paneTypingKey`, then the
 `pane-locks/` lock file) — a retry Enter is only safe while nothing else is typing into that box.
 
+### Every synchronous spawn is bounded (#481, #567)
+
+`Bun.spawnSync` blocks the whole `tg` send and the daemon's single event loop. Every call in
+`tg`, `tg-ctl` and `features/` spreads a bound from `features/util/spawn-timeout.ts`
+(`PROBE_SPAWN` 2 s for read-only tmux/ps/lsof/git/which queries, `TMUX_WRITE_SPAWN` 5 s for
+send-keys/buffers/new-window, `ADMIN_SPAWN` 60 s for launchctl/systemctl/rig installs);
+`tests/spawn-timeout-audit.test.ts` fails on one that names no timeout. tmux is spawned from ONE
+helper per entrypoint — `tmuxSync` in `tg-ctl` (logs a timeout with its subcommand), `tmuxQuery`
+in `tg` (after one timeout the rest of the run skips tmux) — and the audit test pins that. A
+timed-out probe reads as "unknown"; a timed-out tmux step of an inject plan fails `uncertain`
+(tmux may have applied it): the ledger records it, and every caller that would invite a re-send
+checks `mayHaveLanded` (`delivery-ledger.ts`) and reports instead. An omp's open session files and
+cwd come from procfs where it exists, else a bounded lsof (`features/tg-ctl/pid-files.ts`).
+
 ### Existing Features
 
 - `features/agent-role/` — pure coordinator-vs-subagent model (`docs/specs/agent-role-model.md`,

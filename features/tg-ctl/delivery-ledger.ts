@@ -188,6 +188,13 @@ export function decideDelivery(prior: MessageState | undefined): DeliveryDecisio
 // final for the same reason.
 export type SinkResult = { ok: true } | { ok: false; error: string; uncertain?: boolean; unsubmitted?: true };
 
+// The text may sit in the pane — still in the box (`unsubmitted`) or written before the sink
+// lost its connection or hit its bound (`uncertain`, tg-cli#481): the caller reports `error` to the
+// CTO and must not invite a re-send (re-tap, reply again, resend, inbox queue) — it could land twice.
+export function mayHaveLanded(res: SinkResult): boolean {
+  return !res.ok && (res.unsubmitted === true || res.uncertain === true);
+}
+
 // The outcome event a sink's result writes, closing the claim that preceded the send.
 export function sinkOutcomeEvent(ts: number, base: { chat: number; msg: number; target: string }, res: SinkResult): LedgerEvent {
   if (res.ok) return { ts, event: 'delivered', ...base };

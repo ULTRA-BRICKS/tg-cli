@@ -3,12 +3,14 @@
 // unchanged. Real spawns live here (the entrypoint imports these); the pure
 // process-tree parsing is reused from features/tg-ctl/discover.
 import { findAgentInAncestry, parseProcList } from "../tg-ctl/discover"
+import { PROBE_SPAWN } from "../util/spawn-timeout"
 
 export function isProcessRunning(name: string): boolean {
   try {
     const result = Bun.spawnSync(["pgrep", "-x", name], {
       stdout: "pipe",
       stderr: "pipe",
+      ...PROBE_SPAWN,
     })
     return result.exitCode === 0
   } catch {
@@ -29,6 +31,7 @@ export function detectAncestorAgent(): { agent: string; pid: number } | null {
     const result = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="], {
       stdout: "pipe",
       stderr: "pipe",
+      ...PROBE_SPAWN,
     })
     if (result.exitCode !== 0) return null
     const procs = parseProcList(new TextDecoder().decode(result.stdout))

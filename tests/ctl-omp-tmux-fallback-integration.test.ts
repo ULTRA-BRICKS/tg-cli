@@ -24,6 +24,10 @@ function environment() {
   const tmuxLog = join(cfg, 'tmux.log'); writeFileSync(tmuxLog, '');
   const spawnLog = join(cfg, 'spawn.log'); writeFileSync(spawnLog, '');
   const pid = process.pid; // the omp "process" is this runner, so the endpoint (if any) is real
+  // ...and it really holds its session jsonl open: procfs (Linux) reads the runner's own fds;
+  // the lsof shim below answers the same on hosts without procfs (tg-cli#481).
+  const sessionFd = openSync(sessionFile, 'r');
+  cleanup.push(() => closeSync(sessionFd));
   const scripts: Record<string, string> = {
     tmux: `#!/bin/sh\ncase "$*" in\n  *list-panes*) printf 'main\\t0\\t%%9\\t5001\\tbun\\tomp-win\\t/work/omp-pane\\n' ;;\n  *) echo "$*" >> '${tmuxLog}' ;;\nesac\nexit 0\n`,
     ps: `#!/bin/sh\ncase "$*" in *tty*) printf '${pid} ttys099\\n';; *) printf '    1     0 /sbin/launchd\\n 5001     1 /bin/zsh -l\\n ${pid}  5001 /opt/homebrew/bin/omp\\n';; esac\n`,

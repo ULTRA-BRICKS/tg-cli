@@ -12,6 +12,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync } from 
 import { homedir } from 'os';
 import { dirname, join } from 'path';
 import { escapeRegExp } from '../util/regex';
+import { PROBE_SPAWN } from '../util/spawn-timeout';
 
 // Read a UTF-8 file, returning undefined when it does not exist (ENOENT) and
 // re-throwing any other error. Replaces an `existsSync(p) ? readFileSync(p) : …`
@@ -295,7 +296,7 @@ const HOOK_COMMAND =
   `cat "$d"/*.md; }' ${HOOK_MARKER}`;
 
 function detected(cmd: string, ...dirs: string[]): boolean {
-  const probe = Bun.spawnSync(['sh', '-c', `command -v ${cmd}`], { stdout: 'ignore', stderr: 'ignore' });
+  const probe = Bun.spawnSync(['sh', '-c', `command -v ${cmd}`], { stdout: 'ignore', stderr: 'ignore', ...PROBE_SPAWN });
   if (probe.exitCode === 0) return true;
   const home = resolveHome();
   return dirs.some((d) => existsSync(d.startsWith('~/') ? join(home, d.slice(2)) : d));
