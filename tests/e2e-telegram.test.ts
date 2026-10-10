@@ -2,9 +2,12 @@
 // chat/daemon/fixture world. The live run itself is scripts/e2e-telegram.ts.
 import { describe, expect, test } from 'bun:test';
 import {
+  ffmpegHasFlite,
   parseClaudeAuthStatus,
   planFixtures,
+  planVoice,
   randomToken,
+  resolveFixtures,
   restoreDecision,
   scenarioToken,
   selectorCollides,
@@ -351,6 +354,38 @@ describe('runE2E', () => {
     expect(report.cleanupErrors).toEqual([]);
     expect(report.screenshotError).toContain('render hiccup');
   });
+
+  test('a fixture skipped in preflight is an explicit skip row; the run still passes', async () => {
+    const world = new World(specs(['omp']));
+    const report = await world.run({ skippedFixtures: [{ kind: 'cc', reason: 'claude not installed' }] });
+    const row = report.scenarios.find((s) => s.name === 'start:cc');
+    expect(row).toEqual({ name: 'start:cc', status: 'skip', detail: 'claude not installed', evidence: {} });
+    expect(statusOf(report)['agent-route:omp']).toBe('pass');
+    expect(report.ok).toBe(true);
+  });
+
+  test('with no text-to-speech the voice note is skipped with the reason and never synthesized', async () => {
+    const world = new World(specs(['omp']));
+    let synthesized = 0;
+    const report = await runE2E(
+      {
+        chat: world.chat(),
+        host: world.host(),
+        anchor: { read: () => world.anchor, write: (c) => (world.anchor = c) },
+        voiceFile: async () => {
+          synthesized++;
+          return '/tmp/v.ogg';
+        },
+        now: () => world.clock,
+        sleep: async (ms) => { world.clock += ms; },
+        log: () => {},
+      },
+      { run: 'r1', fixtures: world.fixtures, voiceNumber: 42, readyTimeoutSec: 30, agentTimeoutSec: 30, botTimeoutSec: 10, deliveryTimeoutSec: 5, voiceSkipReason: 'no text-to-speech' },
+    );
+    expect(report.scenarios.find((s) => s.name === 'voice-note')).toEqual({ name: 'voice-note', status: 'skip', detail: 'no text-to-speech', evidence: {} });
+    expect(synthesized).toBe(0);
+    expect(report.ok).toBe(true);
+  });
 });
 
 describe('planFixtures', () => {
@@ -450,5 +485,118 @@ describe('transcriptHasNumber', () => {
     expect(transcriptHasNumber('Telegram test number forty-two.', 42)).toBe(true);
     expect(transcriptHasNumber('Telegram test number 142.', 42)).toBe(false);
     expect(transcriptHasNumber('Telegram test number forty.', 42)).toBe(false);
+  });
+});
+
+describe('resolveFixtures', () => {
+  const only = (...bins: string[]) => (bin: string) => bins.includes(bin);
+
+  test('a fixture whose harness binary is missing is skipped with the reason; the others run', () => {
+    const r = resolveFixtures(['omp', 'cc', 'omp-notmux'], [], only('omp', 'abduco'));
+    expect(r.run).toEqual(['omp', 'omp-notmux']);
+    expect(r.skipped).toEqual([{ kind: 'cc', reason: 'claude not installed (pass --require cc to make this fatal)' }]);
+    expect(r.error).toBeNull();
+  });
+
+  test('omp outside tmux also needs abduco', () => {
+    const r = resolveFixtures(['omp', 'omp-notmux'], [], only('omp'));
+    expect(r.run).toEqual(['omp']);
+    expect(r.skipped).toEqual([{ kind: 'omp-notmux', reason: 'abduco not installed (pass --require omp-notmux to make this fatal)' }]);
+  });
+
+  test('--require turns a missing harness binary into a preflight error', () => {
+    const r = resolveFixtures(['omp', 'cc'], ['cc'], only('omp'));
+    expect(r.error).toBe('missing required binaries: claude (--require cc)');
+  });
+
+  test('a required kind outside --fixtures joins the run', () => {
+    const r = resolveFixtures(['omp'], ['codex'], only('omp', 'codex'));
+    expect(r.run).toEqual(['omp', 'codex']);
+    expect(r.error).toBeNull();
+  });
+
+  test('a run with no runnable fixture is an error naming every skip', () => {
+    const r = resolveFixtures(['cc'], [], only());
+    expect(r.run).toEqual([]);
+    expect(r.error).toBe('no runnable fixture: cc: claude not installed');
+  });
+});
+
+describe('planVoice', () => {
+  const env = (platform: string, bins: string[], extra: { ffmpegFilters?: string; piperModel?: string } = {}) => ({
+    platform,
+    has: (bin: string) => bins.includes(bin),
+    ffmpegFilters: () => extra.ffmpegFilters ?? '',
+    piperModel: extra.piperModel,
+  });
+  const phrase = 'Telegram test number 42.';
+  const encode = (source: string) => ['ffmpeg', '-loglevel', 'error', '-y', '-i', source, '-ac', '1', '-ar', '48000', '-c:a', 'libopus', '-b:a', '32k', '/o/voice-42.ogg'];
+
+  test('macOS uses say', () => {
+    expect(planVoice(env('darwin', ['say', 'espeak-ng', 'ffmpeg']), phrase, '/o/voice-42')).toEqual({
+      engine: 'say',
+      synth: { cmd: ['say', '-o', '/o/voice-42.aiff', phrase] },
+      encode: encode('/o/voice-42.aiff'),
+      ogg: '/o/voice-42.ogg',
+    });
+  });
+
+  test('macOS without say falls back like Linux', () => {
+    expect(planVoice(env('darwin', ['espeak-ng', 'ffmpeg']), phrase, '/o/voice-42')).toMatchObject({ engine: 'espeak-ng' });
+  });
+
+  test('Linux falls back to espeak-ng, then espeak', () => {
+    expect(planVoice(env('linux', ['espeak-ng', 'espeak', 'ffmpeg']), phrase, '/o/voice-42')).toMatchObject({
+      engine: 'espeak-ng',
+      synth: { cmd: ['espeak-ng', '-w', '/o/voice-42.wav', phrase] },
+      encode: encode('/o/voice-42.wav'),
+    });
+    expect(planVoice(env('linux', ['espeak', 'ffmpeg']), phrase, '/o/voice-42')).toMatchObject({ engine: 'espeak' });
+  });
+
+  test('ffmpeg filters are probed only when the flite fallback is reached', () => {
+    const probing = { ...env('linux', ['espeak-ng', 'ffmpeg']), ffmpegFilters: () => { throw new Error('probed'); } };
+    expect(planVoice(probing, phrase, '/o/voice-42')).toMatchObject({ engine: 'espeak-ng' });
+  });
+
+  test('piper is used only with a voice model, reading the phrase on stdin', () => {
+    expect(planVoice(env('linux', ['piper', 'ffmpeg']), phrase, '/o/voice-42')).toMatchObject({ engine: null });
+    expect(planVoice(env('linux', ['piper', 'ffmpeg'], { piperModel: '/m/en.onnx' }), phrase, '/o/voice-42')).toMatchObject({
+      engine: 'piper',
+      synth: { cmd: ['piper', '--model', '/m/en.onnx', '--output_file', '/o/voice-42.wav'], stdin: phrase },
+    });
+  });
+
+  test('an ffmpeg built with libflite speaks the phrase itself', () => {
+    const filters = ' ... flite             |->A       Synthesize voice from text using libflite.\n';
+    expect(planVoice(env('linux', ['ffmpeg'], { ffmpegFilters: filters }), phrase, '/o/voice-42')).toMatchObject({
+      engine: 'ffmpeg-flite',
+      synth: { cmd: ['ffmpeg', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', `flite=text='${phrase}'`, '/o/voice-42.wav'] },
+    });
+  });
+
+  test('the flite text keeps only letters, digits, spaces and periods, so it cannot break the filter quoting', () => {
+    const filters = ' ... flite             |->A       Synthesize voice from text using libflite.\n';
+    const plan = planVoice(env('linux', ['ffmpeg'], { ffmpegFilters: filters }), "Don't: say [42], ok\\", '/o/voice-42');
+    expect(plan.engine === 'ffmpeg-flite' && plan.synth.cmd[7]).toBe("flite=text='Don t  say  42   ok '");
+  });
+
+  test('no text-to-speech engine: a skip reason naming the Linux options, never a tone', () => {
+    const plan = planVoice(env('linux', ['ffmpeg', 'say']), phrase, '/o/voice-42');
+    expect(plan.engine).toBeNull();
+    if (plan.engine === null) expect(plan.reason).toContain('espeak-ng');
+  });
+
+  test('no ffmpeg: a skip reason naming ffmpeg', () => {
+    const plan = planVoice(env('darwin', ['say']), phrase, '/o/voice-42');
+    expect(plan.engine).toBeNull();
+    if (plan.engine === null) expect(plan.reason).toContain('ffmpeg');
+  });
+});
+
+describe('ffmpegHasFlite', () => {
+  test('finds the flite filter row in `ffmpeg -filters`', () => {
+    expect(ffmpegHasFlite(' ... flite             |->A       Synthesize voice from text using libflite.')).toBe(true);
+    expect(ffmpegHasFlite(' .. sine              |->A       Generate sine wave audio signal.')).toBe(false);
   });
 });

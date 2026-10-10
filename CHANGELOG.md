@@ -3,6 +3,19 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.18
+
+- **The live Telegram e2e runs on Linux (#563).** `bun scripts/e2e-telegram.ts` always required
+  macOS `say` and every selected fixture's harness, so on Linux even `--dry-run` exited 4
+  (`missing required binaries: say, claude`). Requirements are now per scenario: a fixture whose
+  binary is missing (`claude`, `codex`, `omp`, `abduco`) is reported as a `skip` row in
+  `report.json` and the rest of the run goes on; `--require <kinds>` makes a missing one fatal
+  (exit 4) again. The voice note is made by `say` on macOS, else `espeak-ng`, `espeak`, `piper`
+  (with `TG_E2E_PIPER_MODEL`) or ffmpeg's libflite filter; with none of them the voice-note
+  scenario is skipped with the reason instead of failing the run. A generated tone is not used:
+  the scenario checks that Whisper heard the spoken number. `--help` and AGENTS.md list the
+  Linux prerequisites.
+
 ## 1.55.17
 
 - **The `--tag decision` format gate checks each section by its own content (#216).** Options now

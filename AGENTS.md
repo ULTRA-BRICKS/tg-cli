@@ -630,7 +630,15 @@ in/outside tmux, Claude Code in tmux, codex on request) with random collision-ch
 `/agent` selectors, and removes them afterwards. Every message it sends is a reply, because
 with the bot's threaded mode on a non-reply client message starts a new topic. Use its
 `report.json` + `chat.png` as live acceptance proof for M1–M4 tickets; pure logic and the
-runner live in `features/e2e-telegram/` (tests/e2e-telegram.test.ts).
+runner live in `features/e2e-telegram/` (tests/e2e-telegram.test.ts). Prerequisites per
+scenario (tg-cli#563): a fixture whose binary is missing (`claude` for cc, `codex`, `omp`,
+`abduco` for omp-notmux) is a `skip` row in `report.json` and the run goes on, unless it is
+named in `--require <kinds>` (then exit 4). The voice note needs ffmpeg plus a
+text-to-speech engine: `say` on macOS; on Linux `espeak-ng` (`brew install espeak-ng` or
+`apt install espeak-ng`, no sudo with brew), `espeak`, `piper` with
+`TG_E2E_PIPER_MODEL=<voice.onnx>`, or an ffmpeg built with libflite. With none of them the
+voice-note scenario is skipped with that reason — never a generated tone, since the scenario
+checks that Whisper heard the spoken number.
 
 **Never verify against the native Telegram Desktop app** — checking that a send/reply/hatch
 flow actually works means reading the message through a client, but that client MUST be

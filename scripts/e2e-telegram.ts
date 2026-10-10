@@ -28,7 +28,9 @@ import {
   isFixtureKind,
   parseClaudeAuthStatus,
   planFixtures,
+  planVoice,
   randomToken,
+  resolveFixtures,
   statusNames,
   voicePhrase,
   type FixtureKind,
@@ -47,23 +49,34 @@ import {
 } from '../features/e2e-telegram/runner';
 
 const HELP = `usage: bun scripts/e2e-telegram.ts [--dry-run] [--fixtures omp,cc,omp-notmux[,codex]]
-                                    [--model <cheap model>] [--codex-model <model>] [--out <dir>]
+                                    [--require <kinds>] [--model <cheap model>]
+                                    [--codex-model <model>] [--out <dir>]
 
 Live e2e of the tg bot through the CTO's headless Telegram Web client (qa-cli).
-Requires: the tg-ctl daemon running (never started here), \`qa telegram login\` done,
-\`claude auth login\` done for ~/.claude (cc fixture), tmux, abduco (omp-notmux), omp / claude / codex, say + ffmpeg (voice).
+Requires: the tg-ctl daemon running (never started here), \`qa telegram login\` done, tmux.
+Per fixture: omp (omp), omp-notmux (omp + abduco), cc (claude, with \`claude auth login\`
+done for ~/.claude), codex (codex). A fixture whose binary is missing is reported as a
+skip and the run goes on, unless it is named in --require.
+Voice note: ffmpeg (with libopus) plus a text-to-speech engine — say on macOS; on Linux
+espeak-ng (\`brew install espeak-ng\` / \`apt install espeak-ng\`), espeak, piper with
+TG_E2E_PIPER_MODEL=<voice.onnx>, or an ffmpeg built with libflite. Without one the
+voice-note scenario is reported as a skip with the reason.
 
   --dry-run      preflight only: daemon, Telegram Web login, binaries, collision-free
                  /agent selectors; prints the plan; sends nothing, starts nothing
   --fixtures     fixture kinds (default ${DEFAULT_FIXTURES.join(',')}; also: codex)
+  --require      comma-separated fixture kinds that must run: a missing binary for one
+                 of them exits 4 instead of skipping it (a kind not in --fixtures is added)
   --model        model for omp and Claude Code fixtures (default haiku)
   --codex-model  model for the codex fixture (default gpt-5-mini)
   --out          report directory (default ~/.cache/tg-cli-e2e/<run>)
 
 Env: TG_E2E_QA — qa command (default "qa"; e.g. "uv run --project ~/xp/qa-cli qa").
+     TG_E2E_PIPER_MODEL — piper voice model, when piper is the text-to-speech engine.
      TG_CTL_CONFIG_DIR — tg-cli config dir (default ~/.config/tg-cli).
 Exit: 0 all scenarios passed/skipped, 1 a scenario failed, 2 usage, 3 Telegram Web or
-Claude Code (~/.claude) not logged in, 4 tg-ctl daemon not running or a binary missing.`;
+Claude Code (~/.claude) not logged in, 4 tg-ctl daemon not running, a harness binary
+(tmux, tg, tg-ctl) or a --require'd fixture's binary missing, or no fixture can run.`;
 
 const LOCALE_ENV: Record<string, string> = {
   ...Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined)),
@@ -77,11 +90,12 @@ interface RunResult {
   stderr: string;
 }
 
-function sh(cmd: string[], opts: { cwd?: string; env?: Record<string, string>; timeoutSec?: number } = {}): RunResult {
+function sh(cmd: string[], opts: { cwd?: string; env?: Record<string, string>; timeoutSec?: number; input?: string } = {}): RunResult {
   const proc = Bun.spawnSync({
     cmd,
     cwd: opts.cwd,
     env: opts.env ?? LOCALE_ENV,
+    stdin: opts.input === undefined ? 'ignore' : new TextEncoder().encode(opts.input),
     stdout: 'pipe',
     stderr: 'pipe',
     timeout: (opts.timeoutSec ?? 30) * 1000,
@@ -96,7 +110,8 @@ class Blocked extends Error {
 }
 
 function parseArgs(argv: string[]) {
-  const opts = { dryRun: false, fixtures: [...DEFAULT_FIXTURES], model: 'haiku', codexModel: 'gpt-5-mini', out: '' };
+  const required: FixtureKind[] = [];
+  const opts = { dryRun: false, fixtures: [...DEFAULT_FIXTURES], required, model: 'haiku', codexModel: 'gpt-5-mini', out: '' };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     const value = () => {
@@ -105,13 +120,14 @@ function parseArgs(argv: string[]) {
       return v;
     };
     if (arg === '--dry-run') opts.dryRun = true;
-    else if (arg === '--fixtures') {
+    else if (arg === '--fixtures' || arg === '--require') {
       const kinds = value().split(',');
       const bad = kinds.filter((k) => !isFixtureKind(k));
       if (bad.length) throw new Blocked(`unknown fixture kind(s): ${bad.join(', ')}`, 2);
       // The runner tracks one fixture per kind.
       if (new Set(kinds).size !== kinds.length) throw new Blocked(`duplicate fixture kind in ${kinds.join(',')}`, 2);
-      opts.fixtures = kinds.filter(isFixtureKind);
+      if (arg === '--fixtures') opts.fixtures = kinds.filter(isFixtureKind);
+      else opts.required = kinds.filter(isFixtureKind);
     } else if (arg === '--model') opts.model = value();
     else if (arg === '--codex-model') opts.codexModel = value();
     else if (arg === '--out') opts.out = resolve(value());
@@ -415,15 +431,9 @@ function requireClaudeLogin(): void {
   throw new Blocked(`cannot tell whether Claude Code is logged in: \`claude auth status\` gave no usable answer (exit ${status.code}): ${output}`, 4);
 }
 
-function requireBinaries(kinds: readonly FixtureKind[]): void {
-  const needed = new Set(['tmux', 'tg', 'tg-ctl', 'say', 'ffmpeg']);
-  for (const kind of kinds) {
-    if (kind === 'omp' || kind === 'omp-notmux') needed.add('omp');
-    if (kind === 'omp-notmux') needed.add('abduco');
-    if (kind === 'cc') needed.add('claude');
-    if (kind === 'codex') needed.add('codex');
-  }
-  const missing = [...needed].filter((bin) => !Bun.which(bin));
+// What every run needs; each fixture's own binaries are resolveFixtures' call.
+function requireHarnessBinaries(): void {
+  const missing = ['tmux', 'tg', 'tg-ctl'].filter((bin) => !Bun.which(bin));
   if (missing.length) throw new Blocked(`missing required binaries: ${missing.join(', ')}`, 4);
 }
 
@@ -446,8 +456,11 @@ async function main(): Promise<number> {
   if (!/^tg-ctl: running\b/m.test(status.stdout)) {
     throw new Blocked(`tg-ctl daemon is not running — start it first (this harness never starts one):\n${status.stdout}`, 4);
   }
-  requireBinaries(args.fixtures);
-  if (args.fixtures.includes('cc')) requireClaudeLogin();
+  requireHarnessBinaries();
+  const availability = resolveFixtures(args.fixtures, args.required, (bin) => Bun.which(bin) !== null);
+  if (availability.error) throw new Blocked(availability.error, 4);
+  const kinds = availability.run;
+  if (kinds.includes('cc')) requireClaudeLogin();
 
   const chat = qaChat(botId, username);
   try {
@@ -460,19 +473,32 @@ async function main(): Promise<number> {
   }
 
   const run = randomToken(Math.random, 5);
-  const fixtures = planFixtures(args.fixtures, liveNames(status.stdout), Math.random);
+  const fixtures = planFixtures(kinds, liveNames(status.stdout), Math.random);
   const out = args.out || join(homedir(), '.cache', 'tg-cli-e2e', run);
   const voiceNumber = 10 + Math.floor(Math.random() * 90);
+  const voice = planVoice(
+    {
+      platform: process.platform,
+      has: (bin) => Bun.which(bin) !== null,
+      ffmpegFilters: () => sh(['ffmpeg', '-hide_banner', '-filters']).stdout,
+      piperModel: process.env.TG_E2E_PIPER_MODEL || undefined,
+    },
+    voicePhrase(voiceNumber),
+    join(out, `voice-${voiceNumber}`),
+  );
   const plan = {
     run,
     bot: `@${username} (${botId})`,
     threadedMode: bot.has_topics_enabled === true,
-    ...(args.fixtures.includes('cc') ? { claudeForwardsQuestions: claudeHasQuestionHook() } : {}),
+    ...(kinds.includes('cc') ? { claudeForwardsQuestions: claudeHasQuestionHook() } : {}),
     fixtures: fixtures.map((f) => ({ kind: f.kind, selector: f.selector, inTmux: f.inTmux })),
+    skippedFixtures: availability.skipped,
+    voiceEngine: voice.engine,
     scenarios: [
+      ...availability.skipped.map((s) => `start:${s.kind} (skip: ${s.reason})`),
       ...fixtures.flatMap((f) => [`start:${f.kind}`, `ready:${f.kind}`, `agent-route:${f.kind}`, `reply-route:${f.kind}`]),
       'agent-picker',
-      'voice-note',
+      voice.engine ? 'voice-note' : `voice-note (skip: ${voice.reason})`,
       'question-card',
       `topic-routing (skip: ${TOPIC_SKIP_REASON})`,
     ],
@@ -498,13 +524,13 @@ async function main(): Promise<number> {
           renameSync(tmp, anchorPath);
         },
       },
-      async voiceFile(n) {
-        const aiff = join(out, `voice-${n}.aiff`);
-        const ogg = join(out, `voice-${n}.ogg`);
-        if (sh(['say', '-o', aiff, voicePhrase(n)]).code !== 0) throw new Error('say failed');
-        const r = sh(['ffmpeg', '-loglevel', 'error', '-y', '-i', aiff, '-ac', '1', '-ar', '48000', '-c:a', 'libopus', '-b:a', '32k', ogg]);
+      async voiceFile() {
+        if (!voice.engine) throw new Error(voice.reason);
+        const synth = sh(voice.synth.cmd, { input: voice.synth.stdin });
+        if (synth.code !== 0) throw new Error(`${voice.engine} failed: ${synth.stderr.trim()}`);
+        const r = sh(voice.encode);
         if (r.code !== 0) throw new Error(`ffmpeg failed: ${r.stderr.trim()}`);
-        return ogg;
+        return voice.ogg;
       },
       now: () => Date.now(),
       sleep: (ms) => Bun.sleep(ms),
@@ -519,6 +545,8 @@ async function main(): Promise<number> {
       botTimeoutSec: 45,
       deliveryTimeoutSec: 90,
       screenshotPath: join(out, 'chat.png'),
+      skippedFixtures: availability.skipped,
+      ...(voice.engine ? {} : { voiceSkipReason: voice.reason }),
     },
   );
   const full = { ...plan, startedAt: new Date(started).toISOString(), finishedAt: new Date().toISOString(), ...report };
