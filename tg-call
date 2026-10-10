@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Independent Telegram notification-call CLI; no calendar runtime dependency."""
+from pathlib import Path
+import sys
+sys.path.insert(0,str(Path(__file__).resolve().parent / 'features'))
+from telegram_client.cli import main
+if __name__=='__main__': raise SystemExit(main('caller'))

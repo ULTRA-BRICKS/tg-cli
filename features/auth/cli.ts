@@ -23,7 +23,8 @@ import {
   type PendingWaiting,
 } from './binding';
 import { mergeEnvContent } from './env-file';
-import { chatLabel, formatStatus, type BotInfo, type ChatState } from './status';
+import { sessionPath, sessionState } from '../user-account/sidecar';
+import { chatLabel, formatAccounts, formatStatus, type BotInfo, type ChatState } from './status';
 
 export interface AuthDeps {
   configDir: string;
@@ -153,12 +154,25 @@ export async function runAuth(cmd: AuthCommand, deps: AuthDeps): Promise<number>
   return runLogin(cmd, deps);
 }
 
+// The bot half answers with an exit code; the account half (offline, from the session files)
+// is printed after it in every case and never changes that code — scripts keep their 78.
 async function runStatus(deps: AuthDeps, fromAuto: boolean): Promise<number> {
+  const code = await runBotStatus(deps);
+  deps.out(
+    formatAccounts({
+      personal: sessionState(deps.readFile(sessionPath(deps.configDir, 'personal'))),
+      caller: sessionState(deps.readFile(sessionPath(deps.configDir, 'caller'))),
+    }),
+  );
+  if (fromAuto && code === EXIT.ok) deps.out('Already connected. To bind another chat or bot: tg auth login [--token <token>]');
+  return code;
+}
+
+async function runBotStatus(deps: AuthDeps): Promise<number> {
   const cfg = readConfig(deps);
   const token = cfg.merged.TG_BOT_TOKEN;
   if (!token) {
-    deps.err(`tg is not connected to Telegram: no TG_BOT_TOKEN in ${cfg.envPath}.`);
-    deps.err('Run `tg auth` to connect (BotFather token + one Start tap).');
+    deps.out(`bot:    not connected — run \`tg auth\`\nconfig: ${cfg.envPath}`);
     return EXIT.notConfigured;
   }
   const bot = await getBot(deps, token);
@@ -173,7 +187,6 @@ async function runStatus(deps: AuthDeps, fromAuto: boolean): Promise<number> {
   deps.out(formatStatus({ bot, chat, envPath: cfg.envPath, daemonPid: deps.daemonPid(botIdFromToken(token)), fromEnvironment: cfg.fromEnvironment }));
   if (chat.kind === 'unbound') return EXIT.notConfigured;
   if (chat.kind === 'error') return EXIT.failed;
-  if (fromAuto) deps.out('Already connected. To bind another chat or bot: tg auth login [--token <token>]');
   return EXIT.ok;
 }
 

@@ -108,6 +108,14 @@ chmod +x "$ENTRY_PATH"
 ln -sfn "$ENTRY_PATH" "$BIN/$TOOL"
 echo "tg: symlinked $BIN/$TOOL -> $ENTRY_PATH"
 
+# Independent optional clients: no auth or dependency installation during setup.
+for client in tg-mtproto tg-call; do
+  if [[ -f "$SRC/$client" ]]; then
+    chmod +x "$SRC/$client"
+    ln -sfn "$SRC/$client" "$BIN/$client"
+  fi
+done
+
 # tg-ctl ships alongside tg (inbound control daemon: `tg-ctl start/stop/status`).
 if [[ -f "$SRC/tg-ctl" ]]; then
   chmod +x "$SRC/tg-ctl"

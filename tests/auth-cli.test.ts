@@ -79,7 +79,7 @@ function world(opts: { files?: Record<string, string>; env?: Record<string, stri
 
 function cmd(...argv: string[]): AuthCommand {
   const parsed = parseAuthArgs(['auth', ...argv]);
-  if (parsed === null || 'error' in parsed) throw new Error(`bad test argv ${argv.join(' ')}`);
+  if (parsed === null || 'error' in parsed || 'account' in parsed) throw new Error(`bad test argv ${argv.join(' ')}`);
   return parsed;
 }
 
@@ -321,19 +321,45 @@ describe('auto, status, logout', () => {
     expect(w.out.join('\n')).toContain('tg auth login');
   });
 
-  test('status: full block, exit 0', async () => {
-    const w = world({ files: configured });
+  test('status: full block with both accounts, exit 0', async () => {
+    const session = JSON.stringify({ expected_id: 777, api_id: 5, api_hash: 'h', session: 'SECRET-SESSION', origin: 'login' });
+    const w = world({ files: { ...configured, '/cfg/mtproto/personal.json': session } });
     w.state.daemonPid = 4242;
     expect(await runAuth(cmd('status'), w.deps)).toBe(0);
     expect(w.out.join('\n')).toBe(
-      ['bot:    @my_bot (My Bot) · id 123', 'chat:   Alex (@alex) · private · id 42', `config: ${ENV_PATH}`, 'daemon: running (pid 4242)'].join('\n'),
+      [
+        'bot:    @my_bot (My Bot) · id 123',
+        'chat:   Alex (@alex) · private · id 42',
+        `config: ${ENV_PATH}`,
+        'daemon: running (pid 4242)',
+        'user:   id 777 (logged in by tg)',
+        'caller: not logged in — run `tg auth caller`',
+      ].join('\n'),
     );
+    expect(w.out.join('\n')).not.toContain('SECRET-SESSION');
   });
 
-  test('status: nothing configured → exit 78 with the tg auth hint, no network', async () => {
-    const w = world();
+  test('status: imported and unreadable account sessions are labelled, exit code stays the bot\'s', async () => {
+    const imported = JSON.stringify({ expected_id: 9, api_id: 5, api_hash: 'h', session: 's' });
+    const w = world({ files: { ...configured, '/cfg/mtproto/personal.json': '{not json', '/cfg/mtproto/caller.json': imported } });
+    expect(await runAuth(cmd('status'), w.deps)).toBe(0);
+    const out = w.out.join('\n');
+    expect(out).toContain('user:   session file unreadable — run `tg auth user logout`, then `tg auth user`');
+    expect(out).toContain('caller: id 9 (imported — online use needs --source-idle-confirmed)');
+  });
+
+  test('status: nothing configured → exit 78, bot "not connected", accounts still shown, no network', async () => {
+    const session = JSON.stringify({ expected_id: 777, api_id: 5, api_hash: 'h', session: 's', origin: 'login' });
+    const w = world({ files: { '/cfg/mtproto/caller.json': session } });
     expect(await runAuth(cmd('status'), w.deps)).toBe(78);
-    expect(w.err.join('\n')).toContain('tg auth');
+    expect(w.out.join('\n')).toBe(
+      [
+        'bot:    not connected — run `tg auth`',
+        `config: ${ENV_PATH}`,
+        'user:   not logged in — run `tg auth user`',
+        'caller: id 777 (logged in by tg)',
+      ].join('\n'),
+    );
     expect(w.calls).toHaveLength(0);
   });
 
@@ -350,9 +376,10 @@ describe('auto, status, logout', () => {
     expect(w.out.join('\n')).toContain('unreachable: Bad Request: chat not found');
   });
 
-  test('status: revoked token → exit 3', async () => {
+  test('status: revoked token → exit 3, accounts still shown', async () => {
     const w = world({ files: configured, handlers: { getMe: () => ({ status: 401, body: { ok: false, description: 'Unauthorized' } }) } });
     expect(await runAuth(cmd('status'), w.deps)).toBe(3);
+    expect(w.out.join('\n')).toContain('user:   not logged in');
   });
 
   test('logout --yes removes only the two keys', async () => {

@@ -1,7 +1,12 @@
 // --- `tg auth status` block (docs/specs/tg-auth.md §5) ---
 //
 // Which bot tg sends as and which chat it sends to, by name — the "where do my
-// messages go" answer a bare numeric TG_CHAT_ID never gave. Pure formatting.
+// messages go" answer a bare numeric TG_CHAT_ID never gave — plus the user's own
+// MTProto accounts (`user:` / `caller:`), so one view shows every identity tg can
+// act as. Pure formatting.
+import type { Role } from '../user-account/args';
+import { authCommand } from '../user-account/messages';
+import type { SessionState } from '../user-account/sidecar';
 import type { AuthChat } from './binding';
 
 export interface BotInfo {
@@ -46,4 +51,15 @@ export function formatStatus(s: {
     `config: ${s.envPath}`,
     `daemon: ${s.daemonPid === null ? 'not running' : `running (pid ${s.daemonPid})`}`,
   ].join('\n');
+}
+
+export function formatAccounts(accounts: Record<Role, SessionState>): string {
+  const line = (role: Role, label: string): string => {
+    const s = accounts[role];
+    const auth = authCommand(role);
+    if (s.kind === 'missing') return `${label}not logged in — run \`${auth}\``;
+    if (s.kind === 'unreadable') return `${label}session file unreadable — run \`${auth} logout\`, then \`${auth}\``;
+    return `${label}id ${s.id} (${s.origin === 'login' ? 'logged in by tg' : 'imported — online use needs --source-idle-confirmed'})`;
+  };
+  return [line('personal', 'user:   '), line('caller', 'caller: ')].join('\n');
 }

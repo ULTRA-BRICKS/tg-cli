@@ -3,6 +3,42 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.57.0
+
+- **`tg` now works as YOUR Telegram account and can place voice calls (Refs #562).**
+  `tg auth user` logs your account in with one command (phone + code + 2FA, or `--qr`);
+  `tg call <@user|id|me> --say "…"|--audio <file>` rings once and plays the audio;
+  `tg user send <peer> [text]` sends as you. `tg auth caller` logs in a second account so
+  `tg call me` can ring you. It runs over MTProto in the Python sidecar from
+  `feat/independent-mtproto-call-20261002` (pyrofork + py-tgcalls + ntgcalls), now driven
+  from `tg`: the first account command builds a hash-checked venv under `~/.cache/tg-cli/`
+  with `uv`. `--dry-run` checks everything without connecting; HyperCalendarBot's session
+  can be imported with `--import-session`/`--import-config`.
+- **One `tg auth` for the bot and your own accounts.** `tg auth user|caller …` is parsed by
+  the same `tg auth` parser and documented in the same help (`tg help auth` = `tg auth --help`
+  = `tg auth user --help`); `tg auth status` now lists `user:` and `caller:` next to the bot
+  and chat, read offline from the session files (no Python, no network, exit code unchanged —
+  still 78 without a bot). `tg auth login|status|logout` never reach the sidecar.
+- **A flag is never taken as another flag's value.** `tg call @a --say --dry-run` is a usage
+  error (exit 2), never a real call that speaks "--dry-run"; the same holds for every value-taking
+  flag of `tg call`, `tg auth user|caller` and `tg auth login` (`--token --test`) followed by
+  a dash word. Dash-leading text uses `--say=<text>`; `tg user send <peer> -- <text>` ends
+  options. `tg` passes values to the sidecar as one `--flag=value` token.
+- Two first runs build the runtime once: the second waits as long as a live build can
+  legitimately take (both install steps at their 10-minute timeout, plus slack), takes over
+  only a dead builder's lock, and if the builder is still alive after that, names its pid —
+  it never advises deleting the lock.
+- **Sessions are stored in `~/.config/tg-cli/mtproto/` (0700/0600), not
+  `~/.local/share/tg-cli/auth`.** `install.sh` clones this repo into `~/.local/share/tg-cli`,
+  so the old default put account keys inside a git checkout, unignored.
+- Sidecar commands renamed for the cutover: `import-calendar` → `import-session` (any
+  role), `notify --recipient` → `call --peer`; `login` no longer needs `--begin-login` or
+  `--expected-id` (optional now) and reuses the other account's app credentials by itself.
+  An imported session needs `--source-session-idle-confirmed` for every online use; a
+  session `tg` logged in itself does not.
+- `tg call` and `tg user send` are new exact-match leading words: `tg call me later`
+  (unquoted) no longer sends that text — quote it.
+
 ## 1.56.0
 
 - **`tg auth` connects tg to Telegram in one step (#561).** Paste the BotFather token (or pass

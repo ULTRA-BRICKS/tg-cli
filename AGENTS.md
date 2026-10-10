@@ -11,7 +11,8 @@ no build step) that sends curated agent reports to Telegram via the Bot API.
 
 Credentials: `~/.config/tg-cli/.env` — must contain `TG_BOT_TOKEN` and `TG_CHAT_ID`, written by
 `tg auth` (one Start tap binds the chat; never ask a user to look up a numeric id). A send without
-them exits 78 with the `tg auth` hint.
+them exits 78 with the `tg auth` hint. The user's own Telegram account (MTProto, `tg auth user`)
+lives in `~/.config/tg-cli/mtproto/` (0600).
 
 ---
 
@@ -100,6 +101,26 @@ I/O, fetch, signals, `bun:ffi`):
   grows a Python seam (follow-up). Spec: `docs/specs/2026-06-10-tg-ctl-control-design.md`
   (§16 = shipped v1 scope). After merge to main it gets its own `~/.files/bin/tg-ctl` symlink
   (same live-symlink rule as `tg`).
+- **User-account / call sidecar** (`tg auth user|caller`, `tg call`, `tg user send`; spec
+  `docs/specs/independent-telegram-clients.md`). The Bot API cannot act as the user or place
+  calls, so these run over MTProto in a **Python** sidecar, `features/telegram_client/`
+  (pyrofork + py-tgcalls + ntgcalls, the stack HyperCalendarBot rings with). `tg` stays Bun:
+  `features/user-account/` parses (`args.ts`), builds the handoff as data (`sidecar.ts`),
+  maps codes to text (`messages.ts`) and orchestrates with injected effects (`cli.ts`);
+  `sidecar-fs.ts` is the one impure module (venv build, spawn). `tg` checks the session file
+  first (not logged in = instant exit 3, no Python), then spawns
+  `<venv>/bin/python -m telegram_client <personal|caller> --store=<config>/mtproto …` with
+  `PYTHONPATH=<repo>/features`; the venv is `~/.cache/tg-cli/mtproto-runtime-<lock sha>`, built
+  with `uv pip install --require-hashes -r features/telegram_client/runtime.lock` (NOT
+  `uv run --with-requirements`, which skipped hash checks). `TG_MTPROTO_SIDECAR` overrides the
+  runtime (tests use a fake). Stdout is JSON lines with stable error codes — never library
+  exception text; message text for `tg user send` goes on stdin, never argv. Sessions live in
+  `<config>/mtproto/{personal,caller}.json` (0700 dir, 0600 files, `O_EXCL`, never
+  overwritten) — NEVER under `~/.local/share/tg-cli`, which is where `install.sh` clones this
+  repo. An `import`-origin session (copied from another app) needs
+  `--source-idle-confirmed` for every online use. Tests: `tests/user-account.test.ts` (Bun,
+  fake sidecar) and `tests/telegram-*.test.py` (fakes, run through `tests/telegram-client.test.ts`).
+  No test logs in, sends or rings; live acceptance is a manual checklist.
 
 Feature modules live in `features/<feature-name>/` as **pure TypeScript modules** — no I/O;
 all external dependencies (spawns, fetch, file reads) are injected as function parameters so

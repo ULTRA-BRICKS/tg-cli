@@ -1,0 +1,28 @@
+Native duplex adaptation provenance
+
+Source: HyperCalendarBot, local repository /Users/ultra/xp/hypercalendarbot
+Inspected revision: d9b57f1b3499d28aecf6c13cca3ff6491d00be56
+Sources: scripts/voice-call-bridge.py; src/services/voice/call-session.ts;
+call-session-manager.ts; call-manager.ts.
+
+Retained contracts: incoming 48 kHz mono signed PCM16, 32 ms VAD frames,
+2-byte big-endian sequence header, VAD_START/VAD_END, PLAY_DONE, STOP via
+skip_stream, record capture and leave-call cleanup, generic CallAgent.run turn.
+Adaptation: direct injected Python ports instead of calbot WebSocket/API,
+private WAV lifecycle and independent auth owner; no calendar business logic.
+
+No root LICENSE file or package.json license declaration was found in the
+inspected source. No license grant is inferred. Retain this provenance; any
+external redistribution requires clarification of the source license.
+Dependencies retain their respective upstream licenses and runtime.lock pins.
+
+Provider adaptation additionally refers to nova-streaming-stt.ts,
+silero-tts-service.ts and scripts/silero-tts.py at the revision above.
+Nova request parameters and generic agent payload are preserved. Silero's remote
+hub download was replaced with an explicitly hashed local package, and the
+implicit xenia default was removed. VAD preserves source decimation/threshold.
+
+Compatibility correction: source bridge assumes skip_stream, absent in the pinned
+PyTgCalls 2.2.11. Its play implementation uses NTgCalls.set_stream_sources for an
+existing call. The adapter clears CAPTURE sources through that same native setter;
+it does not use play(None), avoiding accidental redial on a disconnected peer.

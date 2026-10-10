@@ -56,13 +56,73 @@ describe('parseAuthArgs — flags', () => {
     expect(parseAuthArgs(['auth', 'logout', '--test'])).toEqual({ error: expect.stringContaining('--test') });
   });
 
-  test('a value-taking flag never swallows the next flag; on/off flags take no value', () => {
-    expect(parseAuthArgs(['auth', 'login', '--token', '--test'])).toEqual({ error: expect.stringContaining("'--test'") });
-    expect(parseAuthArgs(['auth', 'login', '--timeout', '-5'])).toEqual({ error: expect.stringContaining('--timeout') });
-    expect(parseAuthArgs(['auth', 'login', '--token=-abc'])).toMatchObject({ token: '-abc' });
+  test('a value-taking flag never swallows the next flag (only `--token -` is a dash value)', () => {
+    expect(parseAuthArgs(['auth', 'login', '--token', '--test'])).toEqual({ error: expect.stringContaining('--token') });
+    expect(parseAuthArgs(['auth', 'login', '--timeout', '--test'])).toEqual({ error: expect.stringContaining('--timeout') });
+    expect(parseAuthArgs(['auth', '--token', '-y'])).toEqual({ error: expect.stringContaining('--token') });
+    expect(parseAuthArgs(['auth', 'login', '--timeout=30', '--test'])).toMatchObject({ timeoutSec: 30, test: true });
     expect(parseAuthArgs(['auth', 'login', '--token', '-'])).toMatchObject({ tokenFromStdin: true });
-    expect(parseAuthArgs(['auth', 'logout', '--yes=no'])).toEqual({ error: expect.stringContaining('--yes') });
-    expect(parseAuthArgs(['auth', 'login', '--test=0'])).toEqual({ error: expect.stringContaining('--test') });
+    // booleans take no value: `--yes=no` must not silently mean yes
+    expect(parseAuthArgs(['auth', 'logout', '--yes=no'])).toEqual({ error: expect.stringContaining('--yes takes no value') });
+    expect(parseAuthArgs(['auth', 'login', '--test=1'])).toEqual({ error: expect.stringContaining('--test takes no value') });
+    expect(parseAuthArgs(['auth', 'logout', '--yes='])).toEqual({ error: expect.stringContaining('--yes takes no value') });
+  });
+});
+
+// docs/specs/tg-auth.md §2 "One parser", §9: `tg auth user|caller …` is the same command.
+describe('parseAuthArgs — user / caller accounts', () => {
+  test('user and caller delegate to the account parser', () => {
+    expect(parseAuthArgs(['auth', 'user'])).toEqual({ account: { kind: 'login', role: 'personal', qr: false, json: false } });
+    expect(parseAuthArgs(['auth', 'caller', '--qr', '--expected-id', '42'])).toEqual({
+      account: { kind: 'login', role: 'caller', qr: true, expectedId: '42', json: false },
+    });
+    expect(parseAuthArgs(['auth', 'caller', '--import-session', '/s/voice.session', '--import-config', '/s/.env'])).toEqual({
+      account: { kind: 'import', role: 'caller', session: '/s/voice.session', config: '/s/.env', json: false },
+    });
+    expect(parseAuthArgs(['auth', 'user', '--import-session=/s/a b.session', '--import-config=/s/.env'])).toMatchObject({
+      account: { kind: 'import', session: '/s/a b.session', config: '/s/.env' },
+    });
+    expect(parseAuthArgs(['auth', 'user', 'status', '--online'])).toEqual({
+      account: { kind: 'status', role: 'personal', online: true, sourceIdle: false, json: false },
+    });
+    expect(parseAuthArgs(['auth', 'caller', 'logout'])).toEqual({ account: { kind: 'logout', role: 'caller', json: false } });
+  });
+
+  test('`tg auth user --help` is the one auth help', () => {
+    expect(parseAuthArgs(['auth', 'user', '--help'])).toMatchObject({ sub: 'help' });
+    expect(parseAuthArgs(['auth', 'caller', 'status', '-h'])).toMatchObject({ sub: 'help' });
+  });
+
+  test('account usage errors are auth usage errors pointing at `tg auth --help`', () => {
+    for (const argv of [
+      ['auth', 'user', '--import-session', 'x'],
+      ['auth', 'user', '--qr', '--import-session', 'a', '--import-config', 'b'],
+      ['auth', 'user', '--expected-id', 'abc'],
+      ['auth', 'user', 'status', '--expected-id', '5'],
+      ['auth', 'user', '--online'],
+      ['auth', 'caller', 'logout', '--qr'],
+      ['auth', 'user', 'constructor'],
+      // a value flag followed by a flag: never a session path named `--qr`
+      ['auth', 'user', '--import-session', '--qr'],
+      ['auth', 'user', '--expected-id', '--qr'],
+      ['auth', 'caller', '--import-session', 'a', '--import-config', '--json'],
+      ['auth', 'user', '--qr=yes'],
+    ]) {
+      expect(parseAuthArgs(argv)).toEqual({ error: expect.stringContaining('tg auth --help') });
+    }
+  });
+});
+
+test('AUTH_USAGE is the one help for the bot and both accounts', () => {
+  for (const s of ['tg auth user', 'tg auth caller', '--qr', '--import-session', 'status [--online]', 'mtproto', 'my.telegram.org']) {
+    expect(AUTH_USAGE).toContain(s);
+  }
+});
+
+describe('parseAuthArgs — unchanged surface', () => {
+  test('bot subcommands never reach the account parser', () => {
+    expect(parseAuthArgs(['auth', 'status'])).not.toHaveProperty('account');
+    expect(parseAuthArgs(['auth', 'logout', '--yes'])).not.toHaveProperty('account');
   });
 });
 

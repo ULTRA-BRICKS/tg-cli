@@ -1,7 +1,8 @@
 # `tg auth` — one-action Telegram connection (tg-cli#561)
 
-Status: implemented in 1.56.0. Authoritative for `tg auth`, the send-path "not connected"
-hint, and the daemon's `/start <nonce>` claim.
+Status: implemented in 1.56.0; user-account subcommands joined in 1.57.0. Authoritative for
+`tg auth` (one parser, one help, one status for the bot AND the user's own account), the
+send-path "not connected" hint, and the daemon's `/start <nonce>` claim.
 
 ## 1. Why
 
@@ -26,9 +27,11 @@ as ordinary messages.
 |---|---|
 | `tg auth` | Already connected → prints the status (§5) and exits 0. Otherwise runs `login`. |
 | `tg auth login` (alias `tg auth bot`) | Always (re)binds: token → `getMe` → deep link → wait for `/start` → write `.env`. |
-| `tg auth status` | Bot, target chat, config path, daemon state. Exit 78 when not configured. |
-| `tg auth logout` | Removes `TG_BOT_TOKEN` and `TG_CHAT_ID` from the `.env` (asks first). |
-| `tg auth --help` | Usage. |
+| `tg auth status` | Bot, target chat, config path, daemon state, and the user/caller accounts (§5). Exit 78 when the bot is not configured. |
+| `tg auth logout` | Removes `TG_BOT_TOKEN` and `TG_CHAT_ID` from the `.env` (asks first). Bot only. |
+| `tg auth user [status\|logout] …` | The user's OWN Telegram account over MTProto (§9). |
+| `tg auth caller [status\|logout] …` | A second account that rings the user (§9). |
+| `tg auth --help` (= `tg help auth`, = `tg auth user --help`) | One usage text for all of the above. |
 
 Flags:
 
@@ -40,8 +43,15 @@ Flags:
   is to send nothing.
 - `--yes` (logout): skip the confirmation. Without a terminal, logout requires it (exit 2).
 
-`tg auth user` (an MTProto user-account login, so tg can act as the user and place calls) is
-NOT part of this command yet — see §9.
+A value-taking flag never swallows the next flag: `--token --test` and `--timeout --yes` are
+usage errors (exit 2), not a token `--test`. `--token=<v>` / `--timeout=<v>` are accepted;
+`--token -` (stdin) is the one dash value allowed in the separated form. A boolean flag given a
+value (`--yes=no`, `--test=1`) is a usage error too, never a silent "yes".
+
+**One parser.** `parseAuthArgs` (`features/auth/args.ts`) owns every `tg auth …` argv. When the
+second word is `user` or `caller` it delegates the rest to the user-account parser
+(`parseAccountAuth`, `features/user-account/args.ts`) and returns `{ account }`; `tg` runs that
+through the sidecar runner. Help for either half is the same `AUTH_USAGE`.
 
 ## 3. Login flow
 
@@ -122,19 +132,30 @@ by itself once tg auth has written the chat.
 
 ## 5. Status
 
-`tg auth status` (and a bare `tg auth` on a connected config):
+`tg auth status` (and a bare `tg auth` on a connected config) — one view of every identity tg
+can act as:
 
 ```
 bot:    @my_bot (My Bot) · id 123456
 chat:   Alex (@alex) · private · id 42
 config: /home/alex/.config/tg-cli/.env
 daemon: running (pid 4242)
+user:   id 777000 (logged in by tg)
+caller: not logged in — run `tg auth caller`
 ```
 
 Chat name: a group/channel's `title`, else `first_name last_name`; `@username` when it has
 one. `getChat` failures (the user blocked the bot, a wrong id) print
 `chat:   id 42 — unreachable: <Telegram description>` and exit 1. A variable set in the process
-environment that overrides the file is flagged `(from environment)`.
+environment that overrides the file is flagged `(from environment)`. No bot token →
+``bot:    not connected — run `tg auth` `` plus the config path, exit 78.
+
+`user:` / `caller:` are read OFFLINE from `<configDir>/mtproto/{personal,caller}.json` — no
+Python, no network, the session string is never printed: `id N (logged in by tg)`,
+`id N (imported — online use needs --source-idle-confirmed)`, `not logged in — run …`, or
+``session file unreadable — run `tg auth user logout`, then `tg auth user` ``. They are always
+printed (also when the bot part fails) and never change the exit code, which stays the bot's
+(scripts keep their 78). `tg auth user status --online` is the account check that connects.
 
 ## 6. Config file format
 
@@ -168,26 +189,37 @@ and exits **78** (`EX_CONFIG`), distinct from a failed send (1). `--dry-run`, `-
 |---|---|
 | 0 | success (bound / status OK / logged out / nothing to log out) |
 | 1 | Telegram or network error, chat unreachable, `.env` write failed, logout declined at the prompt, another login for the bot still waiting |
-| 2 | usage error: unknown subcommand/flag, bad token shape, no token and no terminal, logout without `--yes` and no terminal |
+| 2 | usage error: unknown subcommand/flag, a flag given as another flag's value, bad token shape, no token and no terminal, logout without `--yes` and no terminal |
 | 3 | Telegram rejected the token (`getMe` 401/404) |
 | 4 | timed out waiting for the Start tap. The message says "nothing was changed" only when the `.env` still holds the chat it had at the start; if a daemon saved a chat but its confirmation never arrived, it names that chat and `tg auth status` |
 | 5 | another consumer holds this bot's updates (409 with no local daemon, or a webhook) |
 | 78 | not configured (`status`; also the `tg` send gate, §7) |
 
-## 9. Future: `tg auth user`
+`tg auth user|caller …` keeps the sidecar's codes: 0 ok, 2 usage, 3 not logged in / refused,
+1 failed (docs/specs/independent-telegram-clients.md §1).
 
-A user-account (MTProto) login — so tg can read and send as the user and place calls — is
-tracked by tg-cli#562 and the unmerged branch `feat/independent-mtproto-call-20261002`
-(`tg-mtproto login`, sessions under `~/.local/share/tg-cli/auth/`). When it lands it becomes
-`tg auth user` with the same status/logout surface; it is not stubbed here.
+## 9. `tg auth user` / `tg auth caller`
+
+The user-account (MTProto) login — so tg can send as the user and place calls — lives under
+the same command. Its flow, storage (`<configDir>/mtproto/`, 0700/0600) and sidecar are
+specified in docs/specs/independent-telegram-clients.md; here only the shared surface:
+
+- `tg auth user` logs in the user's own account (phone + code + 2FA, or `--qr`);
+  `tg auth caller` logs in the account that rings the user (an account cannot ring itself).
+- `tg auth user|caller status [--online]` and `tg auth user|caller logout` are per account;
+  plain `tg auth status` shows both accounts next to the bot (§5); plain `tg auth logout`
+  touches only the bot keys.
+- `user` and `caller` are never bot subcommands, and `tg auth login|status|logout` never reach
+  the sidecar.
 
 ## 10. Code map
 
 - `features/auth/env-file.ts` — `mergeEnvContent` (§6).
 - `features/auth/binding.ts` — nonce, deep link, pending-file format, `matchStart`,
   `daemonAuthStep` (§3–§4).
-- `features/auth/args.ts` — `parseAuthArgs` (exact-match dispatch, flags).
-- `features/auth/status.ts` — status block formatting.
+- `features/auth/args.ts` — `parseAuthArgs` (exact-match dispatch, flags, `user`/`caller`
+  delegation) and `AUTH_USAGE` (the one help text).
+- `features/auth/status.ts` — status block formatting, including the account lines.
 - `features/auth/cli.ts` — `runAuth`: the orchestration, every effect injected
   (`fetch`, file read/atomic write/unlink, clock/sleep, stdin, daemon liveness, output).
 - `tg` — wires real I/O into `runAuth`; the send-path hint (§7).

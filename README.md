@@ -72,7 +72,7 @@ blocks). Run automatically by the installer.
 **Connect to Telegram** — one command:
 ```bash
 tg auth                 # paste the token from @BotFather, then tap Start in Telegram
-tg auth status          # which bot sends, to which chat (name / @username / id)
+tg auth status          # which bot sends, to which chat — plus your user/caller accounts
 ```
 `tg auth` validates the token, prints a one-time `https://t.me/<bot>?start=…` link, and
 once you tap **Start** writes `TG_BOT_TOKEN` and `TG_CHAT_ID` to `~/.config/tg-cli/.env`
@@ -525,6 +525,44 @@ See `tg help report` for the full flag reference.
 
 ---
 
+## Your own Telegram account — calls and sends
+
+The bot can't call anyone or write as you. `tg` can, through your own Telegram account
+(MTProto, a Python sidecar on pyrofork + py-tgcalls — spec:
+[docs/specs/independent-telegram-clients.md](docs/specs/independent-telegram-clients.md)).
+
+```sh
+tg auth user                         # once: phone + code (+ 2FA) on this terminal; or --qr
+tg call @alice --say "Встреча через 5 минут"   # ring and speak (or --audio file.ogg)
+tg user send @alice "on my way"      # send as you (text or stdin)
+tg auth caller                       # a SECOND account, so tg can ring you:
+tg call me --say "Тони написал в Telegram"
+tg call @alice --audio note.ogg --dry-run       # check everything, connect to nothing
+tg call @alice --say="-5 °C outside"           # dash-leading text needs the = form
+tg auth user status --online         # who is logged in; exit 3 when nobody
+tg auth status                       # bot + user + caller in one view (offline for accounts)
+```
+
+- **Login**: Telegram requires an app registration for any user login — the first
+  `tg auth user` asks for the API ID/hash from https://my.telegram.org/apps (or set
+  `TG_API_ID`/`TG_API_HASH` in the env or `~/.config/tg-cli/.env`); later logins reuse it.
+  Everything is prompted hidden; nothing goes in argv or chat.
+- **Sessions** live in `~/.config/tg-cli/mtproto/` (0700; files 0600, never overwritten).
+  A session file IS your account — keep it private. `tg auth user logout` deletes it;
+  terminate the login itself in Telegram → Settings → Devices.
+- **Runtime**: the first account command builds a Python 3.12 venv under
+  `~/.cache/tg-cli/` with `uv` from the hash-locked `features/telegram_client/runtime.lock`
+  (needs `uv`; calls also need `ffmpeg`; `--say` needs macOS `say` or `espeak-ng`).
+  `TG_MTPROTO_SIDECAR=<executable>` uses a runtime you built yourself instead.
+- **Calls**: one dial, never retried; success = the audio played to the end. An account
+  cannot ring itself, so `tg call me` uses the caller account.
+- **Import** instead of login (e.g. HyperCalendarBot's service account):
+  `tg auth caller --import-session voice_caller.session --import-config calendar/.env`.
+  The key is then shared with that app, so every online use needs `--source-idle-confirmed`
+  (that app must be stopped).
+
+---
+
 ## Agent branding
 
 `tg` auto-detects which agent is running by walking the tmux pane's process tree and prefixes every message with the agent's custom emoji icon. No configuration needed.
@@ -684,6 +722,136 @@ Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 - **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
 
 Each CLI registers a skill into your agent harnesses (`<tool> install-skill`) so agents know it exists — see Install.
+
+---
+
+## Telegram sidecar internals (expert)
+
+`tg-mtproto` (personal account) and `tg-call` (caller account) are the sidecar's own
+entrypoints — the same code `tg` spawns as `python -m telegram_client personal|caller`,
+with the same store (`--store`, default `~/.config/tg-cli/mtproto`). Run them with the
+runtime's Python (`~/.cache/tg-cli/mtproto-runtime-*/bin/python`). Output is JSON lines;
+errors are codes, never library exception text. Exit 3 = refused with a code (missing
+session, safety gate); 1 = operation failed; 130 = interrupted.
+
+```sh
+./tg-mtproto doctor             # offline; never prompts for login
+./tg-call status                # offline; never rings
+./tg-mtproto status --online    # get_me; refuses missing/foreign auth
+./tg-mtproto dialogs --limit 30
+./tg-mtproto history --peer <confirmed-id> --limit 30 --before-id <message-id>
+```
+
+History uses MTProto reads without marking chats read.
+
+Notification trigger — after confirming the contact from actual history, preparing the
+speech audio, and coordinating ownership of the calling session:
+
+```sh
+./tg-mtproto arm --peer <confirmed-contact-id> --trigger ~/.config/tg-cli/triggers/tony.sqlite
+./tg-mtproto watch-call --trigger ~/.config/tg-cli/triggers/tony.sqlite \
+  --audio /private/path/tony-wrote.wav
+```
+
+The watcher subscribes to new incoming updates; it does not poll. It makes at most
+one attempt. A failure or crash after claiming requires manual reconciliation, so
+an uncertain call never repeats automatically. The recipient is the verified personal
+account owner. This is not activated by installation and needs process supervision
+on an always-on host. Neither live auth nor a real call is established by the module
+tests. No trigger for Tony is currently configured. `runtime.lock` is the hash-pinned
+PyPI runtime; a patched ntgcalls binary still needs its own media acceptance.
+
+### Independent conversational transport checkpoint
+
+`python3 tg-call live-smoke` runs an entirely offline duplex integration with fake
+native I/O and mock STT/CallAgent/TTS; it never logs in, dials, or contacts a provider.
+It exercises actual PCM framing, VAD boundaries, private WAV playback, interruption,
+reconnect and hangup cleanup. `tg-call doctor` reports authorization separately from
+conversation readiness. Run the native event binding test with the dedicated runtime:
+
+```
+~/.cache/tg-cli/mtproto-runtime-*/bin/python tests/telegram-duplex.test.py
+```
+
+`telegram_client.duplex.native_transport(calls, peer, vad)` binds installed
+PyTgCalls callbacks for an already connected call. The auth/call owner remains
+responsible for independent `connected(store, "caller")` lifetime; constructing this
+adapter never starts a client or dials. `Conversation` accepts injected streaming
+STT, model and PCM TTS ports. `CallAgentAdapter` preserves the generic
+`run({userId, transcript}) -> {responseText, endCall}` contract.
+STT adapters must stamp final callbacks with captured transport epoch and turn
+generation (`final(text, epoch, generation)`) to reject stale utterances.
+
+Production readiness is deliberately false: provider bindings, pinned local VAD
+weights and the Bracho provider/voice ID still need explicit configuration. No new
+provider credentials were copied. Output uses serialized WAV chunks and native
+PLAY_DONE, not a continuous PCM output device. Real remote-audio latency, native
+late PLAY_DONE ordering after STOP, and live reconnect behavior remain unverified.
+A real call requires separate authorization. See `features/telegram_client/NOTICE`
+for source provenance and unresolved source licensing.
+
+Provider adapters are in `telegram_client.providers`: Nova-3 RU streaming via
+pinned aiohttp; the generic CallAgent JSON stdin executable contract; cancellable
+local Silero TTS worker; hash-verified local Silero TorchScript VAD. No adapter
+activates on import or doctor. `providers.example.json` contains no credentials;
+`credential_env` names an explicitly supplied environment variable. Run:
+
+```
+python3 tg-call doctor --providers-config features/telegram_client/providers.example.json
+```
+
+`build_providers(config)` explicitly activates the configured bindings;
+`attach_configured_session(calls, peer, config)` attaches them to a caller-owned,
+already connected native call. It does not create authorization or dial. The
+caller must separately authorize provider use. The configured generic agent
+executable receives `{userId, transcript}` on stdin and returns JSON
+`{responseText, endCall}` on stdout; it owns persistent user context/tool policy.
+TTS requires an explicit supported speaker, local Silero `v5_ru` package and its
+SHA-256; VAD requires a local Silero TorchScript model and its SHA-256. Do not map
+Bracho to a built-in Silero voice without the actual confirmed preset. If the
+existing Bracho profile uses another engine, configure that engine adapter rather
+than relabeling a Silero speaker. `voice-runtime.lock` records the existing
+calbot macOS CPU Torch/numpy dependency closure; it was not installed in this step.
+The model paths and hashes are deliberately unset; no weight or key was copied.
+
+Provider validation is offline or local mock I/O only. Silero synthesis runs in a
+killable process per text chunk (cold-start latency remains to measure); native
+output remains serialized WAV playback. RU Nova is implemented; Flux EN is not
+wired into this independent provider layer. No real provider health is claimed.
+
+Pinned PyTgCalls 2.2.11 does not implement `skip_stream`. The native adapter uses
+its existing NTgCalls `set_stream_sources(CAPTURE, MediaDescription())` operation
+to clear outgoing sources instead; it never falls back to buffered `pause` or
+`play(None)` (which could redial a disconnected peer). This private binding seam
+is version-sensitive and covered by the installed-native contract test; remote
+buffer flushing remains unverified without a separately approved live call.
+
+With `--providers-config`, doctor exits 3 until both caller auth metadata and
+provider configuration checks pass; a zero status still does not claim live
+Telegram/provider audio verification.
+
+### Shared call-lib and conversational start
+
+The `tg-call-lib` wheel packages this same `telegram_client` source; there is no
+second implementation. `tg-call library-info` and `tg-call-json`'s `describe`
+request report distribution version and module path. The prepared Bun consumer
+is in `adapters/calbot/`; it has not been deployed into the running application.
+
+`tg-call start --providers-config CONFIG` is fail-closed. A real start additionally
+requires `--confirm-call --allow-provider-network --source-session-idle-confirmed`,
+ready provider/media checks, `voice.status: "confirmed"`, an explicit Bracho
+mapping and `agent.protocol: "call-agent-json-v1"`. Before Telegram connects,
+the configured agent's metadata handshake must identify a production-ready
+wrapper. `call-agent-mock` is deterministic and always rejected for live use.
+Missing authorization never invokes login. One dial attempt is owned by the
+shared library, with a 30-second dial bound and at most 1800 seconds of conversation;
+CLI cancellation/JSON-runner SIGTERM close the session and release its auth lock.
+
+Build the local wheel with an already available setuptools backend; install the
+result with `pip --no-index --no-deps` into a separate test/runtime venv. Runtime
+and voice dependencies remain governed by the supplied hashed locks. Local VAD
+weights/license receipts live outside the code repository and are not bundled.
+See `adapters/calbot/README.md` for the JSON wrapper and consumer protocol.
 
 ---
 

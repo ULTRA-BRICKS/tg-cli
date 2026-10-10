@@ -100,6 +100,9 @@ import {
 import { formatSendOk } from "./features/cli/send-output"
 import { versionOutput } from "./features/cli/version"
 import { loadEnv } from "./features/config/env"
+import { parseUserAccountArgs } from "./features/user-account/args"
+import { runUserAccount } from "./features/user-account/cli"
+import { userAccountDeps } from "./features/user-account/sidecar-fs"
 import {
   convertEntitiesToHtml,
   detectHtmlTags,
@@ -159,19 +162,28 @@ export const USAGE = `Usage:
   tg --topic 7 "status"         # post INTO forum topic 7 (else TG_TOPIC)
   printf 'task\\tstatus\\nship\\tdone' | tg --table   # aligned <pre> table
   tg auth                       # connect to Telegram in one step (token + one Start tap)
-  tg auth status                # which bot sends, to which chat (tg help auth)
+  tg auth status                # bot, chat, and your user/caller accounts (tg help auth)
   tg voice setup                # configure inbound voice→text (local Whisper STT)
   tg report --title <t> --ticket <id> --impact <t> --verify-cmd <c> --verify-result <r>
                                  # structured result report → Telegram (tg help report)
   tg --ls-emoji-helpers
 
+As YOUR Telegram account (MTProto; see \`tg help auth\`, \`tg call --help\`):
+  tg auth user                  log in once: phone + code (+ 2FA), or --qr
+  tg auth caller                log in a second account that can ring you
+  tg call @alice --say "text"   ring a user and speak (or --audio file.ogg)
+  tg call me --say "text"       ring YOURSELF from the caller account
+  tg user send @alice "text"    send as you (text or stdin)
+
 The global options (--format, --tag, --title, --subagent, --reply-to, --topic, the feature
-toggles) apply to ANY of the above forms — see Options below.
+toggles) apply to ANY of the bot send forms above — see Options below. The account
+commands take only their own flags.
 
 Help topics (\`tg help <topic>\`):
   format   what Telegram message formatting supports (HTML tags / entities)
   report   the structured result report (tg report)
-  auth     connecting to Telegram: tg auth login / status / logout, exit codes
+  auth     connecting to Telegram: the bot (login / status / logout) and your own
+           accounts (tg auth user|caller), exit codes
 
 Readable long messages:
   For longer status reports, avoid one dense plain-text block. Use headings,
@@ -569,16 +581,29 @@ if (import.meta.main) {
   // finding — this send path used to hardcode the default dir, unlike `replies`).
   const configDir = process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli")
 
-  // `tg auth …` — one-action Telegram connection (docs/specs/tg-auth.md). Runs before every
-  // credential gate: it is how the credentials get there. Exact-match leading token
-  // (parseAuthArgs → null for prose like `tg auth is broken`, which still sends).
+  // `tg auth …` — the bot connection AND the user's own accounts (docs/specs/tg-auth.md):
+  // one parser, one help. Runs before every credential gate: it is how the credentials get
+  // there. Exact-match leading token (parseAuthArgs → null for prose like
+  // `tg auth is broken`, which still sends). `tg auth user|caller …` comes back as
+  // `{ account }` and runs through the MTProto sidecar, never the Bot API.
   const authCmd = parseAuthArgs(rawArgs)
   if (authCmd !== null) {
     if ("error" in authCmd) {
       console.error(`Error: ${authCmd.error}`)
       process.exit(2)
     }
+    if ("account" in authCmd) {
+      process.exit(await runUserAccount(authCmd.account, userAccountDeps(configDir, import.meta.dir, home)))
+    }
     process.exit(await runAuth(authCmd, authDeps(configDir)))
+  }
+
+  // `tg call <peer>`, `tg user send <peer>` — the user's OWN Telegram account over MTProto,
+  // via the Python sidecar (docs/specs/independent-telegram-clients.md). Exact-match leading
+  // tokens; runs before the `tg user` → `tg replies user` shorthand, which keeps every other argv.
+  const userAccount = parseUserAccountArgs(rawArgs)
+  if (userAccount !== null) {
+    process.exit(await runUserAccount(userAccount, userAccountDeps(configDir, import.meta.dir, home)))
   }
 
   // `tg hooks ...` — list / trust / untrust for pre-send-photo hooks. Hooks are
