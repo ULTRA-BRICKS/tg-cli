@@ -136,6 +136,8 @@ function splitSections(text: string): Section[] {
   let from = 0;
   for (const m of scanned.matchAll(SECTION_HEADING_RE)) {
     sections.push({ heading, body: text.slice(from, m.index) });
+    // Tag-stripped text here is only measured and pattern-matched by the gate, never rendered as HTML.
+    // codeql[js/incomplete-multi-character-sanitization]
     heading = (m[2] ?? m[3] ?? '').replace(TAG_RE, '').trim();
     from = m.index + m[0].length;
   }
@@ -153,6 +155,8 @@ function tableOptionRows(body: string): string[][][] {
     tables.push(
       [...table.matchAll(/<tr\b[\s\S]*?<\/tr\s*>/giu)]
         .filter(([tr]) => /<td\b/iu.test(tr))
+        // Cell text is only matched against option shapes, never rendered as HTML.
+        // codeql[js/incomplete-multi-character-sanitization]
         .map(([tr]) => [...tr.matchAll(/<(t[hd])\b[^>]*>([\s\S]*?)<\/\1\s*>/giu)].map((c) => c[2].replace(TAG_RE, '').trim())),
     );
   }
@@ -253,6 +257,8 @@ function hasWallOfText(body: string): boolean {
     if (line.includes('|')) continue; // table row
     if (MARKUP_LINE_RE.test(line)) continue;
     if (BOXED_GLYPH_RE.test(line)) continue; // boxed table
+    // Only the visible length is used; the stripped line is never rendered as HTML.
+    // codeql[js/incomplete-multi-character-sanitization]
     const visible = line.replace(TAG_RE, '').replace(/&(?:#\d+|#x[\da-f]+|\w+);/giu, '&');
     if (visible.length > WALL_LINE_CHARS) return true;
   }
@@ -325,6 +331,8 @@ export function validateEscalationFormat(body: string): EscalationFormatResult {
     sections.some(
       (s) =>
         RECOMMENDATION_RE.test(s.heading) &&
+        // Only tested for content; the stripped body is never rendered as HTML.
+        // codeql[js/incomplete-multi-character-sanitization]
         (HAS_CONTENT_RE.test(s.body.replace(TAG_RE, '')) ||
           s.heading.split(/\s+/u).some((w) => HAS_CONTENT_RE.test(w) && !RECOMMENDATION_LABEL_WORD_RE.test(w))),
     );

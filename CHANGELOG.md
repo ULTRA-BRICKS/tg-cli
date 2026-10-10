@@ -3,6 +3,13 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.17
+
+- **CodeQL passes on main again.** The format gate added in 1.55.16 strips tags from a message
+  only to measure it or match its sections, and never renders the result as HTML. Its four
+  `js/incomplete-multi-character-sanitization` alerts now carry `codeql[...]` markers with that
+  justification.
+
 ## 1.55.16
 
 - **The `--tag decision` format gate checks each section by its own content (#216).** Options now
