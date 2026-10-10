@@ -1,8 +1,8 @@
 import { expect, test } from 'bun:test';
 import { checkAttachmentFile, type FileCheckDeps } from '../features/auto-attach/file-check';
 
-// tg-cli#207: a disk-sourced auto-attach candidate must be re-validated right
-// before the send (detection and send are two different points in time — the
+// tg-cli#207: a disk-sourced attachment must be re-validated right
+// before the send (parsing and send are two different points in time — the
 // file can vanish, get truncated to empty, or lose read permission in
 // between). `checkAttachmentFile` is the pure decision function; the real fs
 // calls (stat/canRead) are injected so this stays disk-free.

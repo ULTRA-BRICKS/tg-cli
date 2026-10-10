@@ -3,12 +3,10 @@
 // directory would block innocent files living next to a secret.
 //
 // Semantics (wired in tg's parseArgs, feature `attach-denylist`, ON by
-// default):
-//   - auto-detected path in the text  → silently skipped, token stays in text
-//     (same posture as the extensionless gate);
-//   - explicit --photo/--file        → HARD ERROR before anything is sent —
-//     an explicit secret attach is almost certainly a mistake or a leak, and
-//     a silent skip would hide it.
+// default): an explicit --photo/--file naming such a file is a HARD ERROR
+// before anything is sent — an explicit secret attach is almost certainly a
+// mistake or a leak, and a silent skip would hide it. (The message text is
+// never resolved into files to attach at all — tg-cli#648.)
 // Override (consciously): --no-feature attach-denylist or
 // features.attach-denylist: false in ~/.config/tg-cli/config.yaml.
 

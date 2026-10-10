@@ -209,8 +209,11 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
   and NO guessing from `CLAUDE_CODE_CHILD_SESSION` (set on the main thread too); the old
   `features/agent-detect/` is deleted. The `[window]` label is the primary name from
   `resolveSessionName` (`features/tg-ctl/session-name.ts`).
-- `features/auto-attach/` — path detection → attach files, R1-R4 text rules, line-spec quotes,
-  worktree-aware + recursive path resolution, transmitter with Telegram message/caption limits.
+- `features/auto-attach/` — the send pipeline for EXPLICIT attachments (`--file`/`--photo` only):
+  R2/R4 text rules, line-spec quotes for an explicitly attached file, transmitter with Telegram
+  message/caption limits. The message text is NEVER resolved into file paths — a token naming an
+  existing file stays plain text (tg-cli#648; the old text-path scan, worktree/recursive lookup
+  and the `auto-attach`/`recursive-attach` flags are deleted, do not bring them back).
   `transmitter.ts` also re-validates every disk attachment right before sending (`file-check.ts`
   — missing/empty/unreadable is skipped with a warning, never fails the whole send, tg-cli#207)
   and refuses a body that would fragment into more than `FLOOD_CAP_MAX_MESSAGES` separate sends

@@ -29,8 +29,7 @@
 //   its tradeoff cells filled; a Recommendation heading counts only when its
 //   section has content; "where to look" needs a real file:line in the TEXT
 //   (tg-cli#217, #221). A `--file`/`--photo` attachment does not count; a
-//   `path:line` typed in the body is auto-attached AND kept in the body, so it
-//   is seen here.
+//   `path:line` typed in the body stays in the body, so it is seen here.
 //
 // PURE — no I/O. Consumed by features/cli/args.ts (parse-time gate) and the tg
 // entrypoint (post-assembly re-check for --table sends).

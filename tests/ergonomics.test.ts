@@ -225,10 +225,7 @@ test('--title guard is gated on the SAME autolink-msgrefs feature flag as the bo
   // With the feature OFF, a tg#<id> in --title is inert plain text, exactly like the body
   // (`tg` gates the body's detectMsgRefs call on the identical flag) — not banned in one place
   // while freely allowed in the other.
-  const msgrefAutolinkOff = false;
-  expect(
-    parseArgs(['--title', 'see tg#5900', 'body'], dir, HOME, true, () => [], true, true, undefined, msgrefAutolinkOff),
-  ).toEqual({
+  expect(parseArgs(['--title', 'see tg#5900', 'body'], dir, HOME, { msgrefAutolink: false })).toEqual({
     action: 'send',
     items: [],
     caption: 'body',
@@ -282,10 +279,8 @@ test('--title refuses a HYP-<id> ticket reference (must move into the body)', ()
 test('--title HYP-<id> guard is gated on the autolink-tasks feature flag', () => {
   // With autolink-tasks OFF, a ticket code in --title is inert plain text, exactly like the
   // body (`tg` gates the body's detectTicketCodes call on the identical flag) — not banned in
-  // one place while freely allowed in the other. The 10th positional arg is ticketAutolink.
-  expect(
-    parseArgs(['--title', 'HYP-1234 done', 'body'], dir, HOME, true, () => [], true, true, undefined, true, false),
-  ).toEqual({
+  // one place while freely allowed in the other.
+  expect(parseArgs(['--title', 'HYP-1234 done', 'body'], dir, HOME, { ticketAutolink: false })).toEqual({
     action: 'send',
     items: [],
     caption: 'body',
@@ -414,53 +409,40 @@ test('--photo with a real RELATIVE dashed filename still attaches (flag value, n
   rmSync(join(dir, '-realfile.png'), { force: true });
 });
 
-// --- Ergonomic #3: auto-attach paths in message text ---
-// CORE CORRECTION (spec §"never excise a path"): detected paths are KEPT in the
-// caption verbatim — only the file is additionally attached. These cases used
-// to assert excision; the CTO reversed that, so they now assert path-kept.
-test('absolute image path in text → photo item, path KEPT in caption', () => {
+// --- Paths in the message text are NEVER attached (tg-cli#648) ---
+// A token naming an existing file stays plain text; only explicit --photo/--file
+// attach. Each shape the old text scanner resolved is pinned here.
+test('absolute image path in text → NOT attached, stays in caption', () => {
   expect(parseArgs(['look', imgAbs, 'here'], dir, HOME)).toEqual({
     action: 'send',
-    items: [{ type: 'photo', path: imgAbs, auto: true }],
+    items: [],
     caption: `look ${imgAbs} here`,
     format: 'plain',
   });
 });
 
-test('absolute non-image path in text → document item, path KEPT', () => {
+test('absolute non-image path in text → NOT attached', () => {
   expect(parseArgs([pdfAbs], dir, HOME)).toEqual({
     action: 'send',
-    items: [{ type: 'document', path: pdfAbs, auto: true }],
+    items: [],
     caption: pdfAbs,
     format: 'plain',
   });
 });
 
-test('auto-detected SVG in text → document (Telegram rejects SVG as photo), path KEPT', () => {
-  const svgAbs = join(dir, 'diagram.svg');
-  writeFileSync(svgAbs, '<svg/>');
-  expect(parseArgs([svgAbs], dir, HOME)).toEqual({
-    action: 'send',
-    items: [{ type: 'document', path: svgAbs, auto: true }],
-    caption: svgAbs,
-    format: 'plain',
-  });
-  rmSync(svgAbs, { force: true });
-});
-
-test('relative existing file resolves against cwd, token KEPT in caption', () => {
+test('relative existing file in text → NOT attached', () => {
   expect(parseArgs(['shot.PNG'], dir, HOME)).toEqual({
     action: 'send',
-    items: [{ type: 'photo', path: imgAbs, auto: true }],
+    items: [],
     caption: 'shot.PNG',
     format: 'plain',
   });
 });
 
-test('path inside a quoted single argv token is detected, KEPT in caption', () => {
+test('path inside a quoted single argv token → NOT attached', () => {
   expect(parseArgs([`look at ${imgAbs} please`], dir, HOME)).toEqual({
     action: 'send',
-    items: [{ type: 'photo', path: imgAbs, auto: true }],
+    items: [],
     caption: `look at ${imgAbs} please`,
     format: 'plain',
   });
@@ -493,17 +475,17 @@ test('directory token is NOT treated as a file', () => {
   });
 });
 
-test('~ home expansion resolves to a real file, token KEPT in caption', () => {
-  // home = dir for this case so ~/shot.PNG resolves to imgAbs.
+test('~ home path to a real file in text → NOT attached', () => {
+  // home = dir for this case so ~/shot.PNG names imgAbs.
   expect(parseArgs(['~/shot.PNG'], '/some/other/cwd', dir)).toEqual({
     action: 'send',
-    items: [{ type: 'photo', path: imgAbs, auto: true }],
+    items: [],
     caption: '~/shot.PNG',
     format: 'plain',
   });
 });
 
-test('explicit --photo takes precedence: same file not attached twice, text path KEPT', () => {
+test('explicit --photo attaches once; the same path in the text adds nothing', () => {
   expect(parseArgs(['--photo', imgAbs, imgAbs, 'cap'], dir, HOME)).toEqual({
     action: 'send',
     items: [{ type: 'photo', path: imgAbs }],
@@ -512,14 +494,10 @@ test('explicit --photo takes precedence: same file not attached twice, text path
   });
 });
 
-test('explicit --file plus auto-detected photo → media group, text path KEPT', () => {
+test('explicit --file plus another existing path in the text → only the --file attaches', () => {
   expect(parseArgs(['--file', pdfAbs, imgAbs, 'both'], dir, HOME)).toEqual({
     action: 'send',
-    items: [
-      // Explicit --file → no `auto`; auto-detected photo → `auto: true`.
-      { type: 'document', path: pdfAbs },
-      { type: 'photo', path: imgAbs, auto: true },
-    ],
+    items: [{ type: 'document', path: pdfAbs }],
     caption: `${imgAbs} both`,
     format: 'plain',
   });
@@ -542,61 +520,32 @@ test('plain multi-line / multi-space text preserves whitespace exactly', () => {
   });
 });
 
-test('caption around a detected path keeps the path AND surrounding formatting', () => {
+test('caption around a path keeps the path AND surrounding formatting, nothing attached', () => {
   expect(parseArgs([`top\n${imgAbs}\nbottom`], dir, HOME)).toEqual({
     action: 'send',
-    items: [{ type: 'photo', path: imgAbs, auto: true }],
+    items: [],
     caption: `top\n${imgAbs}\nbottom`,
     format: 'plain',
   });
 });
 
-// --- Feature OFF path: auto-attach disabled → no text-path scanning ---
-test('auto-attach OFF: path in text is NOT attached, stays as plain text', () => {
-  expect(parseArgs(['look', imgAbs, 'here'], dir, HOME, false)).toEqual({
-    action: 'send',
-    items: [],
-    caption: `look ${imgAbs} here`,
-    format: 'plain',
-  });
-});
-
-test('auto-attach OFF: explicit --photo/--file still attach', () => {
-  expect(parseArgs(['--photo', imgAbs, 'cap'], dir, HOME, false)).toEqual({
-    action: 'send',
-    items: [{ type: 'photo', path: imgAbs }],
-    caption: 'cap',
-    format: 'plain',
-  });
-});
-
-// --- Line-spec: file.ts:N / :N-M / :N:C detected, token KEPT in caption ---
-test('line-spec :N on an existing file → attached with lineSpec, token KEPT', () => {
+// --- Line-spec: only for an explicitly attached file ---
+test('line-spec :N on an existing file in the text → NOT attached', () => {
   const tsAbs = join(dir, 'mod.ts');
   writeFileSync(tsAbs, 'a\nb\nc\nd\ne');
-  const r = parseArgs([`see ${tsAbs}:3`], dir, HOME);
-  expect(r).toEqual({
+  expect(parseArgs([`see ${tsAbs}:3`], dir, HOME)).toEqual({
     action: 'send',
-    items: [
-      {
-        type: 'document',
-        path: tsAbs,
-        // Auto-detected from the text → carries `auto: true` (provenance marker;
-        // explicit --file/--photo items don't carry it).
-        auto: true,
-        lineSpec: { token: `${tsAbs}:3`, startLine: 3, endLine: 3, col: undefined },
-      },
-    ],
+    items: [],
     caption: `see ${tsAbs}:3`,
     format: 'plain',
   });
   rmSync(tsAbs, { force: true });
 });
 
-test('line-spec :N-M range and :N:C column parse onto the item', () => {
+test('line-spec :N-M range and :N:C column parse onto an explicit --file item', () => {
   const tsAbs = join(dir, 'mod2.ts');
   writeFileSync(tsAbs, 'a\nb\nc\nd\ne\nf');
-  const range = parseArgs([`${tsAbs}:2-4`], dir, HOME);
+  const range = parseArgs(['--file', tsAbs, `${tsAbs}:2-4`], dir, HOME);
   expect(range.action).toBe('send');
   if (range.action === 'send') {
     expect(range.items[0].lineSpec).toEqual({
@@ -606,7 +555,8 @@ test('line-spec :N-M range and :N:C column parse onto the item', () => {
       col: undefined,
     });
   }
-  const col = parseArgs([`${tsAbs}:2:5`], dir, HOME);
+  const col = parseArgs(['--file', tsAbs, `${tsAbs}:2:5`], dir, HOME);
+  expect(col.action).toBe('send');
   if (col.action === 'send') {
     expect(col.items[0].lineSpec).toEqual({
       token: `${tsAbs}:2:5`,
@@ -618,13 +568,12 @@ test('line-spec :N-M range and :N:C column parse onto the item', () => {
   rmSync(tsAbs, { force: true });
 });
 
-// GitHub permalink-anchor forms a human pastes (file#L10 / file#L10-L20). The
-// base path resolves and the referenced range lands on the item just like the
-// colon forms, so a pasted GitHub line link gets the inline excerpt too (tg#29).
-test('line-spec #L GitHub anchor on an existing file → attached with lineSpec', () => {
+// GitHub permalink-anchor forms a human pastes (file#L10 / file#L10-L20) land on
+// an explicit --file item just like the colon forms (tg#29).
+test('line-spec #L GitHub anchor adopts onto an explicit --file item', () => {
   const tsAbs = join(dir, 'mod3.ts');
   writeFileSync(tsAbs, 'a\nb\nc\nd\ne\nf');
-  const single = parseArgs([`see ${tsAbs}#L3`], dir, HOME);
+  const single = parseArgs(['--file', tsAbs, `see ${tsAbs}#L3`], dir, HOME);
   expect(single.action).toBe('send');
   if (single.action === 'send') {
     expect(single.items[0].lineSpec).toEqual({
@@ -635,7 +584,8 @@ test('line-spec #L GitHub anchor on an existing file → attached with lineSpec'
     });
     expect(single.caption).toBe(`see ${tsAbs}#L3`);
   }
-  const range = parseArgs([`${tsAbs}#L2-L4`], dir, HOME);
+  const range = parseArgs(['--file', tsAbs, `${tsAbs}#L2-L4`], dir, HOME);
+  expect(range.action).toBe('send');
   if (range.action === 'send') {
     expect(range.items[0].lineSpec).toEqual({
       token: `${tsAbs}#L2-L4`,
@@ -647,11 +597,37 @@ test('line-spec #L GitHub anchor on an existing file → attached with lineSpec'
   rmSync(tsAbs, { force: true });
 });
 
-test('line-spec on a NON-existent file → plain text, no attach', () => {
-  expect(parseArgs(['/nope/x.ts:42', 'hi'], dir, HOME)).toEqual({
+test('a relative line-spec mention adopts onto an explicit --file given relative', () => {
+  const tsAbs = join(dir, 'rel.ts');
+  writeFileSync(tsAbs, 'a\nb\nc');
+  const r = parseArgs(['--file', './rel.ts', 'see (rel.ts:2)'], dir, HOME);
+  expect(r.action).toBe('send');
+  if (r.action === 'send') {
+    expect(r.items).toEqual([
+      { type: 'document', path: './rel.ts', lineSpec: { token: '(rel.ts:2)', startLine: 2, endLine: 2, col: undefined } },
+    ]);
+  }
+  rmSync(tsAbs, { force: true });
+});
+
+test('a line-spec adopts onto an explicit --file whose absolute path has ../ segments', () => {
+  const tsAbs = join(dir, 'norm.ts');
+  writeFileSync(tsAbs, 'a\nb\nc');
+  const dotted = `${dir}/../${dir.split('/').pop()}/norm.ts`;
+  const r = parseArgs(['--file', dotted, `see ${tsAbs}:1`], dir, HOME);
+  expect(r.action).toBe('send');
+  if (r.action === 'send') {
+    expect(r.items[0].lineSpec).toEqual({ token: `${tsAbs}:1`, startLine: 1, endLine: 1, col: undefined });
+  }
+  rmSync(tsAbs, { force: true });
+});
+
+test('a line-spec naming a different file than the --file is plain text', () => {
+  const r = parseArgs(['--file', pdfAbs, 'bug at /nope/x.ts:42'], dir, HOME);
+  expect(r).toEqual({
     action: 'send',
-    items: [],
-    caption: '/nope/x.ts:42 hi',
+    items: [{ type: 'document', path: pdfAbs }],
+    caption: 'bug at /nope/x.ts:42',
     format: 'plain',
   });
 });
@@ -676,12 +652,12 @@ test('line-spec mention of an already --file-attached file adopts the spec', () 
   rmSync(tsAbs, { force: true });
 });
 
-test('plain existing path with no spec has NO lineSpec field', () => {
-  const r = parseArgs([pdfAbs], dir, HOME);
+test('explicit --file with no spec in the text has NO lineSpec field', () => {
+  const r = parseArgs(['--file', pdfAbs, 'see it'], dir, HOME);
   expect(r).toEqual({
     action: 'send',
-    items: [{ type: 'document', path: pdfAbs, auto: true }],
-    caption: pdfAbs,
+    items: [{ type: 'document', path: pdfAbs }],
+    caption: 'see it',
     format: 'plain',
   });
   // No spec: the lineSpec field is absent, not undefined.

@@ -114,7 +114,7 @@ Header badge (--tag / --title), composes with BOTH basic and rich sends:
     • Where to look — a file:line in the TEXT (features/foo.ts:42, ./tg:1219,
       or a #L42 link). A bare path, "and/or", "12:30" do not count, and a
       --file/--photo attachment does not count either — write the file:line
-      into the body (a path:line in the body is also auto-attached).
+      into the body.
   Plus STRUCTURE: each section under its own <h3>/<h4>, enumerations as short
   <ul>/<li> items (never inline "плюсы: a, b, c"), <hr> dividers between
   sections, short lines. Use --format html.

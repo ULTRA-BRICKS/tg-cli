@@ -117,7 +117,7 @@ test('explicit --photo of a denylisted file is also an error', () => {
   expect(r.action).toBe('error');
 });
 
-test('auto-detected denylisted file is silently skipped, token stays in text', () => {
+test('a denylisted file named in the text is not attached, token stays in text', () => {
   const r = parseArgs([`leaked ${join(dir, 'prod.env')} here`], dir, dir);
   expect(r.action).toBe('send');
   if (r.action === 'send') {
@@ -139,12 +139,13 @@ test('explicit --file of a legacy last-alex-target anchor file is still a hard e
 });
 
 test('--no-feature attach-denylist override: explicit attach goes through', () => {
-  const r = parseArgs(['--file', join(dir, 'prod.env'), 'I know what I am doing'], dir, dir, true, () => [], false);
+  const r = parseArgs(['--file', join(dir, 'prod.env'), 'I know what I am doing'], dir, dir, { attachDenylist: false });
   expect(r.action).toBe('send');
   if (r.action === 'send') expect(r.items.length).toBe(1);
 });
 
-test('denylist does not affect ordinary files (regression)', () => {
-  const r = parseArgs([`see ${join(dir, 'normal.ts')}`], dir, dir);
+test('denylist does not affect ordinary explicit files (regression)', () => {
+  const r = parseArgs(['--file', join(dir, 'normal.ts'), 'see it'], dir, dir);
+  expect(r.action).toBe('send');
   if (r.action === 'send') expect(r.items.length).toBe(1);
 });

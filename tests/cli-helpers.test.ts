@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from 'bun:test';
 import { readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { expandHome, hasRealExtension, isImagePath } from '../features/cli/args';
+import { expandHome, isImagePath } from '../features/cli/args';
 import { tempDir } from './helpers/test-temp';
 import {
   VERSION,
@@ -38,20 +38,6 @@ test('isImagePath rejects SVG (Telegram rejects it as a photo) and non-images', 
   expect(isImagePath('notes.txt')).toBe(false);
   expect(isImagePath('Makefile')).toBe(false);
   expect(isImagePath('noext')).toBe(false);
-});
-
-// --- hasRealExtension ---
-test('hasRealExtension is true only for a basename dot with chars after it', () => {
-  expect(hasRealExtension('a.ts')).toBe(true);
-  expect(hasRealExtension('dir/sub/a.js')).toBe(true);
-  expect(hasRealExtension('archive.tar.gz')).toBe(true);
-});
-
-test('hasRealExtension is false for extensionless names and leading-dot files', () => {
-  expect(hasRealExtension('LICENSE')).toBe(false);
-  expect(hasRealExtension('Makefile')).toBe(false);
-  expect(hasRealExtension('.env')).toBe(false);
-  expect(hasRealExtension('dir/.gitignore')).toBe(false);
 });
 
 // --- expandHome ---

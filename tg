@@ -115,10 +115,6 @@ import { formatHelp } from "./features/render/format-help"
 import { colorizeHelp, shouldColorize } from "./features/render/help-color"
 import { createTelegramTransport } from "./features/transport/telegram"
 import { doneReactionForSend } from "./features/tg-ctl/reactions"
-import {
-  enumerateWorktreeRoots,
-  runGitReal,
-} from "./features/auto-attach/worktree"
 import { isEscalationTag } from "./features/render/tag"
 // How long `tg` waits for the daemon's session-topic answer (or its result ack) before
 // posting to General as before (the daemon answers within ~1.2 s, spec §4.3).
@@ -157,7 +153,7 @@ export const USAGE = `Usage:
   tg --photo screen.png "caption"
   tg --file doc.pdf "caption"
   tg --photo a.png --photo b.png "caption"   # repeatable; mix --photo/--file
-  tg "see /abs/path/shot.png"   # existing file paths in text are auto-attached
+  tg "see AGENTS.md"            # text only: paths in the text are never attached
   tg --reply-to 1234 --tag answer "answer"  # thread under inbound message 1234
   tg --topic 7 "status"         # post INTO forum topic 7 (else TG_TOPIC)
   printf 'task\\tstatus\\nship\\tdone' | tg --table   # aligned <pre> table
@@ -288,13 +284,11 @@ Topic help:
                        HTML tags / entities). The canonical form; the old
                        --format-help flag still works as an alias.
 
-Auto-attach (feature, ON by default — toggle with --feature/--no-feature):
-  File paths in the message text that resolve to an existing file (absolute,
-  ~-expanded, or relative to the current directory) are auto-attached: images
-  become photos, everything else becomes a document. The path token is KEPT in
-  the caption (it is NOT removed). Explicit --photo/--file take precedence.
-  Disable with --no-feature auto-attach or features.auto-attach: false in
-  ~/.config/tg-cli/config.yaml.
+Attachments:
+  Only --photo and --file attach a file from disk. A path written in the
+  message text stays plain text and is never attached, even when the file
+  exists. (A fenced code block over 1024 chars pasted into the text is still
+  sent as a fragment document — that is the message's own content.)
 
 Autolink tasks (feature, ON by default — toggle with --feature/--no-feature):
   Ticket-like codes in the text (3 uppercase letters + dash + digits, e.g.
@@ -337,8 +331,8 @@ Code as PDF (feature, ON by default — toggle with --feature/--no-feature):
   Disable with --no-feature code-as-pdf.
 
 Missing/empty/unreadable attachments:
-  A disk attachment (auto-detected or explicit --photo/--file) that goes missing,
-  is truncated to 0 bytes, or loses read permission between detection and send is
+  A disk attachment (explicit --photo/--file) that goes missing,
+  is truncated to 0 bytes, or loses read permission between parsing and send is
   skipped with a stderr warning naming the path and the reason — the rest of the
   send (including the text) still goes out. No toggle: this is a correctness fix,
   not an optional feature.
@@ -353,21 +347,18 @@ Message-flood cap (feature flood-cap, ON by default — toggle with
   tags) are exempt — they always send whole. Override with --no-feature flood-cap
   or features.flood-cap: false in ~/.config/tg-cli/config.yaml.
 
-Attachment encoding and extensionless files:
+Attachment encoding:
   Text documents containing non-ASCII UTF-8 get a BOM prepended to the
   UPLOADED COPY (the file on disk is untouched) so Telegram's preview detects
-  the encoding correctly. Auto-detected files without a real extension
-  (LICENSE, Makefile, .env) are NOT attached; explicit --photo/--file always
-  attach.
+  the encoding correctly.
 
 Never-attach denylist (feature, ON by default — toggle with --feature/--no-feature):
   Secret-looking files are NEVER attached: the .env family (.env, .env.local,
   prod.env), SSH private keys (id_rsa, *.pem, *.key, *.p12, *.pfx, *.ppk),
   credential rc-files (.netrc, .npmrc, .pypirc, .git-credentials, .pgpass),
   shell histories, *.tfvars, credentials.json / client_secret*.json,
-  kubeconfig. Auto-detected mentions are silently skipped; an explicit
-  --photo/--file of such a file is an ERROR. Override consciously with
-  --no-feature attach-denylist.
+  kubeconfig. An explicit --photo/--file of such a file is an ERROR. Override
+  consciously with --no-feature attach-denylist.
 
 Stray-CJK / mixed-script guard (feature cjk-guard, ON by default — toggle with
 --feature/--no-feature):
@@ -392,8 +383,8 @@ Screenshot-attach gate (feature screenshot-guard, ON by default — toggle with
   A message (or --title) that mentions screenshot or скриншот (any case) with
   NO photo/image attached is a HARD ERROR before send. Attach the image with
   tg --photo <path> (or equivalent). Do not dodge by deleting the word —
-  attach the screenshot. A send that already has --photo (or an auto-attached
-  image) is allowed. Override with --no-feature screenshot-guard.
+  attach the screenshot. A send that already has --photo is allowed. Override
+  with --no-feature screenshot-guard.
 
 Unknown flags:
   Unknown dashed tokens (e.g. --foo) are an ERROR: this help is printed to
@@ -784,8 +775,8 @@ if (import.meta.main) {
 
   // Resolve feature flags FIRST: pull --feature/--no-feature out of argv, load
   // ~/.config/tg-cli/config.yaml, and merge (default → config → CLI). The
-  // result gates auto-attach. The transmitter safety nets (caption overflow +
-  // 4096 split) are NOT a feature and always run.
+  // transmitter safety nets (caption overflow + 4096 split) are NOT a feature
+  // and always run.
   const flagResult = applyFeatureFlags(rawArgs)
   if (flagResult.error) {
     console.error(`Error: ${flagResult.error}`)
@@ -806,22 +797,10 @@ if (import.meta.main) {
     enable: flagResult.enable,
     disable: flagResult.disable,
   })
-  const autoAttachOn = features["auto-attach"] !== false
   const attachDenylistOn = features["attach-denylist"] !== false
   const floodCapOn = features["flood-cap"] !== false
 
   const args = flagResult.rest
-  // Memoize the worktree-root enumeration: git is spawned at most once per
-  // process, and only when a path-like token actually misses plain resolution
-  // (parseArgs calls this thunk lazily inside the auto-attach scan).
-  let worktreeRootsCache: string[] | null = null
-  const getWorktreeRoots = (): string[] => {
-    if (worktreeRootsCache === null) {
-      worktreeRootsCache = enumerateWorktreeRoots(process.cwd(), runGitReal)
-    }
-    return worktreeRootsCache
-  }
-  const recursiveAttachOn = features["recursive-attach"] !== false
   // Same flag the body-detection call below gates on (`features["autolink-msgrefs"] !== false`)
   // — threaded into parseArgs so the --title guard honours a disabled feature identically
   // (tg-cli#138 review finding on PR #139: --title must not ban a literal the body allows).
@@ -833,18 +812,11 @@ if (import.meta.main) {
   // Same flag the body-detection `detectTicketCodesExpanded` call below gates on — threaded so
   // the --title HYP-<id> guard honours a disabled feature identically to the body.
   const ticketAutolinkOn = features["autolink-tasks"] !== false
-  const parsed = parseArgs(
-    args,
-    process.cwd(),
-    home,
-    autoAttachOn,
-    getWorktreeRoots,
-    attachDenylistOn,
-    recursiveAttachOn,
-    undefined,
-    msgrefAutolinkOn,
-    ticketAutolinkOn,
-  )
+  const parsed = parseArgs(args, process.cwd(), home, {
+    attachDenylist: attachDenylistOn,
+    msgrefAutolink: msgrefAutolinkOn,
+    ticketAutolink: ticketAutolinkOn,
+  })
 
   // No-send actions resolve BEFORE the credential gate so help/version/info
   // flags work without Telegram credentials configured.
@@ -1408,7 +1380,7 @@ if (import.meta.main) {
   // Screenshot-attach gate (feature `screenshot-guard`, ON by default): a
   // caption/--title that mentions screenshot/скриншот with no photo attached
   // is a hard error before dry-run/transmit (tg-cli#337). Runs HERE so
-  // --dry-run also catches it. A --photo (or auto-attached image) in `items`
+  // --dry-run also catches it. A --photo in `items`
   // skips the gate — that path already has a file. Documents do not count.
   // A photo item whose path is missing/empty is later skipped by
   // checkAttachmentFile and the caption still goes out as text — that is
@@ -1540,7 +1512,7 @@ if (import.meta.main) {
     console.error(
       `Error: --dry-run does not support attachments (${items.length} item(s): ` +
         `${items.map((it) => it.type).join(', ')}) — it only validates the TEXT body. ` +
-        "Drop --photo/--file (or the auto-attached path in the text) to dry-run just the caption.",
+        "Drop --photo/--file to dry-run just the caption.",
     )
     process.exit(1)
   }

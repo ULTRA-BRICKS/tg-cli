@@ -3,6 +3,19 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.58.0
+
+- **A file path in the message text is never attached any more (#648).** `tg "see AGENTS.md"`
+  used to find `AGENTS.md` (in the cwd, any git worktree, or anywhere down the tree) and upload
+  it, md → PDF — so naming a file in a report leaked it into the chat. Now only `--file` and
+  `--photo` attach a file from disk; every path in the text stays plain text (a pasted code
+  block over 1024 chars is still sent as a fragment document, as before). `tg --dry-run "see
+  AGENTS.md"` validates the text instead of refusing with "does not support attachments".
+  Removed with it: the `auto-attach` and `recursive-attach` features (no opt-in remains;
+  `--no-feature auto-attach` is an inert unknown name), the worktree and recursive path
+  lookup, and the extensionless-file gate. A line-spec still works for a file you attach:
+  `tg --file a.ts "bug at a.ts:42"` quotes the lines inline and marks them in the copy.
+
 ## 1.57.3
 
 - **A hatch grant notice reaches only the project that asked (#433 item 3, security).** When an omp's

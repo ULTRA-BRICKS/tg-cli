@@ -63,8 +63,8 @@ afterAll(() => {
 });
 
 // A throwaway HOME with a tg-cli config holding fake creds, so `tg` clears its
-// credential gate and actually hits our mock. The auto-attach worktree scan and
-// the ctl auto-start are both inert here (no TMUX, no MODEL).
+// credential gate and actually hits our mock. The ctl auto-start is inert here
+// (no TMUX, no MODEL).
 function makeHome(): string {
   const home = tempDir('tg-topic-home-');
   dirs.push(home);

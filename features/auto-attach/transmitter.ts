@@ -9,9 +9,8 @@
 //     caption-less and the text becomes separate message(s) (spec §Caption)
 //   - the generic >4096 HTML-safe split, applied LAST (spec §Message splitting)
 //
-// These are transmitter-level SAFETY NETS: they run even when the auto-attach
-// feature is OFF, because they are not part of the feature — they are correct
-// behavior for any send.
+// These are transmitter-level SAFETY NETS that run on every send — they are
+// correct behavior for any send, not an optional feature.
 
 import { decodeHtmlEntities, stripHtmlTags } from '../render/html';
 import { isRichHtml, normalizeRichHtml, validateRichHtml } from '../render/rich';

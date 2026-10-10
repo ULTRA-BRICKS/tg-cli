@@ -1,19 +1,16 @@
 // Line-spec orchestration (spec §Line-spec).
 //
-// This is the testable seam pulled out of the `tg` send path: given the merged
-// attach items + an injected content reader, it decides, per line-spec DOCUMENT:
+// This is the testable seam pulled out of the `tg` send path: given the explicit
+// --photo/--file items + an injected content reader, it decides, per line-spec
+// DOCUMENT (`--file x.ts "see x.ts:42"`):
 //   - the inline AST-aware ±2 snippet quote to splice below the path mention,
 //   - the marker-injected in-memory copy that replaces the disk source on upload.
 //
-// A mentioned file is ALWAYS attached, regardless of size (decision C, 2026-06-11
-// — "не помню чтобы я говорил что маленькие не прикладываем"; for paths the rule
-// is "все аттачим да"). There is NO size gate. The earlier FIX-1 ≤1024 drop was
-// an over-extrapolation of the R3 INLINE-EXCERPT rule (a pasted snippet ≤1024
-// stays inline, not attached) onto path-referenced files — those are different:
-// a path → attach, an inline excerpt → keep inline (R3 lives in extract.ts).
+// Only explicit items reach here — the message text is never resolved into a
+// file to attach (tg-cli#648). There is NO size gate on an attached file.
 //
 // Per item this layer only acts on line-spec text documents:
-//   * Bare paths (no line-spec) and photos attach as-is via the normal send
+//   * Items without a line-spec and photos attach as-is via the normal send
 //     path — nothing to plan here.
 //   * Line-spec on a binary/unknown ext, or an unreadable file → no snippet, no
 //     marker; the file attaches as-is (reading it as UTF-8 would corrupt it).
@@ -26,10 +23,8 @@ import { extractContextRange, injectMarkers, renderQuote } from './snippet';
 export interface GateItem {
   type: 'photo' | 'document';
   path: string;
-  // The trailing location spec, when the path was written as file.ts:N etc.
+  // The trailing location spec, when the text names the file as file.ts:N etc.
   lineSpec?: { token: string; startLine: number; endLine: number; col: number | undefined };
-  // True only for auto-detected items (not explicit --photo/--file).
-  auto?: true;
 }
 
 export interface QuoteRender {
@@ -106,8 +101,7 @@ function baseName(p: string): string {
  * Plan the line-spec snippets and marker copies for a set of attach items.
  * `readText(path)` returns the file's UTF-8 content, or null when the file is
  * missing / binary / unreadable (in which case no snippet/marker is produced and
- * the file attaches as-is). A mentioned file is ALWAYS attached regardless of
- * size (decision C) — there is no size gate here.
+ * the file attaches as-is). An attached file is never size-gated here.
  */
 export function planLineSpecs(items: GateItem[], readText: (path: string) => string | null): LineSpecPlan {
   const quotes: QuoteRender[] = [];

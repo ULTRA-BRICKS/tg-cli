@@ -1,7 +1,7 @@
 // Feature-toggle system for tg-cli.
 //
 // Resolution order (lowest → highest precedence):
-//   1. DEFAULT_FEATURES (auto-attach ON by default)
+//   1. DEFAULT_FEATURES
 //   2. ~/.config/tg-cli/config.yaml  → features.<name>
 //   3. CLI flags --feature <name> (force ON) / --no-feature <name> (force OFF)
 //
@@ -11,15 +11,14 @@
 
 export type FeatureMap = Record<string, boolean>;
 
-// Default feature state. auto-attach is ON by default per spec §North star;
-// autolink-tasks per docs/specs/autolink-tasks.md §North star; autolink-prs
-// resolves GitHub #N refs (issues into the tickets block, PRs in their own
-// block) per docs/specs/autolink-prs.md §North star; md-as-pdf converts attached
-// markdown to PDF (emoji/Cyrillic-safe preview); attach-denylist blocks
-// secret-looking files (.env, keys, credentials); recursive-attach finds
-// mentioned files deeper than cwd (auto-attach spec §Recursive resolution).
+// Default feature state. autolink-tasks per docs/specs/autolink-tasks.md
+// §North star; autolink-prs resolves GitHub #N refs (issues into the tickets
+// block, PRs in their own block) per docs/specs/autolink-prs.md §North star;
+// md-as-pdf converts attached markdown to PDF (emoji/Cyrillic-safe preview);
+// attach-denylist blocks secret-looking files (.env, keys, credentials) given
+// to --photo/--file. There is no feature that attaches files named in the
+// message text — the text is never resolved into paths (tg-cli#648).
 export const DEFAULT_FEATURES: FeatureMap = {
-  'auto-attach': true,
   'autolink-tasks': true,
   'autolink-prs': true,
   // autolink-msgrefs links `tg#<id>` inbound-message references (the convention
@@ -32,7 +31,6 @@ export const DEFAULT_FEATURES: FeatureMap = {
   // file is dropped — useless on iOS). `--with-original`/`--no-pdf` adjust.
   'code-as-pdf': true,
   'attach-denylist': true,
-  'recursive-attach': true,
   // Enforces the tg-cli#208 message-fragmentation cap. `--no-feature
   // flood-cap` or `features.flood-cap: false` in config.yaml opts out.
   'flood-cap': true,

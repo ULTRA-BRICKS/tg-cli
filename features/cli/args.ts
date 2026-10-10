@@ -1,15 +1,14 @@
 // --- Arg parsing (pure) ---
 //
 // Extracted from the `tg` entrypoint (decomposition Stage 0c, docs/specs/
-// tg-decomposition.md). Pure: captures no main() state, all I/O reaches it via
-// injected thunks (getWorktreeRoots / getFileIndex) or the real-fs helpers
-// below. The entrypoint imports `parseArgs` + the `Format` type from here.
-import { readdirSync, statSync } from 'fs';
-import { isAbsolute, join, resolve } from 'path';
+// tg-decomposition.md). Pure: captures no main() state. The only disk access is
+// `resolveExistingFile`, which checks an explicit --photo/--file value — the
+// message text is NEVER resolved into file paths (tg-cli#648). The entrypoint
+// imports `parseArgs` + the `Format` type from here.
+import { statSync } from 'fs';
+import { join, resolve } from 'path';
 import { isNeverAttach } from '../auto-attach/denylist';
 import { parseLineSpec, stripSpecWrappers } from '../auto-attach/snippet';
-import { buildFileIndex, isRecursiveCandidate, matchFromIndex, type ListDir } from '../auto-attach/recursive';
-import { looksPathLike, resolveAcrossWorktrees } from '../auto-attach/worktree';
 import { ESCALATION_TAGS, validateTag } from '../render/tag';
 import { detectMsgRefs } from '../autolink-msgrefs/detect';
 import { detectTicketCodesExpanded } from '../autolink-tasks/detect';
@@ -28,16 +27,10 @@ export interface ItemLineSpec {
 export interface Item {
   type: 'photo' | 'document';
   path: string;
-  // Present only when the path was written with a trailing line-spec
-  // (file.ts:42 / :42-50 / :42:5). Absent otherwise so no-spec parse results
-  // are byte-identical to before (keeps existing toEqual assertions green).
+  // Present only when the explicit --file path is named with a trailing
+  // line-spec in the text (`--file x.ts "see x.ts:42"`). Absent otherwise so
+  // no-spec parse results stay byte-identical (keeps toEqual assertions green).
   lineSpec?: ItemLineSpec;
-  // True ONLY for items DETECTED by the auto-attach path scanner (not for
-  // explicit --photo/--file). Marks auto-detected provenance (e.g. the
-  // attach-denylist silently skips a denylisted AUTO path but hard-errors an
-  // explicit one). Absent on explicit items so their existing toEqual
-  // assertions stay byte-identical.
-  auto?: true;
 }
 
 export type Format = 'plain' | 'html';
@@ -131,8 +124,7 @@ export type ParseResult =
     };
 
 // Extensions that Telegram's sendPhoto accepts. SVG is intentionally excluded:
-// Telegram rejects SVG as a photo, so an auto-detected .svg path falls back to
-// a document (explicit --photo still honors the user's choice).
+// Telegram rejects SVG as a photo (explicit --photo still honors the user's choice).
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'heic', 'heif']);
 
 export function isImagePath(path: string): boolean {
@@ -141,35 +133,31 @@ export function isImagePath(path: string): boolean {
   return IMAGE_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
 }
 
-// A "real" extension = a dot at basename position >0 with word chars after it.
-// LICENSE, Makefile, tg → none; .env (dot at 0, nothing more) → none either.
-// The auto-attach scanner skips extensionless files: they are usually
-// code-adjacent artifacts the receiver can't preview, and dotfiles tend to
-// hold secrets. Explicit --photo/--file remain a direct instruction.
-export function hasRealExtension(path: string): boolean {
-  const base = path.slice(path.lastIndexOf('/') + 1);
-  return /^.+\.[A-Za-z0-9]+$/.test(base);
-}
-
 export function expandHome(token: string, home: string): string {
   if (token === '~') return home;
   if (token.startsWith('~/')) return join(home, token.slice(2));
   return token;
 }
 
+// ~-expand, then make absolute against cwd and normalize (`resolve` collapses
+// `.`/`..` in absolute paths too, so `/etc/../etc/hosts` equals `/etc/hosts`).
+// Pure path math, no disk access.
+function absolutePath(token: string, cwd: string, home: string): string {
+  return resolve(cwd, expandHome(token, home));
+}
+
 /**
- * Resolve a text token to an existing file path, if it is one.
+ * Resolve an explicit --photo/--file value to an existing file path, if it is one.
  * Tries ~-expansion, absolute, and cwd-relative resolution.
  * Returns the absolute path only when it resolves to a real file (not a dir).
  */
 export function resolveExistingFile(token: string, cwd: string, home: string): string | null {
   if (!token) return null;
-  const expanded = expandHome(token, home);
-  const candidate = isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
+  const candidate = absolutePath(token, cwd, home);
   try {
     if (statSync(candidate).isFile()) return candidate;
   } catch {
-    // not a path / no access — treat as ordinary text
+    // not a path / no access
   }
   return null;
 }
@@ -303,6 +291,27 @@ const TAG_GATES: Record<string, TagGate> = {
   ...Object.fromEntries(ESCALATION_TAGS.map((t) => [t, escalationFormatGate])),
 };
 
+export interface ParseOptions {
+  // Never-attach denylist (feature `attach-denylist`, ON by default): an explicit
+  // --photo/--file naming a secret-looking file (.env family, private keys,
+  // credential rc-files, …) is a HARD ERROR.
+  attachDenylist?: boolean;
+  // Message-reference autolinking (feature `autolink-msgrefs`, ON by default): gates the
+  // `--title` tg#<id> guard below, mirroring the SAME flag the body-detection call in the `tg`
+  // entrypoint already gates on. With the feature off, a `tg#<id>` is inert plain text (no
+  // linkify, no gate) in BOTH the title and the body — consistent, rather than banning it from
+  // the title while the identical literal is freely allowed in the body (task-cli#45 / tg-cli
+  // review finding on PR #139).
+  msgrefAutolink?: boolean;
+  // Ticket-code autolinking (feature `autolink-tasks`, ON by default): gates the `--title`
+  // HYP-<id> guard below, mirroring the `msgrefAutolink` gating of the tg#<id> guard. A bare
+  // ticket code in the one-line header is inert (nothing there ever linkifies it) and only
+  // duplicates a body reference the reader can follow — the same rule task-cli/gh-ship enforce
+  // on a ticket title (tg-cli#116). With the feature off, a `TEAM-123` is inert plain text in
+  // BOTH title and body, so it must not be banned in one and allowed in the other.
+  ticketAutolink?: boolean;
+}
+
 /**
  * Parse argv (already sliced past node/script) into an action. Never throws and
  * never calls process.exit: the caller decides what to do with the result.
@@ -320,38 +329,7 @@ export function parseArgs(
   args: string[],
   cwd: string,
   home: string,
-  autoAttach = true,
-  // Worktree-aware fallback: a memoized thunk returning the priority-ordered
-  // list of git worktree roots to probe when a path-like token fails plain
-  // cwd/~/absolute resolution. Injected so tests stub it (and `main` memoizes
-  // the real `enumerateWorktreeRoots`). Defaults to "no extra roots" — with the
-  // thunk absent, resolution is exactly the old cwd-only behavior.
-  getWorktreeRoots: () => string[] = () => [],
-  // Never-attach denylist (feature `attach-denylist`, ON by default): secret-
-  // looking files (.env family, private keys, credential rc-files, …) are
-  // silently skipped by the auto-scan and a HARD ERROR for explicit flags.
-  attachDenylist = true,
-  // Recursive resolution (feature `recursive-attach`, ON by default): third
-  // fallback after plain and worktree-root joins — search the worktree roots
-  // (or cwd outside a git repo) recursively for the mentioned file (auto-attach
-  // spec §Recursive resolution). The index thunk is injectable for tests;
-  // the default builds one lazy real-fs index per parseArgs call.
-  recursiveAttach = true,
-  getFileIndex?: () => string[],
-  // Message-reference autolinking (feature `autolink-msgrefs`, ON by default): gates the
-  // `--title` tg#<id> guard below, mirroring the SAME flag the body-detection call in the `tg`
-  // entrypoint already gates on. With the feature off, a `tg#<id>` is inert plain text (no
-  // linkify, no gate) in BOTH the title and the body — consistent, rather than banning it from
-  // the title while the identical literal is freely allowed in the body (task-cli#45 / tg-cli
-  // review finding on PR #139).
-  msgrefAutolink = true,
-  // Ticket-code autolinking (feature `autolink-tasks`, ON by default): gates the `--title`
-  // HYP-<id> guard below, mirroring the `msgrefAutolink` gating of the tg#<id> guard. A bare
-  // ticket code in the one-line header is inert (nothing there ever linkifies it) and only
-  // duplicates a body reference the reader can follow — the same rule task-cli/gh-ship enforce
-  // on a ticket title (tg-cli#116). With the feature off, a `TEAM-123` is inert plain text in
-  // BOTH title and body, so it must not be banned in one and allowed in the other.
-  ticketAutolink = true,
+  { attachDenylist = true, msgrefAutolink = true, ticketAutolink = true }: ParseOptions = {},
 ): ParseResult {
   // 1. Help / version win anywhere, before the empty check.
   for (const a of args) {
@@ -617,141 +595,32 @@ export function parseArgs(
     i += 1;
   }
 
-  // Auto-detect existing-file paths in the message text. Split the joined text
-  // on whitespace so both `tg /tmp/x.png` and `tg "look /tmp/x.png"` work.
-  const explicitResolved = new Set(
-    explicit.map((it) => resolveExistingFile(it.path, cwd, home)).filter((p): p is string => p !== null),
-  );
-  const autoItems: Item[] = [];
-  // CORE CORRECTION (spec §"never excise a path"): a path mentioned in the text
-  // STAYS in the text verbatim. We only DETECT it and attach the file — we never
-  // strip the token from the caption. (The old behavior excised it; that is now
-  // reversed.) Tokenize purely to find file references; the caption is the
-  // original joined text, untouched except for outer-edge trimming.
-  //
-  // Auto-detection is the `auto-attach` FEATURE. When it is OFF, we skip the
-  // scan entirely — only explicit --photo/--file are attached, and any path in
-  // the text stays as plain words (it is never attached).
-  if (autoAttach) {
-    // Worktree-aware resolution (CTO request): when a token fails the plain
-    // cwd/~/absolute resolve, AND it looks path-like, fall back to probing the
-    // git worktree roots in priority order (current → main → branch-matched →
-    // rest). `getWorktreeRoots` is the injected, memoized thunk; the path-like
-    // gate keeps git OUT of the hot path for ordinary prose. This only changes
-    // WHERE a relative path resolves — never the R1–R4 attach rules.
-    const fileExistsAbs = (p: string): boolean => {
-      try {
-        return statSync(p).isFile();
-      } catch {
-        return false;
-      }
-    };
-    // Recursive index (feature `recursive-attach`): built lazily, at most once
-    // per parseArgs call, and ONLY when some token actually reaches the third
-    // fallback — ordinary sends never pay for a tree walk.
-    const realListDir: ListDir = (abs) => {
-      try {
-        return readdirSync(abs, { withFileTypes: true }).map((d) => ({
-          name: d.name,
-          isFile: d.isFile(),
-          isDirectory: d.isDirectory(),
-        }));
-      } catch {
-        return null;
-      }
-    };
-    let fileIndexCache: string[] | null = null;
-    const getIndex =
-      getFileIndex ??
-      ((): string[] => {
-        if (fileIndexCache === null) {
-          const roots = getWorktreeRoots();
-          fileIndexCache = buildFileIndex(roots.length > 0 ? roots : [cwd], realListDir);
-        }
-        return fileIndexCache;
-      });
-    const resolveWithWorktrees = (token: string): string | null => {
-      const plain = resolveExistingFile(token, cwd, home);
-      if (plain) return plain;
-      if (!looksPathLike(token)) return null;
-      const roots = getWorktreeRoots();
-      if (roots.length > 0) {
-        const fromWorktrees = resolveAcrossWorktrees(token, roots, fileExistsAbs);
-        if (fromWorktrees) return fromWorktrees;
-      }
-      // Third fallback: recursive search (auto-attach spec §Recursive
-      // resolution). The hit is re-checked against the real fs — the index
-      // may be stale within a long-running process.
-      if (recursiveAttach && isRecursiveCandidate(token)) {
-        const hit = matchFromIndex(token, getIndex());
-        if (hit && fileExistsAbs(hit)) return hit;
-      }
-      return null;
-    };
-    const segments = textParts.join(' ').split(/(\s+)/);
-    for (let s = 0; s < segments.length; s++) {
-      const isWhitespace = s % 2 === 1;
-      const seg = segments[s];
-      if (isWhitespace || !seg) continue;
-      // First try a plain existing-file resolve. If that fails, the token may
-      // carry a trailing line-spec (file.ts:42 / :42-50 / :42:5) — strip it and
-      // resolve the base path. The full token stays in the caption either way.
-      // Both resolves go through the worktree-aware fallback.
-      let resolved = resolveWithWorktrees(seg);
-      let spec: ItemLineSpec | undefined;
-      if (!resolved) {
-        // Try the raw token, then the same token with wrapping punctuation stripped
-        // (`(file.ts:42)`, `file.ts:42.`, `` `file.ts:42` ``) so a spec glued to prose
-        // punctuation still resolves (tg#29). The full original `seg` stays the caption token.
-        const ls = parseLineSpec(seg) ?? parseLineSpec(stripSpecWrappers(seg));
-        if (ls) {
-          const baseResolved = resolveWithWorktrees(ls.path);
-          if (baseResolved) {
-            resolved = baseResolved;
-            spec = {
-              token: seg,
-              startLine: ls.startLine,
-              endLine: ls.endLine,
-              col: ls.col,
-            };
-          }
-        }
-      }
-      if (!resolved) continue;
-      // Extensionless gate: an auto-DETECTED file without a real extension is
-      // never attached (the token stays in the text as plain words).
-      if (!hasRealExtension(resolved)) continue;
-      // Never-attach denylist: a secret-looking file mentioned in the text is
-      // never attached (the token stays as plain words).
-      if (attachDenylist && isNeverAttach(resolved)) continue;
-      if (explicitResolved.has(resolved)) {
-        // Already attached (explicit --file/--photo or an earlier mention). Don't
-        // attach twice, but if THIS mention carried a line-spec and the existing
-        // item has none, adopt it so `--file x.ts "see x.ts:42"` still renders a
-        // quote. First spec per file wins (a second, different spec is ignored —
-        // documented in docs/specs/auto-attach.md; the marker copy can only mark
-        // one range). Match on the resolved path, not the raw arg string.
-        if (spec) {
-          // Re-resolve via the SAME worktree-aware path so a cross-worktree
-          // file (whose plain resolve is null) still matches its existing item.
-          const existing = [...explicit, ...autoItems].find(
-            (it) => resolveWithWorktrees(it.path) === resolved && !it.lineSpec,
-          );
-          if (existing) existing.lineSpec = spec;
-        }
-        continue;
-      }
-      explicitResolved.add(resolved); // dedup repeats within the text too
-      const item: Item = { type: isImagePath(resolved) ? 'photo' : 'document', path: resolved, auto: true };
-      if (spec) item.lineSpec = spec;
-      autoItems.push(item);
+  // The message text is NEVER resolved into file paths (tg-cli#648): a token
+  // that happens to name an existing file is plain text, nothing is attached for
+  // it. Only explicit --photo/--file attach. The one thing the text may add is a
+  // line-spec for a file that IS explicitly attached (`--file x.ts "see
+  // x.ts:42"` renders the quote + marker copy). That match is pure path math on
+  // the explicit items — the text never touches the filesystem. First spec per
+  // file wins (the marker copy can only mark one range).
+  const text = textParts.join(' ');
+  if (explicit.length > 0) {
+    const explicitAbs = explicit.map((it) => absolutePath(it.path, cwd, home));
+    for (const seg of text.split(/\s+/)) {
+      if (!seg) continue;
+      // Try the raw token, then the same token with wrapping punctuation stripped
+      // (`(file.ts:42)`, `file.ts:42.`, `` `file.ts:42` ``) so a spec glued to prose
+      // punctuation still matches (tg#29). The full original `seg` stays the quote anchor.
+      const ls = parseLineSpec(seg) ?? parseLineSpec(stripSpecWrappers(seg));
+      if (!ls) continue;
+      const target = absolutePath(ls.path, cwd, home);
+      const item = explicit.find((it, k) => explicitAbs[k] === target && !it.lineSpec);
+      if (item) item.lineSpec = { token: seg, startLine: ls.startLine, endLine: ls.endLine, col: ls.col };
     }
   }
 
-  const items = [...explicit, ...autoItems];
+  const items = explicit;
   // Trim only the outer edges; interior formatting (newlines, alignment) stays.
-  // The path token is intentionally KEPT in the caption (core correction).
-  const caption = textParts.join(' ').replace(/^\s+|\s+$/g, '');
+  const caption = text.replace(/^\s+|\s+$/g, '');
 
   // Per-tag parse-time gates (TAG_GATES above) — a cheap, in-process check run
   // before anything else (no subprocess, no hook). `tag` was already validated
@@ -771,7 +640,7 @@ export function parseArgs(
     }
   }
 
-  // Empty invocation (or nothing left after path excision) → help, exit 0.
+  // Empty invocation → help, exit 0.
   // A bare `--title`/`--tag`/`--table`/`--reply-to` still sends (a header-only
   // or table or reply message), so none of those is an empty invocation. The
   // `--table` body arrives on stdin, read by the entrypoint after parsing.

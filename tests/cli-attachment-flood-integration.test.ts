@@ -79,7 +79,7 @@ test('wiring: a real 0-byte file on disk is skipped by the real `tg` binary, tex
   dirs.push(home);
   const emptyFile = join(home, 'empty.log');
   writeFileSync(emptyFile, '');
-  const { exitCode, stderr } = await runSend([`please check ${emptyFile} for errors`]);
+  const { exitCode, stderr } = await runSend(['--file', emptyFile, `please check ${emptyFile} for errors`]);
   expect(exitCode).toBe(0);
   expect(sent.map((c) => c.kind)).toEqual(['sendMessage']);
   expect(sent[0].body.text as string).toContain(emptyFile);

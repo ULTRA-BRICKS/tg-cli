@@ -37,7 +37,7 @@ Extract into `features/`, by concern (lowest-coupling first):
 
 | Module | From `tg` | Surface |
 |---|---|---|
-| `features/cli/args.ts` | arg parsing §231-560 | `parseArgs`, `isImagePath`, `hasRealExtension`, `expandHome`, `resolveExistingFile`, `Format`/`ParseResult` types |
+| `features/cli/args.ts` | arg parsing §231-560 | `parseArgs`, `isImagePath`, `expandHome`, `resolveExistingFile`, `Format`/`ParseResult` types (`hasRealExtension` deleted with the text-path scan, tg-cli#648) |
 | `features/cli/version.ts` | §77-133 | `versionOutput`, `gitShortHash`, `latestChangelogSection` |
 | `features/branding/emoji.ts` | §565-663 | `EMBEDDABLE_EMOJI_MAP`, `UNICODE_EMOJI_MAP`, `MODEL_EMOJI_MAP`, `EmojiEntity`, `ParsedText`, `parseEmojiHelpers`, `convertEntitiesToHtml` |
 | `features/branding/detect.ts` | §664-720, main §841 | `detectAgentViaAncestry`, `isProcessRunning`, `extractBaseModel`, `detectAiModel`, `detectAiEmoji` |
@@ -66,7 +66,8 @@ closures extract after (Stage 1+).
   `detectAgentViaAncestry`. `tg` 1622 → 1589.
 - **Stage 0c — DONE** (`features/cli/args.ts`): `parseArgs` + path helpers
   (`isImagePath`/`hasRealExtension`/`expandHome`/`resolveExistingFile`, now
-  exported) + `Item`/`ParseResult`/`Format`/`ItemLineSpec`. 5 test files now
+  exported; `hasRealExtension` was later deleted, tg-cli#648)
+  + `Item`/`ParseResult`/`Format`/`ItemLineSpec`. 5 test files now
   import `parseArgs` from `../features/cli/args`. `tg` 1589 → 1255.
 - **Stage 0d — DONE** (`features/cli/version.ts`): `VERSION` +
   `gitShortHash`/`latestChangelogSection`/`versionOutput`; the entrypoint

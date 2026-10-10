@@ -18,7 +18,7 @@ const lineSpec = (token: string, n: number) => ({ token, startLine: n, endLine: 
 test('line-spec file <=1024 → snippet inline + 1 marker attachment (always attached)', () => {
   const content = ['const a = 1', 'const b = 2', 'const c = 3', 'const d = 4', 'const e = 5'].join('\n');
   expect(content.length).toBeLessThanOrEqual(1024);
-  const items: GateItem[] = [{ type: 'document', path: '/x.ts', auto: true, lineSpec: lineSpec('/x.ts:3', 3) }];
+  const items: GateItem[] = [{ type: 'document', path: '/x.ts', lineSpec: lineSpec('/x.ts:3', 3) }];
   const plan = planLineSpecs(items, reader({ '/x.ts': content }));
   // Snippet is always shown for a line-spec.
   expect(plan.quotes.length).toBe(1);
@@ -36,7 +36,7 @@ test('line-spec file <=1024 → snippet inline + 1 marker attachment (always att
 test('line-spec file >1024 → snippet inline + 1 marker attachment', () => {
   const big = Array.from({ length: 200 }, (_, i) => `const v${i} = ${i}`).join('\n');
   expect(big.length).toBeGreaterThan(1024);
-  const items: GateItem[] = [{ type: 'document', path: '/big.ts', auto: true, lineSpec: lineSpec('/big.ts:50', 50) }];
+  const items: GateItem[] = [{ type: 'document', path: '/big.ts', lineSpec: lineSpec('/big.ts:50', 50) }];
   const plan = planLineSpecs(items, reader({ '/big.ts': big }));
   expect(plan.quotes.length).toBe(1);
   expect(plan.marked.length).toBe(1);
@@ -62,20 +62,20 @@ test('explicit (non-auto) line-spec file <=1024 → snippet + attached with mark
 
 // Bare path (no line-spec): this layer plans nothing — bare paths attach as-is
 // via the normal send path. No size discrimination here either.
-test('bare auto document (any size) → no snippet, no marker (attaches via normal path)', () => {
-  const small: GateItem[] = [{ type: 'document', path: '/s.txt', auto: true }];
+test('bare document (any size) → no snippet, no marker (attaches via normal path)', () => {
+  const small: GateItem[] = [{ type: 'document', path: '/s.txt' }];
   const planSmall = planLineSpecs(small, reader({ '/s.txt': 'small file\njust two lines' }));
   expect(planSmall.quotes.length).toBe(0);
   expect(planSmall.marked.length).toBe(0);
 
-  const big: GateItem[] = [{ type: 'document', path: '/b.txt', auto: true }];
+  const big: GateItem[] = [{ type: 'document', path: '/b.txt' }];
   const planBig = planLineSpecs(big, reader({ '/b.txt': 'x'.repeat(2000) }));
   expect(planBig.quotes.length).toBe(0);
   expect(planBig.marked.length).toBe(0);
 });
 
 test('PHOTOS are never snippeted/marked', () => {
-  const items: GateItem[] = [{ type: 'photo', path: '/a.png', auto: true }];
+  const items: GateItem[] = [{ type: 'photo', path: '/a.png' }];
   const plan = planLineSpecs(items, reader({ '/a.png': 'PNGDATA' }));
   expect(plan.quotes.length).toBe(0);
   expect(plan.marked.length).toBe(0);
@@ -83,7 +83,7 @@ test('PHOTOS are never snippeted/marked', () => {
 
 test('binary-ext line-spec (report.pdf:12) → no snippet, no marker, attached as-is', () => {
   const items: GateItem[] = [
-    { type: 'document', path: '/report.pdf', auto: true, lineSpec: lineSpec('/report.pdf:12', 12) },
+    { type: 'document', path: '/report.pdf', lineSpec: lineSpec('/report.pdf:12', 12) },
   ];
   // reader returns null for a pdf (binary).
   const plan = planLineSpecs(items, reader({}));
@@ -92,7 +92,7 @@ test('binary-ext line-spec (report.pdf:12) → no snippet, no marker, attached a
 });
 
 test('unreadable text-ext line-spec → no snippet, no marker (attached as-is)', () => {
-  const items: GateItem[] = [{ type: 'document', path: '/gone.ts', auto: true, lineSpec: lineSpec('/gone.ts:3', 3) }];
+  const items: GateItem[] = [{ type: 'document', path: '/gone.ts', lineSpec: lineSpec('/gone.ts:3', 3) }];
   const plan = planLineSpecs(items, reader({})); // reads null
   expect(plan.quotes.length).toBe(0);
   expect(plan.marked.length).toBe(0);
@@ -106,7 +106,7 @@ test('wiring: small auto doc with pasted content → attached AND R2 strips the 
   const content = 'export const a = 1\nexport const b = 2';
   const path = '/small.ts';
   const text = `Updated:\n${content}\nthanks`;
-  const items: GateItem[] = [{ type: 'document', path, auto: true }];
+  const items: GateItem[] = [{ type: 'document', path }];
 
   // 1. plan the line-specs (none here — bare path).
   const lsPlan = planLineSpecs(items, reader({ [path]: content }));
@@ -130,7 +130,7 @@ test('wiring: large auto doc → attached AND R2 strips the paste', () => {
   const content = 'L\n'.repeat(700); // > 1024
   const path = '/big.ts';
   const text = `Here:\n${content}\nend`;
-  const items: GateItem[] = [{ type: 'document', path, auto: true }];
+  const items: GateItem[] = [{ type: 'document', path }];
 
   const fileContents = items.filter((it) => it.type === 'document').map((it) => ({ path: it.path, content }));
   expect(fileContents.length).toBe(1);

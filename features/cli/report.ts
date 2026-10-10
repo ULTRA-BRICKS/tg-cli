@@ -92,9 +92,8 @@ Optional:
 
 Not supported directly: --photo/--file/--feature/--pdf-device and the other
 global attachment/feature flags — this subcommand's flag set is fixed to the
-fields above. An existing file path mentioned inside --evidence/--summary
-text still gets auto-attached (the auto-attach feature runs on the final
-body like any other send).
+fields above. A file path mentioned inside --evidence/--summary text stays
+plain text; it is never attached.
 
 A --ticket value that already looks like a ticket code (HYP-123) is left as
 plain text so the existing autolink-tasks feature links it. A --pr value is

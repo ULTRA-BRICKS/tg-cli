@@ -10,7 +10,7 @@
 // caller skips this gate. Photo captions therefore pass (tg-cli#337).
 //
 // Assumptions: the caller knows whether any photo is attached (explicit
-// --photo or auto-attach of an image). This module only inspects text.
+// --photo). This module only inspects text.
 // A document (`--file`) is not a photo — mentioning a screenshot while
 // attaching a PDF still blocks.
 //

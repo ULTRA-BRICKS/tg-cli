@@ -140,11 +140,11 @@ tg --file data.csv --file chart.png "Results"
 
 Markdown files (`*.md`, `*.markdown`) are silently converted to PDF via pandoc + headless Chrome before upload. On conversion failure the original file is sent instead — the send is never blocked. Requires `pandoc` and Chrome/Chromium 112+. Disable with `--no-feature md-as-pdf`.
 
-### Auto-attach from message text
+### Only explicit flags attach files
 
-File paths mentioned in the message text are detected and attached automatically (images as photos, everything else as documents). The path token stays in the caption verbatim — it's only detected and attached, never removed. Recursive search across the worktree finds files by bare name or path suffix — `BFS`, shallowest match wins, `node_modules`/`.git`/`dist`-style dirs pruned.
+Only `--file` and `--photo` attach a file from disk. A path written in the message text (`tg "see AGENTS.md"`) stays plain text and is never attached, even when the file exists — naming a file in a report must not upload it (tg-cli#648). To quote lines of a file, attach it and name the range: `tg --file src/a.ts "bug at src/a.ts:42"` shows those lines inline below the mention. (A fenced code block over 1024 characters pasted into the message itself is still sent as a fragment document.)
 
-A file that goes missing, gets truncated to empty, or loses read permission between detection and send (e.g. a log path mentioned before anything has been written to it yet) is silently skipped with a stderr warning naming the path and the reason — it never fails the whole send (tg-cli#207).
+An attached file that goes missing, gets truncated to empty, or loses read permission between parsing and send is skipped with a stderr warning naming the path and the reason — it never fails the whole send (tg-cli#207).
 
 ### Message-flood cap
 
@@ -152,7 +152,7 @@ A message long enough that Telegram's 4096-char limit would fragment it into mor
 
 ### Secret-file denylist
 
-Secret-looking files are **never** attached: `.env` family, SSH private keys, `*.pem`/`*.key`/`*.p12`/`*.pfx`/`*.ppk`, credential rc-files (`.netrc`, `.npmrc`, `.git-credentials`, …), shell histories, `*.tfvars`, `credentials.json`/`client_secret*.json`, `kubeconfig`. Auto-detected mentions are silently skipped; an explicit `--file prod.env` is a hard error. Override: `--no-feature attach-denylist`.
+Secret-looking files are **never** attached: `.env` family, SSH private keys, `*.pem`/`*.key`/`*.p12`/`*.pfx`/`*.ppk`, credential rc-files (`.netrc`, `.npmrc`, `.git-credentials`, …), shell histories, `*.tfvars`, `credentials.json`/`client_secret*.json`, `kubeconfig`. An explicit `--file prod.env` is a hard error. Override: `--no-feature attach-denylist`.
 
 ### Garbled-token guard (`cjk-guard`)
 
@@ -164,7 +164,7 @@ One feature catches two "a garbled token slipped into the message" shapes on the
 
 ### Screenshot-attach gate (`screenshot-guard`)
 
-A message (or `--title`) that mentions **screenshot** or **скриншот** (any case) with **no photo attached** is a **hard error** before send. Attach the image with `tg --photo <path>` (or equivalent). Do not dodge by deleting the word — attach the screenshot. A send that already has `--photo` (or an auto-attached image) is allowed. Override: `--no-feature screenshot-guard`.
+A message (or `--title`) that mentions **screenshot** or **скриншот** (any case) with **no photo attached** is a **hard error** before send. Attach the image with `tg --photo <path>`. Do not dodge by deleting the word — attach the screenshot. A send that already has `--photo` is allowed. Override: `--no-feature screenshot-guard`.
 
 ### Dictionary gate (banned wording)
 
