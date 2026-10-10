@@ -18,17 +18,14 @@
 // CONFIRMED LIVE (2026-08-18, throwaway tmux session): a Bash-tool
 // PermissionRequest renders exactly the "Do you want to proceed?" / numbered
 // Yes-No menu this module parses, and a bare digit keypress submits it
-// instantly (no Enter). NOT yet confirmed, tracked as tg-cli#268: edit/
-// write-tool prompts ("Do you want to make this edit to …?") or
-// plan-approval ("Would you like to proceed?" with "Yes, and auto-accept
-// edits" / "No, keep planning" options) may use different marker text and/or
-// option wording — those fall through to the existing queue-and-wait path
-// today (parsePermissionMenu returns null / pickPermissionMenuDigit returns
-// null for them), not because they're deliberately unsupported, but because
-// they're unverified. Also tg-cli#268: the real rendered deny label may be a
-// verbose form ("No, and tell Claude what to do differently") that
-// pickPermissionMenuDigit's exact "No" match doesn't recognize — same safe
-// fall-through.
+// instantly (no Enter). Measured for the other shapes by the tg-cli#304 study
+// (docs/research/2026-09-04-claude-code-tmux-prompts.md, Claude Code 2.1.261):
+// an Edit prompt's marker is "Do you want to make this edit to <relative
+// path>?" and plan approval's is "… Would you like to proceed?" with options
+// "Yes, auto-accept edits" / "Yes, manually approve edits" / "Tell Claude what
+// to change" — neither matches PROCEED_MARKER, so both fall through to the
+// queue-and-wait path (tg-cli#268 tracks widening it). The deny label of both
+// Bash and Edit menus is a plain "No", which pickPermissionMenuDigit matches.
 //
 // KNOWN LIMITATION: a command containing a real newline (heredocs, multi-
 // line strings) can never satisfy permissionMenuMatchesRequest's per-line

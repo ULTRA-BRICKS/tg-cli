@@ -3,6 +3,21 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.8
+
+- **The Claude Code-in-tmux prompt study is in the repo, with a pure "is a prompt still
+  pending?" check built on it (#304).** `docs/research/2026-09-04-claude-code-tmux-prompts.md`
+  records, from a real Claude Code 2.1.261 in an isolated home and private tmux server, what
+  every prompt shape looks like (Bash and Edit permission, plan approval, AskUserQuestion with
+  one or several questions and its review screen), that the terminal menu is up while a
+  PermissionRequest hook runs and a hook reply after the timeout is ignored, what
+  `<config>/sessions/<pid>.json` reports while idle, busy or waiting (it survives `kill -9`),
+  and what each key sent with `tmux send-keys` does. The scripts are in `tools/cc-study/`, the
+  raw captures in `docs/cc-tmux-evidence/`. `features/tg-ctl/claude-prompt-state.ts` encodes it:
+  `readPendingClaudePrompt` (a `❯ N.` cursor row with no idle input box below it) and
+  `parseClaudeSessionRecord`, tested against verbatim captures in
+  `tests/fixtures/claude-prompt/`. Not used by the daemon yet.
+
 ## 1.55.6
 
 - **The test suite no longer reads the machine it runs on, and no longer parks the daemon under test

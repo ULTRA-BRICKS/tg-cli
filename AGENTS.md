@@ -414,6 +414,16 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
   key — e.g. copy-mode swallows it). No waiting process, no dependency on a hook reconnect that may
   never come for a terminal-fallback permission. Every other agent kind, and claude when the menu
   can't be re-verified live, falls through unchanged to the queuing mechanism below.
+- **Is a Claude Code prompt still pending? (`features/tg-ctl/claude-prompt-state.ts`, tg-cli#304):**
+  PURE checks from the measured study `docs/research/2026-09-04-claude-code-tmux-prompts.md`
+  (re-run with `tools/cc-study/`, raw captures in `docs/cc-tmux-evidence/`).
+  `readPendingClaudePrompt(paneText)`: pending exactly when the capture has a `❯ N.` cursor row and
+  no idle input box (`❯`+NBSP between two rules) below it; reports the shape (permission, edit,
+  plan, question, question-review, unknown), options and selected digit.
+  `parseClaudeSessionRecord(<config>/sessions/<pid>.json)`: `waiting` + `waitingFor` tells a
+  permission/plan (`permission prompt`) from a question (`input needed`); the file survives SIGKILL,
+  so liveness is pid + `procStart`. Fixtures in `tests/fixtures/claude-prompt/` are verbatim study
+  captures. Not wired into card wording or late delivery yet (tg-cli#304).
 - **Queued permission decisions (never drop a tap on a disconnected permission, and never expire it
   on the SHORT question timer — Alex tg#9982):** the pane-inject path above covers claude when its
   menu is live and verifiable; every other case (a permission has no pane-text-injection fallback in
