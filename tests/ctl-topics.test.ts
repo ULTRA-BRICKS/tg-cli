@@ -386,10 +386,15 @@ test('a /new in a topic carries its replay key: its own message id and its chat'
   expect(r.actions[0]).toMatchObject({ kind: 'new-command', threadId: 50, messageId: 24, chatId: CHAT_ID });
 });
 
-test('row 1: /stop, /kill and harness-reserved verbs are NOT daemon verbs — they reach the bound session verbatim', () => {
-  for (const cmd of ['/stop', '/kill', '/usage', '/cost', '/stats', '/compact']) {
+test('row 1: harness-reserved verbs are NOT daemon verbs — they reach the bound session verbatim', () => {
+  for (const cmd of ['/usage', '/cost', '/stats', '/compact']) {
     expect(stepUpdates([inTopic(20, { text: cmd })], bound).actions[0]).toEqual({ kind: 'topic-route', threadId: 50, payload: text(cmd, 20) });
   }
+});
+
+test('row 1b: /stop and /kill in a bound topic act on its session, never typed as text (tg-cli#555)', () => {
+  expect(stepUpdates([inTopic(21, { text: '/stop' })], bound).actions[0]).toEqual({ kind: 'topic-control', threadId: 50, control: 'stop', messageId: 21 });
+  expect(stepUpdates([inTopic(22, { text: '/kill' })], bound).actions[0]).toEqual({ kind: 'topic-control', threadId: 50, control: 'kill', messageId: 22 });
 });
 
 test('row 2: prose in a BOUND topic → topic-route with the wrapped text', () => {
@@ -409,10 +414,10 @@ test('row 2: a prose reply carries the quote anchor; a /command or `!` reply sta
   const replyTo = { message_id: 42, date: 1_749_000_000, text: 'quoted text', chat: { id: CHAT_ID } };
   const prose = stepUpdates([inTopic(25, { text: 'yes, do it', reply_to_message: replyTo })], bound).actions[0];
   expect(prose.kind === 'topic-route' && prose.payload.type === 'text' && prose.payload.text).toMatch(/^↩ tg#42 «/);
-  expect(stepUpdates([inTopic(26, { text: '/stop', reply_to_message: replyTo })], bound).actions[0]).toEqual({
+  expect(stepUpdates([inTopic(26, { text: '/compact', reply_to_message: replyTo })], bound).actions[0]).toEqual({
     kind: 'topic-route',
     threadId: 50,
-    payload: text('/stop', 26),
+    payload: text('/compact', 26),
   });
   expect(stepUpdates([inTopic(16, { text: '!ls', reply_to_message: replyTo })], bound).actions[0]).toEqual({
     kind: 'topic-route',
@@ -603,7 +608,7 @@ test('topic: an unrecognised word replying to a permission card is prose for the
 });
 
 test('topic: a /command or !shell reply to a card is never a decision', () => {
-  const slash = stepUpdates([inTopic(106, { text: '/stop', reply_to_message: replyTo(50) })], cardOpts());
+  const slash = stepUpdates([inTopic(106, { text: '/compact', reply_to_message: replyTo(50) })], cardOpts());
   expect(slash.actions[0]).toMatchObject({ kind: 'topic-route' });
   const bang = stepUpdates([inTopic(107, { text: '!ls', reply_to_message: replyTo(50) })], cardOpts());
   expect(bang.actions[0]).toMatchObject({ kind: 'topic-route' });

@@ -315,6 +315,9 @@ export type Action =
   // A message in a topic BOUND to a session → deliver the payload to that session (the
   // entrypoint answers in the topic when the session is gone). Never spawns, never falls back.
   | { kind: 'topic-route'; threadId: number; payload: TopicPayload }
+  // /stop or /kill typed in a topic BOUND to a session (§4.4 row 1b) → Escape in / SIGINT to THAT
+  // session, like the flat verbs on the flat target. Answered in the topic.
+  | { kind: 'topic-control'; threadId: number; control: 'stop' | 'kill'; messageId: number }
   // A message in an UNKNOWN topic (user-created, implicit, or a lost binding) → queue it for the
   // topic and post the attach picker there once. Delivered to the picked session, in order.
   | { kind: 'topic-hold'; threadId: number; payload: TopicPayload }
@@ -376,11 +379,11 @@ export type Action =
       choice: 'continue' | 'cancel';
       messageId: number | null;
     }
-  // A free-text message answering an in-flight flat-/new prompt (the awaiting-dir step — an
-  // absolute path typed instead of tapping a button). `text` is the raw user text. The entrypoint
-  // matches it to the SINGLE pending session in awaiting-dir (a flat chat has at most one /new in
-  // flight at a time); a stray one with no pending session falls through to normal handling.
-  | { kind: 'new-answer'; text: string; from: string; messageId: number };
+  // A free-text message answering an in-flight /new prompt (the awaiting-dir step — an absolute
+  // path typed instead of tapping a button). `text` is the raw user text. The entrypoint matches
+  // it to the newest pending session in awaiting-dir asked in the same place: the flat chat, or
+  // the forum topic `threadId` (tg-cli#555); a stray one falls through to normal handling.
+  | { kind: 'new-answer'; text: string; from: string; messageId: number; threadId?: number };
 
 export interface StepResult {
   actions: Action[];

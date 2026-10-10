@@ -10,7 +10,7 @@ const CHAT_ID = 1000;
 const NOW = 1_750_000_000;
 const wrap = (name: string, msg: string) => `[TG from ${name}] ${msg}`;
 
-function makeOpts(over: Partial<{ newSessionAwaitingDir: () => boolean }> = {}) {
+function makeOpts(over: Partial<{ newSessionAwaitingDir: (threadId: number | null) => boolean }> = {}) {
   return {
     cfg: { ...DEFAULT_CONTROL } as ControlConfig,
     chatId: CHAT_ID,
@@ -219,13 +219,50 @@ test('topics-on: a path message INSIDE a topic is routed to the topic, NOT eaten
       }),
     ],
     {
-      ...makeOpts({ newSessionAwaitingDir: () => true }),
+      ...makeOpts({ newSessionAwaitingDir: (tid) => tid === null }),
       topicsEnabled: true,
       topicStatusOf: (tid: number) => (tid === 555 ? 'bound' : null),
     },
   );
   expect(r.actions.some((x) => x.kind === 'topic-route')).toBe(true);
   expect(r.actions.some((x) => x.kind === 'new-answer')).toBe(false);
+});
+
+// tg-cli#555 (1): a `/new` typed in a topic asks for its dir in that topic, so the path typed
+// there answers it — the flat /new's answer gate never sees topic messages.
+test('topics-on: a path typed in the topic whose /new awaits its dir answers that /new', () => {
+  const asked: Array<number | null> = [];
+  const r = stepUpdates([upd(28, { text: '/tmp', message_thread_id: 555, is_topic_message: true })], {
+    ...makeOpts({ newSessionAwaitingDir: (tid) => (asked.push(tid), tid === 555) }),
+    topicsEnabled: true,
+    topicStatusOf: (tid: number) => (tid === 555 ? 'bound' : null),
+  });
+  expect(asked).toContain(555);
+  expect(r.actions.find((x) => x.kind === 'new-answer')).toEqual({ kind: 'new-answer', text: '/tmp', from: 'Alex', messageId: 28, threadId: 555 });
+  expect(r.actions.some((x) => x.kind === 'topic-route' || x.kind === 'topic-hold')).toBe(false);
+});
+
+test('topics-on: prose in a topic with a pending /new still goes to the session', () => {
+  const r = stepUpdates([upd(29, { text: 'fix the bug', message_thread_id: 555, is_topic_message: true })], {
+    ...makeOpts({ newSessionAwaitingDir: () => true }),
+    topicsEnabled: true,
+    topicStatusOf: () => 'bound',
+  });
+  expect(r.actions.some((x) => x.kind === 'topic-route')).toBe(true);
+  expect(r.actions.some((x) => x.kind === 'new-answer')).toBe(false);
+});
+
+// tg-cli#555 (2): /stop and /kill in a bound topic act on that topic's session, like the flat verbs.
+test('topics-on: /stop and /kill in a bound topic are session controls, not text', () => {
+  const opts = { ...makeOpts(), topicsEnabled: true, topicStatusOf: (tid: number) => (tid === 555 ? ('bound' as const) : null) };
+  const stop = stepUpdates([upd(30, { text: '/stop', message_thread_id: 555, is_topic_message: true })], opts);
+  expect(stop.actions.find((x) => x.kind === 'topic-control')).toEqual({ kind: 'topic-control', threadId: 555, control: 'stop', messageId: 30 });
+  const kill = stepUpdates([upd(31, { text: '/kill@tgbot', message_thread_id: 555, is_topic_message: true })], opts);
+  expect(kill.actions.find((x) => x.kind === 'topic-control')).toEqual({ kind: 'topic-control', threadId: 555, control: 'kill', messageId: 31 });
+  // An unknown topic holds it behind the attach picker, like any other message (§4.4 row 4).
+  const unknown = stepUpdates([upd(32, { text: '/stop', message_thread_id: 777, is_topic_message: true })], opts);
+  expect(unknown.actions.some((x) => x.kind === 'topic-hold')).toBe(true);
+  expect(unknown.actions.some((x) => x.kind === 'topic-control')).toBe(false);
 });
 
 test('a tnm: tap from an UNAUTHORIZED sender is rejected, never routed to spawn', () => {

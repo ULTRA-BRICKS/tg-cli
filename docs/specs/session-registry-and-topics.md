@@ -255,19 +255,31 @@ Question, permission and hatch cards (`questions.ts` `buildButtonMessage`) resol
 session key and add `message_thread_id` the same way. Callback handling is unchanged, because
 callbacks carry message ids, not threads.
 
+Daemon notices about a session go into the same topic (tg-cli#554): the limit/overload stall
+notice with its auto-continue button (`tg-ctl harness-event`, matched by the payload's session id,
+else its pane), the hatch critical reminder and the unanswered-question reminder (each matched like
+its card). A notice uses the session's existing topic and never opens one; with no topic it goes to
+General. The unanswered-question reminder lists every overdue card in one message, so it goes into a
+topic only when all of them belong to one session, else to General. A thread rejection falls back to
+General; in the daemon it also gets the §4.5 retry and miss accounting, while the `harness-event`
+hook process (not the registry's writer) only falls back.
+
 ### 4.4 Inbound triage (`features/tg-ctl/updates.ts`)
 
 Decision table, evaluated in order for a message with `message_thread_id = T`:
 
 | # | Condition | Action |
 |---|---|---|
-| 1 | Daemon verb: the `TOPIC_GLOBAL_CMDS` set in `updates.ts` (`/status`, `/agent`, `/new`, `/tasks`, `/limit`, `/daily`, `/spend`) | Run it and answer **in T**, in any topic, bound or not. `/stop` and `/kill` are deliberately not in the set: in a bound topic they reach that topic's session, and in an unknown topic they go through row 4. (Motivation: today the intercept runs only in bound topics, so an unknown topic drops even `/status`.) |
+| 1 | Daemon verb: the `TOPIC_GLOBAL_CMDS` set in `updates.ts` (`/status`, `/agent`, `/new`, `/tasks`, `/limit`, `/daily`, `/spend`) | Run it and answer **in T**, in any topic, bound or not. `/stop` and `/kill` are deliberately not in the set (row 1b). (Motivation: today the intercept runs only in bound topics, so an unknown topic drops even `/status`.) A `/new` typed in T asks its questions in T, and a path typed in T (no reply, `/`-led, not a daemon verb) while that `/new` awaits its directory answers it; a `/new` asked elsewhere never takes T's text (tg-cli#555). |
+| 1b | `/stop` or `/kill` in a T bound to a session (tg-cli#555) | Act on **that** session as the flat verbs act on the flat target: `/stop` presses Escape in its tmux pane (an omp outside tmux has none: answered in T), `/kill` sends SIGINT to its agent process. Every outcome is answered in T; a gone session gets the row 3 reply. In an unknown T they are held like any message (row 4). |
 | 2 | T is bound to a `live` entry | Deliver the text, voice, photo, document or album through the **same delivery function as the flat path**, `deliverToSession(key, payload)`: the omp-live bridge → in-tmux send-keys fallback (#483) → cc/codex send-keys, voice transcription, media download. Acknowledge the way the flat path does. Never fall back to another session. |
 | 3 | T is bound to a `gone` entry | Reply in T: "`<name>` is not running — resume with `rig omp run --resume …`", or the harness's hint from the adapter. Do not deliver. Do not spawn. |
 | 4 | T is unknown: a user-created topic, an `is_name_implicit` topic, or a topic whose binding was lost | Queue the payload for T (FIFO, 10 min from the first item; album parts and later messages join the same queue) and post the **attach picker** in T once. The queue is its own store keyed by `threadId`, persisted with the same pattern as `deferred.json` (atomic tmp+rename, restored on bootstrap, covered by the SIGTERM drain), so a daemon restart neither loses it nor skips its expiry reply. The buttons are live entries, the most recent first. Choosing entry E delivers every queued payload to E, in order. If E has no topic, T becomes E's topic and is renamed to E's title. If E already has one, T stays unbound and the reply links E's topic. When the queue expires, the bot replies "N messages not delivered — pick a session" in T. |
 | 5 | `forum_topic_created` / `_edited` / `_closed` service messages | Record them only. There is no spawn wizard and no `tmux rename-window`. A user topic rename is left alone until the next session rename overwrites it (§4.7). |
 
-No path drops a message silently. Every branch either delivers or answers in T.
+No path drops a message silently. Every branch either delivers or answers in T. A voice note that
+cannot be transcribed because `voice.enabled: false` is answered in T ("voice notes are off"); the
+flat chat keeps that opt-out silent (tg-cli#555).
 
 A text reply to a permission or hatch card, or to an abandoned question card, answers that card
 before any row above applies (cards are posted into the session's topic, so "yes" / "no" / the answer arrives here);

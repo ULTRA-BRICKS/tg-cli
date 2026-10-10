@@ -56,7 +56,9 @@ export interface StepOpts {
   // path ANSWER to it rather than an inject. The entrypoint owns the pending-session store (in
   // memory), like it owns routes/topics. Unset → no /new in flight → plain text injects as normal,
   // keeping 1:1 byte-identical when the feature isn't triggered.
-  newSessionAwaitingDir?: () => boolean;
+  // `threadId`: the forum topic the message was written in, null for the flat chat — a /new
+  // asks for its dir where it was typed, so only a message in that same place answers it.
+  newSessionAwaitingDir?: (threadId: number | null) => boolean;
   // Retained post-timeout question cards are answered by replying to the card with text.
   // The entrypoint owns the retained-question store, so the pure step only asks whether
   // the replied-to Telegram message_id is one of those cards.
@@ -343,8 +345,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
       // isLikelySlashCommand test wrongly rejected it. A real /command (`/status`, a second `/new`)
       // or a reply is never consumed as the answer. Topic messages (control.topics on) are already
       // routed + `continue`d by the topics block above, so they never reach this gate. (issue #27)
-      const isDirAnswerCandidate = !m.reply_to_message && m.text.startsWith('/') && !isDaemonSlashCommand(m.text);
-      if (isDirAnswerCandidate && (opts.newSessionAwaitingDir?.() ?? false)) {
+      if (isDirAnswerCandidate(m) && (opts.newSessionAwaitingDir?.(null) ?? false)) {
         action = { kind: 'new-answer', text: m.text, from: name, messageId: m.message_id };
       } else {
         // A reply carrying prose forwards the quote anchor (items 2,3) via
@@ -453,6 +454,12 @@ function isDaemonSlashCommand(text: string): boolean {
   return DAEMON_SLASH_COMMANDS.has(verb);
 }
 
+// Could this message be the typed directory a pending /new waits for? A `/`-led, non-reply
+// message that is not one of the daemon's own commands — the path FORM, so prose never is.
+function isDirAnswerCandidate(m: TgMessage): boolean {
+  return !m.reply_to_message && !!m.text && m.text.startsWith('/') && !isDaemonSlashCommand(m.text);
+}
+
 // Command-vs-prompt split (spec §13). Verbs match on the first whitespace
 // token; unknown slash commands pass through VERBATIM so the harness
 // interprets its own (/compact, /clear, …) — no wrap on those.
@@ -543,9 +550,10 @@ function cardReplyAction(m: TgMessage, name: string, opts: StepOpts, threadId?: 
 }
 
 // Daemon verbs answered in ANY forum topic, bound or not (§4.4 row 1). `/stop` and `/kill` are
-// deliberately absent: in a bound topic they reach that topic's session, and in an unknown topic
-// they are held like any other message.
+// not: in a bound topic they act on that topic's session (row 1b), and in an unknown topic they
+// are held like any other message.
 const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks', '/limit', '/daily', '/spend']);
+const TOPIC_SESSION_CONTROLS: Record<string, 'stop' | 'kill'> = { '/stop': 'stop', '/kill': 'kill' };
 
 // Inbound topic triage (docs/specs/session-registry-and-topics.md §4.4). Returns the actions for
 // a topic service message or a message inside a forum topic, else null ("not a topic message":
@@ -569,6 +577,15 @@ function topicActionFor(updateId: number, m: TgMessage, name: string, opts: Step
   const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, '');
   if (TOPIC_GLOBAL_CMDS.has(verb)) {
     return [textAction(text, name, opts, m.message_id, m.chat.id, m.reply_to_message?.message_id ?? null, threadId)];
+  }
+  // A /new typed in this topic asks for its dir here, so a path typed here answers it — the same
+  // answer gate as the flat chat, scoped to the topic (tg-cli#555).
+  if (isDirAnswerCandidate(m) && (opts.newSessionAwaitingDir?.(threadId) ?? false)) {
+    return [{ kind: 'new-answer', text, from: name, messageId: m.message_id, threadId }];
+  }
+  const control = Object.hasOwn(TOPIC_SESSION_CONTROLS, verb) ? TOPIC_SESSION_CONTROLS[verb] : undefined;
+  if (control && opts.topicStatusOf?.(threadId) === 'bound') {
+    return [{ kind: 'topic-control', threadId, control, messageId: m.message_id }];
   }
   // A text reply to a question/permission/hatch card answers the card — the cards are posted into
   // the session's topic, so the answer arrives here (tg-cli#551).

@@ -3,6 +3,20 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.6
+
+- **A session's limit/overload stall notice, hatch critical reminder and unanswered-question
+  reminder now arrive in the session's topic (#554).** They were sent with no
+  `message_thread_id`, so in a chat with topics they landed in General while the session's cards
+  and posts — and the card a reminder points "above" to — were in its topic. A notice uses the
+  session's existing topic (never opens one) and falls back to General when the topic refuses it;
+  a reminder that lists cards from several sessions stays in General.
+- **Inside a topic (#555):** a path typed in the topic where `/new` asked for its directory now
+  answers that `/new` (it was typed into the session or held behind the attach picker, and the
+  `/new` hung until reaped); `/stop` and `/kill` in a bound topic now press Escape in / SIGINT that
+  topic's session, like the flat verbs (they were typed into the harness as text); a voice note
+  sent while `voice.enabled: false` is answered in the topic instead of vanishing.
+
 ## 1.55.5
 
 - **An agent's `tg --reply-to <id>` answer to a message written inside a topic now lands in that

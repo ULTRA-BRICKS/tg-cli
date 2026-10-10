@@ -2059,13 +2059,46 @@ async function sendToSessionTopic(ctx: Ctx, key: SessionKey, threadId: number, t
   }
   if (resp.ok) {
     clearSessionTopicMisses(ctx, key)
-    const result = resp.json.result
-    const messageId = result && typeof result === "object" && "message_id" in result ? result.message_id : undefined
-    return typeof messageId === "number" ? messageId : null
+    return sentMessageId(resp.json)
   }
   if (!isThreadRejection(resp.description) && !isTopicDeletedError(resp.description)) return null
   await noteSessionTopicMiss(ctx, key, threadId, resp.description)
   return sendMessage(ctx, text, extra)
+}
+
+// The message_id of a successful sendMessage answer, else null.
+function sentMessageId(json: Record<string, unknown>): number | null {
+  const result = json.result
+  const messageId = result && typeof result === "object" && "message_id" in result ? result.message_id : undefined
+  return typeof messageId === "number" ? messageId : null
+}
+
+// A daemon notice about a session — a limit stall notice, a hatch or unanswered-question
+// reminder (tg-cli#554) — goes where that session's cards and posts are: its topic when it has
+// one, else General. A notice never opens a topic. `inDaemon`: a thread rejection gets the §4.5
+// retry and miss accounting, which only the daemon may run (it is the registry's sole writer);
+// a hook process passes false and just falls back to General.
+async function sendSessionNotice(
+  ctx: Ctx,
+  entry: SessionEntry | null,
+  text: string,
+  extra: Record<string, unknown> = {},
+  inDaemon = true,
+): Promise<number | null> {
+  const threadId = ctx.cfg.topics || ctx.cfg.privateTopics ? (entry?.threadId ?? null) : null
+  if (entry === null || threadId === null) return sendMessage(ctx, text, extra)
+  if (inDaemon) return sendToSessionTopic(ctx, entry.key, threadId, text, extra)
+  const resp = await botPostResult(ctx, "sendMessage", { chat_id: ctx.chatId, text, ...extra, message_thread_id: threadId })
+  if (resp.ok) return sentMessageId(resp.json)
+  if (!isThreadRejection(resp.description) && !isTopicDeletedError(resp.description)) return null
+  return sendMessage(ctx, text, extra)
+}
+
+// The live session a question/permission/hatch card belongs to (spec §4.3): the request's
+// resolved session key, else its origin session id or pane.
+function cardSessionOf(ctx: Ctx, req: ButtonRequest): SessionEntry | null {
+  return (req.sessionKey ? liveEntry(ctx, req.sessionKey) : null)
+    ?? findSessionForCard(currentRegistry(ctx), { agent: req.agent, sessionId: req.origin?.sessionId, paneId: req.paneId })
 }
 
 // hook-socket `resolve-session` (§4.3): which live session is this `tg` in, and its topic.
@@ -4903,8 +4936,7 @@ async function forwardAndPostQuestion(
 
   // The card goes into its session's topic (spec §4.3), created on this first card if need be.
   // The asking session is req.sessionKey (resolved on arrival, §2.6), else looked up by origin/pane.
-  const cardSession = (req.sessionKey ? liveEntry(ctx, req.sessionKey) : null)
-    ?? findSessionForCard(currentRegistry(ctx), { agent: req.agent, sessionId: req.origin?.sessionId, paneId: req.paneId })
+  const cardSession = cardSessionOf(ctx, req)
   const threadId = cardSession ? await sessionTopic(ctx, cardSession.key) : null
   const payload = buildButtonMessage(ctx.chatId, req, threadId)
   const messageId = await sendButtonCard(ctx, payload, threadId !== null && cardSession ? cardSession.key : null)
@@ -7023,7 +7055,8 @@ async function runHarnessEventPayload(ctx: Ctx, argv: string[], now: number, pay
     const keyboard = notif.button ? { inline_keyboard: [[{ text: notif.button.label, callback_data: notif.button.data }]] } : undefined
     const extra: Record<string, unknown> = { parse_mode: "HTML" }
     if (keyboard) extra.reply_markup = keyboard
-    const messageId = await sendMessage(ctx, notif.text, extra)
+    const session = findSessionForCard(currentRegistry(ctx), { agent, sessionId: ev.sessionId ?? undefined, paneId: ev.paneId ?? undefined })
+    const messageId = await sendSessionNotice(ctx, session, notif.text, extra, false)
     if (ev.sourceMessageId !== null) await setMessageReaction(ctx, ev.sourceMessageId, reactionForStage("stalled"))
     if (retryableOverload && messageId !== null) {
       claimOverloadAutoContinue(ctx, ev, now, overloadLanguage, windowName)
@@ -7588,12 +7621,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (s.ts < cutoff) pendingNew.delete(tok)
     }
   }
-  // True while at least one /new session is awaiting its working directory — so stepUpdates
-  // treats the next plain prose message as the typed path answer (injected via newSessionAwaitingDir).
-  const newSessionAwaitingDir = (): boolean => {
+  // True while a /new asked in `threadId` (a forum topic, or null for the flat chat) is awaiting
+  // its working directory — so stepUpdates treats the next path-shaped message THERE as the typed
+  // answer. A /new asks where it was typed, so another place never answers it (tg-cli#555).
+  const newSessionAwaitingDir = (threadId: number | null): boolean => {
     reapNewSessions()
     for (const s of pendingNew.values()) {
-      if (s.status === "awaiting-dir") return true
+      if (s.status === "awaiting-dir" && s.threadId === threadId) return true
     }
     return false
   }
@@ -9358,25 +9392,19 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       ? paneSessionRefusal(key, target.paneId) === null
       : target.pid === null || listLiveOmpAgents().some((a) => a.pid === target.pid)
 
-  // THE delivery to a registry session (§4.4 row 2), shared by the bound-topic route and the
-  // attach picker: a fresh scan says where the session lives NOW (a resumed omp keeps its key
-  // under a new pid; a moved one keeps it in a new pane), then the flat path above delivers it —
-  // the omp-live endpoint, the in-tmux send-keys fallback (#483), cc/codex send-keys, voice STT
-  // and media download. Never a fallback to another session. `gone`: nothing was sent.
-  const deliverToSession = async (
+  // Where a registry session runs NOW (§4.4 row 2), shared by topic delivery and the topic
+  // /stop and /kill: a fresh scan (a resumed omp keeps its key under a new pid; a moved one keeps
+  // it in a new pane), re-confirmed when that scan may be stale — the §2.6 check rescans a pane
+  // that changed hands; an out-of-tmux omp's pid must still be live — else a forced scan says
+  // where it went, or that it is gone. Never another session.
+  const locateSession = async (
     key: string,
-    threadId: number,
-    payload: TopicPayload,
-  ): Promise<{ kind: "sent"; ok: boolean } | { kind: "gone"; name: string | null }> => {
+  ): Promise<{ kind: "live"; paneId: string; target: Extract<SessionDeliveryTarget, { kind: "live" }> } | { kind: "gone"; name: string | null }> => {
     // A resumed omp's new process publishes a new endpoint; pick it up before the scan.
     await refreshOriginalHosts()
     const reg = refreshSessionRegistry()
     if (!reg) return { kind: "gone", name: null }
     let target = sessionDeliveryTarget(reg, key)
-    // That scan may be a rate-limited one from moments ago. Before rendering (STT, download),
-    // confirm the session is still where it says — the §2.6 check rescans a pane that changed
-    // hands; an out-of-tmux omp's pid must still be live — else a forced scan says where it went,
-    // or that it is gone.
     if (target.kind === "live" && !sessionStillAt(key, target)) {
       target = sessionDeliveryTarget(refreshSessionRegistry(true) ?? reg, key)
     }
@@ -9385,8 +9413,65 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // out-of-tmux omp's endpoint-only locator.
     const paneId = target.paneId ?? (target.pid !== null ? liveOmpPaneId(target.pid) : null)
     if (paneId === null) return { kind: "gone", name: target.name }
-    log(`topic ${threadId}: → session ${key} at ${paneId}`)
-    return { kind: "sent", ok: await deliverTopicPayload(threadId, paneId, target.cwd, payload, key) }
+    return { kind: "live", paneId, target }
+  }
+
+  // THE delivery to a registry session (§4.4 row 2), shared by the bound-topic route and the
+  // attach picker: the flat path above delivers it — the omp-live endpoint, the in-tmux
+  // send-keys fallback (#483), cc/codex send-keys, voice STT and media download. `gone`:
+  // nothing was sent.
+  const deliverToSession = async (
+    key: string,
+    threadId: number,
+    payload: TopicPayload,
+  ): Promise<{ kind: "sent"; ok: boolean } | { kind: "gone"; name: string | null }> => {
+    const where = await locateSession(key)
+    if (where.kind === "gone") return where
+    log(`topic ${threadId}: → session ${key} at ${where.paneId}`)
+    return { kind: "sent", ok: await deliverTopicPayload(threadId, where.paneId, where.target.cwd, payload, key) }
+  }
+
+  // /stop and /kill typed in a bound topic (§4.4 row 1b, tg-cli#555) act on THAT topic's session,
+  // exactly like the flat verbs act on the flat target: /stop presses Escape in its tmux pane,
+  // /kill sends SIGINT to its agent process. Every outcome is answered in the topic.
+  const handleTopicControl = async (action: Extract<Action, { kind: "topic-control" }>): Promise<boolean> => {
+    const { threadId, control } = action
+    const entry = resolveTopicSession(threadId, findTopic(loadTopics(), threadId))
+    if (!entry) {
+      await sendToTopic(threadId, `/${control}: this topic has no session`)
+      return false
+    }
+    const where = await locateSession(entry.key)
+    if (where.kind === "gone") {
+      await sendToTopic(threadId, goneTopicReply({ name: where.name ?? entry.name.primary, harness: HARNESS_AGENT[entry.harness] }))
+      return false
+    }
+    const name = where.target.name || entry.name.primary || entry.key
+    if (control === "stop") {
+      if (!where.paneId.startsWith("%")) {
+        await sendToTopic(threadId, `/stop: ${name} runs outside tmux — no pane to press Escape in`)
+        return false
+      }
+      const res = await executeInjectSteps(buildKeyInjectPlan(where.paneId, "Escape"))
+      log(`topic ${threadId}: /stop → Escape to ${entry.key} at ${where.paneId} ok=${res.ok}`)
+      if (!res.ok) await sendToTopic(threadId, `/stop failed: ${res.error}`)
+      return res.ok
+    }
+    const pid = where.target.pid
+    if (pid === null) {
+      await sendToTopic(threadId, "agent pid unknown — not killed")
+      return false
+    }
+    try {
+      // SIGINT, as the flat /kill (spec §5.2 reserves it for the explicit verb).
+      process.kill(pid, "SIGINT")
+      log(`topic ${threadId}: /kill → SIGINT to ${entry.key} pid ${pid}`)
+      await sendToTopic(threadId, `session killed — ${name}`)
+      return true
+    } catch (err) {
+      await sendToTopic(threadId, `kill failed: ${err}`)
+      return false
+    }
   }
 
   // §4.4 rows 2–3 for a topic the registry knows: its session gets the message wherever it runs;
@@ -10240,8 +10325,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // The NEWEST awaiting-dir session owns the typed path (review #2): even though handleNewCommand
     // clears prior sessions on a fresh /new, take the newest as a belt-and-suspenders so the path
     // always lands on the prompt the user is actually answering.
+    const threadId = action.threadId ?? null
     const session = [...pendingNew.values()]
-      .filter((s) => s.status === "awaiting-dir")
+      .filter((s) => s.status === "awaiting-dir" && s.threadId === threadId)
       .sort((a, b) => b.ts - a.ts)[0]
     if (!session) return false // no /new awaiting a dir — defensive (stepUpdates only emits when one is)
     const out = replyContext(session.threadId)
@@ -10263,7 +10349,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // defensive) also re-asks.
       if (path.startsWith("/") && isLikelySlashCommand(path)) {
         // A harness control-command passthrough (/compact, /clear), not new content — no
-        // git-state banner (see withGitStateBanner's scope note).
+        // git-state banner (see withGitStateBanner's scope note). In a topic it goes to the
+        // topic's session, as any other topic message would have.
+        if (action.threadId !== undefined) {
+          const payload: TopicPayload = { type: "text", text: path, from: action.from, messageId: action.messageId }
+          return topicStatusOf(action.threadId) === null
+            ? handleTopicHold({ kind: "topic-hold", threadId: action.threadId, payload })
+            : handleTopicRoute({ kind: "topic-route", threadId: action.threadId, payload })
+        }
         return injectViaTarget((target) => buildTextInjectPlan(target.pane.paneId, path), path, true, action.messageId)
       }
       await sendMessage(ctx, `\`${path || "(empty)"}\` is not an absolute path to an existing directory — send a full path like /Users/you/project.`, out)
@@ -10564,11 +10657,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const voicePartial = parseVoiceConfig(rawYaml)
     ctx.voice = resolveVoiceConfig(voicePartial)
 
-    // Master switch: an explicit `voice.enabled: false` means OFF — drop the
-    // note silently (no onboarding, no re-enable). The documented opt-out must
-    // survive a discoverable Whisper still being on the box.
+    // Master switch: an explicit `voice.enabled: false` means OFF — no onboarding, no re-enable.
+    // The documented opt-out must survive a discoverable Whisper still being on the box. The
+    // flat chat drops the note silently; in a topic it is answered, since no topic path drops a
+    // message silently (§4.4, tg-cli#555).
     if (voicePartial.enabled === false) {
       log("voice note ignored — voice.enabled: false")
+      if (out.message_thread_id !== undefined) await sendMessage(ctx, "not delivered — voice notes are off (voice.enabled: false); send text instead", out)
       return null
     }
 
@@ -11493,6 +11588,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   const actionResourceKey = (action: Action): string | null => {
     switch (action.kind) {
       case "topic-route":
+      case "topic-control":
       case "topic-hold":
       case "topic-attach":
       case "topic-event":
@@ -11510,6 +11606,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return `req:${action.requestId}`
       case "limit-continue":
         return `pane:${action.paneId}`
+      // A path typed in a topic may pass through to the topic's session (handleNewAnswer):
+      // keep it in order with that topic's deliveries.
+      case "new-answer":
+        return action.threadId !== undefined ? `thread:${action.threadId}` : null
       default:
         return null
     }
@@ -11729,6 +11829,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return transcribeVoice(action)
       case "topic-route":
         return handleTopicRoute(action)
+      case "topic-control":
+        return handleTopicControl(action)
       case "topic-hold":
         return handleTopicHold(action)
       case "topic-attach":
@@ -11896,7 +11998,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             hookId !== null
               ? `⏳ still waiting on your decision for hatch request ${hookId}${pointer}`
               : `⏳ still waiting on your decision — ${label}${pointer}`
-          const sentId = await sendMessage(ctx, text)
+          const sentId = await sendSessionNotice(ctx, cardSessionOf(ctx, req), text)
           if (sentId === null) {
             // Send failed — never mark sent (see markCriticalReminderSent's own doc
             // comment): this reminder stays due and is retried next sweep instead of
@@ -11957,10 +12059,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (UNANSWERED_REMINDER_AFTER_MS > 0) {
         const sweepNow = Date.now()
         const open: OpenQuestion[] = []
+        const reqOf = new Map<string, ButtonRequest>()
         const collect = (key: string, req: ButtonRequest, messageId: number | null, openedAt: number): void => {
           if (req.critical === true) return
           const label = resolveSessionName({ tmuxWindow: req.windowName, cwd: req.cwd }).primary
           open.push({ key, openedAt, label, question: req.question, messageId })
+          reqOf.set(key, req)
         }
         for (const [key, e] of pendingButtons) collect(key, e.req, e.messageId, e.at)
         for (const [key, e] of abandonedButtons) if (!e.queuedDecision) collect(key, e.req, e.messageId, e.at)
@@ -11969,7 +12073,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         let changed = plan.changed
         const prior = unansweredReminderState.messageId
         if (plan.send) {
-          const sentId = await sendMessage(ctx, unansweredReminderText(plan.overdue, sweepNow))
+          // One reminder lists every overdue card: it goes into their session's topic when they
+          // all belong to one session (tg-cli#554), else to General, where it can name them all.
+          const sessions = new Set(plan.overdue.map((q) => {
+            const req = reqOf.get(q.key)
+            return req ? cardSessionOf(ctx, req) : null
+          }))
+          const [only] = sessions
+          const sentId = await sendSessionNotice(ctx, sessions.size === 1 ? (only ?? null) : null, unansweredReminderText(plan.overdue, sweepNow))
           if (sentId === null) {
             // A failed send is never marked: the same questions stay due next sweep.
             log(`unanswered-reminder-send-failed: open=${plan.overdue.length}`)
