@@ -9,15 +9,15 @@
 // ask` per case against a mock Telegram (TG_API_BASE) and read that log back.
 
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir, trackChild } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
-const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-askfwd-'));
+const cfgDir = tempDir('tgctl-askfwd-');
 writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 // Registration names a DIFFERENT cwd than the questions below send, so a request
@@ -75,7 +75,7 @@ let daemon: Subprocess;
 
 beforeAll(async () => {
   const logFd = openSync(logPath, 'a');
-  daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+  daemon = trackChild(Bun.spawn([process.execPath, TG_CTL, 'run'], {
     env: {
       PATH: `${join(cfgDir, 'bin')}:${process.env.PATH ?? ''}`,
       HOME: cfgDir,
@@ -83,7 +83,7 @@ beforeAll(async () => {
       TG_API_BASE: `http://127.0.0.1:${server.port}`,
     },
     stdio: ['ignore', logFd, logFd],
-  });
+  }));
   procs.push(daemon);
   closeSync(logFd);
 
@@ -101,7 +101,6 @@ afterAll(async () => {
     }
   }
   server.stop(true);
-  rmSync(cfgDir, { recursive: true, force: true });
 });
 
 // Fire one `tg-ctl ask` with the given normalized request payload. A DROPPED

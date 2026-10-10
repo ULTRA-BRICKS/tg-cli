@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { spawnSyncBounded } from './helpers/spawn-sync';
+import { tempDir } from './helpers/test-temp';
 
 // HERMETIC PATH for every spawned `deploy.sh`: only the system dirs that `git` /
 // `bash` / coreutils live in — NEVER the host PATH. A `deploy` that could find the
@@ -120,7 +120,7 @@ function plantStubTg(opts: { installSkillCode?: number } = {}) {
 }
 
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'tg-deploy-test-'));
+  root = tempDir('tg-deploy-test-');
   origin = join(root, 'origin.git');
   checkout = join(root, 'checkout');
 

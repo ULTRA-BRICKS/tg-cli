@@ -1,9 +1,9 @@
 import { afterAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir, trackChild } from './helpers/test-temp';
 
 // Integration test for auto-continue scheduling (tg-cli#113). Proves: (1) tapping
 // the auto-continue button arms + PERSISTS a schedule and answers the callback;
@@ -17,7 +17,7 @@ const SCHEDULES = 'tg-ctl.123.schedules.json';
 
 // `tmuxScript`: the fake tmux; the default hosts no agent pane anywhere.
 function makeCfg(tmuxScript = TMUX_NO_SERVER_SHIM): string {
-  const dir = mkdtempSync(join(tmpdir(), 'tgctl-autocont-'));
+  const dir = tempDir('tgctl-autocont-');
   writeFileSync(join(dir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(dir, 'config.yaml'), 'control:\n  enabled: true\n');
   writeFileSync(join(dir, 'tg-ctl.123.registration.json'), JSON.stringify({ cwd: dir }));
@@ -30,7 +30,7 @@ function makeCfg(tmuxScript = TMUX_NO_SERVER_SHIM): string {
 const procs: Subprocess[] = [];
 function spawnDaemon(cfgDir: string, port: number): Subprocess {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
-  const d = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+  const d = trackChild(Bun.spawn([process.execPath, TG_CTL, 'run'], {
     env: {
       PATH: `${join(cfgDir, 'bin')}:${process.env.PATH ?? ''}`,
       HOME: cfgDir,
@@ -38,7 +38,7 @@ function spawnDaemon(cfgDir: string, port: number): Subprocess {
       TG_API_BASE: `http://127.0.0.1:${port}`,
     },
     stdio: ['ignore', logFd, logFd],
-  });
+  }));
   procs.push(d);
   closeSync(logFd);
   return d;

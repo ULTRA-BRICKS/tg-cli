@@ -1,9 +1,9 @@
 import { afterAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir, trackChild } from './helpers/test-temp';
 
 // Regression for tg-cli#97: a question whose stable requestId re-forwards AFTER it
 // was answered must REPLAY the stored answer down the socket and post NO second
@@ -17,7 +17,6 @@ const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
 const procs: Subprocess[] = [];
 const servers: ReturnType<typeof Bun.serve>[] = [];
-const tempDirs: string[] = [];
 
 afterAll(async () => {
   for (const p of procs) {
@@ -27,12 +26,10 @@ afterAll(async () => {
     }
   }
   for (const s of servers) s.stop(true);
-  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
 });
 
 function makeCfgDir(): string {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-replay-'));
-  tempDirs.push(cfgDir);
+  const cfgDir = tempDir('tgctl-replay-');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ cwd: cfgDir }));
@@ -43,7 +40,7 @@ function makeCfgDir(): string {
 
 async function startDaemon(cfgDir: string, port: number, extraEnv: Record<string, string> = {}): Promise<Subprocess> {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
-  const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+  const daemon = trackChild(Bun.spawn([process.execPath, TG_CTL, 'run'], {
     env: {
       PATH: `${join(cfgDir, 'bin')}:${process.env.PATH ?? ''}`,
       HOME: cfgDir,
@@ -52,7 +49,7 @@ async function startDaemon(cfgDir: string, port: number, extraEnv: Record<string
       ...extraEnv,
     },
     stdio: ['ignore', logFd, logFd],
-  });
+  }));
   procs.push(daemon);
   closeSync(logFd);
   const socket = join(cfgDir, 'tg-ctl.123.sock');

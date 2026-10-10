@@ -1,9 +1,9 @@
 import { afterAll, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { BANNER_ADVICE } from '../features/tg-ctl/git-state';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 
 // End-to-end verification of the git-state-check banner (features/tg-ctl/git-state.ts):
 // the REAL `tg-ctl run` daemon, against a fake Telegram + a fake tmux/ps that report ONE
@@ -26,7 +26,7 @@ afterAll(async () => {
 });
 
 function gitFixture(kind: 'dirty-feature-branch' | 'clean-main' | 'not-a-repo'): string {
-  const dir = mkdtempSync(join(tmpdir(), `tgctl-gitstate-${kind}-`));
+  const dir = tempDir(`tgctl-gitstate-${kind}-`);
   if (kind === 'not-a-repo') return dir;
 
   const git = (...args: string[]): void => {
@@ -104,7 +104,7 @@ exit 0
 // the plain wrap/passthrough).
 async function injectedTextFor(fixtureDir: string, text = 'fix the other thing', mode: 'auto' | 'selected' = 'auto'): Promise<string> {
   const nowSec = Math.floor(Date.now() / 1000);
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-gitstate-cfg-'));
+  const cfgDir = tempDir('tgctl-gitstate-cfg-');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 

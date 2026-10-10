@@ -1,11 +1,11 @@
 import { afterAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, trackCfgDir, trackProc } from './helpers/daemon-lifecycle';
 import { BOT_COMMANDS } from '../features/tg-ctl/bot-commands';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 
 // The daemon must self-provision its command menu on startup: POST setMyCommands
 // once, with the published BOT_COMMANDS, before entering the poll loop. And it
@@ -72,7 +72,7 @@ function spawnDaemon(cfgDir: string, shimDir: string, port: number): Subprocess 
 }
 
 function setupConfigDir(): { cfgDir: string; shimDir: string } {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-smc-'));
+  const cfgDir = tempDir('tgctl-smc-');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const shimDir = join(cfgDir, 'bin');

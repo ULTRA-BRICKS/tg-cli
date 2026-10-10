@@ -1,11 +1,11 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { hatchGrantNoticeText } from '../features/tg-ctl/grants';
 import { agentInboxKey } from '../features/tg-ctl/unreachable';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 
 // Integration test (tg-cli#456, replacing the tg-cli#306 inbox channel): Claude Code and
 // Codex are reached through a tmux pane or a rig-wrapper host. An interactive claude/codex
@@ -18,7 +18,7 @@ import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
-const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-unreachable-'));
+const cfgDir = tempDir('tgctl-unreachable-');
 writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 

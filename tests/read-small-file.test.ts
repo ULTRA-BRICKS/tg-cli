@@ -1,8 +1,8 @@
 import { test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { readSmallFile } from '../features/transport/telegram';
+import { tempDir } from './helpers/test-temp';
 
 // readSmallFile replaced a statSync()+readFileSync() pair (js/file-system-race)
 // with a single-fd open→fstat→read. These pin its contract: the BOM-prepend
@@ -12,7 +12,7 @@ import { readSmallFile } from '../features/transport/telegram';
 let dir: string;
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), 'tg-readsmall-'));
+  dir = tempDir('tg-readsmall-');
 });
 
 afterEach(() => {

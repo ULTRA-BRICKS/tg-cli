@@ -1,10 +1,10 @@
 import { appendFileSync } from 'node:fs';
 import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { afterAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 
 // Integration (tg-cli#323): inbound Telegram text reaches a live omp child via ACP
 // session/prompt with TMUX unset. A tmux send-keys path would fail this test
@@ -13,7 +13,7 @@ import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
-const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-omp-acp-'));
+const cfgDir = tempDir('tgctl-omp-acp-');
 writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 

@@ -10,12 +10,17 @@
 //   * a daemon test without its own `ps` shim enumerates every live omp each tick (lsof twice
 //     and a jsonl read per omp), starving the hook socket its asks and taps arrive on.
 // Per-test shims prepend their own dir to PATH, so they still win over what is set up here.
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { afterAll } from 'bun:test';
+import { chmodSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { LAUNCHCTL_NO_JOBS_SHIM, PGREP_NO_MATCH_SHIM, PS_NO_AGENTS_SHIM } from './helpers/hermetic-host';
+import { cleanupTestRun, sweepRunProcesses, tempDir } from './helpers/test-temp';
 
-const shimDir = mkdtempSync(join(tmpdir(), 'tg-hermetic-bin-'));
+// shimDir doubles as the run's fingerprint (tg-cli#486): it is unique to this run and sits on the
+// PATH of every child (the spawn wrapper below gives it to children spawned without one too) — and
+// so of their children, a detached `tg-ctl start` daemon or an abduco server included. The
+// end-of-run sweep kills whatever still carries it.
+const shimDir = tempDir('tg-hermetic-bin-');
 for (const [name, body] of Object.entries({ ps: PS_NO_AGENTS_SHIM, launchctl: LAUNCHCTL_NO_JOBS_SHIM, pgrep: PGREP_NO_MATCH_SHIM })) {
   const path = join(shimDir, name);
   writeFileSync(path, body);
@@ -29,7 +34,7 @@ process.env.PATH = `${shimDir}:${process.env.PATH ?? ''}`;
 // listed, matched or typed into. `-L <name>` tests still start their own throwaway server there.
 // Under /tmp, not tmpdir(): the socket path is <dir>/tmux-<uid>/<label> and a unix socket path
 // holds ~104 bytes — macOS's /var/folders/... tmpdir leaves a `-L tgctl-test-<pid>` socket 3 short.
-const tmuxTmpDir = mkdtempSync('/tmp/tg-hermetic-');
+const tmuxTmpDir = tempDir('tg-hermetic-', { short: true });
 process.env.TMUX_TMPDIR = tmuxTmpDir;
 delete process.env.TMUX;
 delete process.env.TMUX_PANE;
@@ -61,7 +66,23 @@ function hermeticSpawn<Spawn extends typeof Bun.spawn | typeof Bun.spawnSync>(sp
 Bun.spawn = hermeticSpawn(Bun.spawn);
 Bun.spawnSync = hermeticSpawn(Bun.spawnSync);
 
-process.on('exit', () => {
-  rmSync(shimDir, { recursive: true, force: true });
-  rmSync(tmuxTmpDir, { recursive: true, force: true });
-});
+// Run-scoped, not per-file: a preload's afterAll fires once, after the last file. Kill first so
+// no daemon is still writing into a dir being removed. A run cut short still cleans up: `exit`
+// covers a bail-out, and SIGINT/SIGTERM (Ctrl-C, a watchdog's TERM) end the process without
+// `exit` firing, so they clean up and then exit with the signal's conventional status. Only a
+// SIGKILL leaves the run's dirs behind.
+let ended = false;
+function endRun(): void {
+  if (ended) return;
+  ended = true;
+  sweepRunProcesses(shimDir, tmuxTmpDir);
+  cleanupTestRun();
+}
+afterAll(endRun);
+process.on('exit', endRun);
+for (const [signal, status] of [['SIGINT', 130], ['SIGTERM', 143]] as const) {
+  process.once(signal, () => {
+    endRun();
+    process.exit(status);
+  });
+}

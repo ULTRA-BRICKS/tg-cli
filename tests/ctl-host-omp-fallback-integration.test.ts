@@ -3,12 +3,12 @@
 // spawn), exactly once. The sibling cases: with an endpoint nothing is typed; an omp that no
 // live host owns fails closed and is never typed into.
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { closeSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const SID = '01a0d2d7-6202-702d-b9e8-006b656b0799';
@@ -28,8 +28,8 @@ interface Scenario {
 }
 
 async function daemon({ endpoint, hosted }: Scenario) {
-  const cfg = mkdtempSync(join(tmpdir(), 'tgctl-host-omp-'));
-  const sockDir = mkdtempSync('/tmp/tgo-');
+  const cfg = tempDir('tgctl-host-omp-');
+  const sockDir = tempDir('tgo-', { short: true });
   const socketPath = join(sockDir, `${NAME}@testhost`);
   const bin = join(cfg, 'bin');
   mkdirSync(bin);

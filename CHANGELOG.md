@@ -3,6 +3,21 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.57.2
+
+- **A test run no longer leaves temp dirs or daemons behind (#486, #550).** Every test made its
+  dirs with a bare `mkdtempSync` and never removed most of them — ~7000 `tgctl-*`/`tg-*` dirs and
+  6.7 GB an hour on a RAM-backed /tmp under agent load — and real-abduco tests left their
+  `abduco -n` servers running. All tests now get dirs from `tempDir()` in
+  `tests/helpers/test-temp.ts`, which the preload removes when the run ends — also when the run is
+  cut short by Ctrl-C or SIGTERM — after killing every process the run started (tracked with
+  `trackChild`, or found by the run's unique shim/tmux dir in its environment: detached
+  `tg-ctl start` daemons, abduco servers). The per-test cleanup hunks from 1.57.1 now go through
+  the same helper. `tests/temp-hygiene.test.ts` forbids direct `mkdtemp` in tests/, checks that a
+  SIGTERMed child run leaves its TMPDIR empty, and, in a whole-suite run only (no file, `-t` or
+  `--watch` filter; ~25 s), runs integration files in a child `bun test` with a private TMPDIR,
+  asserting it comes back empty with no surviving process.
+
 ## 1.57.1
 
 - **Daemon integration tests no longer depend on host load or the host's processes (#375, #550,

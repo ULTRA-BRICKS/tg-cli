@@ -9,11 +9,11 @@
 // the #279 case runs the daemon from a throwaway git checkout (a copy of this tree) so
 // commits can move its HEAD. Never touches the developer's live daemon or LaunchAgent.
 import { afterEach, expect, test } from 'bun:test';
-import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackCfgDir, trackProc } from './helpers/daemon-lifecycle';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 
 const REPO = join(import.meta.dir, '..');
 const TG_CTL = join(REPO, 'tg-ctl');
@@ -45,7 +45,7 @@ function startMockBot(): number {
 // tg-ctl invocation (daemon, stop, restart, status) runs under — the restart launcher
 // forwards its own env to the successor, so TG_API_BASE reaches it.
 function prepareCfg(prefix: string): { cfgDir: string; env: Record<string, string> } {
-  const cfgDir = mkdtempSync(join(tmpdir(), prefix));
+  const cfgDir = tempDir(prefix);
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   mkdirSync(join(cfgDir, 'bin'));
@@ -276,7 +276,7 @@ function git(cwd: string, ...args: string[]): string {
 
 // A throwaway checkout holding exactly what the daemon loads, so commits can move its HEAD.
 function makeCheckout(): string {
-  const co = mkdtempSync(join(tmpdir(), 'tgctl-checkout-'));
+  const co = tempDir('tgctl-checkout-');
   for (const rel of ['tg-ctl', 'features', 'tools', 'package.json']) cpSync(join(REPO, rel), join(co, rel), { recursive: true });
   writeFileSync(join(co, 'README.md'), 'checkout\n');
   git(co, 'init', '-q', '-b', 'main');

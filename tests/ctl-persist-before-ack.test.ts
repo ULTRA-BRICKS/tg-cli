@@ -1,11 +1,11 @@
 import { appendFileSync } from 'node:fs';
 import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { afterAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 import { TMUX_NO_SERVER_SHIM, tmuxNoServerShim } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 import { NO_AGENT_REPLY } from '../tg-ctl';
 import { parsePendingBatch, serializePendingBatch } from '../features/tg-ctl/updates';
 
@@ -48,7 +48,7 @@ const SIGKILL_UPDATE = {
 };
 
 const sigkillReg = createDaemonRegistry();
-const sigkillCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-sigkill-'));
+const sigkillCfgDir = tempDir('tgctl-sigkill-');
 const pendingBatchPath = join(sigkillCfgDir, 'tg-ctl.123.pending-batch.json');
 writeFileSync(join(sigkillCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(sigkillCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
@@ -106,7 +106,6 @@ afterAll(async () => {
   heldReply.resolve();
   await reapDaemons(sigkillReg);
   sigkillServer.stop(true);
-  rmSync(sigkillCfgDir, { recursive: true, force: true });
 });
 
 test('SIGKILL after pending-batch write recovers on respawn — message not lost', async () => {
@@ -176,7 +175,7 @@ test('SIGKILL after pending-batch write recovers on respawn — message not lost
 
 // --- (c) fire-and-forget omp ACP delivery ---
 
-const ffCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-ff-omp-'));
+const ffCfgDir = tempDir('tgctl-ff-omp-');
 writeFileSync(join(ffCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(ffCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 
@@ -277,7 +276,6 @@ afterAll(async () => {
   await reapDaemons(ffReg);
   ffServer.stop(true);
   await ffEndpoint.close();
-  rmSync(ffCfgDir, { recursive: true, force: true });
 });
 
 test('original OMP acknowledgement does not wait for the busy model to finish a turn', async () => {

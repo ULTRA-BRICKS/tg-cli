@@ -1,10 +1,10 @@
 import { appendFileSync } from 'node:fs';
 import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 import { NO_AGENT_REPLY } from '../tg-ctl';
 
 // tg-cli#454 — the live shape of a rig `omp run` session (2026-09-29, panes %0–%4):
@@ -91,7 +91,7 @@ async function waitFor(pred: () => boolean, ms = 12_000): Promise<void> {
 }
 
 async function makeHarness(routes: unknown[] = []) {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-omp-abduco-'));
+  const cfgDir = tempDir('tgctl-omp-abduco-');
   writeFileSync(join(cfgDir, '.env'), ['TG_BOT_TOKEN=123:abc', 'TG_CHAT_ID=1', ''].join('\n'));
   writeFileSync(join(cfgDir, 'config.yaml'), ['control:', '  enabled: true', ''].join('\n'));
   writeFileSync(join(cfgDir, 'tg-ctl.123.routes.json'), JSON.stringify(routes));

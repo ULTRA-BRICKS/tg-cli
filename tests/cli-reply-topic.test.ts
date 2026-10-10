@@ -1,8 +1,9 @@
 import { afterAll, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { createServer, type Server as NetServer } from 'net';
 import { join } from 'path';
 import { parseHistory, serializeHistoryRecord, type HistoryRecord } from '../features/replies/history';
+import { tempDir } from './helpers/test-temp';
 
 // tg-cli#551: an agent answers a message the CTO wrote inside a topic with `tg --reply-to <id>`.
 // Telegram does not put such a reply into the topic of its anchor in a private chat with topics —
@@ -48,7 +49,7 @@ interface Home {
 
 // /tmp, not tmpdir(): the daemon socket path must stay under the 104-byte unix limit.
 function makeHome(history: HistoryRecord[]): Home {
-  const home = mkdtempSync('/tmp/tgrt-');
+  const home = tempDir('tgrt-', { short: true });
   dirs.push(home);
   const cfg = join(home, '.config', 'tg-cli');
   mkdirSync(cfg, { recursive: true });

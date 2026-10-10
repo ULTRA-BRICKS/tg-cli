@@ -1,8 +1,8 @@
 import { expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -11,7 +11,7 @@ const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 // forward (once it holds the flock — see tg-ctl's runDaemon comment) rather
 // than silently resetting the CTO's routing anchor to the ambiguity picker.
 test('daemon startup migrates a legacy last-alex-target.json anchor to last-user-target.json', async () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-legacy-anchor-'));
+  const cfgDir = tempDir('tgctl-legacy-anchor-');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 
@@ -71,7 +71,7 @@ test('daemon startup migrates a legacy last-alex-target.json anchor to last-user
 // ctl-lock.test.ts, a later restart after invalidation has nothing left to
 // resurrect from.
 test('daemon startup never clobbers an existing last-user-target.json, and removes the now-redundant legacy file so it cannot resurrect later', async () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-legacy-anchor-noop-'));
+  const cfgDir = tempDir('tgctl-legacy-anchor-noop-');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 

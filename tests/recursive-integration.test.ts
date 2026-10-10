@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { parseArgs } from '../features/cli/args';
+import { tempDir } from './helpers/test-temp';
 
 // End-to-end through parseArgs against a real temp filesystem — same pattern
 // as worktree-integration.test.ts. parseArgs is invoked WITHOUT an injected
@@ -14,7 +14,7 @@ const HOME = '/home/tester';
 const REL = 'docs/specs/2026-06-10-design.md';
 
 beforeAll(() => {
-  root = mkdtempSync(join(tmpdir(), 'tg-rec-'));
+  root = tempDir('tg-rec-');
   mkdirSync(join(root, 'docs', 'specs'), { recursive: true });
   writeFileSync(join(root, REL), '# spec body');
   // A same-named file buried in node_modules must never be found.

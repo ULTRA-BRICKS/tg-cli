@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { parseArgs } from '../features/cli/args';
+import { tempDir } from './helpers/test-temp';
 
 // Two simulated worktree roots. The mentioned file exists ONLY in `feature`.
 // `parseArgs` is invoked with cwd == main; without worktree-aware resolution
@@ -14,8 +14,8 @@ const HOME = '/home/tester';
 const REL = 'docs/specs/x.md';
 
 beforeAll(() => {
-  main = mkdtempSync(join(tmpdir(), 'tg-wt-main-'));
-  feature = mkdtempSync(join(tmpdir(), 'tg-wt-feat-'));
+  main = tempDir('tg-wt-main-');
+  feature = tempDir('tg-wt-feat-');
   mkdirSync(join(feature, 'docs', 'specs'), { recursive: true });
   writeFileSync(join(feature, REL), '# spec body');
 });
@@ -42,8 +42,8 @@ test('relative path present only in feature worktree resolves from main (auto-at
 test('relative path present only in main resolves from a sibling worktree', () => {
   // cwd is an EMPTY sibling worktree (no REL under it); the file lives only in
   // `onlyMain`. Plain cwd resolution fails → worktree fallback finds it in main.
-  const cwdWt = mkdtempSync(join(tmpdir(), 'tg-wt-cwd-'));
-  const onlyMain = mkdtempSync(join(tmpdir(), 'tg-wt-onlymain-'));
+  const cwdWt = tempDir('tg-wt-cwd-');
+  const onlyMain = tempDir('tg-wt-onlymain-');
   mkdirSync(join(onlyMain, 'docs', 'specs'), { recursive: true });
   writeFileSync(join(onlyMain, REL), '# main spec');
   try {

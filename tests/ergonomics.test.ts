@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { parseArgs } from '../features/cli/args';
 import { VERSION } from '../tg';
+import { tempDir } from './helpers/test-temp';
 
 // Real temp files for existence checks — no Telegram API is ever touched.
 let dir: string;
@@ -12,7 +12,7 @@ let pdfAbs: string;
 const HOME = '/home/tester';
 
 beforeAll(() => {
-  dir = mkdtempSync(join(tmpdir(), 'tg-ergo-'));
+  dir = tempDir('tg-ergo-');
   imgAbs = join(dir, 'shot.PNG'); // uppercase ext → case-insensitive check
   pdfAbs = join(dir, 'report.pdf');
   writeFileSync(imgAbs, 'fake');
@@ -46,7 +46,7 @@ for (const flag of ['--version', '-v']) {
   test(`${flag} prints version + git hash + changelog, exit 0, no creds needed`, () => {
     const proc = Bun.spawnSync(['bun', TG_SCRIPT, flag], {
       // No TG_BOT_TOKEN / TG_CHAT_ID — version must work without credentials.
-      env: { PATH: process.env.PATH ?? '', HOME: '/tmp/tg-cli-test-home' },
+      env: { PATH: process.env.PATH ?? '', HOME: tempDir('tg-cli-test-home-') },
     });
     const out = proc.stdout.toString();
     expect(proc.exitCode).toBe(0);

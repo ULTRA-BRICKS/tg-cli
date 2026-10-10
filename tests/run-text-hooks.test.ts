@@ -3,16 +3,16 @@
 // by-default, fail-open) for run-text-hooks.ts's gateText/runPreSendTextHooks,
 // using a fake bash hook.
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { gateText, runPreSendTextHooks } from '../features/hooks/run-text-hooks';
 import { hooksActive, toolHooksDir } from '../features/hooks/run-photo-hooks';
+import { tempDir } from './helpers/test-temp';
 
 let home: string;
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), 'tg-text-hooks-home-'));
+  home = tempDir('tg-text-hooks-home-');
 });
 
 afterEach(() => {

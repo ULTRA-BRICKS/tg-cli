@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 // CLI wiring for the dictionary gate (features/cli/dict-gate.ts, tg-cli#302).
 // The gate runs in the `tg` entrypoint on the FINAL assembled caption/title,
@@ -21,7 +21,7 @@ let photoPath: string;
 const OFFLINE = { TG_API_BASE: 'http://127.0.0.1:57194' };
 
 beforeAll(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'tg-dict-gate-'));
+  scratch = tempDir('tg-dict-gate-');
   // A minimal valid 1x1 PNG so `--photo` resolves at parse time.
   photoPath = join(scratch, 'shot.png');
   writeFileSync(

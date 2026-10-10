@@ -6,9 +6,9 @@
 // loaded by the test run. (A real `launchctl load` would register a RunAtLoad agent into the
 // tester's session and actually start the daemon — exactly the side effect this avoids.)
 import { expect, setDefaultTimeout, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 import {
   claudeStatusLineTelemetryInstalled,
   codexUsageHookInstalled,
@@ -47,7 +47,7 @@ function reapDaemon(cfg: string, botId: string): void {
 // external supervisor), tmux panes and the process table. Unshimmed, `status` took seconds and
 // the status tests hit bun's 5s timeout on a busy host. Per-test shims (`exitCodeShimDir`) are
 // prepended to HOST_PATH, so they still win.
-const HERMETIC_BIN = mkdtempSync(join(tmpdir(), 'tgctl-svc-bin-'));
+const HERMETIC_BIN = tempDir('tgctl-svc-bin-');
 writeFileSync(join(HERMETIC_BIN, 'launchctl'), `#!/bin/sh\n[ "$1" = list ] && printf 'PID\\tStatus\\tLabel\\n'\nexit 0\n`, { mode: 0o755 });
 writeFileSync(join(HERMETIC_BIN, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
 writeFileSync(join(HERMETIC_BIN, 'ps'), `#!/bin/sh\nprintf '    1     0 /sbin/launchd\\n'\nexit 0\n`, { mode: 0o755 });
@@ -77,8 +77,8 @@ function processCwd(pid: number): string | null {
 
 // A throwaway HOME + config dir with fake creds so the bot-token gate passes.
 function fakeEnv() {
-  const home = mkdtempSync(join(tmpdir(), 'tgctl-svc-'));
-  const cfg = mkdtempSync(join(tmpdir(), 'tgctl-cfg-'));
+  const home = tempDir('tgctl-svc-');
+  const cfg = tempDir('tgctl-cfg-');
   writeFileSync(join(cfg, '.env'), 'TG_BOT_TOKEN=123456:FAKE\nTG_CHAT_ID=42\n');
   return { home, cfg, env: { HOME: home, TG_CTL_CONFIG_DIR: cfg } as Record<string, string> };
 }
@@ -88,7 +88,7 @@ function fakeEnv() {
 // us drive both the success (code 0) and command-FAILURE (code != 0) branches without touching
 // real autostart.
 function exitCodeShimDir(name: string, code: number): string {
-  const dir = mkdtempSync(join(tmpdir(), 'tgctl-shim-'));
+  const dir = tempDir('tgctl-shim-');
   const shim = join(dir, name);
   writeFileSync(shim, `#!/bin/sh\nexit ${code}\n`);
   chmodSync(shim, 0o755);
@@ -96,7 +96,7 @@ function exitCodeShimDir(name: string, code: number): string {
 }
 
 test('bare `tg-ctl` prints HELP on stdout and exits 0 — never launches', () => {
-  const proc = run([], { HOME: '/tmp/tg-ctl-svc-nohome' });
+  const proc = run([], { HOME: tempDir('tg-ctl-svc-nohome-') });
   expect(proc.exitCode).toBe(0);
   const out = proc.stdout.toString();
   expect(out).toContain('Usage:');
@@ -108,14 +108,14 @@ test('bare `tg-ctl` prints HELP on stdout and exits 0 — never launches', () =>
 });
 
 test('unknown subcommand exits 1 with USAGE on stderr', () => {
-  const proc = run(['frobnicate'], { HOME: '/tmp/tg-ctl-svc-nohome' });
+  const proc = run(['frobnicate'], { HOME: tempDir('tg-ctl-svc-nohome-') });
   expect(proc.exitCode).toBe(1);
   expect(proc.stderr.toString()).toContain('Usage:');
 });
 
 test('codex-usage-hook is a quiet no-op when tg credentials are not configured', () => {
-  const home = mkdtempSync(join(tmpdir(), 'tgctl-no-creds-'));
-  const cfg = mkdtempSync(join(tmpdir(), 'tgctl-no-creds-cfg-'));
+  const home = tempDir('tgctl-no-creds-');
+  const cfg = tempDir('tgctl-no-creds-cfg-');
   const proc = run(['codex-usage-hook'], { HOME: home, TG_CTL_CONFIG_DIR: cfg });
   expect(proc.exitCode).toBe(0);
   expect(proc.stdout.toString()).toBe('');
@@ -196,7 +196,7 @@ test('install-hooks provisions Claude statusLine and Codex Stop usage telemetry 
 
 test('install-hooks and status respect CODEX_HOME for Codex hooks', () => {
   const { home, env } = fakeEnv();
-  const codexHome = mkdtempSync(join(tmpdir(), 'tgctl-codex-home-'));
+  const codexHome = tempDir('tgctl-codex-home-');
   const codexEnv = { ...env, CODEX_HOME: codexHome };
 
   const proc = run(['install-hooks'], codexEnv);
@@ -256,7 +256,7 @@ test('status reports when a project-local Claude statusLine shadows the installe
   const installed = run(['install-hooks'], env);
   expect(installed.exitCode).toBe(0);
 
-  const project = mkdtempSync(join(tmpdir(), 'tgctl-proj-'));
+  const project = tempDir('tgctl-proj-');
   mkdirSync(join(project, '.claude'), { recursive: true });
   writeFileSync(
     join(project, '.claude', 'settings.json'),
@@ -283,7 +283,7 @@ test('status checks the registered active scope when invoked from another direct
   const installed = run(['install-hooks'], env);
   expect(installed.exitCode).toBe(0);
 
-  const project = mkdtempSync(join(tmpdir(), 'tgctl-proj-'));
+  const project = tempDir('tgctl-proj-');
   mkdirSync(join(project, '.claude'), { recursive: true });
   writeFileSync(
     join(project, '.claude', 'settings.json'),
@@ -292,7 +292,7 @@ test('status checks the registered active scope when invoked from another direct
   writeFileSync(join(cfg, 'tg-ctl.123456.registration.json'), `${JSON.stringify([{ cwd: project, registeredAt: 2 }])}\n`);
 
   const shimDir = exitCodeShimDir('tmux', 0);
-  const otherDir = mkdtempSync(join(tmpdir(), 'tgctl-other-'));
+  const otherDir = tempDir('tgctl-other-');
   const proc = run(['status'], { ...env, PATH: `${shimDir}:${HOST_PATH}` }, otherDir);
 
   expect(proc.exitCode).toBe(0);
@@ -307,7 +307,7 @@ test('install-hooks from a shadowed project wraps that project-local statusLine 
   const installed = run(['install-hooks'], env);
   expect(installed.exitCode).toBe(0);
 
-  const project = mkdtempSync(join(tmpdir(), 'tgctl-proj-'));
+  const project = tempDir('tgctl-proj-');
   const projectSettingsPath = join(project, '.claude', 'settings.json');
   mkdirSync(join(project, '.claude'), { recursive: true });
   writeFileSync(projectSettingsPath, `${JSON.stringify({ statusLine: { type: 'command', command: 'printf project-only' } })}\n`);
@@ -334,7 +334,7 @@ test('status stops at the nearest project collector instead of reporting an ance
   const installed = run(['install-hooks'], env);
   expect(installed.exitCode).toBe(0);
 
-  const project = mkdtempSync(join(tmpdir(), 'tgctl-proj-'));
+  const project = tempDir('tgctl-proj-');
   const nested = join(project, 'subdir');
   mkdirSync(join(project, '.claude'), { recursive: true });
   mkdirSync(join(nested, '.claude'), { recursive: true });
@@ -453,7 +453,7 @@ test.if(process.platform === 'darwin')(
 // Without creds, it exits 1 for auth, NOT because of the "unknown subcommand" check.
 // Distinguisher: unknown exits with USAGE on stderr; missing-creds exits with "TG_BOT_TOKEN".
 test('restart: known subcommand — rejected for missing creds, not as unknown', () => {
-  const proc = run(['restart'], { HOME: '/tmp/tg-ctl-restart-nocreds' });
+  const proc = run(['restart'], { HOME: tempDir('tg-ctl-restart-nocreds-') });
   expect(proc.exitCode).toBe(1);
   expect(proc.stderr.toString()).not.toContain('Usage:');
   expect(proc.stderr.toString()).toContain('TG_BOT_TOKEN');
@@ -551,7 +551,7 @@ test('restart while the old daemon is alive leaves a live successor (no dropped 
 // with only HOME in env (no TG_CTL_CONFIG_DIR); the grandchild must land its
 // pidfile in the HOME-derived configDir, proving it received the right configDir.
 test('env-pin: grandchild uses ctx.configDir when TG_CTL_CONFIG_DIR absent from env', () => {
-  const home = mkdtempSync(join(tmpdir(), 'tgctl-envpin-'));
+  const home = tempDir('tgctl-envpin-');
   const cfgDir = join(home, '.config', 'tg-cli');
   mkdirSync(cfgDir, { recursive: true });
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123456:FAKE\nTG_CHAT_ID=42\n');
@@ -577,8 +577,8 @@ test('start launches the daemon from a stable cwd, not the caller cwd', async ()
   const deployedDir = join(home, '.files', 'bin');
   mkdirSync(deployedDir, { recursive: true });
   symlinkSync(TG_CTL, join(deployedDir, 'tg-ctl'));
-  const launchDir = mkdtempSync(join(tmpdir(), 'tgctl-launch-cwd-'));
-  const shimDir = mkdtempSync(join(tmpdir(), 'tgctl-snapshot-shim-'));
+  const launchDir = tempDir('tgctl-launch-cwd-');
+  const shimDir = tempDir('tgctl-snapshot-shim-');
   writeFileSync(
     join(shimDir, 'tmux'),
     "#!/bin/sh\nprintf 's\\t1\\t%%9\\t111\\t2.1.199\\text\\t\\t/project\\n'\n",

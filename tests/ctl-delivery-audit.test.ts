@@ -3,11 +3,11 @@
 // transcripts and the daemon log combine into the report — and the command's transcript scan.
 
 import { describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { buildAuditReport, logDeliveryIds, transcriptCopies, type AuditInput } from '../features/tg-ctl/delivery-audit';
 import type { HistoryRecord } from '../features/replies/history';
+import { tempDir } from './helpers/test-temp';
 
 const CHAT = 5;
 
@@ -182,7 +182,7 @@ describe('buildAuditReport', () => {
 // With no inbound history left (trimmed, or a fresh box) there is no window start: the scan
 // must still read every transcript, or the ledger's messages all look undelivered.
 test('audit-delivery reads transcripts when history holds no inbound message', () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-audit-'));
+  const cfgDir = tempDir('tgctl-audit-');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   const date = Math.floor(Date.now() / 1000) - 60;
   writeFileSync(join(cfgDir, 'tg-ctl.123.delivery.jsonl'), `${JSON.stringify({ ts: Date.now(), event: 'received', update: 1, date, chat: 1, msg: 42 })}\n`);

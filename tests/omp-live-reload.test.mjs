@@ -1,14 +1,14 @@
 // Installed OMP requires a saved restart, NOT hot reload, for JS extension changes.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, copyFile, appendFile, writeFile, rm } from 'node:fs/promises';
+import { mkdir, copyFile, appendFile, writeFile, rm } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { tempDir } from './helpers/test-temp.ts';
 const exec = promisify(execFile);
 test('a fresh process loads current adapter and runtime after a saved restart', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'omp-loader-'));
+  const root = tempDir('omp-loader-');
   t.after(() => rm(root, { recursive: true, force: true }));
   for (const file of ['extensions/omp-live.ts', 'features/tg-ctl/omp-live-extension.mjs', 'features/tg-ctl/omp-live-runtime.mjs']) {
     const dst = join(root, file); await mkdir(join(dst, '..'), { recursive: true });

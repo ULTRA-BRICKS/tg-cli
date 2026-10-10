@@ -7,12 +7,12 @@
 // Assumptions: the daemon takes the flock before writing the pidfile; lsof can name
 // the lock holder. Does not touch the developer's live LaunchAgent.
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { spawnSyncBounded } from './helpers/spawn-sync';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir, trackChild } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -64,7 +64,7 @@ async function startDaemon(cfgDir: string, port: number): Promise<Subprocess> {
   mkdirSync(join(cfgDir, 'bin'));
   writeFileSync(join(cfgDir, 'bin', 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
-  const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+  const daemon = trackChild(Bun.spawn([process.execPath, TG_CTL, 'run'], {
     env: {
       PATH: `${join(cfgDir, 'bin')}:${process.env.PATH ?? ''}`,
       HOME: cfgDir,
@@ -72,7 +72,7 @@ async function startDaemon(cfgDir: string, port: number): Promise<Subprocess> {
       TG_API_BASE: `http://127.0.0.1:${port}`,
     },
     stdio: ['ignore', logFd, logFd],
-  });
+  }));
   closeSync(logFd);
   procs.push(daemon);
   const pidFile = join(cfgDir, 'tg-ctl.123.pid');
@@ -99,7 +99,7 @@ function runStatus(cfgDir: string): { exitCode: number | null; stdout: string; s
 
 // Real daemon + mock Bot API; poll loops wait on pidfile/socket/send, not a guessed sleep.
 test('status reports running after the pidfile is deleted while the process is alive', async () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-status-nopid-'));
+  const cfgDir = tempDir('tgctl-status-nopid-');
   const { port } = startMockBot();
   const daemon = await startDaemon(cfgDir, port);
   const pid = daemon.pid;
@@ -111,7 +111,7 @@ test('status reports running after the pidfile is deleted while the process is a
 }, 20_000);
 
 test('status reports running when the socket is gone too — lock holder is enough', async () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-status-nosock-'));
+  const cfgDir = tempDir('tgctl-status-nosock-');
   const { port } = startMockBot();
   const daemon = await startDaemon(cfgDir, port);
   const pid = daemon.pid;
@@ -123,7 +123,7 @@ test('status reports running when the socket is gone too — lock holder is enou
 }, 20_000);
 
 test('ask is still attempted when the pidfile is gone but the process is alive', async () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-ask-nopid-'));
+  const cfgDir = tempDir('tgctl-ask-nopid-');
   const { port, sent } = startMockBot();
   await startDaemon(cfgDir, port);
   unlinkSync(join(cfgDir, 'tg-ctl.123.pid'));

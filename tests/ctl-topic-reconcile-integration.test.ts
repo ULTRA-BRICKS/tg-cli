@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 
 // Startup crash-orphan reconcile (reconcileTopicsOnStartup in tg-ctl), end to end: the real daemon,
 // a fake Telegram server, and a fake tmux/ps. The flat `/new` private-topic spawn persists
@@ -100,7 +100,7 @@ interface Started {
 }
 
 async function startWith(s: Scenario): Promise<Started> {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-reconcile-'));
+  const cfgDir = tempDir('tgctl-reconcile-');
   const spawnLog = join(cfgDir, 'spawn.log');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), `control:\n  enabled: true\n  topics: ${s.topics ?? true}\n`);

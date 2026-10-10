@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 
 // tg-cli#72: an ambiguous route / a reply to a GONE agent must post the inline-
 // keyboard PICKER (tappable buttons, like /agent) — NOT the old plain-text
@@ -111,7 +111,7 @@ interface Harness {
 
 // `regs` lets a test register one or both agents (the per-pane registration SET).
 function makeHarness(regs: Array<{ paneId: string; cwd: string }>, routes: unknown[] = []): Harness {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-ambig-'));
+  const cfgDir = tempDir('tgctl-ambig-');
   const dirHyper = join(cfgDir, 'hyperide');
   const dirTools = join(cfgDir, 'agent-tools');
   mkdirSync(dirHyper, { recursive: true });

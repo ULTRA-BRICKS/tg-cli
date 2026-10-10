@@ -1,10 +1,10 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { MSGREF_EXCERPT_MAX } from '../features/autolink-msgrefs/render';
 import { serializeHistoryRecord } from '../features/replies/history';
 import type { HistoryRecord } from '../features/replies/history';
+import { tempDir } from './helpers/test-temp';
 
 const TG_SCRIPT = join(import.meta.dir, '..', 'tg');
 
@@ -31,7 +31,7 @@ afterAll(() => {
 });
 
 function makeHome(chatId: string = '1'): string {
-  const home = mkdtempSync(join(tmpdir(), 'tg-msgref-excerpt-'));
+  const home = tempDir('tg-msgref-excerpt-');
   dirs.push(home);
   const cfg = join(home, '.config', 'tg-cli');
   mkdirSync(cfg, { recursive: true });

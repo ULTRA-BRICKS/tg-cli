@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 import {
   LONG_UNSTRUCTURED_MESSAGE_WARNING,
   shouldWarnLongUnstructuredPlainMessage,
@@ -222,7 +222,7 @@ afterAll(() => {
 });
 
 function makeHome(): string {
-  const home = mkdtempSync(join(tmpdir(), 'tg-message-structure-'));
+  const home = tempDir('tg-message-structure-');
   dirs.push(home);
   const cfg = join(home, '.config', 'tg-cli');
   mkdirSync(cfg, { recursive: true });

@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 
 // End-to-end defer-while-waiting (spec tg#30): the real daemon, a fake Telegram
 // server, and a fake tmux/ps that reports ONE claude pane (%1) and LOGS every
@@ -70,7 +70,7 @@ exit 0
 }
 
 function makeCfgDir(): string {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-defer-'));
+  const cfgDir = tempDir('tgctl-defer-');
   const injectLog = join(cfgDir, 'inject.log');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');

@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 // Regression coverage for the `--dry-run` flag (tg-cli issue: a subagent
 // iterating against the strict `--tag decision` escalation-format
@@ -51,7 +51,7 @@ afterAll(() => {
 // actually reach the mock server instead of dying earlier on missing creds —
 // the strongest form of this regression test.
 function makeHomeWithCreds(): string {
-  const home = mkdtempSync(join(tmpdir(), 'tg-dry-run-home-'));
+  const home = tempDir('tg-dry-run-home-');
   dirs.push(home);
   const cfg = join(home, '.config', 'tg-cli');
   mkdirSync(cfg, { recursive: true });
@@ -164,7 +164,7 @@ test('--dry-run with a MALFORMED decision body: still hard-blocks (exit 1) befor
 });
 
 test('--dry-run needs NO credentials at all: works with a HOME that has no ~/.config/tg-cli/.env', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'tg-dry-run-no-creds-'));
+  const home = tempDir('tg-dry-run-no-creds-');
   dirs.push(home);
   const { exitCode, stdout, stderr } = await run(['--dry-run', 'plain status update, no tag'], {
     PATH: process.env.PATH ?? '',
@@ -176,7 +176,7 @@ test('--dry-run needs NO credentials at all: works with a HOME that has no ~/.co
 });
 
 test('--dry-run prints the rendered body it would have sent', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'tg-dry-run-preview-'));
+  const home = tempDir('tg-dry-run-preview-');
   dirs.push(home);
   const { stdout } = await run(['--dry-run', 'hello from a dry run'], {
     PATH: process.env.PATH ?? '',
@@ -190,7 +190,7 @@ test('--dry-run prints the rendered body it would have sent', async () => {
 // when attachments are not even inspected — reject explicitly instead of a
 // silent partial pass.
 test('--dry-run with an attachment (--photo/--file) is a hard error, not a silent partial OK', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'tg-dry-run-attach-'));
+  const home = tempDir('tg-dry-run-attach-');
   dirs.push(home);
   const missingPhoto = join(home, 'nonexistent.png');
   const { exitCode, stdout, stderr } = await run(
@@ -237,7 +237,7 @@ test('--dry-run --table (rows via stdin) validates the FINAL rendered table and 
 });
 
 test('--dry-run still hard-blocks a cjk-guard violation (stray CJK glyph) before printing OK', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'tg-dry-run-cjk-'));
+  const home = tempDir('tg-dry-run-cjk-');
   dirs.push(home);
   // A lone CJK ideograph glued mid-word into Latin text — the exact shape the
   // cjk-guard exists to catch (see features/cli/cjk-guard.ts).

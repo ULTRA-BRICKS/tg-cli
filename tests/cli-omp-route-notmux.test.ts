@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 // tg-cli#339: outbound `tg` from an omp with no tmux pane must stamp routes.json
 // paneId omp:<pid> so a Telegram reply can find that live process. tg-cli#363:
@@ -35,9 +35,9 @@ function writeFakeOmpPs(dir: string, nestedParent = false): void {
 }
 
 async function sendFromOmp(nestedParent: boolean, text: string): Promise<{ configDir: string; received: unknown[] }> {
-  const home = mkdtempSync(join(tmpdir(), 'tg-omp-route-home-'));
-  const configDir = mkdtempSync(join(tmpdir(), 'tg-omp-route-cfg-'));
-  const binDir = mkdtempSync(join(tmpdir(), 'tg-omp-route-bin-'));
+  const home = tempDir('tg-omp-route-home-');
+  const configDir = tempDir('tg-omp-route-cfg-');
+  const binDir = tempDir('tg-omp-route-bin-');
   dirs.push(home, configDir, binDir);
   writeFileSync(join(configDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFakeOmpPs(binDir, nestedParent);

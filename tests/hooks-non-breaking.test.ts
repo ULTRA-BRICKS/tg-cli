@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { existsSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { gatePhotos, hooksActive, hooksRoot, runPreSendPhotoHooks } from '../features/hooks/run-photo-hooks';
+import { tempDir } from './helpers/test-temp';
 
 // THE GATE: prove the no-descriptors path is byte-identical to "no hooks at
 // all" — no subprocess, no audit, no extra work beyond a single stat. These
@@ -11,7 +11,7 @@ import { gatePhotos, hooksActive, hooksRoot, runPreSendPhotoHooks } from '../fea
 let home: string;
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), 'tg-hooks-nb-'));
+  home = tempDir('tg-hooks-nb-');
 });
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });

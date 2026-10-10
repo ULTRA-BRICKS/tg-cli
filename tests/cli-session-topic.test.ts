@@ -1,8 +1,8 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { createServer, type Server } from 'net';
-import { tmpdir } from 'os';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 // `tg --session-topic` (tg-cli#553): a launcher of a nohup-detached child (reparented to pid 1, so
 // the daemon cannot match it by ancestry) asks for the topic of the session it runs in and exports
@@ -24,9 +24,9 @@ interface Fixture {
 }
 
 function fixture(topicsYaml = 'control:\n  enabled: true\n  topics: true\n'): Fixture {
-  const home = mkdtempSync(join(tmpdir(), 'tg-st-home-'));
+  const home = tempDir('tg-st-home-');
   const configDir = join(home, '.config', 'tg-cli');
-  const binDir = mkdtempSync(join(tmpdir(), 'tg-st-bin-'));
+  const binDir = tempDir('tg-st-bin-');
   dirs.push(home, binDir);
   mkdirSync(configDir, { recursive: true });
   writeFileSync(join(configDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=-100123\n');

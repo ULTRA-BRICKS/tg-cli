@@ -11,16 +11,16 @@
 // back to a bare atomic append only when the lock is genuinely unavailable
 // for the whole spin budget.
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'fs';
 import { join } from 'path';
 import { appendAudit, auditFile } from '../features/hooks/run-photo-hooks';
 import { MAX_AUDIT_LINES, type AuditLine } from '../features/hooks/runner';
+import { tempDir } from './helpers/test-temp';
 
 let home: string;
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), 'tg-audit-lock-'));
+  home = tempDir('tg-audit-lock-');
 });
 
 afterEach(() => {

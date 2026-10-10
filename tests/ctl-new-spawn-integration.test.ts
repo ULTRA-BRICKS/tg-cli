@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 
 // End-to-end flat `/new` command (issue #27): the REAL daemon + a fake Telegram server + a fake
 // tmux/ps. A `/new [<harness>|<model>] [<dir>] name [<task>]` message drives the interactive flow
@@ -139,7 +139,7 @@ exit 0
 }
 
 function makeCfgDir(topics: boolean): { cfgDir: string; spawnLog: string } {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-new-'));
+  const cfgDir = tempDir('tgctl-new-');
   cfgDirs.push(cfgDir);
   const spawnLog = join(cfgDir, 'spawn.log');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
@@ -277,7 +277,7 @@ test('full /new flow: command → dir tap → harness tap → model tap spawns o
 });
 
 test('BUG 1: a NUMERIC tmux session name spawns successfully (no `index 1 in use` collision)', async () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-new-'));
+  const cfgDir = tempDir('tgctl-new-');
   cfgDirs.push(cfgDir);
   const spawnLog = join(cfgDir, 'spawn.log');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
@@ -470,7 +470,7 @@ exit 0
 }
 
 test('/new <name> whose slug collides with a live window WARNS but still proceeds (review #5)', async () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-new-'));
+  const cfgDir = tempDir('tgctl-new-');
   cfgDirs.push(cfgDir);
   const spawnLog = join(cfgDir, 'spawn.log');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
@@ -620,7 +620,7 @@ function retryTap(id: number, token: string): unknown {
 }
 
 test('a spawn FAILURE offers a Retry button and does NOT re-ask the model (BUG 1: no loop)', async () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-new-'));
+  const cfgDir = tempDir('tgctl-new-');
   cfgDirs.push(cfgDir);
   const spawnLog = join(cfgDir, 'spawn.log');
   const failFlag = join(cfgDir, 'FAIL_SPAWN');
@@ -694,7 +694,7 @@ test('a Retry tap on a session that never failed (awaiting-model) is refused (wr
 });
 
 test('a Retry after the working dir vanished re-asks for a dir and does NOT spawn into nothing', async () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-new-'));
+  const cfgDir = tempDir('tgctl-new-');
   cfgDirs.push(cfgDir);
   const spawnLog = join(cfgDir, 'spawn.log');
   const failFlag = join(cfgDir, 'FAIL_SPAWN');

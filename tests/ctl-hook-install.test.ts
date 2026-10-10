@@ -497,12 +497,12 @@ test('runClaudeHookSelfHeal #211: no sentinel + PARTIAL hooks → still not-opte
 // --- #212: the real-disk writer must write THROUGH a symlinked settings.json
 // (dotfile managers) and keep the file's mode, never swap in a 0600 regular file. ---
 import { writeSettingsPreservingLink } from '../features/tg-ctl/hook-install';
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { chmodSync, lstatSync, mkdirSync, readFileSync, readlinkSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { tempDir } from './helpers/test-temp';
 
 test('writeSettingsPreservingLink #212: symlinked settings.json stays a symlink, target updated, mode kept', () => {
-  const home = mkdtempSync(join(tmpdir(), 'tg-212-'));
+  const home = tempDir('tg-212-');
   mkdirSync(join(home, 'dotfiles'));
   mkdirSync(join(home, '.claude'));
   const target = join(home, 'dotfiles', 'claude-settings.json');
@@ -520,7 +520,7 @@ test('writeSettingsPreservingLink #212: symlinked settings.json stays a symlink,
 });
 
 test('writeSettingsPreservingLink #212: regular file keeps its mode (not forced to 0600)', () => {
-  const home = mkdtempSync(join(tmpdir(), 'tg-212-'));
+  const home = tempDir('tg-212-');
   const p = join(home, 'settings.json');
   writeFileSync(p, '{}\n');
   chmodSync(p, 0o640);
@@ -531,7 +531,7 @@ test('writeSettingsPreservingLink #212: regular file keeps its mode (not forced 
 });
 
 test('writeSettingsPreservingLink #212: missing file → created with the private 0600 default', () => {
-  const p = join(mkdtempSync(join(tmpdir(), 'tg-212-')), 'settings.json');
+  const p = join(tempDir('tg-212-'), 'settings.json');
   writeSettingsPreservingLink(p, '{}\n');
   expect(readFileSync(p, 'utf8')).toBe('{}\n');
   expect(statSync(p).mode & 0o777).toBe(0o600);

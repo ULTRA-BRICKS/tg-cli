@@ -2,11 +2,11 @@
 // original process; the real daemon types into its own pane instead of refusing.
 // With an endpoint, delivery stays on the endpoint and nothing is typed (no duplicate).
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, openSync, closeSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, openSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { createDaemonRegistry, spawnDaemon, reapDaemons } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const SID = '01a0d2d7-6202-702d-b9e8-006b656b0799';
@@ -15,7 +15,7 @@ const cleanup: Array<() => Promise<void> | void> = [];
 afterEach(async () => { await reapDaemons(reg); for (const fn of cleanup.splice(0)) await fn(); });
 
 function environment() {
-  const cfg = mkdtempSync(join(tmpdir(), 'tgctl-omp-tmux-'));
+  const cfg = tempDir('tgctl-omp-tmux-');
   const bin = join(cfg, 'bin'); mkdirSync(bin);
   writeFileSync(join(cfg, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfg, 'config.yaml'), 'control:\n  enabled: true\n  git_state_banner: false\n');

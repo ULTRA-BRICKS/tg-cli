@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 // End-to-end tests for HTML auto-detection: when the message body contains
 // Telegram HTML tags (<b>, <i>, <code>, etc.) without an explicit --format html,
@@ -38,7 +38,7 @@ afterAll(() => {
 });
 
 function makeHome(): string {
-  const home = mkdtempSync(join(tmpdir(), 'tg-html-detect-'));
+  const home = tempDir('tg-html-detect-');
   dirs.push(home);
   const cfg = join(home, '.config', 'tg-cli');
   mkdirSync(cfg, { recursive: true });

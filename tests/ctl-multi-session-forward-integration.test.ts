@@ -11,8 +11,7 @@
 // fire `tg-ctl ask` per case, read posted messages back from the mock + the log.
 
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import {
@@ -23,10 +22,11 @@ import {
   trackProc,
 } from './helpers/daemon-lifecycle';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
-const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-multisess-'));
+const cfgDir = tempDir('tgctl-multisess-');
 writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 const regPath = join(cfgDir, 'tg-ctl.123.registration.json');

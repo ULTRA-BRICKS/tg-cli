@@ -23,12 +23,12 @@ import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 // match — see tg-awareness-nudge.ts's own "Population" doc comment on why
 // (ensureOmpAcp's attach path can itself SPAWN a session).
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const LIVE_CWD = '/Users/u/work/review-cli';
@@ -82,7 +82,7 @@ exit 0
 }
 
 async function makeCfgDir() {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-hatch-proactive-'));
+  const cfgDir = tempDir('tgctl-hatch-proactive-');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   // registration is irrelevant here — hatch bypasses the registration gate — but

@@ -1,14 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,readFile,writeFile,rm,chmod,readdir} from 'node:fs/promises';
+import {readFile,writeFile,rm,chmod,readdir} from 'node:fs/promises';
 import {createServer,createConnection} from 'node:net';
 import {join} from 'node:path';
-import {tmpdir} from 'node:os';
 import {spawn} from 'node:child_process';
 import {randomBytes} from 'node:crypto';
 import {startLiveEndpoint,sendLiveMessage,listLiveEndpoints,requestEndpoint} from '../features/tg-ctl/omp-live-runtime.mjs';
+import {tempDir} from './helpers/test-temp.ts';
 async function fixture(t) {
- const root=await mkdtemp(join(tmpdir(),'ol-limit-')); const received=[];
+ const root=tempDir('ol-limit-'); const received=[];
  const endpoint=await startLiveEndpoint({root,snapshot:()=>({sessionId:'s',cwd:'/test'}),send:t=>received.push(t)});
  t.after(async()=>{await endpoint.close();await rm(root,{recursive:true,force:true});});
  return {root,endpoint,received,meta:JSON.parse(await readFile(endpoint.metadataPath,'utf8'))};

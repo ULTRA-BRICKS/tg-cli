@@ -4,9 +4,9 @@ import {
   SUBSTRING_FALLBACK_EXCLUDED_KEYS,
   MODEL_EMOJI_MAP,
 } from "../features/branding/emoji"
-import { mkdtempSync, writeFileSync, chmodSync } from "fs"
-import { tmpdir } from "os"
+import { writeFileSync, chmodSync } from "fs"
 import { join } from "path"
+import { tempDir } from "./helpers/test-temp"
 
 // Import the emoji map from the CLI
 const TG_PATH = new URL("../tg", import.meta.url).pathname
@@ -22,7 +22,7 @@ async function combinedSource(): Promise<string> {
 // Prepending it to PATH lets us prove the Claude env check wins over the
 // pgrep fallback even when an ollama daemon is genuinely up.
 function fakePgrepBinDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const dir = tempDir("tg-fakebin-")
   const script = '#!/bin/sh\nfor a in "$@"; do [ "$a" = "ollama" ] && exit 0; done\nexit 1\n'
   const p = join(dir, "pgrep")
   writeFileSync(p, script)
@@ -66,6 +66,8 @@ function writeFakePs(dir: string, agentCommand: string | string[]): void {
 
 // Sanitize environment for subprocess tests
 // Whitelist only essential vars to prevent env leakage
+const TEST_HOME = tempDir("tg-cli-test-home-")
+
 function sanitizeEnv(): Record<string, string> {
   const whitelist = ["PATH", "TMPDIR"]
   const env: Record<string, string> = {}
@@ -76,7 +78,7 @@ function sanitizeEnv(): Record<string, string> {
     }
   }
   // Use a temporary HOME to prevent loading user's tg-cli config
-  env["HOME"] = "/tmp/tg-cli-test-home"
+  env["HOME"] = TEST_HOME
   return env
 }
 
@@ -966,7 +968,7 @@ test("CLAUDECODE env detects claude (not a background ollama daemon)", async () 
   // check, and this test exercises the ENV path — a real agent in the test
   // runner's own process tree (e.g. a dev's tmux pane) would win instead.
   const env = sanitizeEnv()
-  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const binDir = tempDir("tg-fakebin-")
   writeFakePs(binDir, "")
   const proc = Bun.spawn({
     cmd: ["bun", "run", TG_PATH, "--detect-model"],
@@ -1011,7 +1013,7 @@ test("TG_AI_MODEL overrides CLAUDECODE detection", async () => {
 test("--detect-model works without Telegram credentials (info-only flag)", async () => {
   // Neutral ancestry for the same reason as the CLAUDECODE-env test above.
   const env = sanitizeEnv()
-  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const binDir = tempDir("tg-fakebin-")
   writeFakePs(binDir, "")
   const proc = Bun.spawn({
     cmd: ["bun", "run", TG_PATH, "--detect-model"],
@@ -1068,7 +1070,7 @@ test("codex ancestor beats a background ollama daemon (fake ps + fake pgrep)", a
   // through to the pgrep block and a background `ollama` daemon won — branding
   // codex sessions as ollama. Ancestry detection must now win.
   const env = sanitizeEnv()
-  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const binDir = tempDir("tg-fakebin-")
   const ollamaScript =
     '#!/bin/sh\nfor a in "$@"; do [ "$a" = "ollama" ] && exit 0; done\nexit 1\n'
   writeFileSync(join(binDir, "pgrep"), ollamaScript)
@@ -1187,7 +1189,7 @@ test("REGRESSION (#246): CLAUDECODE=1 with an omp ancestor brands omp, not claud
   // env check used to run BEFORE the ancestry walk, so every outbound send
   // from an omp session misbranded 'claude ✳️'. The ancestry walk must win.
   const env = sanitizeEnv()
-  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const binDir = tempDir("tg-fakebin-")
   writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
   chmodSync(join(binDir, "pgrep"), 0o755)
   writeFakePs(binDir, "/opt/homebrew/bin/omp")
@@ -1207,7 +1209,7 @@ test("CLAUDECODE=1 with a claude ancestor still brands claude (no behavior chang
   // Companion pin to the #246 reorder: a REAL claude session has claude in its
   // ancestry, so moving the walk ahead of the env check changes nothing there.
   const env = sanitizeEnv()
-  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const binDir = tempDir("tg-fakebin-")
   writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
   chmodSync(join(binDir, "pgrep"), 0o755)
   writeFakePs(binDir, "claude")
@@ -1227,7 +1229,7 @@ test("opencode ancestor is refined to the config model name", async () => {
   // Lineage-first ordering (#246): an opencode ancestor resolves the session's
   // actual MODEL NAME via `opencode debug config`, not the generic kind.
   const env = sanitizeEnv()
-  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const binDir = tempDir("tg-fakebin-")
   writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
   chmodSync(join(binDir, "pgrep"), 0o755)
   writeFakePs(binDir, "opencode")
@@ -1249,7 +1251,7 @@ test("opencode ancestor is refined to the config model name", async () => {
 
 test("an opencode ancestor with an UNREADABLE config falls back to the generic kind", async () => {
   const env = sanitizeEnv()
-  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const binDir = tempDir("tg-fakebin-")
   writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
   chmodSync(join(binDir, "pgrep"), 0o755)
   writeFakePs(binDir, "opencode")
@@ -1271,7 +1273,7 @@ test("lineage beats an inherited OPENCODE marker (stale env from an outer pane)"
   // OPENCODE=1, but the codex ancestor is the real sender. The ancestry walk
   // must win over the env marker (#246 review).
   const env = sanitizeEnv()
-  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const binDir = tempDir("tg-fakebin-")
   writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
   chmodSync(join(binDir, "pgrep"), 0o755)
   writeFakePs(binDir, "/opt/homebrew/bin/codex exec --json")
@@ -1293,7 +1295,7 @@ test("lineage beats an inherited OPENCODE marker (stale env from an outer pane)"
 
 test("OPENCODE env resolves the model name when no ancestor matches (detached spawn)", async () => {
   const env = sanitizeEnv()
-  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const binDir = tempDir("tg-fakebin-")
   writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
   chmodSync(join(binDir, "pgrep"), 0o755)
   writeFakePs(binDir, "") // neutral ancestry → env-marker fallback path
@@ -1318,7 +1320,7 @@ test("nested claude inside an opencode pane brands claude (lineage over inherite
   // actual launcher, so claude wins — the pre-#246 env-first order happened
   // to get this right, the first reorder shape regressed it (review finding).
   const env = sanitizeEnv()
-  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const binDir = tempDir("tg-fakebin-")
   writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
   chmodSync(join(binDir, "pgrep"), 0o755)
   writeFakePs(binDir, "claude")
@@ -1338,7 +1340,7 @@ test("nearest ancestor wins with TWO agents in one tree (opencode → claude →
   // nested topologies this PR reasons about have BOTH agents in the real
   // tree — the walk must return the NEAREST (claude), not the outer opencode.
   const env = sanitizeEnv()
-  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const binDir = tempDir("tg-fakebin-")
   writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
   chmodSync(join(binDir, "pgrep"), 0o755)
   // Custom three-level tree via the chain form: tg → claude → opencode
@@ -1361,7 +1363,7 @@ test("detached nested spawn (OPENCODE+CLAUDECODE, no ancestry) brands claude", a
   // (inherited from an outer pane, two hops). This matches the pre-#246
   // relative order — the smallest possible behavior delta.
   const env = sanitizeEnv()
-  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const binDir = tempDir("tg-fakebin-")
   writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
   chmodSync(join(binDir, "pgrep"), 0o755)
   writeFakePs(binDir, "") // neutral ancestry → env-marker fallback path
@@ -1383,7 +1385,7 @@ test("detached nested spawn (OPENCODE+CLAUDECODE, no ancestry) brands claude", a
 
 test("OPENCODE env with an UNREADABLE config falls back to the generic kind (symmetric with the ancestor path)", async () => {
   const env = sanitizeEnv()
-  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const binDir = tempDir("tg-fakebin-")
   writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
   chmodSync(join(binDir, "pgrep"), 0o755)
   writeFakePs(binDir, "") // neutral ancestry → env-marker fallback path
@@ -1406,7 +1408,7 @@ test("omp ancestor brands the session as omp with the pie emoji (fake ps)", asyn
   // resolve its emoji from MODEL_EMOJI_MAP — the AgentKind→emoji-key bridge is
   // string-keyed, so this guards the connection, not just the two ends.
   const env = sanitizeEnv()
-  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const binDir = tempDir("tg-fakebin-")
   writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
   chmodSync(join(binDir, "pgrep"), 0o755)
   writeFakePs(binDir, "/opt/homebrew/bin/omp")

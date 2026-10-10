@@ -1,11 +1,11 @@
 import { afterAll, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { existsSync, rmSync, statSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { buildKeyInjectPlan, buildTextInjectPlan } from '../features/tg-ctl/inject';
 import { messageStillTyped } from '../features/tg-ctl/input-box';
 import { permissionMenuUnchanged } from '../features/tg-ctl/permission-menu';
 import type { AgentKind, InjectStep } from '../features/tg-ctl/types';
+import { tempDir } from './helpers/test-temp';
 
 // Real-tmux integration (spec §11): InjectStep plans executed against a live
 // tmux pane running a readline stub. Everything runs on a THROWAWAY socket
@@ -110,7 +110,7 @@ async function executeSteps(steps: InjectStep[], agent: AgentKind = 'claude'): P
 
 // The "agent": prints READY, then echoes GOT:<line> per submitted line. Echoed
 // keystrokes never start with "GOT:", so GOT-lines count submissions exactly.
-const stubDir = mkdtempSync(join(tmpdir(), 'tgctl-tmux-'));
+const stubDir = tempDir('tgctl-tmux-');
 const stubPath = join(stubDir, 'stub.ts');
 writeFileSync(stubPath, "console.log('READY');\nfor await (const line of console) console.log(`GOT:${line}`);\n");
 

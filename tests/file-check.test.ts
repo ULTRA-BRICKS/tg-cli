@@ -53,9 +53,9 @@ test('an existing, non-empty, readable file is "ok"', () => {
 // the SAME shape of real-fs deps locally (mirroring what `tg` wires) so the
 // checker's behavior against a genuine filesystem is still covered, without
 // exporting an impure helper from the feature module.
-import { accessSync, chmodSync, constants, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { accessSync, chmodSync, constants, mkdirSync, rmSync, statSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 function realFsDeps(): FileCheckDeps {
   return {
@@ -72,7 +72,7 @@ function realFsDeps(): FileCheckDeps {
 }
 
 test('real fs: nonexistent path → missing, 0-byte file → empty, populated file → ok', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tg-cli-file-check-'));
+  const dir = tempDir('tg-cli-file-check-');
   try {
     const missing = join(dir, 'nope.log');
     const empty = join(dir, 'empty.log');
@@ -89,7 +89,7 @@ test('real fs: nonexistent path → missing, 0-byte file → empty, populated fi
 });
 
 test('real fs: a directory path (not a file) is "missing"', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tg-cli-file-check-'));
+  const dir = tempDir('tg-cli-file-check-');
   try {
     const sub = join(dir, 'subdir');
     mkdirSync(sub);
@@ -104,7 +104,7 @@ test('real fs: a non-empty file with read permission revoked is "unreadable"', (
   // skip rather than false-fail there (mirrors the repo's own guard style for
   // environment-dependent checks).
   if (typeof process.getuid === 'function' && process.getuid() === 0) return;
-  const dir = mkdtempSync(join(tmpdir(), 'tg-cli-file-check-'));
+  const dir = tempDir('tg-cli-file-check-');
   try {
     const locked = join(dir, 'locked.pdf');
     writeFileSync(locked, 'secret bytes');

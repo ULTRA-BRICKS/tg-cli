@@ -1,10 +1,10 @@
 import { afterAll, expect, test } from 'bun:test';
-import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { createConnection } from 'net';
-import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, trackCfgDir, trackProc } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 
 // Full inbound-VOICE round-trip against a Bot-API fake (mirrors
 // ctl-daemon-integration.test.ts). The Whisper + ffmpeg binaries are PATH shims
@@ -186,8 +186,7 @@ function makeCfgDir(opts: {
   modelPath: string;
 } {
   const withFfmpeg = opts.withFfmpeg ?? true;
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-voice-'));
-  tempDirs.push(cfgDir);
+  const cfgDir = tempDir('tgctl-voice-');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 
   const shimDir = join(cfgDir, 'bin');
@@ -286,12 +285,10 @@ function makeCfgDir(opts: {
 
 const reg = createDaemonRegistry();
 const servers: { stop: (force?: boolean) => void }[] = [];
-const tempDirs: string[] = [];
 
 afterAll(async () => {
   await reapDaemons(reg);
   for (const s of servers) s.stop(true);
-  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
 });
 
 async function runDaemon(
@@ -828,8 +825,7 @@ test('daemon stays responsive (socket accepts) DURING a slow transcription — a
 // ggml model) so decideOnboarding returns 'ready'. The config dir + ffmpeg on
 // PATH are caller-controlled.
 function fakeWhisperHome(): { home: string; binDir: string } {
-  const home = mkdtempSync(join(tmpdir(), 'tgctl-vsetup-'));
-  tempDirs.push(home);
+  const home = tempDir('tgctl-vsetup-');
   const wc = join(home, 'xp', 'whisper.cpp');
   mkdirSync(join(wc, 'build', 'bin'), { recursive: true });
   mkdirSync(join(wc, 'models'), { recursive: true });

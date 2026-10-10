@@ -11,12 +11,12 @@
 // additionally answers `capture-pane` from a sentinel file the test controls,
 // so a test can simulate "the menu is still showing" vs "already resolved".
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
 import { DANGEROUS_LONG, permissionBoxFor as menuFor, SAFE_LONG, SHARED_99 } from './fixtures/permission-menu';
+import { tempDir } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const PANE_ID = '%1';
@@ -110,7 +110,7 @@ exit 0
 }
 
 function makeCfgDir(): string {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-permpane-'));
+  const cfgDir = tempDir('tgctl-permpane-');
   const injectLog = join(cfgDir, 'inject.log');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');

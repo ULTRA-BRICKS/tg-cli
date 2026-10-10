@@ -1,11 +1,11 @@
 import { afterEach, expect, test } from 'bun:test';
 import { createServer, type Socket } from 'net';
-import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Server } from 'net';
 import type { Subprocess } from 'bun';
 import { trackProc, createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 import {
   clampGenericAskTimeoutSec,
   GENERIC_ASK_ORIGIN_AGENT,
@@ -37,7 +37,7 @@ afterEach(async () => {
 }, 20_000);
 
 function makeCfgDir(creds = true): string {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-gask-'));
+  const cfgDir = tempDir('tgctl-gask-');
   if (creds) writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   return cfgDir;
 }
@@ -518,7 +518,7 @@ test('two concurrent generic asks never share a requestId (fresh id per invocati
 // getUpdates/callback_query path -- not a fake echo. ---
 
 function makeRealDaemonCfgDir(): string {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-gask-e2e-'));
+  const cfgDir = tempDir('tgctl-gask-e2e-');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   // Deliberately NO registration file. Generic CLI asks are the universal

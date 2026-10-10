@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 // End-to-end forum-topics OUTBOUND threading (docs/specs/tg-forum-topics.md §8,
 // increment 2): run the REAL `tg` binary against a mock Bot-API server
@@ -66,7 +66,7 @@ afterAll(() => {
 // credential gate and actually hits our mock. The auto-attach worktree scan and
 // the ctl auto-start are both inert here (no TMUX, no MODEL).
 function makeHome(): string {
-  const home = mkdtempSync(join(tmpdir(), 'tg-topic-home-'));
+  const home = tempDir('tg-topic-home-');
   dirs.push(home);
   const cfg = join(home, '.config', 'tg-cli');
   mkdirSync(cfg, { recursive: true });

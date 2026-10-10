@@ -1,21 +1,19 @@
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
 const reg = createDaemonRegistry();
 const servers: Array<{ stop: (closeActiveConnections?: boolean) => void }> = [];
-const tempDirs: string[] = [];
 
 afterEach(async () => {
   await reapDaemons(reg);
   for (const s of servers.splice(0)) s.stop(true);
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 test('tg-ctl ask returns no decision immediately when the Telegram prompt cannot be sent', async () => {
@@ -47,8 +45,7 @@ test('tg-ctl ask returns no decision immediately when the Telegram prompt cannot
 }, 10_000);
 
 test('tg-ctl ask exits 0 with no output when credentials are absent', async () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-buttons-nocreds-'));
-  tempDirs.push(cfgDir);
+  const cfgDir = tempDir('tgctl-buttons-nocreds-');
   const ask = Bun.spawn([process.execPath, TG_CTL, 'ask'], {
     env: {
       HOME: cfgDir,
@@ -680,8 +677,7 @@ function daemonLog(cfgDir: string): string {
 }
 
 function makeCfgDir(): string {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-buttons-fail-'));
-  tempDirs.push(cfgDir);
+  const cfgDir = tempDir('tgctl-buttons-fail-');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ cwd: cfgDir }));

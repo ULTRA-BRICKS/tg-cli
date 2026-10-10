@@ -1,8 +1,8 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseHistory } from '../features/replies/history';
+import { tempDir } from './helpers/test-temp';
 
 // tg-cli#136: `tg` (outbound) and the daemon (inbound) both read-modify-write
 // history.jsonl. Unlocked, two concurrent writers lose each other's rows.
@@ -10,7 +10,7 @@ import { parseHistory } from '../features/replies/history';
 const WRITER = join(import.meta.dir, '..', 'features', 'replies', 'history-file.ts');
 
 test('concurrent writers never lose each other\'s history rows', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tg-history-lock-'));
+  const dir = tempDir('tg-history-lock-');
   try {
     const path = join(dir, 'history.jsonl');
     const writers = 6;

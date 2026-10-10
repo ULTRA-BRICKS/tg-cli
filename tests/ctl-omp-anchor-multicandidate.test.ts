@@ -1,11 +1,11 @@
 import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { appendFileSync } from 'node:fs';
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 import { tmuxNoServerShim } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 
 // tg-cli regression (reply-to-agent routing, tg-cli#78 anchor): a non-reply
 // inbound must bind to the pane of the CTO's OWN last resolved delivery — the
@@ -119,7 +119,7 @@ function fakeOmpScript(log: string): string {
 }
 
 async function makeHarness() {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-omp-anchor-'));
+  const cfgDir = tempDir('tgctl-omp-anchor-');
   writeFileSync(join(cfgDir, '.env'), ['TG_BOT_TOKEN=123:abc', 'TG_CHAT_ID=1', ''].join('\n'));
   writeFileSync(join(cfgDir, 'config.yaml'), ['control:', '  enabled: true', ''].join('\n'));
   writeFileSync(join(cfgDir, 'tg-ctl.123.routes.json'), JSON.stringify([]));

@@ -1,17 +1,17 @@
 // #450: exercise the real daemon, original receiver, and local sockets; never clone ACP.
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, openSync, closeSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, openSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { createDaemonRegistry, spawnDaemon, reapDaemons } from './helpers/daemon-lifecycle';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const reg = createDaemonRegistry();
 const cleanup: Array<() => Promise<void> | void> = [];
 afterEach(async () => { await reapDaemons(reg); for (const fn of cleanup.splice(0)) await fn(); });
 async function fixture(publish: boolean) {
-  const cfg = mkdtempSync(join(tmpdir(), 'tgctl-original-'));
+  const cfg = tempDir('tgctl-original-');
   const bin = join(cfg, 'bin'); mkdirSync(bin);
   writeFileSync(join(cfg, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfg, 'config.yaml'), 'control:\n  enabled: true\n');
@@ -72,7 +72,7 @@ test('missing original endpoint reports unavailable instead of spawning a replac
   expect(f.notices.join('\n')).toMatch(/bridge|endpoint|original/i);
 }, 15000);
 test('omp-live status is a credential-free public CLI returning a JSON array', async () => {
-  const cfg = mkdtempSync(join(tmpdir(), 'tgctl-status-original-'));
+  const cfg = tempDir('tgctl-status-original-');
   const p = Bun.spawn([process.execPath, TG_CTL, 'omp-live', 'status', '--json'], {
     env: { ...process.env, HOME: cfg, TG_CTL_CONFIG_DIR: cfg, TG_BOT_TOKEN: '', TG_CHAT_ID: '' },
     stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',

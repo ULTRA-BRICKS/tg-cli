@@ -1,12 +1,12 @@
 import { appendFileSync } from 'node:fs';
 import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 import { serializeRegistry } from '../features/tg-ctl/session-registry-store';
 import type { SessionEntry } from '../features/tg-ctl/session-registry';
+import { tempDir } from './helpers/test-temp';
 
 // #339 / #450: preserve every no-tmux route, but deliver to the original process.
 
@@ -121,7 +121,7 @@ function fakeOmpScript(spawnLog: string): string {
 }
 
 async function makeHarness(opts: { routes?: unknown[]; sessions?: SessionEntry[] } = {}) {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-omp-reply-'));
+  const cfgDir = tempDir('tgctl-omp-reply-');
   writeFileSync(join(cfgDir, '.env'), ['TG_BOT_TOKEN=123:abc', 'TG_CHAT_ID=1', ''].join('\n'));
   writeFileSync(join(cfgDir, 'config.yaml'), ['control:', '  enabled: true', ''].join('\n'));
   writeFileSync(join(cfgDir, 'tg-ctl.123.routes.json'), JSON.stringify(opts.routes ?? []));

@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, lstat, readFile, chmod } from 'node:fs/promises';
+import { mkdir, rm, lstat, readFile, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import extension from '../features/tg-ctl/omp-live-extension.mjs';
 import { listLiveEndpoints, sendLiveMessage } from '../features/tg-ctl/omp-live-runtime.mjs';
+import { tempDir } from './helpers/test-temp.ts';
 
 async function setup(t, pi = {}) {
-  const config = await mkdtemp(join(tmpdir(), 'omp-ext-'));
+  const config = tempDir('omp-ext-');
   const root = join(config, 'omp-live');
   const prior = process.env.TG_CTL_CONFIG_DIR;
   process.env.TG_CTL_CONFIG_DIR = config;

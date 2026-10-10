@@ -4,11 +4,11 @@
 // rig-managed (~/.codex/config.toml carries rig's bridge marker); it is NEVER baked into the
 // pure model catalog, and NEVER applied to a user's own untrusted hooks on a machine without rig.
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { MODEL_CATALOG, spawnArgvWithTask } from '../features/tg-ctl/models';
 import { applyCodexHookTrustBypass, codexHooksRigManaged } from '../features/tg-ctl/rig-delegate';
+import { tempDir } from './helpers/test-temp';
 
 const FLAG = '--dangerously-bypass-hook-trust';
 const RIG_MARKER = '# >>> rig managed: codex hook bridge';
@@ -16,7 +16,7 @@ const RIG_MARKER = '# >>> rig managed: codex hook bridge';
 let home: string;
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), 'tg-codex-trust-'));
+  home = tempDir('tg-codex-trust-');
 });
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });

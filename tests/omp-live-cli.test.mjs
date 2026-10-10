@@ -1,17 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, mkdir, writeFile, readFile, lstat, chmod, symlink } from 'node:fs/promises';
+import { rm, mkdir, writeFile, readFile, lstat, chmod, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
+import { tempDir } from './helpers/test-temp.ts';
 const exec = promisify(execFile);
 const cli = fileURLToPath(new URL('../tools/omp-live-cli.mjs', import.meta.url));
 
 test('standalone CLI lists and sends to an existing endpoint, not another OMP process', async t => {
-  const config = await mkdtemp(join(tmpdir(), 'omp-cli-'));
+  const config = tempDir('omp-cli-');
   const received = [];
   const ep = await startLiveEndpoint({ root: join(config, 'omp-live'), snapshot: () => ({ sessionId: 'original', cwd: config, busy: false }), send: text => received.push(text) });
   t.after(async () => { await ep.close(); await rm(config, { recursive: true, force: true }); });
@@ -25,7 +25,7 @@ test('standalone CLI lists and sends to an existing endpoint, not another OMP pr
 });
 
 test('installation is idempotent and does not overwrite a user-owned extension', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'omp-cli-install-'));
+  const root = tempDir('omp-cli-install-');
   t.after(() => rm(root, { recursive: true, force: true }));
   const args = [cli, 'install', '--agent-root', root];
   assert.equal(JSON.parse((await exec(process.execPath, args)).stdout).changed, true);
@@ -38,7 +38,7 @@ test('installation is idempotent and does not overwrite a user-owned extension',
 
 
 test('new extension directory is private even under a permissive umask', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'omp-cli-umask-'));
+  const root = tempDir('omp-cli-umask-');
   t.after(() => rm(root, { recursive: true, force: true }));
   const source = `process.umask(0); const {runOmpLiveCommand}=await import(${JSON.stringify(new URL('../tools/omp-live-cli.mjs', import.meta.url).href)}); process.exitCode=await runOmpLiveCommand(['install','--agent-root',${JSON.stringify(root)}]);`;
   const result = await exec(process.execPath, ['--input-type=module', '-e', source]);
@@ -47,7 +47,7 @@ test('new extension directory is private even under a permissive umask', async t
 });
 
 test('installation refuses an existing writable directory and a symlink target', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'omp-cli-unsafe-'));
+  const root = tempDir('omp-cli-unsafe-');
   t.after(() => rm(root, { recursive: true, force: true }));
   const directory = join(root, 'extensions');
   await mkdir(directory); await chmod(directory, 0o777);
@@ -63,7 +63,7 @@ test('installation refuses an existing writable directory and a symlink target',
 
 
 test('a planted FIFO cannot block extension installation', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'omp-cli-fifo-'));
+  const root = tempDir('omp-cli-fifo-');
   t.after(() => rm(root, { recursive: true, force: true }));
   await mkdir(join(root, 'extensions'), { mode: 0o700 });
   await exec('mkfifo', [join(root, 'extensions', 'tg-omp-live.ts')]);
@@ -73,7 +73,7 @@ test('a planted FIFO cannot block extension installation', async t => {
 
 
 test('loader write permissions and size are rejected without modifying the file', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'omp-cli-target-'));
+  const root = tempDir('omp-cli-target-');
   t.after(() => rm(root, { recursive: true, force: true }));
   await mkdir(join(root, 'extensions'), { mode: 0o700 });
   const target = join(root, 'extensions', 'tg-omp-live.ts');

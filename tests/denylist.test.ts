@@ -1,9 +1,9 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { isNeverAttach } from '../features/auto-attach/denylist';
 import { parseArgs } from '../features/cli/args';
+import { tempDir } from './helpers/test-temp';
 
 // --- pattern matching (basename-based) ---
 
@@ -97,7 +97,7 @@ test('denylist: matches the basename, not the directory', () => {
 
 // --- parseArgs integration ---
 
-const dir = mkdtempSync(join(tmpdir(), 'tg-denylist-'));
+const dir = tempDir('tg-denylist-');
 writeFileSync(join(dir, 'prod.env'), 'TOKEN=supersecret\n');
 writeFileSync(join(dir, 'normal.ts'), 'export const x = 1\n');
 writeFileSync(join(dir, 'tg-ctl.987.last-user-target.json'), '{"paneId":"%3","cwd":"/repo","ts":1}\n');

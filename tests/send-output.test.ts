@@ -1,8 +1,8 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { formatSendOk } from '../features/cli/send-output';
+import { tempDir } from './helpers/test-temp';
 
 test('formatSendOk keeps OK first and appends reusable tg# refs', () => {
   expect(formatSendOk([])).toBe('OK');
@@ -63,7 +63,7 @@ afterAll(() => {
 });
 
 function makeHome(): string {
-  const home = mkdtempSync(join(tmpdir(), 'tg-send-output-'));
+  const home = tempDir('tg-send-output-');
   dirs.push(home);
   const cfg = join(home, '.config', 'tg-cli');
   mkdirSync(cfg, { recursive: true });

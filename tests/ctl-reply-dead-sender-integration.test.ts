@@ -1,10 +1,10 @@
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 import { PS_NO_AGENTS_SHIM, TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 
 // Regression for the "dead sender" reply-routing path: a one-shot/disposable
 // sender (a subagent process running `tg --tag report`, or any headless
@@ -119,7 +119,7 @@ interface HarnessOpts {
 }
 
 function makeHarness(opts: HarnessOpts = {}): Harness {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-dead-sender-'));
+  const cfgDir = tempDir('tgctl-dead-sender-');
   const dirParent = join(cfgDir, 'proj-parent');
   const dirOther = join(cfgDir, 'proj-other');
   mkdirSync(dirParent, { recursive: true });

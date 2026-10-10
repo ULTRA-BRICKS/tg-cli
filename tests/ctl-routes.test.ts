@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 import {
   parseRoutes,
   appendRoute,
@@ -328,7 +328,7 @@ test('withRoutesLock: onContended=skip STILL runs the body when the lock IS acqu
 // --- fsRoutesLockIo: the REAL filesystem backing (O_EXCL lockfile + pid liveness) ---
 
 test('fsRoutesLockIo: real O_EXCL lockfile serializes two writers — no lost route entries', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tg-routeslock-'));
+  const dir = tempDir('tg-routeslock-');
   const routesFile = join(dir, 'routes.json');
   const lockPath = `${routesFile}.lock`;
   const alive = new Set([111, 222]);
@@ -359,7 +359,7 @@ test('fsRoutesLockIo: real O_EXCL lockfile serializes two writers — no lost ro
 });
 
 test('fsRoutesLockIo: a real DEAD-owner lockfile is broken; a real held lock blocks acquire', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tg-routeslock-dead-'));
+  const dir = tempDir('tg-routeslock-dead-');
   const lockPath = join(dir, 'routes.json.lock');
 
   // A crashed writer left a lockfile owned by a DEAD pid.
@@ -389,7 +389,7 @@ test('fsRoutesLockIo: an EMPTY/unparseable lockfile (SIGKILL-window orphan) is b
   // and writeFileSync(pid) leaves a present-but-EMPTY lockfile with no owner. The
   // old two-state read treated "unreadable" like "absent" → never broken → every
   // later send wedged. It must now be classified breakable.
-  const dir = mkdtempSync(join(tmpdir(), 'tg-routeslock-orphan-'));
+  const dir = tempDir('tg-routeslock-orphan-');
   const lockPath = join(dir, 'routes.json.lock');
 
   for (const garbage of ['', '   ', 'not-a-pid', '0', '-5']) {

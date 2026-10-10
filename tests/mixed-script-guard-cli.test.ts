@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 // CLI wiring for the mixed-script "garbage token" guard
 // (features/cli/mixed-script-guard.ts). It runs in the `tg` entrypoint on the
@@ -14,7 +15,7 @@ import { join } from 'path';
 const TG_SCRIPT = join(import.meta.dir, '..', 'tg');
 const BASE_ENV = {
   PATH: process.env.PATH ?? '',
-  HOME: '/tmp/tg-cli-test-home-mixed-script',
+  HOME: tempDir('tg-cli-test-home-mixed-script-'),
   TG_BOT_TOKEN: 'fake-token',
   TG_CHAT_ID: '123456',
 };

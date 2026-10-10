@@ -3,19 +3,19 @@
 // the READER (runReplies) through a real file. Guards the wire format end to end
 // without a live Telegram bot.
 import { expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { inboundHistoryRecords } from '../features/replies/inbound';
 import { buildOutboundHistoryRecords, outboundHistoryText } from '../features/replies/outbound';
 import { appendRecordsToBlob, type HistoryRecord } from '../features/replies/history';
+import { tempDir } from './helpers/test-temp';
 import { runReplies } from '../features/replies/cli';
 import type { TgUpdate } from '../features/tg-ctl/types';
 
 const CHAT = 555;
 
 test('inbound writer → file → tg replies reader, scoped to the routed pane', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tg-replies-'));
+  const dir = tempDir('tg-replies-');
   const file = join(dir, 'history.jsonl');
 
   const updates: TgUpdate[] = [
@@ -47,7 +47,7 @@ test('inbound writer → file → tg replies reader, scoped to the routed pane',
 });
 
 test('outbound writer → file → tg replies agent reader', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tg-replies-'));
+  const dir = tempDir('tg-replies-');
   const file = join(dir, 'history.jsonl');
 
   const text = outboundHistoryText('done, shipped', { photos: 0, documents: 0 });
@@ -81,7 +81,7 @@ test('outbound writer → file → tg replies agent reader', () => {
 // NON-FIRST id (the album's 2nd item) must still be recall-able via
 // `tg replies --json`, matching what buildReplyAnchor promises.
 test('outbound writer (multi-id) → file → a NON-FIRST id is recall-able via --json', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tg-replies-'));
+  const dir = tempDir('tg-replies-');
   const file = join(dir, 'history.jsonl');
 
   const text = outboundHistoryText('', { photos: 3, documents: 0 });
@@ -111,7 +111,7 @@ test('outbound writer (multi-id) → file → a NON-FIRST id is recall-able via 
 // If appendRecordsToBlob's serializer ever dropped groupId, this would fail
 // with 3 lines instead of 1 (review: tg-cli#131 follow-up, tg-cli#134).
 test('outbound writer (multi-id) → file → plain listing collapses to ONE line', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tg-replies-'));
+  const dir = tempDir('tg-replies-');
   const file = join(dir, 'history.jsonl');
 
   const text = outboundHistoryText('', { photos: 3, documents: 0 });
@@ -133,7 +133,7 @@ test('outbound writer (multi-id) → file → plain listing collapses to ONE lin
 });
 
 test('both writers append to the SAME file; `all` shows the conversation in order', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tg-replies-'));
+  const dir = tempDir('tg-replies-');
   const file = join(dir, 'history.jsonl');
 
   // Inbound first.

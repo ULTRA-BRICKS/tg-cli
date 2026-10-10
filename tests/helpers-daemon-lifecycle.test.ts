@@ -7,8 +7,7 @@
 //      temp cfgDir's own pid file, so it can never touch a non-temp daemon.
 
 import { afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, openSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { existsSync, openSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import {
@@ -19,6 +18,7 @@ import {
   trackCfgDir,
   __test,
 } from './helpers/daemon-lifecycle';
+import { tempDir, trackChild } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -29,7 +29,7 @@ afterEach(async () => {
 });
 
 function makeCfgDir(): string {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-lifecycle-selftest-'));
+  const cfgDir = tempDir('tgctl-lifecycle-selftest-');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   return cfgDir;
@@ -66,10 +66,10 @@ test('scoped backstop reaps a daemon that was NEVER tracked in procs[]', async (
   // procs[] pass cannot see it; only the cfgDir-scoped pid-file sweep can.
   const cfgDir = makeCfgDir();
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
-  const leaked: Subprocess = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+  const leaked: Subprocess = trackChild(Bun.spawn([process.execPath, TG_CTL, 'run'], {
     env: daemonEnv(cfgDir),
     stdio: ['ignore', logFd, logFd],
-  });
+  }));
   const socket = join(cfgDir, 'tg-ctl.123.sock');
   const t0 = Date.now();
   while (Date.now() - t0 < 5000 && !existsSync(socket)) await Bun.sleep(50);
@@ -111,10 +111,10 @@ test('settle-reap (detachedStarts) reaps a late daemon that grabbed the freed fl
   trackCfgDir(reg, cfgDir, { detachedStarts: true });
 
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
-  const late: Subprocess = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+  const late: Subprocess = trackChild(Bun.spawn([process.execPath, TG_CTL, 'run'], {
     env: daemonEnv(cfgDir),
     stdio: ['ignore', logFd, logFd],
-  });
+  }));
   // Don't wait for its socket — let it come up DURING reapDaemons' settle window,
   // exactly like a real late grandchild.
   const reaped = await reapDaemons(reg);

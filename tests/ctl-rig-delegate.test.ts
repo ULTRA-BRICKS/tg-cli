@@ -5,10 +5,10 @@
 // 0/1, `delegate [ARGS...]` runs `rig <ARGS...>` and exits with rig's code, or 97 (NO_RIG_EXIT) if
 // rig is absent) so the test never depends on a real agent-tools checkout being present on disk.
 import { afterAll, afterEach, beforeEach, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { chmodSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { detectRig, resolveAgentToolsLib, runRigDelegate } from '../features/tg-ctl/rig-delegate';
+import { tempDir } from './helpers/test-temp';
 
 // An isolated PATH that has a WORKING `python3` and nothing else — deliberately excludes
 // wherever a real `rig` might be installed on the dev machine (this machine has one), so the
@@ -30,7 +30,7 @@ function pythonOnlyPath(): string {
   if (out.exitCode !== 0 || !exe) {
     throw new Error(`cannot resolve the real python3 interpreter for test isolation (probe=${probe}, exit=${out.exitCode})`);
   }
-  const dir = mkdtempSync(join(tmpdir(), 'tgctl-py3-bin-'));
+  const dir = tempDir('tgctl-py3-bin-');
   symlinkSync(exe, join(dir, 'python3'));
   pythonBinDir = dir;
   return dir;
@@ -44,7 +44,7 @@ afterAll(() => {
 let root: string;
 
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'tgctl-rig-delegate-'));
+  root = tempDir('tgctl-rig-delegate-');
 });
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });

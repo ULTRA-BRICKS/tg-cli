@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 // End-to-end wiring proof (tg-cli#207 / tg-cli#208): run the REAL `tg` binary
 // against a mock Bot-API server and assert the actual wire calls, not just the
@@ -42,7 +42,7 @@ afterAll(() => {
 });
 
 function makeHome(): string {
-  const home = mkdtempSync(join(tmpdir(), 'tg-flood-home-'));
+  const home = tempDir('tg-flood-home-');
   dirs.push(home);
   const cfg = join(home, '.config', 'tg-cli');
   mkdirSync(cfg, { recursive: true });
@@ -75,7 +75,7 @@ async function runSend(
 
 test('wiring: a real 0-byte file on disk is skipped by the real `tg` binary, text still delivers', async () => {
   sent = [];
-  const home = mkdtempSync(join(tmpdir(), 'tg-flood-scratch-'));
+  const home = tempDir('tg-flood-scratch-');
   dirs.push(home);
   const emptyFile = join(home, 'empty.log');
   writeFileSync(emptyFile, '');
@@ -89,7 +89,7 @@ test('wiring: a real 0-byte file on disk is skipped by the real `tg` binary, tex
 
 test('wiring: an explicit --file pointing at a missing path is skipped, caption still delivers', async () => {
   sent = [];
-  const home = mkdtempSync(join(tmpdir(), 'tg-flood-scratch-'));
+  const home = tempDir('tg-flood-scratch-');
   dirs.push(home);
   const missing = join(home, 'does-not-exist.pdf');
   const { exitCode, stderr } = await runSend(['--file', missing, 'weekly report']);
@@ -109,7 +109,7 @@ test('wiring: an explicit --file pointing at a missing path is skipped, caption 
 // because conversion never starts on the empty file in the first place.
 test('wiring: an empty ORIGINAL .ts file is dropped BEFORE code-as-pdf conversion runs (no PDF, no sendDocument)', async () => {
   sent = [];
-  const home = mkdtempSync(join(tmpdir(), 'tg-flood-scratch-'));
+  const home = tempDir('tg-flood-scratch-');
   dirs.push(home);
   const emptySource = join(home, 'empty.ts');
   writeFileSync(emptySource, '');

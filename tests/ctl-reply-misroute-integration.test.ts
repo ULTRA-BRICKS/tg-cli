@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 
 // Regression for issue #53: with TWO agents running, a reply to agent-B's (%5)
 // message was mis-delivered to agent-A (%2). Root cause: a RECOGNIZED reply
@@ -118,7 +118,7 @@ interface HarnessOpts {
 }
 
 function makeHarness(opts: HarnessOpts = {}): Harness {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-misroute-'));
+  const cfgDir = tempDir('tgctl-misroute-');
   // Distinct project dirs so routeMatchesPane can confirm same-project for %5.
   const dir3d = join(cfgDir, 'proj-3d');
   const dirRig = join(cfgDir, 'proj-rig');

@@ -1,10 +1,10 @@
 import { afterAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Server, Subprocess } from 'bun';
 import { parseRegistry, serializeRegistry } from '../features/tg-ctl/session-registry-store';
 import type { SessionEntry } from '../features/tg-ctl/session-registry';
+import { tempDir, trackChild } from './helpers/test-temp';
 import { parseHistory } from '../features/replies/history';
 
 // A session's forum topic follows its registry session (docs/specs/session-registry-and-topics.md
@@ -39,7 +39,7 @@ interface Fixture {
 }
 
 function makeFixture(sessions: SessionEntry[]): Fixture {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-topic-delivery-'));
+  const cfgDir = tempDir('tgctl-topic-delivery-');
   const injectLog = join(cfgDir, 'inject.log');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n  topics: true\n');
@@ -142,7 +142,7 @@ function startApi(): FakeApi {
 
 async function startDaemon(fx: Fixture, port: number): Promise<void> {
   const logFd = openSync(join(fx.cfgDir, 'daemon.log'), 'a');
-  const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+  const daemon = trackChild(Bun.spawn([process.execPath, TG_CTL, 'run'], {
     env: {
       PATH: `${join(fx.cfgDir, 'bin')}:${process.env.PATH ?? ''}`,
       HOME: fx.cfgDir,
@@ -150,7 +150,7 @@ async function startDaemon(fx: Fixture, port: number): Promise<void> {
       TG_API_BASE: `http://127.0.0.1:${port}`,
     },
     stdio: ['ignore', logFd, logFd],
-  });
+  }));
   procs.push(daemon);
   closeSync(logFd);
   const socket = join(fx.cfgDir, 'tg-ctl.123.sock');

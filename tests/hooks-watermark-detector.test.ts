@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { rmSync, symlinkSync, writeFileSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { runPreSendPhotoHooks, toolHooksDir, trustFile } from '../features/hooks/run-photo-hooks';
 import { invocationDigest } from '../features/hooks/types';
 import { createHash } from 'crypto';
+import { tempDir } from './helpers/test-temp';
 
 // Unit tests for `looks_like_empty_vscode_watermark()` in
 // features/hooks/review-descriptor/pre_send_photo.py — the WARN-only
@@ -78,7 +78,7 @@ const [BOX_X0, BOX_X1, BOX_Y0, BOX_Y1] = readWatermarkBox();
 let home: string;
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), 'tg-watermark-'));
+  home = tempDir('tg-watermark-');
 });
 
 afterEach(() => {

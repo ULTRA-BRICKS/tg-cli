@@ -3,9 +3,9 @@
 // MTProto sidecar (TG_MTPROTO_SIDECAR) at once, so every test can see which of the two a
 // command reached — and that the other was never touched.
 import { afterAll, describe, expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 const TG = join(import.meta.dir, '..', 'tg');
 const BOT = { id: 123, is_bot: true, username: 'my_bot', first_name: 'My Bot' };
@@ -45,8 +45,7 @@ interface World {
 }
 
 function world(opts: { bot?: boolean } = {}): World {
-  const home = mkdtempSync(join(tmpdir(), 'tg-auth-ua-'));
-  cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+  const home = tempDir('tg-auth-ua-');
   const cfg = join(home, 'cfg');
   const capture = join(home, 'capture');
   mkdirSync(cfg, { recursive: true });

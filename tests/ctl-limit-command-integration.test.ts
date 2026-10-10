@@ -1,15 +1,15 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
 test('/limit [agent] reports the latest stored usage buckets through the Telegram daemon', async () => {
   const now = Date.now();
   const nowSec = Math.floor(now / 1000);
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-limit-command-'));
+  const cfgDir = tempDir('tgctl-limit-command-');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   writeFileSync(

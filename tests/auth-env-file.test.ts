@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 import { loadEnv } from '../features/config/env';
 import { mergeEnvContent } from '../features/auth/env-file';
 
@@ -51,7 +51,7 @@ describe('mergeEnvContent', () => {
 
   test('round-trips through the shared loader', () => {
     const content = mergeEnvContent('# c\nOTHER=v\n', { TG_BOT_TOKEN: '7:sec-ret_x', TG_CHAT_ID: '-1001' });
-    const p = join(mkdtempSync(join(tmpdir(), 'tg-auth-env-')), '.env');
+    const p = join(tempDir('tg-auth-env-'), '.env');
     writeFileSync(p, content);
     expect(loadEnv(p)).toEqual({ OTHER: 'v', TG_BOT_TOKEN: '7:sec-ret_x', TG_CHAT_ID: '-1001' });
   });

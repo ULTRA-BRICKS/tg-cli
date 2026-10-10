@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 
 // docs/specs/2026-09-30-harness-agnostic-control.md: a Claude Code session a rig wrapper hosts
 // in abduco OUTSIDE tmux is reachable. The daemon runs its REAL discovery against PATH-shimmed
@@ -15,9 +15,9 @@ import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const NAME = 'claude-3f9a0c1d2e4b';
 
-const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-hostpty-'));
+const cfgDir = tempDir('tgctl-hostpty-');
 // A short socket dir: a unix socket path is limited to 104 bytes on Darwin.
-const sockDir = mkdtempSync('/tmp/tgh-');
+const sockDir = tempDir('tgh-', { short: true });
 const socketPath = join(sockDir, `${NAME}@testhost`);
 writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');

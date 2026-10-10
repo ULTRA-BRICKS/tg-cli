@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'fs';
+import { chmodSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'fs';
 import { createHash } from 'crypto';
-import { tmpdir } from 'os';
 import { join } from 'path';
 import {
   gatePhotos,
@@ -13,13 +12,14 @@ import {
   auditFile,
 } from '../features/hooks/run-photo-hooks';
 import { invocationDigest } from '../features/hooks/types';
+import { tempDir } from './helpers/test-temp';
 
 // Each test builds an isolated fake $HOME with ~/.agents/hooks/ underneath.
 let home: string;
 let pngPath: string;
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), 'tg-hooks-home-'));
+  home = tempDir('tg-hooks-home-');
   pngPath = join(home, 'shot.png');
   writeFileSync(pngPath, 'PNGDATA');
 });

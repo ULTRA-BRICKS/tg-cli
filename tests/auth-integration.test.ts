@@ -1,8 +1,8 @@
 import { afterAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, statSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 
 // docs/specs/tg-auth.md — the REAL `tg auth …` (and, for the daemon path, a real
 // `tg-ctl run`) against a fake Bot API over HTTP (TG_API_BASE). The test learns
@@ -73,7 +73,7 @@ afterAll(async () => {
 });
 
 function tempDirs(prefix: string): { home: string; cfg: string } {
-  const home = mkdtempSync(join(tmpdir(), `tgctl-${prefix}-`));
+  const home = tempDir(`tgctl-${prefix}-`);
   const cfg = join(home, 'cfg');
   return { home, cfg };
 }

@@ -1,10 +1,10 @@
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 import { PS_NO_AGENTS_SHIM, TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 
 // Integration test for the /tasks bot command (tg-cli#115) against a fake Bot
 // API, with stub `task` and `gh` binaries on PATH. Proves the daemon composes
@@ -51,7 +51,7 @@ async function startTasksDaemon(cfgDir: string, binDir: string, apiPort: number,
   }
 }
 
-const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-'));
+const cfgDir = tempDir('tgctl-tasks-');
 writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 const projectDir = join(cfgDir, 'project');
@@ -150,7 +150,7 @@ test('/tasks without selector follows the last-user-target anchor, not routes.js
   // fallback is gone. The anchor's pane-id-reuse guard (routeMatchesPane)
   // requires the anchor's recorded cwd to match the CANDIDATE'S LIVE
   // pane_current_path, so both live panes are given real (non-empty) paths here.
-  const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-route-'));
+  const localCfgDir = tempDir('tgctl-tasks-route-');
   writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const routedDir = join(localCfgDir, 'routed-project');
@@ -265,7 +265,7 @@ test('/tasks without selector: routes.json ALONE (no anchor) no longer resolves 
   // %1 (routed-project). Now it must send the explicit "not resolvable" error
   // instead of guessing — proving the routes.json fallback is genuinely gone,
   // not just shadowed by the anchor when both are present.
-  const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-noanchor-'));
+  const localCfgDir = tempDir('tgctl-tasks-noanchor-');
   writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const routedDir = join(localCfgDir, 'routed-project');
@@ -354,7 +354,7 @@ exit 0
 }, 15_000);
 
 test('/tasks matches duplicate task ids to PRs by repo identity, not worktree basename', async () => {
-  const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-dup-project-'));
+  const localCfgDir = tempDir('tgctl-tasks-dup-project-');
   writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const worktreeDir = join(localCfgDir, 'tg-cli-wt-178-tasks-view');
@@ -443,7 +443,7 @@ test('/tasks matches duplicate task ids to PRs by repo identity, not worktree ba
 }, 15_000);
 
 test('/tasks reply scopes to the replied-to agent instead of the latest sender', async () => {
-  const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-reply-'));
+  const localCfgDir = tempDir('tgctl-tasks-reply-');
   writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const repliedDir = join(localCfgDir, 'replied-project');
@@ -552,7 +552,7 @@ exit 0
 }, 15_000);
 
 test('/tasks <agent> uses matching registration when tmux has no path', async () => {
-  const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-agent-'));
+  const localCfgDir = tempDir('tgctl-tasks-agent-');
   writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const agentDir = join(localCfgDir, 'agent-project');
@@ -641,7 +641,7 @@ exit 0
 }, 15_000);
 
 test('/tasks without a resolvable project sends an explicit error instead of running in daemon cwd', async () => {
-  const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-noscope-'));
+  const localCfgDir = tempDir('tgctl-tasks-noscope-');
   writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const projectA = join(localCfgDir, 'project-a');
@@ -741,7 +741,7 @@ exit 0
 }, 15_000);
 
 test('/tasks pagination callback sends the requested page with a filter keyboard', async () => {
-  const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-page-'));
+  const localCfgDir = tempDir('tgctl-tasks-page-');
   writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const projectDir = join(localCfgDir, 'project');
@@ -893,7 +893,7 @@ JSON
 }, 20_000);
 
 test('/tasks callback state is scoped by Telegram chat id as well as message id', async () => {
-  const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-chat-scope-'));
+  const localCfgDir = tempDir('tgctl-tasks-chat-scope-');
   writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const projectDir = join(localCfgDir, 'project');
@@ -990,7 +990,7 @@ test('/tasks callback state is scoped by Telegram chat id as well as message id'
 }, 20_000);
 
 test('/tasks in a bound topic keeps the topic thread on the board and callbacks', async () => {
-  const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-topic-'));
+  const localCfgDir = tempDir('tgctl-tasks-topic-');
   writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n  topics: true\n');
   const projectDir = join(localCfgDir, 'project');
@@ -1094,7 +1094,7 @@ test('/tasks in a bound topic keeps the topic thread on the board and callbacks'
 }, 20_000);
 
 test('/tasks render failure fallback stays in the bound topic reply context', async () => {
-  const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-topic-fallback-'));
+  const localCfgDir = tempDir('tgctl-tasks-topic-fallback-');
   writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n  topics: true\n');
   const projectDir = join(localCfgDir, 'project');
@@ -1169,7 +1169,7 @@ test('/tasks render failure fallback stays in the bound topic reply context', as
 }, 20_000);
 
 test('/tasks in a pathless topic fails closed in the topic reply context', async () => {
-  const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-topic-unresolved-'));
+  const localCfgDir = tempDir('tgctl-tasks-topic-unresolved-');
   writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n  topics: true\n');
   writeFileSync(join(localCfgDir, 'tg-ctl.123.topics.json'), JSON.stringify([{ threadId: 123, name: 'Tasks', status: 'bound', paneId: '%1', ts: 1 }]));
@@ -1240,7 +1240,7 @@ test('/tasks in a pathless topic fails closed in the topic reply context', async
 }, 20_000);
 
 test('/tasks status-scoped pagination keeps the status label on page callbacks', async () => {
-  const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-status-page-'));
+  const localCfgDir = tempDir('tgctl-tasks-status-page-');
   writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const projectDir = join(localCfgDir, 'project');
@@ -1371,7 +1371,7 @@ esac
 }, 20_000);
 
 test('/tasks All quick filter callback unpins an explicit status board', async () => {
-  const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-status-filter-'));
+  const localCfgDir = tempDir('tgctl-tasks-status-filter-');
   writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const projectDir = join(localCfgDir, 'project');
@@ -1510,7 +1510,7 @@ esac
 }, 20_000);
 
 test('/tasks stale pagination callback answers expired without guessing a project', async () => {
-  const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-stale-page-'));
+  const localCfgDir = tempDir('tgctl-tasks-stale-page-');
   writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const projectDir = join(localCfgDir, 'project');

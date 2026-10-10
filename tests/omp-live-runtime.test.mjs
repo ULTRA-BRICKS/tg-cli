@@ -1,14 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm, stat, symlink, chmod, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { readFile, readdir, rm, stat, symlink, chmod, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fork } from 'node:child_process';
 import { once } from 'node:events';
 import { startLiveEndpoint, listLiveEndpoints, sendLiveMessage, requestEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
+import { tempDir } from './helpers/test-temp.ts';
 
 async function fixture(t, send) {
-  const root = await mkdtemp(join(tmpdir(), 'omp-live-test-'));
+  const root = tempDir('omp-live-test-');
   let state = { sessionId: 's-original', sessionFile: '/not/opened/session.jsonl', cwd: '/same/cwd', busy: false, title: 'Original' };
   const received = [];
   const endpoint = await startLiveEndpoint({ root, snapshot: () => state, send: send ?? (text => { received.push(text); }) });
@@ -42,7 +42,7 @@ test('concurrent retries are idempotent, conflicting reuse is rejected', async t
 });
 
 test('missing endpoint fails rather than creating or resuming an agent', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'omp-live-none-'));
+  const root = tempDir('omp-live-none-');
   t.after(() => rm(root, { recursive: true, force: true }));
   await assert.rejects(sendLiveMessage({ root, pid: process.pid, requestId: 'missing', text: 'hello' }), /endpoint_unavailable/);
   assert.deepEqual(await readdir(root), []);
@@ -81,7 +81,7 @@ test('metadata and socket are private; public list cannot leak tokens', async t 
 
 test('symlinked registry and metadata are refused', async t => {
   const f = await fixture(t);
-  const parent = await mkdtemp(join(tmpdir(), 'omp-live-links-'));
+  const parent = tempDir('omp-live-links-');
   t.after(() => rm(parent, { recursive: true, force: true }));
   await symlink(f.root, join(parent, 'registry'));
   await assert.rejects(listLiveEndpoints(join(parent, 'registry')), /unsafe_registry/);
@@ -112,7 +112,7 @@ test('closing an endpoint removes only its own registration', async t => {
 });
 
 test('long metadata root uses a private short socket, not an invalid macOS-length path', async t => {
-  const parent = await mkdtemp(join(tmpdir(), 'omp-live-long-'));
+  const parent = tempDir('omp-live-long-');
   const root = join(parent, 'x'.repeat(95), 'registry');
   const ep = await startLiveEndpoint({ root, snapshot: () => ({ sessionId: 'long', sessionFile: null, cwd: parent, busy: true }), send: () => {} });
   t.after(async () => { await ep.close(); await rm(parent, { recursive: true, force: true }); });
@@ -122,7 +122,7 @@ test('long metadata root uses a private short socket, not an invalid macOS-lengt
 });
 
 test('cross-process delivery preserves the original receiver PID and does not start another receiver', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'omp-live-child-'));
+  const root = tempDir('omp-live-child-');
   const child = fork(new URL('./omp-live-fixture.mjs', import.meta.url), [root], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
   t.after(async () => { if (child.exitCode === null) { child.kill('SIGTERM'); await once(child, 'exit'); } await rm(root, { recursive: true, force: true }); });
   const [ready] = await once(child, 'message');
@@ -135,7 +135,7 @@ test('cross-process delivery preserves the original receiver PID and does not st
 });
 
 test('#458: a host too busy to answer the status probe is listed alive-busy; a send times out, never "unavailable"', { timeout: 20_000 }, async t => {
-  const root = await mkdtemp(join(tmpdir(), 'omp-live-slow-'));
+  const root = tempDir('omp-live-slow-');
   const child = fork(new URL('./omp-live-fixture.mjs', import.meta.url), [root], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
   let socketDir = null;
   t.after(async () => {

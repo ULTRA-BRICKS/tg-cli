@@ -9,14 +9,14 @@
 // the CTO, never dropped silently.
 
 import { afterEach, expect, test } from 'bun:test';
-import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { serializeDeferredStore } from '../features/tg-ctl/deferred-store';
 import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const PANE_ID = '%1';
@@ -32,7 +32,7 @@ afterEach(async () => {
 
 // A claude pane %1; `list-panes` reports no pane while `<cfgDir>/pane-gone` exists.
 function makeCfgDir(): string {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-exactly-once-'));
+  const cfgDir = tempDir('tgctl-exactly-once-');
   const injectLog = join(cfgDir, 'inject.log');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
@@ -295,7 +295,7 @@ test('a deferred message the flush cannot type is reported to the CTO', async ()
 }, 25_000);
 
 test('an omp restarted between two deliveries of one message receives it once', async () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-exactly-once-omp-'));
+  const cfgDir = tempDir('tgctl-exactly-once-omp-');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const bin = join(cfgDir, 'bin');

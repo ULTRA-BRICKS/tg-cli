@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
+import { existsSync, readFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { connectAbducoSocket } from '../features/tg-ctl/abduco-client';
 import { MSG_ATTACH, MSG_CONTENT, MSG_DETACH, attachPacket, contentPackets, detachPacket, injectIntoAbducoSession } from '../features/tg-ctl/abduco-pty';
+import { tempDir } from './helpers/test-temp';
 
 // The real unix-socket client against an in-process stand-in for abduco's server: what
 // reaches the socket must decode as the same packet stream, in order, and a dead
@@ -37,7 +37,7 @@ function alive(pid: number): boolean {
 }
 
 function sockPath(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'tg-abc-'));
+  const dir = tempDir('tg-abc-');
   dirs.push(dir);
   return join(dir, 's');
 }
@@ -120,7 +120,7 @@ const abduco = Bun.which('abduco');
 // the typed line reaches the file through a separate process — no in-process event to await.
 test.skipIf(abduco === null)('real abduco: the text reaches the session PTY intact and exactly once', async () => {
   // a short base: a unix socket path (sun_path) is limited to 104 bytes on Darwin
-  const dir = mkdtempSync('/tmp/tg-abd-');
+  const dir = tempDir('tg-abd-', { short: true });
   dirs.push(dir);
   const out = join(dir, 'typed.txt');
   const serverPid = join(dir, 'server.pid');
@@ -145,7 +145,7 @@ test.skipIf(abduco === null)('real abduco: the text reaches the session PTY inta
 // bracketed paste: abduco must accept the split packets and hand the PTY every byte in order,
 // and the separate Enter must still submit it once. each line the PTY delivers is appended as is (the paste markers ride on the first and last line).
 test.skipIf(abduco === null)('real abduco: a multi-packet multi-line message arrives whole, in order, exactly once', async () => {
-  const dir = mkdtempSync('/tmp/tg-abd-');
+  const dir = tempDir('tg-abd-', { short: true });
   dirs.push(dir);
   const out = join(dir, 'typed.txt');
   const serverPid = join(dir, 'server.pid');

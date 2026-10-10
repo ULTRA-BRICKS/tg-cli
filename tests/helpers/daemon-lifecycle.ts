@@ -19,12 +19,13 @@
 // Safety invariant — the backstop sweep is SCOPED to the test's own temp config
 // dirs. It only ever kills a pid read from `<cfgDir>/tg-ctl.<botId>.pid`, where
 // every daemon (tracked or detached) records its real pid. cfgDir is always a
-// `mkdtempSync(tmpdir(), 'tgctl-*')` path, so the sweep can NEVER match the CTO's
+// `tempDir('tgctl-*')` path, so the sweep can NEVER match the CTO's
 // real daemon (a non-temp config dir). It does not pattern-match process names.
 
 import type { Subprocess } from 'bun';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { trackChild } from './test-temp';
 
 // All integration tests use the mock token `123:abc` → botId `123`.
 const DEFAULT_BOT_ID = '123';
@@ -134,7 +135,9 @@ export function createDaemonRegistry(): DaemonRegistry {
  */
 export function trackProc(reg: DaemonRegistry, proc: Subprocess): Subprocess {
   reg.procs.push(proc);
-  return proc;
+  // Also run-scoped: an interrupted run skips this test's teardown, and off Linux the
+  // preload's process sweep is a no-op, so only trackChild reaches this daemon then.
+  return trackChild(proc);
 }
 
 /**

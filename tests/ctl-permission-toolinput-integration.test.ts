@@ -8,15 +8,15 @@
 // Runs against a LOCAL fake Telegram server (Bun.serve, token `123:abc`,
 // chat 1) — nothing ever reaches a real chat.
 import { afterAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir, trackChild } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
-const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-perm-'));
+const cfgDir = tempDir('tgctl-perm-');
 writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ cwd: cfgDir }));
@@ -80,7 +80,7 @@ afterAll(async () => {
 
 test('PreToolUse plan-approval Proceed tap replies allow + updatedInput (tool_input survives the socket)', async () => {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
-  const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+  const daemon = trackChild(Bun.spawn([process.execPath, TG_CTL, 'run'], {
     env: {
       PATH: `${join(cfgDir, 'bin')}:${process.env.PATH ?? ''}`,
       HOME: cfgDir,
@@ -88,7 +88,7 @@ test('PreToolUse plan-approval Proceed tap replies allow + updatedInput (tool_in
       TG_API_BASE: `http://127.0.0.1:${server.port}`,
     },
     stdio: ['ignore', logFd, logFd],
-  });
+  }));
   procs.push(daemon);
   closeSync(logFd);
 

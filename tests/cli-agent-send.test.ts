@@ -1,8 +1,8 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { toSansBold } from '../features/prefix-style/style';
+import { tempDir } from './helpers/test-temp';
 
 // A Latin subagent label is rendered through the SAME Sans-Serif Bold styling as
 // [window] (styleWindowName) — the wire-level text carries the styled unicode
@@ -52,7 +52,7 @@ afterAll(() => {
 // A throwaway HOME with a tg-cli config holding fake creds, so `tg` clears its
 // credential gate and actually hits our mock.
 function makeHome(): string {
-  const home = mkdtempSync(join(tmpdir(), 'tg-agent-home-'));
+  const home = tempDir('tg-agent-home-');
   dirs.push(home);
   const cfg = join(home, '.config', 'tg-cli');
   mkdirSync(cfg, { recursive: true });

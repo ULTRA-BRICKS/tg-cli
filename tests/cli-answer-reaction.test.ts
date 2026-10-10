@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 // tg-cli#114 AC3: a `tg --tag answer --reply-to <id>` send flips the reaction on
 // message <id> to the done mark (👌). Runs the REAL `tg` binary against a mock
@@ -34,7 +34,7 @@ afterAll(() => {
 });
 
 function makeHome(): string {
-  const home = mkdtempSync(join(tmpdir(), 'tg-answer-home-'));
+  const home = tempDir('tg-answer-home-');
   dirs.push(home);
   const cfg = join(home, '.config', 'tg-cli');
   mkdirSync(cfg, { recursive: true });

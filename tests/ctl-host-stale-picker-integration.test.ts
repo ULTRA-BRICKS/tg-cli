@@ -2,11 +2,11 @@
 // not type into anything. The daemon re-verifies the host against a fresh process table inside
 // the delivery claim and answers that it is no longer running; the surviving host is untouched.
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { closeSync, mkdirSync, mkdtempSync, openSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { closeSync, mkdirSync, openSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const HOSTS = [
@@ -14,9 +14,9 @@ const HOSTS = [
   { name: 'claude-bbbb00000002', label: 'beta', serverPid: 42000, harnessPid: 42002 },
 ] as const;
 
-const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-stalepick-'));
+const cfgDir = tempDir('tgctl-stalepick-');
 // A short socket dir: a unix socket path is limited to 104 bytes on Darwin.
-const sockDir = mkdtempSync('/tmp/tgs-');
+const sockDir = tempDir('tgs-', { short: true });
 writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n  git_state_banner: false\n');
 mkdirSync(join(cfgDir, 'hosts'), { mode: 0o700 });

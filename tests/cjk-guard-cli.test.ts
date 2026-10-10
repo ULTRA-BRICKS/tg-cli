@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 // CLI wiring for the stray-CJK guard (features/cli/cjk-guard.ts). The guard runs
 // in the `tg` entrypoint on the FINAL decoded caption/title, right before send.
@@ -13,7 +14,7 @@ import { join } from 'path';
 const TG_SCRIPT = join(import.meta.dir, '..', 'tg');
 const BASE_ENV = {
   PATH: process.env.PATH ?? '',
-  HOME: '/tmp/tg-cli-test-home-cjk',
+  HOME: tempDir('tg-cli-test-home-cjk-'),
   TG_BOT_TOKEN: 'fake-token',
   TG_CHAT_ID: '123456',
 };

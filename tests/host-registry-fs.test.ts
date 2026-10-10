@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { createServer } from 'net';
-import { tmpdir } from 'os';
 import { join } from 'path';
 import { readHostRecordFile, readHostRecords } from '../features/tg-ctl/host-registry-fs';
+import { tempDir } from './helpers/test-temp';
 
 const UID = process.getuid?.() ?? -1;
 const dirs: string[] = [];
@@ -12,7 +12,7 @@ afterEach(() => {
 });
 
 function hostsDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'tg-hosts-'));
+  const dir = tempDir('tg-hosts-');
   dirs.push(dir);
   return dir;
 }
@@ -67,7 +67,7 @@ test('a FIFO named like a record is rejected without hanging the read', () => {
 
 test('a unix socket named like a record is rejected, not skipped as vanished', async () => {
   // a socket path holds ~104 bytes on Darwin: tmpdir() (/var/folders/...) is too long for it
-  const dir = mkdtempSync('/tmp/tgh-');
+  const dir = tempDir('tgh-', { short: true });
   dirs.push(dir);
   const server = createServer();
   await new Promise<void>((resolve) => server.listen(join(dir, 'claude-3f9a0c1d2e4b.json'), resolve));

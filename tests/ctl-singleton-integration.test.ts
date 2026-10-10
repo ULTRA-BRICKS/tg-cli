@@ -1,10 +1,10 @@
 import { afterAll, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, trackCfgDir, trackProc } from './helpers/daemon-lifecycle';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 
 // Process-level singleton check (spec §6, §11): two REAL `tg-ctl run` daemons
 // race for the same per-bot flock; exactly one survives, the loser exits 0
@@ -31,7 +31,7 @@ const server = Bun.serve({
 
 // Isolated config dir: creds in .env (the entrypoint reads them from there),
 // control enabled. botIdFromToken('123:abc') = '123' → state files tg-ctl.123.*.
-const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-singleton-'));
+const cfgDir = tempDir('tgctl-singleton-');
 writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 const pidFile = join(cfgDir, 'tg-ctl.123.pid');
@@ -125,7 +125,7 @@ test('flock singleton: one daemon survives, the loser exits 0, SIGTERM cleans th
 // pidfile with a FOREIGN live pid (a successor's), SIGTERM the daemon, and assert
 // the foreign pidfile SURVIVES. RED before the fix (cleanExit unlinked it blindly).
 test('cleanExit leaves a FOREIGN pidfile intact — a successor pidfile survives the old daemon shutdown (tg#93)', async () => {
-  const ownCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-ownership-'));
+  const ownCfgDir = tempDir('tgctl-ownership-');
   writeFileSync(join(ownCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(ownCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const ownPidFile = join(ownCfgDir, 'tg-ctl.123.pid');

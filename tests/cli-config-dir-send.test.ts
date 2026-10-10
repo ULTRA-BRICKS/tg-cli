@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 // The outbound `tg` sender's credential resolution honors TG_CTL_CONFIG_DIR (review
 // finding, tg-cli#263 sweep): before this fix, the send path and `tg hooks ...`
@@ -38,8 +38,8 @@ afterAll(() => {
 // An empty HOME (no ~/.config/tg-cli at all) plus a SEPARATE dir carrying creds —
 // proves resolution goes through TG_CTL_CONFIG_DIR, not merely "falls back to HOME".
 function makeEmptyHomeAndConfigDir(): { home: string; configDir: string } {
-  const home = mkdtempSync(join(tmpdir(), 'tg-cfgdir-home-'));
-  const configDir = mkdtempSync(join(tmpdir(), 'tg-cfgdir-work-'));
+  const home = tempDir('tg-cfgdir-home-');
+  const configDir = tempDir('tg-cfgdir-work-');
   dirs.push(home, configDir);
   writeFileSync(join(configDir, '.env'), 'TG_BOT_TOKEN=999:work\nTG_CHAT_ID=42\n');
   return { home, configDir };
@@ -69,7 +69,7 @@ test('a non-default TG_CTL_CONFIG_DIR is honored for the real send — no ~/.con
 
 test('with NO TG_CTL_CONFIG_DIR, the default ~/.config/tg-cli/.env is still used (regression: the override must not become mandatory)', async () => {
   received = [];
-  const home = mkdtempSync(join(tmpdir(), 'tg-cfgdir-default-home-'));
+  const home = tempDir('tg-cfgdir-default-home-');
   dirs.push(home);
   const cfg = join(home, '.config', 'tg-cli');
   mkdirSync(cfg, { recursive: true });
@@ -86,7 +86,7 @@ test('with NO TG_CTL_CONFIG_DIR, the default ~/.config/tg-cli/.env is still used
 
 test('an empty HOME with no TG_CTL_CONFIG_DIR still hard-fails on missing credentials (sanity: the override is not silently bypassing the gate)', async () => {
   received = [];
-  const home = mkdtempSync(join(tmpdir(), 'tg-cfgdir-nocreds-home-'));
+  const home = tempDir('tg-cfgdir-nocreds-home-');
   dirs.push(home);
   const { exitCode, stderr } = await run(['should never send'], {
     PATH: process.env.PATH ?? '',

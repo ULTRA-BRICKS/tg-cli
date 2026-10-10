@@ -1,15 +1,15 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { parseArgs } from '../features/cli/args';
+import { tempDir } from './helpers/test-temp';
 
 // Auto-attach must skip files WITHOUT a real extension (LICENSE, Makefile,
 // binaries like `tg`, dotfiles like `.env`): they are usually code-adjacent
 // artifacts the reader can't preview, and dotfiles tend to hold secrets.
 // Explicit --file/--photo are direct instructions and always attach.
 
-const dir = mkdtempSync(join(tmpdir(), 'tg-extless-'));
+const dir = tempDir('tg-extless-');
 writeFileSync(join(dir, 'LICENSE'), 'MIT license text\n');
 writeFileSync(join(dir, '.env'), 'SECRET=1\n');
 writeFileSync(join(dir, 'Makefile'), 'all:\n\techo ok\n');

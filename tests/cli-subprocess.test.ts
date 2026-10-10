@@ -1,12 +1,13 @@
 import { expect, test } from 'bun:test';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 // Run the real `tg` script as a subprocess for the no-send actions/errors that
 // resolve BEFORE the Telegram credential gate — so no API is ever touched and no
 // creds are needed (mirrors the --version subprocess test in ergonomics.test.ts).
 
 const TG_SCRIPT = join(import.meta.dir, '..', 'tg');
-const NO_CREDS_ENV = { PATH: process.env.PATH ?? '', HOME: '/tmp/tg-cli-test-home' };
+const NO_CREDS_ENV = { PATH: process.env.PATH ?? '', HOME: tempDir('tg-cli-test-home-') };
 
 function run(args: string[], stdin?: string) {
   return Bun.spawnSync(['bun', TG_SCRIPT, ...args], {

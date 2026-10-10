@@ -9,16 +9,16 @@
 // timer against a mock Telegram and read the CLIENT's stderr (what the hook sees).
 
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { tempDir, trackChild } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const REGISTERED_CWD = '/registered/project';
 
-const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-asktruth-'));
+const cfgDir = tempDir('tgctl-asktruth-');
 writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 // An UNSCOPED request (no paneId — the hatch helper's shape) matches a registration by cwd.
@@ -58,7 +58,7 @@ const daemonEnv = {
 
 beforeAll(async () => {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
-  const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], { env: daemonEnv, stdio: ['ignore', logFd, logFd] });
+  const daemon = trackChild(Bun.spawn([process.execPath, TG_CTL, 'run'], { env: daemonEnv, stdio: ['ignore', logFd, logFd] }));
   procs.push(daemon);
   closeSync(logFd);
   const socket = join(cfgDir, 'tg-ctl.123.sock');
@@ -127,7 +127,7 @@ test('a request the daemon declines is reported as NOT-POSTED with the daemon re
 }, 15_000);
 
 test('no daemon at all is reported as UNREACHABLE', async () => {
-  const lonely = mkdtempSync(join(tmpdir(), 'tgctl-asktruth-nodaemon-'));
+  const lonely = tempDir('tgctl-asktruth-nodaemon-');
   writeFileSync(join(lonely, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(lonely, 'config.yaml'), 'control:\n  enabled: true\n');
   const proc = Bun.spawn([process.execPath, TG_CTL, 'ask'], {

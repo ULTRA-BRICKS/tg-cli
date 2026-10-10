@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 
 // End-to-end forum-topic inbound triage (docs/specs/session-registry-and-topics.md §4.4): the
 // real daemon, a fake Telegram server, and a fake tmux/ps reporting TWO claude
@@ -91,7 +91,7 @@ function makeCfgDir(opts: {
   seedTopics?: unknown[] | ((cfgDir: string) => unknown[]);
   fleet?: boolean; // false → tmux lists no panes: no session is running
 }): string {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-topics-'));
+  const cfgDir = tempDir('tgctl-topics-');
   const injectLog = join(cfgDir, 'inject.log');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), `control:\n  enabled: true\n  topics: ${opts.topics}\n`);

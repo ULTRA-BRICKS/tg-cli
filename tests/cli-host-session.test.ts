@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 // docs/specs/2026-09-30-harness-agnostic-control.md §2–§3: a harness a rig wrapper hosts in
 // abduco outside tmux finds its registration record through $RIG_SESSION. `tg` takes the
@@ -23,9 +23,9 @@ interface Fixture {
 // A `ps` that shows no agent anywhere: the tests run under omp/claude themselves, and the real
 // ancestry must not leak into an outside-tmux identity.
 function fixture(record: Record<string, unknown> | null, opts: { ompAncestor?: boolean; rigSession?: string } = {}): Fixture {
-  const home = mkdtempSync(join(tmpdir(), 'tg-host-home-'));
-  const configDir = mkdtempSync(join(tmpdir(), 'tg-host-cfg-'));
-  const binDir = mkdtempSync(join(tmpdir(), 'tg-host-bin-'));
+  const home = tempDir('tg-host-home-');
+  const configDir = tempDir('tg-host-cfg-');
+  const binDir = tempDir('tg-host-bin-');
   dirs.push(home, configDir, binDir);
   writeFileSync(join(configDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   const ps = opts.ompAncestor

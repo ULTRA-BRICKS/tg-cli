@@ -1,9 +1,9 @@
 import { expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { convertCodeToPdf, DEVICE_PRESETS } from '../features/code-pdf/convert';
 import { findChrome, type ConvertDeps } from '../features/md-pdf/convert';
+import { tempDir } from './helpers/test-temp';
 
 const realDeps: ConvertDeps = {
   run: (cmd, timeoutMs) => {
@@ -14,7 +14,7 @@ const realDeps: ConvertDeps = {
       return null;
     }
   },
-  makeTempDir: () => mkdtempSync(join(tmpdir(), 'tg-codepdf-test-')),
+  makeTempDir: () => tempDir('tg-codepdf-test-'),
   writeFile: (path, content) => writeFileSync(path, content),
   readFile: (path) => readFileSync(path, 'utf8'),
   fileExists: (path) => existsSync(path),
@@ -107,7 +107,7 @@ test('convertCodeToPdf: zero-byte PDF output is a failure', () => {
 test.skipIf(!available)(
   'integration: a .ts file renders to a real mobile PDF',
   () => {
-    const dir = mkdtempSync(join(tmpdir(), 'tg-codepdf-src-'));
+    const dir = tempDir('tg-codepdf-src-');
     const tsPath = join(dir, 'sample.ts');
     writeFileSync(
       tsPath,
@@ -129,7 +129,7 @@ test.skipIf(!available)(
 test.skipIf(!available)(
   'integration: a .json file renders to a real mobile PDF',
   () => {
-    const dir = mkdtempSync(join(tmpdir(), 'tg-codepdf-src-'));
+    const dir = tempDir('tg-codepdf-src-');
     const jsonPath = join(dir, 'config.json');
     writeFileSync(jsonPath, JSON.stringify({ name: 'tg', nested: { a: [1, 2, 3], b: true } }, null, 2));
     const { pdfPath, error } = convertCodeToPdf(jsonPath, realDeps, DEVICE_PRESETS.iphone15pro);

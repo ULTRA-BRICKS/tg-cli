@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { createHash } from 'crypto';
-import { tmpdir } from 'os';
 import { join } from 'path';
 import { runHooksCli } from '../features/hooks/cli';
 import { toolHooksDir, trustFile } from '../features/hooks/run-photo-hooks';
+import { tempDir } from './helpers/test-temp';
 
 // `tg hooks trust/list/untrust`. Hooks are trust-by-default, so `trust` is a
 // no-op unless the AGENTS_HOOKS_TRUST=1 guard re-engages the TOFU pin path — at
@@ -22,7 +22,7 @@ let origLog: typeof console.log;
 let origErr: typeof console.error;
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), 'tg-hooks-cli-'));
+  home = tempDir('tg-hooks-cli-');
   logs = [];
   errs = [];
   origLog = console.log;

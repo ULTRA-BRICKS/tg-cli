@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 // CLI wiring for the screenshot-attach gate (features/cli/screenshot-guard.ts).
 // A text send that mentions screenshot/скриншот with no photo attached must
@@ -14,7 +14,7 @@ import { join } from 'path';
 const TG_SCRIPT = join(import.meta.dir, '..', 'tg');
 const BASE_ENV = {
   PATH: process.env.PATH ?? '',
-  HOME: '/tmp/tg-cli-test-home-screenshot-guard',
+  HOME: tempDir('tg-cli-test-home-screenshot-guard-'),
   TG_BOT_TOKEN: 'fake-token',
   TG_CHAT_ID: '123456',
 };
@@ -78,7 +78,7 @@ test('blocks screenshot mention when --photo path is missing', () => {
 });
 
 test('allows screenshot mention when --photo is attached', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tg-screenshot-photo-'));
+  const dir = tempDir('tg-screenshot-photo-');
   mkdirSync(dir, { recursive: true });
   const img = join(dir, 'x.png');
   writeFileSync(img, 'PNGDATA');

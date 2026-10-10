@@ -1,8 +1,8 @@
 import { expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { convertMdToPdf, findChrome, type ConvertDeps } from '../features/md-pdf/convert';
+import { tempDir } from './helpers/test-temp';
 
 // Real-tool integration: requires pandoc + Chrome. Skipped cleanly when either
 // is missing so CI on a bare box stays green.
@@ -16,7 +16,7 @@ const realDeps: ConvertDeps = {
       return null;
     }
   },
-  makeTempDir: () => mkdtempSync(join(tmpdir(), 'tg-mdpdf-test-')),
+  makeTempDir: () => tempDir('tg-mdpdf-test-'),
   writeFile: (path, content) => writeFileSync(path, content),
   readFile: (path) => readFileSync(path, 'utf8'),
   fileExists: (path) => existsSync(path),
@@ -38,7 +38,7 @@ const available = pandocAvailable && chromeAvailable;
 test.skipIf(!available)(
   'integration: Cyrillic+emoji markdown converts to a real PDF',
   () => {
-    const dir = mkdtempSync(join(tmpdir(), 'tg-mdpdf-src-'));
+    const dir = tempDir('tg-mdpdf-src-');
     const mdPath = join(dir, 'отчёт тест.md');
     writeFileSync(mdPath, '# Отчёт 🚁\n\nПривет, проверка — ёжик, объём. ✅🔥\n');
     const { pdfPath, error } = convertMdToPdf(mdPath, realDeps);
@@ -53,7 +53,7 @@ test.skipIf(!available)(
 
 test('integration: conversion failure reports an error, no pdf, and the tmp dir for cleanup', () => {
   const failingDeps: ConvertDeps = { ...realDeps, run: () => ({ exitCode: 1, stderr: 'boom' }) };
-  const dir = mkdtempSync(join(tmpdir(), 'tg-mdpdf-src-'));
+  const dir = tempDir('tg-mdpdf-src-');
   const mdPath = join(dir, 'x.md');
   writeFileSync(mdPath, '# x');
   const { pdfPath, error, tmpDir } = convertMdToPdf(mdPath, failingDeps);
@@ -68,7 +68,7 @@ test('integration: zero-byte PDF output is a failure, not a success', () => {
     run: () => ({ exitCode: 0, stderr: '' }), // both tools "succeed"
     fileSize: () => 0, // ...but the PDF is empty
   };
-  const dir = mkdtempSync(join(tmpdir(), 'tg-mdpdf-src-'));
+  const dir = tempDir('tg-mdpdf-src-');
   const mdPath = join(dir, 'x.md');
   writeFileSync(mdPath, '# x');
   const { pdfPath, error } = convertMdToPdf(mdPath, deps);
@@ -89,7 +89,7 @@ function captureMdCmds(mdPath: string): { pandocArgs: string[]; chromeArgs: stri
   let chromeArgs: string[] = [];
   // Own the temp dir so the real writeFile (style.css) it gets is cleaned up — the
   // mocked Chrome never produces a PDF, so the production cleanup path never runs.
-  const tmp = mkdtempSync(join(tmpdir(), 'tg-mdpdf-argv-'));
+  const tmp = tempDir('tg-mdpdf-argv-');
   const deps: ConvertDeps = {
     ...realDeps,
     makeTempDir: () => tmp,
@@ -136,7 +136,7 @@ test.skipIf(!available)(
     // proof is pandoc's rendered HTML (the exfil happened THERE, not in the PDF):
     // `--embed-resources` would emit `data:…;base64,<secret bytes>` for each local
     // `src=`. Without it, only a relative reference survives and no file is read.
-    const dir = mkdtempSync(join(tmpdir(), 'tg-mdpdf-exfil-'));
+    const dir = tempDir('tg-mdpdf-exfil-');
     const secret = `TOPSECRET_${Math.random().toString(36).slice(2)}_exfil`;
     writeFileSync(join(dir, 'secret.png'), `${secret}\n`); // a local file an <img src> targets
     writeFileSync(join(dir, 'secret.txt'), `${secret}\n`);

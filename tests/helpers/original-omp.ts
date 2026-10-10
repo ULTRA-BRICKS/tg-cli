@@ -1,10 +1,9 @@
 // Real process-bound Unix socket fixture; no replacement process is ever spawned.
-import { mkdtempSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { rmSync } from 'node:fs';
+import { tempDir } from './test-temp';
 import { startLiveEndpoint, sendLiveMessage, listLiveEndpoints } from '../../features/tg-ctl/omp-live-runtime.mjs';
 export async function originalFixture(send?: (text: string) => void | Promise<void>) {
-  const root = mkdtempSync(join(tmpdir(), 'omp-owned-test-'));
+  const root = tempDir('omp-owned-test-');
   const state = { sessionId: 'original', sessionFile: null, cwd: '/same', title: 'Original', busy: true };
   const inputs: string[] = [];
   const endpoint = await startLiveEndpoint({ root, snapshot: () => ({ ...state }),

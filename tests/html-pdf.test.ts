@@ -10,8 +10,7 @@
 //   - the HTML→PDF render writes an INTERMEDIATE doc that renders the tags as
 //     DOM (no escaped `&lt;b&gt;` leak; real <strong>/<table>/<h1> structure).
 import { expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import {
   CODE_EXT_LANG,
@@ -27,6 +26,7 @@ import {
 } from '../features/code-pdf/convert';
 import type { ConvertDeps } from '../features/md-pdf/convert';
 import type { SendItem } from '../features/auto-attach/types';
+import { tempDir } from './helpers/test-temp';
 
 const disk = (path: string, type: 'photo' | 'document' = 'document'): SendItem => ({
   type,
@@ -534,7 +534,7 @@ const realDeps: ConvertDeps = {
       return null;
     }
   },
-  makeTempDir: () => mkdtempSync(join(tmpdir(), 'tg-htmlpdf-test-')),
+  makeTempDir: () => tempDir('tg-htmlpdf-test-'),
   writeFile: (path, content) => writeFileSync(path, content),
   readFile: (path) => readFileSync(path, 'utf8'),
   fileExists: (path) => existsSync(path),
@@ -557,7 +557,7 @@ test.skipIf(!pandocAvailable)(
     // Render with real pandoc but a STUBBED Chrome (we only need pandoc's
     // doc.html, not the final PDF). Snapshot doc.html when it is written.
     let renderedHtml = '';
-    const dir = mkdtempSync(join(tmpdir(), 'tg-htmlpdf-real-'));
+    const dir = tempDir('tg-htmlpdf-real-');
     const deps: ConvertDeps = {
       ...realDeps,
       makeTempDir: () => dir,
@@ -617,7 +617,7 @@ test.skipIf(!pandocAvailable)(
   'integration(real pandoc): a `>`-shielded onerror is stripped from the printed doc (review bypass)',
   () => {
     let printedHtml = '';
-    const dir = mkdtempSync(join(tmpdir(), 'tg-htmlpdf-bypass-'));
+    const dir = tempDir('tg-htmlpdf-bypass-');
     // The raw report: the `>` inside alt="…" defeats a first-`>` raw matcher; the
     // trailing onerror would otherwise reach pandoc and be kept on the <img>.
     const payload = '<b>ok</b>\n<img alt=">" src="x" onerror="beacon()">\n';
@@ -654,7 +654,7 @@ test.skipIf(!pandocAvailable)(
 // doc.html (post-LAYER-2) that would be printed. Shared by the payload-shape and
 // content-survival integration tests so they can't drift on the deps wiring.
 function renderPrintedDoc(report: string): string {
-  const dir = mkdtempSync(join(tmpdir(), 'tg-htmlpdf-shape-'));
+  const dir = tempDir('tg-htmlpdf-shape-');
   let printed = '';
   const deps: ConvertDeps = {
     ...realDeps,

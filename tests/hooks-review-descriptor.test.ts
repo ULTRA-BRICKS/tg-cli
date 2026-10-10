@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync } from 'fs';
+import { chmodSync, mkdirSync, rmSync, symlinkSync, writeFileSync, readFileSync } from 'fs';
 import { createHash } from 'crypto';
-import { tmpdir } from 'os';
 import { join } from 'path';
 import { runPreSendPhotoHooks, toolHooksDir, trustFile } from '../features/hooks/run-photo-hooks';
 import { invocationDigest } from '../features/hooks/types';
+import { tempDir } from './helpers/test-temp';
 
 // End-to-end through the REAL review-side Python executable
 // (features/hooks/review-descriptor/pre_send_photo.py), with `review` itself
@@ -20,7 +20,7 @@ let pngPath: string;
 let savedPath: string | undefined;
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), 'tg-review-hook-'));
+  home = tempDir('tg-review-hook-');
   binDir = join(home, 'bin');
   mkdirSync(binDir, { recursive: true });
   pngPath = join(home, 'shot.png');

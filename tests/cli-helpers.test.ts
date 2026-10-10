@@ -1,8 +1,8 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { expandHome, hasRealExtension, isImagePath } from '../features/cli/args';
+import { tempDir } from './helpers/test-temp';
 import {
   VERSION,
   latestChangelogSection,
@@ -20,7 +20,7 @@ afterAll(() => {
   for (const d of dirs) rmSync(d, { recursive: true, force: true });
 });
 function tmp(): string {
-  const d = mkdtempSync(join(tmpdir(), 'tg-cli-helpers-'));
+  const d = tempDir('tg-cli-helpers-');
   dirs.push(d);
   return d;
 }

@@ -1,9 +1,9 @@
 import { afterEach, expect, setDefaultTimeout, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { tempDir } from './helpers/test-temp';
 import { parseTopics } from '../features/tg-ctl/topics';
 
 // End-to-end private-chat forum topics (Bot API 9.4): the REAL daemon + a fake Telegram server.
@@ -100,7 +100,7 @@ exit 0
 }
 
 function makeCfgDir(privateTopics: boolean): { cfgDir: string; spawnLog: string } {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-pt-'));
+  const cfgDir = tempDir('tgctl-pt-');
   cfgDirs.push(cfgDir);
   const spawnLog = join(cfgDir, 'spawn.log');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');

@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { chmodSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 
 // Integration (tg-cli#358, revised by Alex escalation point 5, 2026-09-25, and
 // by the one session-name resolver, tg-cli#455/#448): inside tmux the `[window]`
@@ -76,7 +76,7 @@ function psHeredocLines(binDir: string): string[] {
 }
 
 test('tg --detect-agent: detached omp session (no tmux) is named by its session title — no "no tmux" placeholder (tg-cli#455)', () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tg-omp-title-'));
+  const cfgDir = tempDir('tg-omp-title-');
   const { binDir } = setupOmpSession(cfgDir);
 
   const launcher = join(cfgDir, 'run-detect-agent.sh');
@@ -102,7 +102,7 @@ for (const [failure, tmuxShim] of [
   ['non-zero exit', '#!/bin/sh\nexit 1\n'],
   ['exit 0, empty fields', "#!/bin/sh\nprintf '\\t\\n'\nexit 0\n"],
 ]) test(`tg --detect-agent: TMUX set but the pane query fails (${failure}) → the session title, never a false "no tmux" (tg-cli#448)`, () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tg-omp-title-tmuxfail-'));
+  const cfgDir = tempDir('tg-omp-title-tmuxfail-');
   const { binDir } = setupOmpSession(cfgDir);
   writeFileSync(join(binDir, 'tmux'), tmuxShim, { mode: 0o755 });
   const launcher = join(cfgDir, 'run-detect-agent.sh');
@@ -122,7 +122,7 @@ for (const [failure, tmuxShim] of [
 });
 
 test('tg --detect-agent: a Claude Code pane title (`✳ <title>`) is the secondary name next to the tmux window (tg-cli#455)', () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tg-cc-pane-title-'));
+  const cfgDir = tempDir('tg-cc-pane-title-');
   const binDir = join(cfgDir, 'bin');
   mkdirSync(binDir);
   writeFileSync(
@@ -165,7 +165,7 @@ test('tg --detect-agent: a Claude Code pane title (`✳ <title>`) is the seconda
 });
 
 test('tg --detect-agent: a real tmux window name is NEVER replaced by the omp session title — both show (Alex escalation point 5 regression)', () => {
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tg-omp-title-tmux-'));
+  const cfgDir = tempDir('tg-omp-title-tmux-');
   const { binDir } = setupOmpSession(cfgDir);
   writeFileSync(
     join(binDir, 'tmux'),
@@ -218,10 +218,10 @@ test('a stray-CJK omp session title never blocks the send (guard scoped to expli
   // process's OWN ppid at `ps`-invocation time (same helper
   // cli-omp-route-notmux.test.ts uses), so no pre-baked launcher script or
   // `$$`-substitution heredoc is needed here.
-  const cfgDir = mkdtempSync(join(tmpdir(), 'tg-omp-title-cjk-'));
+  const cfgDir = tempDir('tg-omp-title-cjk-');
   const { binDir } = setupOmpSession(cfgDir, 'Fix ка日eat bug');
   writeFakeOmpPs(binDir);
-  const configDir = mkdtempSync(join(tmpdir(), 'tg-omp-title-cjk-cfg-'));
+  const configDir = tempDir('tg-omp-title-cjk-cfg-');
   writeFileSync(join(configDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 
   const received: Array<{ text: string }> = [];

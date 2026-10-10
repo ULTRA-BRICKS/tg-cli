@@ -4,10 +4,10 @@
 // fake `rig` + fake `agenttools_rig_delegate` package (see tests/ctl-rig-delegate.test.ts for
 // the same fixture pattern) so this never depends on — or touches — a real rig install.
 import { expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from 'fs';
-import { tmpdir } from 'os';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { codexUsageHookInstalled } from '../features/tg-ctl/hook-install';
+import { tempDir } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const CODEX_USAGE_CMD = 'tg-ctl codex-usage-hook';
@@ -21,8 +21,8 @@ const PYTHON3_DIR = require('path').dirname(Bun.which('python3') ?? '/usr/bin/py
 const BASE_PATH = `${require('path').dirname(Bun.which('bun') ?? '/usr/bin/bun')}:${PYTHON3_DIR}:${process.env.PATH ?? ''}`;
 
 function fakeEnv() {
-  const home = mkdtempSync(join(tmpdir(), 'tgctl-rigdelegate-home-'));
-  const cfg = mkdtempSync(join(tmpdir(), 'tgctl-rigdelegate-cfg-'));
+  const home = tempDir('tgctl-rigdelegate-home-');
+  const cfg = tempDir('tgctl-rigdelegate-cfg-');
   writeFileSync(join(cfg, '.env'), 'TG_BOT_TOKEN=123456:FAKE\nTG_CHAT_ID=42\n');
   return { home, cfg };
 }
@@ -88,7 +88,7 @@ function run(args: string[], env: Record<string, string>) {
 }
 
 test('install-hooks: rig present, telemetry not yet rig-provisioned — delegates AND writes hooks.json directly (no telemetry loss)', () => {
-  const root = mkdtempSync(join(tmpdir(), 'tgctl-rigdelegate-root-'));
+  const root = tempDir('tgctl-rigdelegate-root-');
   const { home, cfg } = fakeEnv();
   const { source, binDir, rigLog } = fakeAgentToolsCheckout(root, { withRig: true, rigExitCode: 0 });
 
@@ -112,7 +112,7 @@ test('install-hooks: rig present, telemetry not yet rig-provisioned — delegate
 });
 
 test('install-hooks: rig provisions telemetry in config.toml — skips the direct hooks.json write (no duplication)', () => {
-  const root = mkdtempSync(join(tmpdir(), 'tgctl-rigdelegate-root-'));
+  const root = tempDir('tgctl-rigdelegate-root-');
   const { home, cfg } = fakeEnv();
   const { source, binDir, rigLog } = fakeAgentToolsCheckout(root, { withRig: true, rigExitCode: 0 });
 
@@ -143,7 +143,7 @@ test('install-hooks: rig provisions telemetry in config.toml — skips the direc
 });
 
 test('install-hooks: a PRESENT rig that FAILS surfaces the exit code and does NOT write hooks.json', () => {
-  const root = mkdtempSync(join(tmpdir(), 'tgctl-rigdelegate-root-'));
+  const root = tempDir('tgctl-rigdelegate-root-');
   const { home, cfg } = fakeEnv();
   const { source, binDir } = fakeAgentToolsCheckout(root, { withRig: true, rigExitCode: 7 });
 
@@ -164,7 +164,7 @@ test('install-hooks: a real rig failure with exit 3 PROPAGATES and does NOT fall
   // Guards the "branch on 97 EXACTLY, not any nonzero" invariant. Before agent-tools#282 the
   // NO_RIG sentinel WAS 3, colliding with rig's own EXIT_DRIFT=3; a caller keying on 3 would
   // wrongly fall back on a genuine rig drift/failure. Exit 3 must now propagate like any failure.
-  const root = mkdtempSync(join(tmpdir(), 'tgctl-rigdelegate-root-'));
+  const root = tempDir('tgctl-rigdelegate-root-');
   const { home, cfg } = fakeEnv();
   const { source, binDir } = fakeAgentToolsCheckout(root, { withRig: true, rigExitCode: 3 });
 
@@ -183,7 +183,7 @@ test('install-hooks: delegate returns the NO_RIG_EXIT sentinel (97) — treated 
   // agent-tools#282 moved the "rig absent" sentinel off 3 (collided with rig's EXIT_DRIFT) to 97.
   // detectRig said present, but `delegate` reports rig gone (uninstalled mid-flight). The caller
   // must recognize the sentinel as ABSENCE and self-install — NOT propagate 97 as a rig failure.
-  const root = mkdtempSync(join(tmpdir(), 'tgctl-rigdelegate-root-'));
+  const root = tempDir('tgctl-rigdelegate-root-');
   const { home, cfg } = fakeEnv();
   const { source, binDir } = fakeAgentToolsCheckout(root, { withRig: true, delegateSentinel: true });
 
@@ -202,7 +202,7 @@ test('install-hooks: delegate returns the NO_RIG_EXIT sentinel (97) — treated 
 });
 
 test('install-hooks: rig absent (agent-tools package unresolvable) — falls back to the direct write, unaffected', () => {
-  const root = mkdtempSync(join(tmpdir(), 'tgctl-rigdelegate-root-'));
+  const root = tempDir('tgctl-rigdelegate-root-');
   const { home, cfg } = fakeEnv();
 
   const proc = run(['install-hooks'], {

@@ -1,9 +1,9 @@
 import { afterAll, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 import { tmuxNoServerShim } from './helpers/hermetic-host';
+import { tempDir } from './helpers/test-temp';
 import { NO_AGENT_REPLY } from '../tg-ctl';
 import { withClaudeHooks, withClaudeStatusLineTelemetry, withHarnessHooks } from '../features/tg-ctl/hook-install';
 
@@ -95,11 +95,11 @@ const server = Bun.serve({
   },
 });
 
-const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-daemon-'));
+const cfgDir = tempDir('tgctl-daemon-');
 writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 const pidFile = join(cfgDir, 'tg-ctl.123.pid');
-const statusProject = mkdtempSync(join(tmpdir(), 'tgctl-status-project-'));
+const statusProject = tempDir('tgctl-status-project-');
 
 // tmux PATH shim: log argv, then answer as a host with no tmux server — no panes, so
 // discovery yields no-agent and the daemon must answer with the guard text. (An "exit 0,
@@ -133,8 +133,6 @@ afterAll(async () => {
     expect(() => process.kill(pid, 0)).toThrow();
   }
   server.stop(true);
-  rmSync(cfgDir, { recursive: true, force: true });
-  rmSync(statusProject, { recursive: true, force: true });
 });
 
 test('daemon round-trip: old owner message still delivered, guard replies, /status, allowlist drop, media download', async () => {

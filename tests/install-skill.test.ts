@@ -1,9 +1,9 @@
 import { test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'fs';
-import { tmpdir } from 'os';
+import { rmSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { installSkill } from '../features/install-skill/install';
 import { TAG_PILL_FALLBACK } from '../features/branding/emoji';
+import { tempDir } from './helpers/test-temp';
 
 // installSkill() resolves everything from os.homedir(), which honors $HOME on
 // posix — so we point HOME at a throwaway dir and assert on what it writes.
@@ -15,7 +15,7 @@ let origHome: string | undefined;
 
 beforeEach(() => {
   origHome = process.env.HOME;
-  TH = mkdtempSync(join(tmpdir(), 'tg-installskill-'));
+  TH = tempDir('tg-installskill-');
   mkdirSync(join(TH, '.claude', 'skills'), { recursive: true });
   process.env.HOME = TH;
 });

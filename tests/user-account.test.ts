@@ -2,10 +2,10 @@
 // (docs/specs/independent-telegram-clients.md §1). Pure parsing/handoff tests, then the REAL
 // `tg` binary spawned against a fake sidecar (TG_MTPROTO_SIDECAR) to prove the argv/env/stdin
 // it hands over and the "not logged in" path, which must never start the sidecar.
-import { afterAll, describe, expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { describe, expect, test } from 'bun:test';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir } from './helpers/test-temp';
 import { parseUserAccountArgs } from '../features/user-account/args';
 import {
   BUILD_STEP_TIMEOUT_MS,
@@ -19,10 +19,6 @@ import { ensureSidecarRuntime } from '../features/user-account/sidecar-fs';
 import { describeError } from '../features/user-account/messages';
 
 const TG = join(import.meta.dir, '..', 'tg');
-const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
 
 describe('parseUserAccountArgs', () => {
   test('is null for everything that is not ours, so plain sends still send', () => {
@@ -162,12 +158,11 @@ interface Fixture {
 }
 
 function fixture(): Fixture {
-  const home = mkdtempSync(join(tmpdir(), 'tg-ua-home-'));
+  const home = tempDir('tg-ua-home-');
   const configDir = join(home, 'cfg');
   const capture = join(home, 'capture');
   mkdirSync(configDir, { recursive: true });
   mkdirSync(capture);
-  dirs.push(home);
   const fake = join(home, 'fake-sidecar');
   writeFileSync(
     fake,

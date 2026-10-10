@@ -1,7 +1,7 @@
 import { afterAll, afterEach, expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tempDir, trackChild } from './helpers/test-temp';
 
 // Integration test for `tg-ctl harness-event` (tg-cli#113) against a fake Bot
 // API. Proves: (1) a StopFailure payload with a parseable reset produces a
@@ -11,7 +11,7 @@ import { join } from 'path';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
-const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-harness-'));
+const cfgDir = tempDir('tgctl-harness-');
 writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 
@@ -42,7 +42,6 @@ const server = Bun.serve({
 afterAll(() => {
   killOverloadRetryChildren();
   server.stop(true);
-  rmSync(cfgDir, { recursive: true, force: true });
 });
 
 afterEach(() => {
@@ -640,7 +639,9 @@ test('retryable overload does not duplicate a live pending child when ps cannot 
   reactions.length = 0;
   const retryPath = join(cfgDir, 'tg-ctl.123.overload-retries.json');
   const retryKey = JSON.stringify(['%3', 'abc123', 'ext']);
-  const live = Bun.spawn(['/bin/sh', '-c', 'sleep 60']);
+  // `sleep` itself, not `sh -c 'sleep 60'`: the SIGTERM below killed only the shell and orphaned
+  // its sleep for a minute (tg-cli#486).
+  const live = trackChild(Bun.spawn(['sleep', '60']));
   writeFileSync(retryPath, `${JSON.stringify({
     version: 1,
     retries: [{
@@ -651,7 +652,7 @@ test('retryable overload does not duplicate a live pending child when ps cannot 
       nextAt: Date.now() + 60_000,
     }],
   })}\n`);
-  const fakeBin = mkdtempSync(join(tmpdir(), 'tgctl-fake-ps-'));
+  const fakeBin = tempDir('tgctl-fake-ps-');
   const fakePs = join(fakeBin, 'ps');
   writeFileSync(fakePs, '#!/bin/sh\nexit 1\n');
   chmodSync(fakePs, 0o755);
@@ -1480,7 +1481,7 @@ test('Codex usage Stop hook relies on existing warning dedupe for repeated sampl
 test('bare harness-event (no --agent) labels the notification with the live pane agent, not the tmux window name', async () => {
   sentMessages.length = 0;
   reactions.length = 0;
-  const fakeBinDir = mkdtempSync(join(tmpdir(), 'tgctl-harness-fakebin-'));
+  const fakeBinDir = tempDir('tgctl-harness-fakebin-');
   writeFileSync(
     join(fakeBinDir, 'tmux'),
     `#!/bin/sh
@@ -1532,7 +1533,7 @@ exit 0
 test('bare harness-event (no --agent) applies codex try-again reset parsing for a live codex pane in a non-codex-named window', async () => {
   sentMessages.length = 0;
   reactions.length = 0;
-  const fakeBinDir = mkdtempSync(join(tmpdir(), 'tgctl-harness-fakebin-'));
+  const fakeBinDir = tempDir('tgctl-harness-fakebin-');
   writeFileSync(
     join(fakeBinDir, 'tmux'),
     `#!/bin/sh
