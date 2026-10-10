@@ -356,6 +356,7 @@ import {
   harnessHooksInstalled,
   reconcileClaudeHooks,
   runClaudeHookSelfHeal,
+  writeSettingsPreservingLink,
   withClaudeStatusLineTelemetry,
   withCodexUsageHook,
 } from "./features/tg-ctl/hook-install"
@@ -3129,12 +3130,16 @@ function ensureClaudeHooksOnStartup(ctx: Ctx): void {
           writeFileSync(p, content)
         } catch {}
       },
-      writeAtomic: atomicWrite,
+      writeAtomic: writeSettingsPreservingLink,
       ensureDir: (dir: string) => mkdirSync(dir, { recursive: true }),
+      markOptedIn: (p: string) => writeFileSync(p, `${new Date().toISOString()}\n`),
     }
     const res = runClaudeHookSelfHeal(fs, paths, CLAUDE_HOOK_COMMANDS)
     if (res.outcome === "healed") {
       log("ensureClaudeHooksOnStartup: re-merged dropped Claude Code hooks into settings.json")
+    }
+    if (res.outcome === "migrated") {
+      log("ensureClaudeHooksOnStartup: pre-sentinel hook install detected; wrote the opt-in sentinel (#211)")
     }
   } catch (err) {
     log(`ensureClaudeHooksOnStartup failed: ${err}`)

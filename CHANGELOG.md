@@ -3,6 +3,16 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.8
+
+- **The daemon's Claude Code hook self-heal no longer replaces a symlinked
+  `~/.claude/settings.json` with a regular 0600 file (#212).** It now resolves the link and
+  atomically replaces the TARGET, keeping the file's existing mode, so dotfile managers keep
+  owning the file.
+- **Hook installs that predate the opt-in sentinel are migrated (#211).** When
+  `claude-hooks-installed` is absent but settings.json already carries every tg-ctl hook, the
+  daemon writes the sentinel on startup so self-heal applies; a partial install stays opted out.
+
 ## 1.55.7
 
 - **Answering a question that had no tmux pane now delivers the messages queued behind it (#127).**

@@ -54,7 +54,13 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
     server) spawned by `claude`. Owns Telegram I/O; inbound-only (outbound stays
     `tg`, §4).
 - **Hook installer** — writes the question/permission-forwarding hooks into
-  `~/.claude/settings.json`.
+  `~/.claude/settings.json`. `install-hooks` writes the opt-in sentinel
+  `<configDir>/claude-hooks-installed`; on startup the daemon re-merges dropped
+  hooks only when the sentinel exists (restore-only, never first-install). A
+  settings.json that already carries every tg-ctl hook but has no sentinel
+  (an install that predates it) is migrated: the daemon writes the sentinel
+  (#211). Self-heal writes go THROUGH a symlinked settings.json to its target
+  and keep the file's existing mode (#212).
 
 **Transport selection / priority (corrected by review F3/F5):**
 - **Poll/tmux is the primary transport**, not the fallback. "Channel has

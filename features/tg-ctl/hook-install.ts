@@ -1,3 +1,5 @@
+import { chmodSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
+
 // Idempotent installer for the q→buttons agent-question hooks
 // (docs/specs/2026-06-10-tg-ctl-control-design.md §8). PURE: the entrypoint
 // reads/writes ~/.claude/settings.json (backing it up first) and prints guidance;
@@ -300,6 +302,8 @@ export interface HookSelfHealFs {
   backup(path: string, content: string): void;
   writeAtomic(path: string, content: string): void;
   ensureDir(dir: string): void;
+  // Writes the opt-in sentinel (used only by the #211 pre-sentinel migration).
+  markOptedIn(path: string): void;
 }
 
 export interface HookSelfHealPaths {
@@ -318,7 +322,8 @@ export type HookSelfHealSkipReason =
 
 export type HookSelfHealOutcome =
   | { outcome: 'skipped'; reason: HookSelfHealSkipReason }
-  | { outcome: 'healed' };
+  | { outcome: 'healed' }
+  | { outcome: 'migrated' };
 
 // Orchestrate the startup self-heal over an injected fs. RESTORE-ONLY: it only
 // re-merges hooks into a settings.json that EXISTS and is READABLE — it never
@@ -332,10 +337,17 @@ export function runClaudeHookSelfHeal(
   paths: HookSelfHealPaths,
   cmds: ClaudeHookCommands,
 ): HookSelfHealOutcome {
-  // Opt-in is the FIRST gate (matches the documented precedence and avoids a
-  // needless read/stat of settings.json on every start for a user who never
-  // adopted the hooks).
-  if (!fs.exists(paths.sentinelPath)) return { outcome: 'skipped', reason: 'not-opted-in' };
+  // Opt-in is the FIRST gate. Without the sentinel the only thing we do is the
+  // #211 migration: a settings.json that ALREADY carries every tg-ctl hook was
+  // produced by an `install-hooks` run that predates the sentinel, so record the
+  // opt-in it implies. A partial/absent/broken file stays not-opted-in.
+  if (!fs.exists(paths.sentinelPath)) {
+    if (isPreSentinelInstall(fs, paths.settingsPath, cmds)) {
+      fs.markOptedIn(paths.sentinelPath);
+      return { outcome: 'migrated' };
+    }
+    return { outcome: 'skipped', reason: 'not-opted-in' };
+  }
   // `exists` FIRST (no TOCTOU ambiguity), then read only when present.
   if (!fs.exists(paths.settingsPath)) return { outcome: 'skipped', reason: 'no-settings-file' };
   const raw = fs.read(paths.settingsPath);
@@ -349,4 +361,37 @@ export function runClaudeHookSelfHeal(
   fs.ensureDir(paths.settingsDir);
   fs.writeAtomic(paths.settingsPath, plan.settingsJson);
   return { outcome: 'healed' };
+}
+
+function isPreSentinelInstall(fs: HookSelfHealFs, settingsPath: string, cmds: ClaudeHookCommands): boolean {
+  if (!fs.exists(settingsPath)) return false;
+  const raw = fs.read(settingsPath);
+  if (raw === null) return false;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    return claudeHooksFullyInstalled(parsed as Record<string, unknown>, cmds);
+  } catch {
+    return false;
+  }
+}
+
+// Atomically replace settings.json WITHOUT breaking how the user keeps it (#212):
+// a dotfile-managed symlink is resolved and its TARGET is replaced (renaming over
+// the link itself would swap it for a regular file), and the existing mode is
+// kept instead of forcing 0600. The temp file lives beside the real target so the
+// rename stays on one filesystem.
+export function writeSettingsPreservingLink(path: string, content: string): void {
+  let target = path;
+  let mode = 0o600;
+  try {
+    target = realpathSync(path);
+    mode = statSync(target).mode & 0o7777;
+  } catch {
+    // missing file: write a fresh one at `path` with the private default
+  }
+  const tmp = `${target}.tmp`;
+  writeFileSync(tmp, content, { mode });
+  chmodSync(tmp, mode); // the umask may have narrowed the creation mode
+  renameSync(tmp, target);
 }

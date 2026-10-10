@@ -400,6 +400,7 @@ function fakeFs(seed: Record<string, string>, opts: { unreadable?: string[] } = 
       backup: (p: string, c: string) => { files.set(p, c); },
       writeAtomic: (p: string, c: string) => { files.set(p, c); },
       ensureDir: (d: string) => { dirs.push(d); },
+      markOptedIn: (p: string) => { files.set(p, 'migrated\n'); },
     },
   };
 }
@@ -470,4 +471,68 @@ test('planClaudeHookSelfHeal: whitespace-only settings → write with null backu
   if (plan.action !== 'write') throw new Error('unreachable');
   expect(plan.backup).toBeNull();
   expect(claudeHooksFullyInstalled(JSON.parse(plan.settingsJson), CLAUDE_CMDS)).toBe(true);
+});
+
+// --- #211: a pre-sentinel install (settings.json already carries every tg-ctl
+// hook, but predates the opt-in sentinel) migrates to opted-in. ---
+
+test('runClaudeHookSelfHeal #211: no sentinel + fully installed settings → sentinel written, migrated', () => {
+  const full = JSON.stringify(reconcileClaudeHooks({}, CLAUDE_CMDS).settings);
+  const { files, fs } = fakeFs({ [SETTINGS]: full });
+  expect(runClaudeHookSelfHeal(fs, SELF_PATHS, CLAUDE_CMDS)).toEqual({ outcome: 'migrated' });
+  expect(files.has(SENTINEL)).toBe(true);
+  expect(files.get(SETTINGS)).toBe(full); // settings untouched
+  // the next start sees the sentinel and takes the normal opted-in path
+  expect(runClaudeHookSelfHeal(fs, SELF_PATHS, CLAUDE_CMDS)).toEqual({ outcome: 'skipped', reason: 'already-installed' });
+});
+
+test('runClaudeHookSelfHeal #211: no sentinel + PARTIAL hooks → still not-opted-in, no sentinel written', () => {
+  const full = reconcileClaudeHooks({}, CLAUDE_CMDS).settings as Record<string, unknown>;
+  const partial = JSON.stringify({ ...full, statusLine: undefined });
+  const { files, fs } = fakeFs({ [SETTINGS]: partial });
+  expect(runClaudeHookSelfHeal(fs, SELF_PATHS, CLAUDE_CMDS)).toEqual({ outcome: 'skipped', reason: 'not-opted-in' });
+  expect(files.has(SENTINEL)).toBe(false);
+});
+
+// --- #212: the real-disk writer must write THROUGH a symlinked settings.json
+// (dotfile managers) and keep the file's mode, never swap in a 0600 regular file. ---
+import { writeSettingsPreservingLink } from '../features/tg-ctl/hook-install';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+test('writeSettingsPreservingLink #212: symlinked settings.json stays a symlink, target updated, mode kept', () => {
+  const home = mkdtempSync(join(tmpdir(), 'tg-212-'));
+  mkdirSync(join(home, 'dotfiles'));
+  mkdirSync(join(home, '.claude'));
+  const target = join(home, 'dotfiles', 'claude-settings.json');
+  writeFileSync(target, '{}\n');
+  chmodSync(target, 0o644);
+  const link = join(home, '.claude', 'settings.json');
+  symlinkSync(target, link);
+
+  writeSettingsPreservingLink(link, '{"healed":true}\n');
+
+  expect(lstatSync(link).isSymbolicLink()).toBe(true);
+  expect(readlinkSync(link)).toBe(target);
+  expect(readFileSync(target, 'utf8')).toBe('{"healed":true}\n');
+  expect(statSync(target).mode & 0o777).toBe(0o644);
+});
+
+test('writeSettingsPreservingLink #212: regular file keeps its mode (not forced to 0600)', () => {
+  const home = mkdtempSync(join(tmpdir(), 'tg-212-'));
+  const p = join(home, 'settings.json');
+  writeFileSync(p, '{}\n');
+  chmodSync(p, 0o640);
+  writeSettingsPreservingLink(p, '{"a":1}\n');
+  expect(lstatSync(p).isSymbolicLink()).toBe(false);
+  expect(readFileSync(p, 'utf8')).toBe('{"a":1}\n');
+  expect(statSync(p).mode & 0o777).toBe(0o640);
+});
+
+test('writeSettingsPreservingLink #212: missing file → created with the private 0600 default', () => {
+  const p = join(mkdtempSync(join(tmpdir(), 'tg-212-')), 'settings.json');
+  writeSettingsPreservingLink(p, '{}\n');
+  expect(readFileSync(p, 'utf8')).toBe('{}\n');
+  expect(statSync(p).mode & 0o777).toBe(0o600);
 });
