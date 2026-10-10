@@ -193,6 +193,9 @@ function forgejoGetter(repo: ForgejoRepo, authorization: string, timeoutMs: numb
   return async (path, signal) => {
     try {
       const res = await fetch(`${repo.origin}/api/v1${path}`, {
+        // The Authorization value is fj's stored token for exactly this host (read from fj's key
+        // store by design); redirects are not followed, so it never reaches another host.
+        // codeql[js/file-access-to-http]
         headers: { Accept: 'application/json', 'User-Agent': USER_AGENT, Authorization: authorization },
         redirect: 'manual',
         signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
