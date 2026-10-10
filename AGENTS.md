@@ -644,6 +644,56 @@ Roadmap and priorities: docs/ROADMAP.md (source of truth since 2026-09-29).
 - **Version bumps**: the `VERSION` const in `tg` must have a matching `## <version>` section in
   `CHANGELOG.md`. A test asserts this — do not forget it.
 
+### Full suite on Runpod
+
+The full `bun test ./tests` spawns thousands of daemons, tmux servers and abduco sessions for
+~10 min; on a workstation already running a swarm of agents it competes with everything else
+and its timing-sensitive tests flake. Run it on a Runpod CPU pod instead (tg-cli#616):
+
+```sh
+scripts/remote-test.sh                          # full suite of the checkout you are in
+scripts/remote-test.sh tests/foo.test.ts -t x   # any `bun test` arguments instead
+scripts/remote-test.sh -C ../other-worktree     # another checkout
+```
+
+It syncs the checkout's tracked and untracked-but-not-ignored files (uncommitted work
+included; no `.git`, no `node_modules`) to a fresh directory on the pod, snapshots them as one
+git commit there, runs the suite as an unprivileged user under `ci/test/bun-test-watchdog.sh`
+with the same bun version as the local `bun --version`, streams the output and saves it to
+`~/.cache/tg-cli/remote-test/<run>.log`, then kills every process the run started and removes
+its directory — also on Ctrl-C or TERM. Exit code is bun's (0 pass, 1 failures); 124 = timeout
+(`--timeout`, default 1800 s) or watchdog stall, 2 = usage/config error, 3 = the pod could not be
+prepared (provisioning, git snapshot, `bun install`), 255 = ssh failure. Up to `TG_REMOTE_TEST_SLOTS`
+(default 3) runs share the pod at once; more wait for a slot. On the 8-vCPU pod a full run takes
+~7.8 min, and three at once each took the same. The
+first run against a new pod provisions it (apt packages, abduco, Chrome, Pillow, bun) — a few
+minutes, once; `scripts/remote-test.sh --setup` does only that.
+
+Configure the pod in the environment or in `~/.config/tg-cli/remote-test.env` (sourced
+`KEY=VALUE` lines; the environment wins, and a pod id or host given there replaces the file's
+address as a whole). Never commit that file — it names live infrastructure.
+
+- `TG_REMOTE_TEST_POD_ID=<pod id>` — resolved with `runpodctl ssh info` on every run, so a pod
+  restart (new ssh port) needs no edit; or `TG_REMOTE_TEST_HOST` (+ `TG_REMOTE_TEST_PORT`) for a
+  fixed ssh address.
+- `TG_REMOTE_TEST_KEY` — ssh identity; default `~/.runpod/ssh/runpodctl-ssh-key`, the key
+  `runpodctl doctor` registers on the account (the pod must be created after the key is
+  registered: Runpod injects account keys at boot).
+
+A pod bills while it runs. Find it with `runpodctl pod list`; `runpodctl pod stop <pod id>` ends
+the compute charge (its container disk is wiped, so the next run after `runpodctl pod start`
+re-provisions; if the restarted pod reuses an ip:port the script prints the `ssh-keygen -R` line
+for its changed host key), `runpodctl pod delete <pod id>` removes it. The pod in use was created with
+Runpod's REST v2 API — CPU flavor `cpu3c` (compute-optimized, 2 GB/vCPU), 8 vCPU / 16 GB,
+$0.24/h at the time of writing:
+
+```sh
+curl -X POST https://api.runpod.io/v2/pods -H "Authorization: Bearer $RUNPOD_API_KEY" \
+  -H 'Content-Type: application/json' -d '{"name":"tg-cli-remote-test",
+  "image":"runpod/base:1.0.2-ubuntu2404","cpu":{"id":"cpu3c","vcpuCount":8},"disk":40,
+  "ports":["22/tcp"],"startSsh":true}'
+```
+
 ---
 
 ## Useful Gotchas
