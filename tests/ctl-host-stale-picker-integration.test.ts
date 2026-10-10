@@ -6,6 +6,7 @@ import { closeSync, mkdirSync, mkdtempSync, openSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const HOSTS = [
@@ -58,7 +59,7 @@ const tree = (hosts: readonly (typeof HOSTS)[number][]): string =>
 writeFileSync(treeFile, tree(HOSTS));
 const binDir = join(cfgDir, 'bin');
 mkdirSync(binDir);
-writeFileSync(join(binDir, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+writeFileSync(join(binDir, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
 writeFileSync(join(binDir, 'ps'), `#!/bin/sh\ncase "$*" in *tty*) printf '    1 ??\\n';; *) cat '${treeFile}';; esac\nexit 0\n`, { mode: 0o755 });
 writeFileSync(join(binDir, 'lsof'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 

@@ -22,6 +22,7 @@ import {
   trackCfgDir,
   trackProc,
 } from './helpers/daemon-lifecycle';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -39,7 +40,7 @@ writeFileSync(
   ]),
 );
 mkdirSync(join(cfgDir, 'bin'));
-writeFileSync(join(cfgDir, 'bin', 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+writeFileSync(join(cfgDir, 'bin', 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
 
 const sentMessages: { text: string; reply_markup?: unknown }[] = [];
 

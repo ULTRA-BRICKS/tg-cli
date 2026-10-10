@@ -5,6 +5,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { tmuxNoServerShim } from './helpers/hermetic-host';
 
 // tg-cli regression (reply-to-agent routing, tg-cli#78 anchor): a non-reply
 // inbound must bind to the pane of the CTO's OWN last resolved delivery — the
@@ -129,10 +130,7 @@ async function makeHarness() {
   writeFileSync(tmuxLog, '');
   writeFileSync(
     join(binDir, 'tmux'),
-    `#!/bin/sh
-echo "$0 $*" >> ${JSON.stringify(tmuxLog).slice(1, -1)}
-exit 0
-`,
+    tmuxNoServerShim(`echo "$0 $*" >> ${JSON.stringify(tmuxLog).slice(1, -1)}\n`),
     { mode: 0o755 },
   );
 

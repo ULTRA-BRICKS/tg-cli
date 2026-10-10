@@ -17,7 +17,7 @@
 // the arithmetic at the scheduler layer directly.
 //
 // Harness mirrors ctl-hatch-approval-retry-integration.test.ts exactly (same
-// mockTelegram/fakeTmux/daemon-lifecycle helpers) — hatch requests are
+// mockTelegram/hermetic-host/daemon-lifecycle helpers) — hatch requests are
 // structurally headless, so no real tmux pane is ever involved.
 import { afterEach, expect, test } from 'bun:test';
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
@@ -25,6 +25,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
+import { PS_NO_AGENTS_SHIM, TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -36,21 +37,14 @@ afterEach(async () => {
   for (const s of servers.splice(0)) await s.stop(true);
 });
 
-function fakeTmux(): string {
-  return `#!/bin/sh\nexit 0\n`;
-}
-function fakePs(): string {
-  return `#!/bin/sh\nexit 0\n`;
-}
-
 function makeCfgDir(): string {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-hatch-critical-'));
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ cwd: cfgDir }));
   mkdirSync(join(cfgDir, 'bin'));
-  writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmux(), { mode: 0o755 });
-  writeFileSync(join(cfgDir, 'bin', 'ps'), fakePs(), { mode: 0o755 });
+  writeFileSync(join(cfgDir, 'bin', 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
+  writeFileSync(join(cfgDir, 'bin', 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
   return cfgDir;
 }
 

@@ -5,6 +5,7 @@ import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, trackCfgDir, trackProc } from './helpers/daemon-lifecycle';
 import { BOT_COMMANDS } from '../features/tg-ctl/bot-commands';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 // The daemon must self-provision its command menu on startup: POST setMyCommands
 // once, with the published BOT_COMMANDS, before entering the poll loop. And it
@@ -77,7 +78,7 @@ function setupConfigDir(): { cfgDir: string; shimDir: string } {
   const shimDir = join(cfgDir, 'bin');
   mkdirSync(shimDir);
   // tmux shim: empty pane list, never touches the real server, exits 0.
-  writeFileSync(join(shimDir, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(shimDir, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
   return { cfgDir, shimDir };
 }
 

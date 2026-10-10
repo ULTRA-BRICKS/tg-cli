@@ -5,6 +5,7 @@ import { join } from 'path';
 import { hatchGrantNoticeText } from '../features/tg-ctl/grants';
 import { agentInboxKey } from '../features/tg-ctl/unreachable';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 // Integration test (tg-cli#456, replacing the tg-cli#306 inbox channel): Claude Code and
 // Codex are reached through a tmux pane or a rig-wrapper host. An interactive claude/codex
@@ -24,7 +25,7 @@ writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 const binDir = join(cfgDir, 'bin');
 mkdirSync(binDir);
 // No tmux panes at all.
-writeFileSync(join(binDir, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+writeFileSync(join(binDir, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
 // ps: the 3-column tree read AND the 2-column `pid tty` read, keyed off argv.
 writeFileSync(
   join(binDir, 'ps'),

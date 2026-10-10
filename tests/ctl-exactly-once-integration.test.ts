@@ -16,6 +16,7 @@ import type { Subprocess } from 'bun';
 import { serializeDeferredStore } from '../features/tg-ctl/deferred-store';
 import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const PANE_ID = '%1';
@@ -299,7 +300,7 @@ test('an omp restarted between two deliveries of one message receives it once', 
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const bin = join(cfgDir, 'bin');
   mkdirSync(bin);
-  writeFileSync(join(bin, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(bin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
   const sessionId = '01a0ffff-0000-7000-8000-000000000299';
   const sessionFile = join(cfgDir, `2026-09-30T00-00-00-000Z_${sessionId}.jsonl`);
   writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', version: 3, id: sessionId, cwd: '/w/exactly-once', title: 'ExactlyOnce' })}\n`);

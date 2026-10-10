@@ -13,6 +13,7 @@ import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, unlinkSync,
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackCfgDir, trackProc } from './helpers/daemon-lifecycle';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 const REPO = join(import.meta.dir, '..');
 const TG_CTL = join(REPO, 'tg-ctl');
@@ -48,7 +49,7 @@ function prepareCfg(prefix: string): { cfgDir: string; env: Record<string, strin
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   mkdirSync(join(cfgDir, 'bin'));
-  writeFileSync(join(cfgDir, 'bin', 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(cfgDir, 'bin', 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
   const env = {
     PATH: `${join(cfgDir, 'bin')}:${process.env.PATH ?? ''}`,
     HOME: cfgDir,

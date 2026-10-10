@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { createDaemonRegistry, spawnDaemon, reapDaemons } from './helpers/daemon-lifecycle';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const reg = createDaemonRegistry();
 const cleanup: Array<() => Promise<void> | void> = [];
@@ -21,7 +22,7 @@ async function fixture(publish: boolean) {
   const scripts: Record<string, string> = {
     ps: `#!/bin/sh\ncase "$*" in *tty*) printf '${process.pid} ??\\n';; *) printf '${process.pid} 1 /opt/homebrew/bin/omp\\n';; esac\n`,
     lsof: `#!/bin/sh\nprintf 'p${process.pid}\\nfcwd\\nn/work/original\\nn${sessionFile}\\n'\n`,
-    tmux: '#!/bin/sh\nexit 0\n',
+    tmux: TMUX_NO_SERVER_SHIM,
     omp: `#!/bin/sh\nprintf 'FORBIDDEN ACP CLONE\\n' >> '${spawnLog}'\nexit 1\n`,
   };
   for (const [name, text] of Object.entries(scripts)) writeFileSync(join(bin, name), text, { mode: 0o755 });

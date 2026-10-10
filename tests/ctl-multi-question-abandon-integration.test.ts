@@ -12,6 +12,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
+import { tmuxNoServerShim } from './helpers/hermetic-host';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -22,7 +23,7 @@ writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ cwd: cfgDir }));
 mkdirSync(join(cfgDir, 'bin'));
 // The tmux stub LOGS its argv so the test can prove no send-keys injection ran.
-writeFileSync(join(cfgDir, 'bin', 'tmux'), `#!/bin/sh\necho "$@" >> "${tmuxLog}"\nexit 0\n`, { mode: 0o755 });
+writeFileSync(join(cfgDir, 'bin', 'tmux'), tmuxNoServerShim(`echo "$@" >> "${tmuxLog}"\n`), { mode: 0o755 });
 
 const sentMessages: Array<{ message_id: number; text: string; callback_data: string }> = [];
 const answeredCallbacks: Array<{ callback_query_id: string; text?: string }> = [];

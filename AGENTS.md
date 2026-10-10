@@ -537,6 +537,15 @@ Roadmap and priorities: docs/ROADMAP.md (source of truth since 2026-09-29).
 
 - **TDD**: write tests in `tests/*.test.ts` first; run with `bun test ./tests` (scope to `./tests` —
   a bare `bun test` from a parent dir falsely grabs sibling-repo tests). All 1460 tests must pass.
+- **Hermetic host**: `bunfig.toml` preloads `tests/hermetic-env.ts`, which puts a `ps` that lists only
+  launchd, a `launchctl` with no jobs and a tmux with no server (`TMUX_TMPDIR` is a private empty dir)
+  in front of every test's PATH, so a test never sees the developer's own omp/claude sessions or
+  tmux panes (#545). A test's own PATH shim wins over those, and MUST NOT make `tmux` exit 0 with empty
+  output or `ps` print no rows: the daemon retries both as the launchd flake with a synchronous 120 ms
+  sleep, four snapshots per poll tick, and the hook socket (asks, taps) is served only between ticks.
+  Use `tests/helpers/hermetic-host.ts` (`TMUX_NO_SERVER_SHIM`, `tmuxNoServerShim(before)`,
+  `PS_NO_AGENTS_SHIM`). `Bun.spawn` with no `env:` option does NOT see the preload's PATH — pass `env`
+  explicitly, as the suite already does.
 - **Codex review** before committing non-trivial changes: `codex exec review --uncommitted`
   (findings appear at the end of output after thinking/exec noise — use `tail -80`).
 - **Version bumps**: the `VERSION` const in `tg` must have a matching `## <version>` section in

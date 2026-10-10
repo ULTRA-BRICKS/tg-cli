@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startLiveEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const SID = '01a0d2d7-6202-702d-b9e8-006b656b0799';
@@ -55,7 +56,7 @@ async function daemon({ endpoint, hosted }: Scenario) {
     ? `    1     0 /sbin/launchd\\n41000     1 abduco -n ${NAME} rig host-run ${NAME}\\n41001 41000 /opt/homebrew/bin/python3 /Users/u/bin/rig host-run ${NAME}\\n ${pid} 41001 /opt/homebrew/bin/omp\\n`
     : `    1     0 /sbin/launchd\\n 5001     1 /bin/zsh -l\\n ${pid}  5001 /opt/homebrew/bin/omp\\n`;
   const scripts: Record<string, string> = {
-    tmux: '#!/bin/sh\nexit 0\n',
+    tmux: TMUX_NO_SERVER_SHIM,
     ps: `#!/bin/sh\ncase "$*" in *tty*) printf '${pid} ttys099\\n';; *) printf '${tree}';; esac\n`,
     lsof: `#!/bin/sh\nprintf 'p${pid}\\nfcwd\\nn/work/hosted-omp\\nn${sessionFile}\\n'\n`,
     omp: `#!/bin/sh\nprintf 'FORBIDDEN SPAWN %s\\n' "$*" >> '${spawnLog}'\nexit 1\n`,

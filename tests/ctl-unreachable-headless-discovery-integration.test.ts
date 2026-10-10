@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, openSync, closeSync, writeFileSync 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 // Integration test (tg-cli#413 follow-up): a FULLY headless claude session — no
 // controlling terminal at all (not merely "no tmux pane"), parented directly under
@@ -23,7 +24,7 @@ writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 const binDir = join(cfgDir, 'bin');
 mkdirSync(binDir);
 // No tmux panes at all.
-writeFileSync(join(binDir, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+writeFileSync(join(binDir, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
 // ps: the 3-column tree read AND the 2-column `pid tty` read, keyed off argv.
 // EVERY pid reports `??` on the tty query — a fully headless host with no
 // controlling terminal anywhere, not even for pid 1.

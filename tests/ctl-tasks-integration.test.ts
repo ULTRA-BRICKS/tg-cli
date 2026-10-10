@@ -4,6 +4,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { PS_NO_AGENTS_SHIM, TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 // Integration test for the /tasks bot command (tg-cli#115) against a fake Bot
 // API, with stub `task` and `gh` binaries on PATH. Proves the daemon composes
@@ -59,7 +60,7 @@ writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ cwd
 
 const bin = join(cfgDir, 'bin');
 mkdirSync(bin);
-writeFileSync(join(bin, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+writeFileSync(join(bin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
 const taskInvocationLog = join(cfgDir, 'task-invocation.txt');
 const ghInvocationLog = join(cfgDir, 'gh-invocation.txt');
 // Stub task-cli: two tickets, one with a due date.
@@ -362,8 +363,8 @@ test('/tasks matches duplicate task ids to PRs by repo identity, not worktree ba
 
   const localBin = join(localCfgDir, 'bin');
   mkdirSync(localBin);
-  writeFileSync(join(localBin, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-  writeFileSync(join(localBin, 'ps'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(localBin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
+  writeFileSync(join(localBin, 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
   const tasksJson = JSON.stringify([
     {
       project: 'alex-mextner/tg-cli',
@@ -749,8 +750,8 @@ test('/tasks pagination callback sends the requested page with a filter keyboard
 
   const localBin = join(localCfgDir, 'bin');
   mkdirSync(localBin);
-  writeFileSync(join(localBin, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-  writeFileSync(join(localBin, 'ps'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(localBin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
+  writeFileSync(join(localBin, 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
   const ackMarker = join(localCfgDir, 'callback-ack');
   const localTaskInvocationLog = join(localCfgDir, 'task-invocation.txt');
 
@@ -901,8 +902,8 @@ test('/tasks callback state is scoped by Telegram chat id as well as message id'
 
   const localBin = join(localCfgDir, 'bin');
   mkdirSync(localBin);
-  writeFileSync(join(localBin, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-  writeFileSync(join(localBin, 'ps'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(localBin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
+  writeFileSync(join(localBin, 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
   const localTaskInvocationLog = join(localCfgDir, 'task-invocation.txt');
   const localGhInvocationLog = join(localCfgDir, 'gh-invocation.txt');
   const tasksJson = JSON.stringify([{ id: '#60', title: 'Forgotten task', state: 'todo', url: 'https://gh/60' }]);
@@ -1001,7 +1002,7 @@ test('/tasks in a bound topic keeps the topic thread on the board and callbacks'
 
   const localBin = join(localCfgDir, 'bin');
   mkdirSync(localBin);
-  writeFileSync(join(localBin, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(localBin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
   writeFileSync(join(localBin, 'ps'), '#!/bin/sh\nprintf "111 1 claude\\n"\n', { mode: 0o755 });
   const localTaskInvocationLog = join(localCfgDir, 'task-invocation.txt');
   const localGhInvocationLog = join(localCfgDir, 'gh-invocation.txt');
@@ -1102,8 +1103,8 @@ test('/tasks render failure fallback stays in the bound topic reply context', as
 
   const localBin = join(localCfgDir, 'bin');
   mkdirSync(localBin);
-  writeFileSync(join(localBin, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-  writeFileSync(join(localBin, 'ps'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(localBin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
+  writeFileSync(join(localBin, 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
   const tasksJson = JSON.stringify([{ id: '#71', title: 'Topic task', state: 'todo', url: 'https://gh/71' }]);
   writeFileSync(join(localBin, 'task'), `#!/bin/sh\ncat <<'JSON'\n${tasksJson}\nJSON\n`, { mode: 0o755 });
   writeFileSync(join(localBin, 'gh'), '#!/bin/sh\nprintf "[]\\n"\n', { mode: 0o755 });
@@ -1175,8 +1176,8 @@ test('/tasks in a pathless topic fails closed in the topic reply context', async
 
   const localBin = join(localCfgDir, 'bin');
   mkdirSync(localBin);
-  writeFileSync(join(localBin, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-  writeFileSync(join(localBin, 'ps'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(localBin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
+  writeFileSync(join(localBin, 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
   writeFileSync(join(localBin, 'task'), '#!/bin/sh\necho task should not run >&2\nexit 42\n', { mode: 0o755 });
   writeFileSync(join(localBin, 'gh'), '#!/bin/sh\necho gh should not run >&2\nexit 42\n', { mode: 0o755 });
 
@@ -1248,8 +1249,8 @@ test('/tasks status-scoped pagination keeps the status label on page callbacks',
 
   const localBin = join(localCfgDir, 'bin');
   mkdirSync(localBin);
-  writeFileSync(join(localBin, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-  writeFileSync(join(localBin, 'ps'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(localBin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
+  writeFileSync(join(localBin, 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
   const localTaskInvocationLog = join(localCfgDir, 'task-invocation.txt');
   const doneTasks = JSON.stringify(
     Array.from({ length: 11 }, (_, index) => ({
@@ -1379,8 +1380,8 @@ test('/tasks All quick filter callback unpins an explicit status board', async (
 
   const localBin = join(localCfgDir, 'bin');
   mkdirSync(localBin);
-  writeFileSync(join(localBin, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-  writeFileSync(join(localBin, 'ps'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(localBin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
+  writeFileSync(join(localBin, 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
   const localTaskInvocationLog = join(localCfgDir, 'task-invocation.txt');
   const doneTasks = JSON.stringify([{ id: '#40', title: 'Done task', state: 'done', url: 'https://gh/40' }]);
   const activeTasks = JSON.stringify([{ id: '#41', title: 'Active task', state: 'in-progress', url: 'https://gh/41' }]);
@@ -1518,8 +1519,8 @@ test('/tasks stale pagination callback answers expired without guessing a projec
 
   const localBin = join(localCfgDir, 'bin');
   mkdirSync(localBin);
-  writeFileSync(join(localBin, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-  writeFileSync(join(localBin, 'ps'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(localBin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
+  writeFileSync(join(localBin, 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
   const localTaskInvocationLog = join(localCfgDir, 'task-invocation.txt');
   const localGhInvocationLog = join(localCfgDir, 'gh-invocation.txt');
   writeFileSync(join(localBin, 'task'), `#!/bin/sh\nprintf 'ran\\n' > '${localTaskInvocationLog}'\nprintf '[]\\n'\n`, { mode: 0o755 });

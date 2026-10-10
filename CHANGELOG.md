@@ -3,6 +3,35 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.6
+
+- **The test suite no longer reads the machine it runs on, and no longer parks the daemon under test
+  in `sleepSync` (#545).** A full `bun test ./tests` on a developer machine failed 29–46 tests
+  (callback taps, ask-forward logging, hatch grants, `/tasks` pages, omp-live, `html-auto-detect`,
+  `dry-run`, `dict-gate-cli`). No product bug and no shared-state race: neither full log contains an
+  EPIPE. Three test-environment causes, each measured:
+  1. **Empty shims.** A daemon test whose `tmux` exits 0 with no output, or whose `ps` prints no
+     rows, is read by the daemon as the launchd flake: three attempts with a synchronous 120 ms
+     sleep each, four snapshots per poll tick. The mock Bot API answers `getUpdates` at once (Telegram
+     holds it ~50 s), so ticks run back to back and the hook socket — asks, taps — is served only
+     between them. One tick took ~4 s (3 polls in 15 s; 108 with a realistic shim); `tg-ctl ask` to
+     card took 3.1–4.2 s against 57–350 ms, inside a 5 s test budget that had to cover several hops.
+     The shims now behave like a host with tmux unused: `tmux` exits 1 (no server), `ps` lists launchd.
+  2. **The host's process table.** A daemon test without its own `ps` shim enumerated every live omp on
+     the machine each tick (two `lsof` and a session-jsonl read per omp). `tg` climbed from the test
+     process to the omp session that launched `bun test` and took its title as the `[window]` name — a
+     Cyrillic title made `html-auto-detect` red deterministically (every plain message went out as
+     HTML) — and spent 1.3 s of `ps` + `lsof` + jsonl read on it per run, which pushed `dry-run` and
+     `dict-gate-cli` past bun's 5 s timeout under load.
+  3. **Load.** The remaining failures of the first run came while the machine's swap was full (load
+     average ~400, every process runnable); they are not reproducible on a calm host.
+
+  `bunfig.toml` now preloads `tests/hermetic-env.ts`: a `ps` that lists only launchd (every other
+  `ps` call reaches the real one), a `launchctl` with no jobs, a private empty `TMUX_TMPDIR` and no
+  inherited `TMUX`/`TMUX_PANE` sit in front of every test's PATH; a test's own shim still wins.
+  `tests/helpers/hermetic-host.ts` holds the shim bodies (`TMUX_NO_SERVER_SHIM`, `tmuxNoServerShim`,
+  `PS_NO_AGENTS_SHIM`), and the daemon tests that shipped empty ones use them. No product code changed.
+
 ## 1.55.5
 
 - **An agent's `tg --reply-to <id>` answer to a message written inside a topic now lands in that

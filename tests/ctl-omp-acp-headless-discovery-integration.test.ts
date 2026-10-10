@@ -4,6 +4,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 import { NO_AGENT_REPLY } from '../tg-ctl';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 // Regression (tg-cli live incident, 2026-09-17): a genuinely live, interactive
 // omp session with NEITHER a controlling tty NOR a tmux pane (e.g. started
@@ -24,7 +25,7 @@ const binDir = join(cfgDir, 'bin');
 mkdirSync(binDir);
 
 // No tmux server at all.
-writeFileSync(join(binDir, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+writeFileSync(join(binDir, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
 
 // One omp process, pid 30099, tty `??` (NO controlling terminal) and — since
 // there are no tmux panes at all — no tmux pane either. This is the exact

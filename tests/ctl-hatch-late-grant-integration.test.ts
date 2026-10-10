@@ -23,6 +23,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
+import { PS_NO_AGENTS_SHIM, TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -40,8 +41,8 @@ function makeCfgDir(): string {
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ cwd: cfgDir }));
   mkdirSync(join(cfgDir, 'bin'));
-  writeFileSync(join(cfgDir, 'bin', 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-  writeFileSync(join(cfgDir, 'bin', 'ps'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(cfgDir, 'bin', 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
+  writeFileSync(join(cfgDir, 'bin', 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
   return cfgDir;
 }
 

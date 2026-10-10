@@ -12,6 +12,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { spawnSyncBounded } from './helpers/spawn-sync';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -61,7 +62,7 @@ async function startDaemon(cfgDir: string, port: number): Promise<Subprocess> {
     JSON.stringify({ paneId: '%1', cwd: cfgDir }),
   );
   mkdirSync(join(cfgDir, 'bin'));
-  writeFileSync(join(cfgDir, 'bin', 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(cfgDir, 'bin', 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
   const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
     env: {

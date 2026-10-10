@@ -4,6 +4,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { PS_NO_AGENTS_SHIM, TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 // Regression for the "dead sender" reply-routing gap: a one-shot/disposable
 // sender (a subagent process running `tg --tag report`, or any headless
@@ -309,12 +310,8 @@ test('DEAD SENDER, two live agents in that same project: still ambiguous, falls 
 
 test('DEAD SENDER, no live agent anywhere: a visible no-agent reply, never a silent drop', async () => {
   const h = makeHarness({ omitParent: true });
-  writeFileSync(join(h.cfgDir, 'bin', 'ps'), `#!/bin/sh\nexit 0\n`, { mode: 0o755 });
-  writeFileSync(
-    join(h.cfgDir, 'bin', 'tmux'),
-    `#!/bin/sh\nsub="$1"; shift\ncase "$sub" in\n  list-panes) ;;\n  *) ;;\nesac\nexit 0\n`,
-    { mode: 0o755 },
-  );
+  writeFileSync(join(h.cfgDir, 'bin', 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
+  writeFileSync(join(h.cfgDir, 'bin', 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
   const tg = startFakeTg();
   const daemon = await startDaemon(h.cfgDir, tg.port);
 

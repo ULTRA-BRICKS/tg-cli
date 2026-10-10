@@ -3,6 +3,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 // Regression for tg-cli#97: a question whose stable requestId re-forwards AFTER it
 // was answered must REPLAY the stored answer down the socket and post NO second
@@ -33,7 +34,7 @@ function makeCfgDir(): string {
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ cwd: cfgDir }));
   mkdirSync(join(cfgDir, 'bin'));
-  writeFileSync(join(cfgDir, 'bin', 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(cfgDir, 'bin', 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
   return cfgDir;
 }
 

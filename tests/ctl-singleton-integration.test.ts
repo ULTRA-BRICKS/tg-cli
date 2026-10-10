@@ -4,6 +4,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, trackCfgDir, trackProc } from './helpers/daemon-lifecycle';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 // Process-level singleton check (spec §6, §11): two REAL `tg-ctl run` daemons
 // race for the same per-bot flock; exactly one survives, the loser exits 0
@@ -39,7 +40,7 @@ const pidFile = join(cfgDir, 'tg-ctl.123.pid');
 // server (this test runs on dev machines with live agent panes).
 const shimDir = join(cfgDir, 'bin');
 mkdirSync(shimDir);
-writeFileSync(join(shimDir, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+writeFileSync(join(shimDir, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
 
 function spawnDaemon(): Subprocess {
   // Explicit env (no inherit): no TMUX, no real credentials, shim first on PATH.

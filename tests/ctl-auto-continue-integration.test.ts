@@ -3,6 +3,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 // Integration test for auto-continue scheduling (tg-cli#113). Proves: (1) tapping
 // the auto-continue button arms + PERSISTS a schedule and answers the callback;
@@ -15,7 +16,7 @@ const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const SCHEDULES = 'tg-ctl.123.schedules.json';
 
 // `tmuxScript`: the fake tmux; the default hosts no agent pane anywhere.
-function makeCfg(tmuxScript = '#!/bin/sh\nexit 0\n'): string {
+function makeCfg(tmuxScript = TMUX_NO_SERVER_SHIM): string {
   const dir = mkdtempSync(join(tmpdir(), 'tgctl-autocont-'));
   writeFileSync(join(dir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(dir, 'config.yaml'), 'control:\n  enabled: true\n');

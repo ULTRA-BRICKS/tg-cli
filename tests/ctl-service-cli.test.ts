@@ -16,6 +16,7 @@ import {
   withClaudeHooks,
   withClaudeStatusLineTelemetry,
 } from '../features/tg-ctl/hook-install';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 import { spawnSyncBounded } from './helpers/spawn-sync';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
@@ -48,7 +49,7 @@ function reapDaemon(cfg: string, botId: string): void {
 // prepended to HOST_PATH, so they still win.
 const HERMETIC_BIN = mkdtempSync(join(tmpdir(), 'tgctl-svc-bin-'));
 writeFileSync(join(HERMETIC_BIN, 'launchctl'), `#!/bin/sh\n[ "$1" = list ] && printf 'PID\\tStatus\\tLabel\\n'\nexit 0\n`, { mode: 0o755 });
-writeFileSync(join(HERMETIC_BIN, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+writeFileSync(join(HERMETIC_BIN, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
 writeFileSync(join(HERMETIC_BIN, 'ps'), `#!/bin/sh\nprintf '    1     0 /sbin/launchd\\n'\nexit 0\n`, { mode: 0o755 });
 const HOST_PATH = `${HERMETIC_BIN}:${process.env.PATH ?? ''}`;
 

@@ -28,6 +28,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const LIVE_CWD = '/Users/u/work/review-cli';
@@ -47,7 +48,7 @@ afterEach(async () => {
 function writeFakeBins(cfgDir: string, sessionFile: string, acpLog: string): string {
   const binDir = join(cfgDir, 'bin');
   mkdirSync(binDir);
-  writeFileSync(join(binDir, 'tmux'), `#!/bin/sh\nexit 0\n`, { mode: 0o755 });
+  writeFileSync(join(binDir, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
   writeFileSync(
     join(binDir, 'ps'),
     `#!/bin/sh

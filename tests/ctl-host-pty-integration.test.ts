@@ -3,6 +3,7 @@ import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSyn
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
 
 // docs/specs/2026-09-30-harness-agnostic-control.md: a Claude Code session a rig wrapper hosts
 // in abduco OUTSIDE tmux is reachable. The daemon runs its REAL discovery against PATH-shimmed
@@ -49,7 +50,7 @@ writeFileSync(
 
 const binDir = join(cfgDir, 'bin');
 mkdirSync(binDir);
-writeFileSync(join(binDir, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+writeFileSync(join(binDir, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
 writeFileSync(
   join(binDir, 'ps'),
   `#!/bin/sh
