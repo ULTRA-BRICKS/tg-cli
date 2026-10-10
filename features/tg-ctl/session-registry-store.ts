@@ -147,7 +147,9 @@ function migrateRoutes(raw: string | null, reg: Registry, nowSec: number): Store
   let migrated = 0;
   let legacy = 0;
   const out = rows.map((r) => {
-    if (r.sessionKey !== undefined || r.legacySince !== undefined) return r;
+    // A rig-wrapper host is no registry session yet (#536): its row cannot resolve, yet the session
+    // may be alive and its replies must still route there, not to "that session is gone".
+    if (r.sessionKey !== undefined || r.legacySince !== undefined || r.paneId.startsWith('host:')) return r;
     const key = resolveLocatorToSession(reg, r.paneId, r.cwd);
     if (key) {
       migrated++;

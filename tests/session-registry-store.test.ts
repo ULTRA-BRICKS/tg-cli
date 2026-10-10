@@ -143,6 +143,15 @@ test('routes: resolvable rows gain their sessionKey (paneId kept as a hint); the
   ]);
 });
 
+// A rig-wrapper host (`host:<name>`, docs/specs/2026-09-30-harness-agnostic-control.md §4) is not
+// a registry session yet (#536), so the migration cannot resolve its route — but the session is
+// alive. Marking the row legacy turned every reply to it into "that agent is no longer running".
+test('routes: a host:<name> row the registry does not track is left as is, never legacy', () => {
+  const io = new MemIo({ routes: JSON.stringify([{ id: 6, paneId: 'host:claude-3f9a0c1d2e4b', cwd: '/w/landing', ts: 15 }]) });
+  runMigration(REGISTRY, io, { now: NOW, livePaneIds: LIVE_PANES });
+  expect(parseRoutes(io.files.routes!)).toEqual([{ id: 6, paneId: 'host:claude-3f9a0c1d2e4b', cwd: '/w/landing', ts: 15 }]);
+});
+
 test('routes: a legacy row is dropped 7 days after migration, on the next send', () => {
   const rows = [
     { id: 3, paneId: '%0', ts: 12, legacySince: NOW_SEC },

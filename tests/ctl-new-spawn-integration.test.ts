@@ -772,3 +772,47 @@ test('REGRESSION (review #1, 2nd pass): a harness command /compact mid-/new reac
   expect(sent(sends, 'is not an absolute path')).toBe(false);
   daemon.kill();
 });
+
+// #500: a crash after a flat `/new` ran `tmux new-window` but before its batch finished leaves the
+// `/new` in the pending-batch journal. The restarted daemon replays it — and must not start a
+// second copy of the agent. The fake tmux SIGKILLs the daemon right after the first new-window.
+test('#500: a flat /new replayed from the journal after a crash mid-spawn does not spawn a second agent', async () => {
+  const { cfgDir, spawnLog } = makeCfgDir(false);
+  const crashFlag = join(cfgDir, 'crash-on-new-window');
+  writeFileSync(crashFlag, '');
+  writeFileSync(
+    join(cfgDir, 'bin', 'tmux'),
+    `#!/bin/sh
+sub="$1"; shift
+case "$sub" in
+  list-panes) printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '%1' '4241' 'claude' 'main' '' '${cfgDir}' ;;
+  display-message) printf 'main\\n' ;;
+  new-window)
+    printf 'new-window %s\\n' "$*" >> '${spawnLog}'
+    if [ -f '${crashFlag}' ]; then rm -f '${crashFlag}'; kill -9 "$PPID"; fi
+    printf '%s\\n' '${SPAWNED_PANE}'
+    ;;
+  set-option) : ;; send-keys) : ;; load-buffer) cat > /dev/null ;;
+esac
+exit 0
+`,
+    { mode: 0o755 },
+  );
+  const { server, sends } = makeServer([[textMsg(170, `/new opus ${cfgDir} crashy fix the build`)]]);
+  const crashed = await startDaemon(cfgDir, server.port);
+  await waitFor(() => crashed.signalCode !== null || crashed.exitCode !== null, 15_000);
+  const journal = join(cfgDir, 'tg-ctl.123.pending-batch.json');
+  expect(crashed.signalCode).toBe('SIGKILL');
+  expect(existsSync(journal)).toBe(true);
+  expect(spawnArgvLog(spawnLog)).toHaveLength(1);
+
+  await startDaemon(cfgDir, server.port);
+  // The journal is unlinked once its replay fully ran: the end-of-recovery event.
+  await waitFor(() => !existsSync(journal), 15_000);
+  expect(existsSync(journal)).toBe(false);
+  expect(spawnArgvLog(spawnLog)).toHaveLength(1);
+  expect(readFileSync(join(cfgDir, 'daemon.log'), 'utf8')).toMatch(/replayed \/new not re-run/);
+  // No second "spawned" confirmation; the user is told the replay did not start another agent.
+  expect(sends.filter((s) => String(s.text).startsWith('spawned'))).toEqual([]);
+  expect(sends.some((s) => /crashy/.test(String(s.text)) && /restart/.test(String(s.text)))).toBe(true);
+}, 40_000);

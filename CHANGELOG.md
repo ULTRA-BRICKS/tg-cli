@@ -3,6 +3,33 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.20
+
+- **Inbound routing matrix: every kind of Telegram message × every place a session runs, against
+  the real daemon (#614).** `tests/ctl-inbound-matrix-integration.test.ts` (one hermetic world per
+  column in `tests/helpers/inbound-world.ts`) sends plain text, a reply to the agent's report,
+  `/agent <name> …`, a voice note, a photo, a document, a photo reply, an edited message and a
+  picker tap to omp in tmux (with and without omp-live), omp outside tmux (with an endpoint, and
+  without one — fail closed), Claude Code and codex in tmux, claude/codex outside tmux (refused with
+  the `rig harness run` hint) and a rig-wrapper `host:<name>` session. Each cell checks the agent got
+  the message exactly once, the delivery ledger's one `delivered` record names that session, the
+  `tg replies` row names it, the 👀 receipt — or, for a refusal, the reply that says why and no
+  delivery. Plus a pending-batch replay after a kill for each sink, the sender allowlist and a
+  two-hour-old message (#183). Bugs it found, fixed here:
+  - **A reply to a hosted (rig-wrapper) session was answered "that agent is no longer running".**
+    The session registry's one-shot `routes.json` migration marked a `host:<name>` row legacy: the
+    registry does not track hosted sessions yet (#536), so the row could not resolve. It is now left
+    as is and keeps routing.
+  - **Inbound history rows for a session outside tmux had no agent (#571).** A message auto-bound to
+    the only reachable session — an omp outside tmux, or a hosted session — and a reply to a hosted
+    session were written untagged, so `tg replies` for that agent missed what the CTO sent. They now
+    carry the name the picker shows for that session.
+  - **A flat `/new` replayed after a crash mid-spawn started a second agent (#500).** `tmux
+    new-window` is now claimed in the delivery ledger under the `/new` message's id; the replay
+    finds the claim, starts nothing, and tells the user the window was already being started.
+  - Still open, pinned as a `test.todo` body: an album (`media_group_id`) arrives as one delivery per
+    photo (#280).
+
 ## 1.55.19
 
 - **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on

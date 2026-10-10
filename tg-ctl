@@ -10250,16 +10250,28 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       await sendMessage(ctx, "private-topic fallback choice is already open — tap Continue without topics or Cancel this spawn.", out)
       return false
     }
-    // Flat spawn path (no private topic, or createForumTopic failed gracefully).
-    const spawned = spawnNewWindow(slug, session.dir, modelId, session.task, spawnToken)
+    // Flat spawn path (no private topic, or createForumTopic failed gracefully). `new-window` is not
+    // idempotent, so it is claimed in the delivery ledger under the /new's own message id (#500): a
+    // crash after it leaves the claim open, and the pending-batch replay of that /new is suppressed
+    // instead of starting a second agent (the startup report already names the open claim).
+    const dir = session.dir
+    const spawned = await deliverInboundOnce(session.sourceMessageId, `new window ${slug}`, async () =>
+      spawnNewWindow(slug, dir, modelId, session.task, spawnToken),
+    )
     if (!spawned.ok) {
       // Spawn FAILED → report the error once and offer a Retry button (answers preserved), NEVER
       // re-ask the model. See offerNewRetry.
       return offerNewRetry(session, spawned.error, promptMessageId)
     }
-    stampSpawnToken(spawned.paneId, spawnToken)
     pendingNew.delete(session.token)
     if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
+    // A suppressed replay returns no pane: an earlier run of this /new claimed the spawn.
+    if (!("paneId" in spawned)) {
+      log(`new-command: message ${session.sourceChatId}/${session.sourceMessageId} already spawned window ${slug} (or was spawning it) before a restart — replayed /new not re-run`)
+      await sendMessage(ctx, `recovered after a daemon restart: \`/new ${session.name}\` already started window \`${slug}\` (or was starting it when the daemon stopped) — not started again; check tmux before running /new again`, out)
+      return true
+    }
+    stampSpawnToken(spawned.paneId, spawnToken)
     const taskNote = session.task.trim().length > 0 ? ` with task: ${session.task.trim()}` : ""
     await sendMessage(ctx, `spawned \`${modelId}\` in \`${session.dir}\` (window \`${slug}\`)${taskNote} — use \`/agent ${slug}\` to talk to it`, out)
     return true
@@ -12332,7 +12344,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // discovered target.
       if (updates.length > 0) {
         const found = discover()
-        const targetPane = found.ok ? found.target.pane.paneId : null
+        // Outside tmux a message goes to the sole reachable session (injectViaTarget's no-agent
+        // path) — an `omp:<pid>` or `host:<name>` candidate — and a reply to one goes back to it.
+        // Listed lazily: only when tmux has no target or a reply names such a locator.
+        let outsideCandidates: AgentCandidate[] | null = null
+        const candidates = (): AgentCandidate[] => (outsideCandidates ??= listAgentCandidates())
+        const targetPane = found.ok
+          ? found.target.pane.paneId
+          : found.reason === "no-agent" && candidates().length === 1
+            ? candidates()[0].paneId
+            : null
         const histRoutes = parseRoutes(readFileOrNull(ctx.paths.routes))
         // Map a resolved target pane → the human AGENT NAME it belongs to, so
         // each inbound record is attributed (targetAgent) and `tg replies` can
@@ -12351,7 +12372,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           const p = agentPanes.find((x) => x.paneId === pane)
           if (p) return resolveSessionName({ tmuxWindow: p.windowName, cwd: p.panePath }).primary || null
           const key = resolveSession(pane)
-          return registry?.sessions.find((e) => e.key === key)?.name.primary || null
+          const named = registry?.sessions.find((e) => e.key === key)?.name.primary
+          if (named) return named
+          // Not (yet) in the registry — a hosted session (#571), or an omp before the first scan:
+          // the name the picker and `/agent` show for that locator.
+          if (pane.startsWith("%")) return null
+          return candidates().find((c) => c.paneId === pane)?.windowName || null
         }
         // A message inside a forum topic belongs to the topic's session — the one `topic-route`
         // delivers it to (tg-cli#551): the registry owner, else the session on the pane a
