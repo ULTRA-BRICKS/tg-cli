@@ -20,10 +20,20 @@
 //   `ESCALATION_GATE_ENFORCE=0` exists for the rare genuine edge case. The error
 //   lists EXACTLY which sections are missing so the caller can fix and resend.
 //
-// PURE — no I/O. Consumed by features/cli/args.ts (parse-time gate) and mirrored
-// by the pre-send-text hook.
-
-import { detectTableKind } from '../render/table';
+// SECTION-AWARE (tg-cli#216)
+//   Generous does not mean shape-only. The body is split at its headings and
+//   each requirement is checked against real content, not mere presence of a
+//   tag somewhere: Options needs ONE table with >= 2 option rows, or ONE list of
+//   >= 2 items outside the Context / Recommendation / Where-to-look sections
+//   (bullets from unrelated sections never add up); an options table must have
+//   its tradeoff cells filled; a Recommendation heading counts only when its
+//   section has content; "where to look" needs a real file:line in the TEXT
+//   (tg-cli#217, #221). A `--file`/`--photo` attachment does not count; a
+//   `path:line` typed in the body is auto-attached AND kept in the body, so it
+//   is seen here.
+//
+// PURE — no I/O. Consumed by features/cli/args.ts (parse-time gate) and the tg
+// entrypoint (post-assembly re-check for --table sends).
 
 export interface EscalationFormatResult {
   ok: boolean;
@@ -39,22 +49,161 @@ const RECOMMENDATION_RE =
 const PROS_CONS_RE =
   /\b(pros?|cons?|trade[- ]?offs?|advantages?|disadvantages?|upsides?|downsides?|benefits?|drawbacks?)\b|плюс|минус|компромисс|преимуществ|недостат|за и против|риск/iu;
 
-// A file / code reference: `foo.ts`, `path/bar.py:42`, `a/b/c`. Precise enough
-// that ordinary prose ("e.g.", "i.e.") does not match: a known code extension
-// (optionally with :line), a slashed path, or a bare `name:line`.
-const FILE_REF_RE =
-  /\b[\w.-]*\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|json|ya?ml|md|sh|sql|toml|css|scss|html?|vue|svelte|c|cc|cpp|h|hpp|java|rb|php|swift|kt)\b(?::\d+)?|\b[\w-]+\/[\w./-]+|\b[\w.-]+:\d+\b/iu;
+// A concrete `file:line` pointer — the "where to look" contract (tg-cli#217).
+// The file part must LOOK like a file: a slashed path (`features/cli/args:12`,
+// `./tg:1219`), a name with a known code extension (`foo.ts:42`), or a
+// well-known extensionless build file (`Makefile:12`). The line part is a
+// `:<n>` suffix or a forge `#L<n>` anchor. A bare path with no line, and
+// ordinary prose tokens such as `and/or`, `A/B`, `12:30`, `step:2` or a URL's
+// `host:port`, are not references (tg-cli#221).
+//
+// Matched per whitespace/markup-delimited TOKEN and anchored at its start: an
+// unanchored scan of a long `a/a/a/…` run would retry from every offset
+// (quadratic). A URL's `scheme://host/` prefix is dropped first, so a forge
+// link's path is what gets matched.
+const FILE_REF_TOKEN_RE = new RegExp(
+  String.raw`^(?:\.{0,2}\/)?(?:(?:[\w.-]+\/)+[\w.-]*\w` +
+    String.raw`|[\w.-]*\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|json|ya?ml|md|sh|sql|toml|css|scss|html?|vue|svelte|c|cc|cpp|h|hpp|java|rb|php|swift|kt|lua|zig|ex|exs)` +
+    String.raw`|Makefile|Dockerfile|Containerfile|Justfile|Rakefile|Gemfile|Procfile)(?::\d+|#L\d+)(?!\d)`,
+  'iu',
+);
+const TOKEN_SPLIT_RE = /[\s<>"'`()[\]{},;]+/u;
+const URL_PREFIX_RE = /^[a-z][\w+.-]*:\/\/[^/]*\/?/iu;
 
-// A <ul>/<ol>/<li> list — the structural alternative to a table for options.
+function hasFileRef(text: string): boolean {
+  return text.split(TOKEN_SPLIT_RE).some((token) => FILE_REF_TOKEN_RE.test(token.replace(URL_PREFIX_RE, '')));
+}
+
+// A <ul>/<ol>/<li> list — the readability requirement for enumerations.
 const LIST_RE = /<(?:ul|ol|li)\b/iu;
-const LI_RE = /<li\b/giu;
 // Section headings (Rich Message) — the readability requirement.
 const HEADING_RE = /<h[1-6]\b/giu;
 const HR_RE = /<hr\b/iu;
 
+// --- Sections (tg-cli#216) ---
+// A heading — `<h1>`..`<h6>` or a markdown `#` line — opens a section that runs
+// to the next heading; text before the first heading is a section with an empty
+// heading. A `#` line inside code (`<pre># install deps</pre>`, a ``` fence) is
+// a comment, not a heading.
+const SECTION_HEADING_RE = /<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1\s*>|^[ \t]*#{1,6}[ \t]+(.+)$/gimu;
+const FENCED_CODE_RE = /^ {0,3}(`{3,}|~{3,})[\s\S]*?(?:^ {0,3}\1|$(?![\s\S]))/gmu;
+// An Options section by name — it wins over the non-options names below, so
+// "Предлагаемые варианты" (proposed options) or "Options and context" is still
+// an options section.
+const OPTIONS_HEADING_RE = /\b(?:options?|alternatives?|choices?)\b|вариант|опци|альтернатив/iu;
+// Sections whose bullets and tables are NOT the options: Context,
+// Recommendation, Where to look. Bullets from them never satisfy Options.
+const NON_OPTIONS_HEADING_RE = new RegExp(
+  `${RECOMMENDATION_RE.source}|where to look|references?|links?|context|background|где смотреть|ссылк|контекст`,
+  'iu',
+);
+// Words a Recommendation heading uses as a mere LABEL; anything else in the
+// heading ("I recommend A", "Рекомендую A") is the recommendation itself.
+const RECOMMENDATION_LABEL_WORD_RE = /^(?:recommendations?|рекомендаци[яи]|my|our|моя|мои|наша|наши)[:.]?$/iu;
+const TAG_RE = /<[^>]*>/gu;
+const HAS_CONTENT_RE = /[\p{L}\p{N}]/u;
+
+interface Section {
+  heading: string; // tag-stripped heading text; '' for the preamble
+  body: string;
+}
+
+// <pre>/<code> elements: their contents are literal text, never markup — a
+// tag-shaped string inside (`<pre>renders as "<h3>"</pre>`) or a `# comment`
+// line is not a heading or a block tag (tg-cli#270).
+const CODE_ELEMENT_RE = /<(pre|code)\b([^>]*)>([\s\S]*?)<\/\1\s*>/giu;
+// Rewrites the CONTENTS of every <pre>/<code> element with `mask`, keeping the
+// element's own tags.
+function maskCodeContents(text: string, mask: (inner: string) => string): string {
+  return text.replace(CODE_ELEMENT_RE, (m, tag: string, attrs: string, inner: string) => {
+    const open = `<${tag}${attrs}>`;
+    return open + mask(inner) + m.slice(open.length + inner.length);
+  });
+}
+// Same-length stand-ins for angle brackets, so tag-shaped code text is inert.
+function maskAngles(code: string): string {
+  return code.replace(/</gu, '‹').replace(/>/gu, '›');
+}
+
+function splitSections(text: string): Section[] {
+  // Neutralize heading syntax inside code with SAME-LENGTH stand-ins, so the
+  // heading scan cannot start (or end) inside code and the offsets still slice
+  // the original text.
+  const neutralize = (code: string): string => maskAngles(code).replace(/^([ \t]*)#/gmu, '$1＃');
+  const scanned = maskCodeContents(text, neutralize).replace(FENCED_CODE_RE, neutralize);
+  const sections: Section[] = [];
+  let heading = '';
+  let from = 0;
+  for (const m of scanned.matchAll(SECTION_HEADING_RE)) {
+    sections.push({ heading, body: text.slice(from, m.index) });
+    heading = (m[2] ?? m[3] ?? '').replace(TAG_RE, '').trim();
+    from = m.index + m[0].length;
+  }
+  sections.push({ heading, body: text.slice(from) });
+  return sections;
+}
+
+// The option rows of every HTML `<table>` and markdown pipe grid in `body`,
+// each row its trimmed visible cell texts. Header rows are dropped: a row of
+// `<th>` only, and the grid line above the `| --- |` separator. A table with no
+// `<th>` row keeps every row (no header to guess at).
+function tableOptionRows(body: string): string[][][] {
+  const tables: string[][][] = [];
+  for (const [table] of body.matchAll(/<table\b[\s\S]*?<\/table\s*>/giu)) {
+    tables.push(
+      [...table.matchAll(/<tr\b[\s\S]*?<\/tr\s*>/giu)]
+        .filter(([tr]) => /<td\b/iu.test(tr))
+        .map(([tr]) => [...tr.matchAll(/<(t[hd])\b[^>]*>([\s\S]*?)<\/\1\s*>/giu)].map((c) => c[2].replace(TAG_RE, '').trim())),
+    );
+  }
+  const lines = body.split('\n').map((l) => l.trim());
+  for (let i = 1; i < lines.length; i += 1) {
+    if (!(lines[i].includes('|') && lines[i].includes('-') && /^[\s|:-]+$/u.test(lines[i]))) continue;
+    const rows: string[][] = [];
+    for (let j = i + 1; j < lines.length && lines[j].includes('|'); j += 1) {
+      rows.push(lines[j].replace(/^\||\|$/gu, '').split('|').map((c) => c.trim()));
+    }
+    tables.push(rows);
+  }
+  return tables;
+}
+
+// The option rows of our boxed `tg --table` grid (a `<pre>` of `│` rows; the
+// first is the header).
+function boxedOptionRows(body: string): string[][][] {
+  return [...body.matchAll(/<pre\b[^>]*>[^<]*[┌└][\s\S]*?<\/pre\s*>/giu)].map(([pre]) =>
+    pre
+      .split('\n')
+      .filter((l) => l.includes('│'))
+      .map((l) => l.split('│').slice(1, -1).map((c) => c.trim()))
+      .slice(1),
+  );
+}
+
+// The item count of every top-level <ul>/<ol> in `body`. Only an outer list's
+// own <li> count: a nested pros/cons sub-list under one option does not make it
+// two options.
+function topLevelListItemCounts(body: string): number[] {
+  const counts: number[] = [];
+  let depth = 0;
+  for (const [, close, tag] of body.matchAll(/<(\/?)(ul|ol|li)\b[^>]*>/giu)) {
+    const isList = tag.toLowerCase() !== 'li';
+    if (isList && !close) {
+      if (depth === 0) counts.push(0);
+      depth += 1;
+    } else if (isList) {
+      depth = Math.max(0, depth - 1);
+    } else if (!close && depth === 1) {
+      counts[counts.length - 1] += 1;
+    }
+  }
+  return counts;
+}
+
 // A "wall of text": run-on prose with no structure. Two shapes, both what the
 // CTO flagged (tg#8970 — an 8-point message that was still "very hard to read"):
-//   1. A single non-markup line longer than WALL_LINE_CHARS (a run-on paragraph).
+//   1. A single non-markup line whose VISIBLE text (tags stripped, entities
+//      counted as one char — tg-cli#259) is longer than WALL_LINE_CHARS.
 //   2. An inline comma-run enumeration after a pros/cons label on ONE line
 //      ("плюсы: a, b, c, d") instead of a <ul> of one-line items.
 const WALL_LINE_CHARS = 350;
@@ -70,11 +219,26 @@ const INLINE_ENUM_RE =
 // BEFORE an opening tag and AFTER a closing/void tag — never splitting an
 // element from its own tags — so `<li>…</li>` stays one line and the
 // skip-list below (which matches a line's STARTING tag, e.g. `<li`) keeps
-// excluding it exactly as it did for a literal-newline body.
-const OPEN_BLOCK_RE = /<(?:h[1-6]|p|tr|li|table|ul|ol|blockquote|pre)\b[^>]*>/giu;
-const CLOSE_BLOCK_RE = /<\/(?:h[1-6]|p|tr|li|table|ul|ol|blockquote|pre)\s*>|<(?:hr|br)\b[^>]*\/?>/giu;
+// excluding it exactly as it did for a literal-newline body. The set is every
+// block element of Telegram's Rich Message tier (tg-cli#270); a tag added here
+// must also be decided for BOTH skip-lists (MARKUP_LINE_RE).
+const BLOCK_TAGS =
+  'h[1-6]|p|tr|li|table|caption|thead|tbody|tfoot|ul|ol|blockquote|pre|details|summary|aside|footer|figure|figcaption|tg-math-block';
+const OPEN_BLOCK_RE = new RegExp(`<(?:${BLOCK_TAGS})\\b[^>]*>`, 'giu');
+const CLOSE_BLOCK_RE = new RegExp(`</(?:${BLOCK_TAGS})\\s*>|<(?:hr|br)\\b[^>]*/?>`, 'giu');
+// A visual line that is table/list/code/quote markup, not the sender's prose:
+// skipped by both the wall-of-text and the Context-prose checks. <aside> is a
+// pull quote (someone else's words, like <blockquote>); <tg-math-block> is a
+// formula (like <pre>).
+const MARKUP_LINE_RE =
+  /^<\/?(?:table|tr|td|th|thead|tbody|tfoot|caption|ul|ol|li|pre|code|blockquote|aside|tg-math-block)\b/iu;
+const BOXED_GLYPH_RE = /[│┌┬┐└┴┘├┼┤─]/u;
+// Code contents get their angle brackets masked and their newlines folded, so
+// a whole <pre>/<code> element stays on the visual line its opening tag starts.
 function withVisualLineBreaks(body: string): string {
-  return body.replace(OPEN_BLOCK_RE, (tag) => `\n${tag}`).replace(CLOSE_BLOCK_RE, (tag) => `${tag}\n`);
+  return maskCodeContents(body, (inner) => maskAngles(inner).replace(/\r?\n/gu, ' '))
+    .replace(OPEN_BLOCK_RE, (tag) => `\n${tag}`)
+    .replace(CLOSE_BLOCK_RE, (tag) => `${tag}\n`);
 }
 function hasWallOfText(body: string): boolean {
   for (const raw of withVisualLineBreaks(body).split('\n')) {
@@ -87,9 +251,10 @@ function hasWallOfText(body: string): boolean {
     // across unrelated sections of a one-line body — see tg-cli#261.
     if (INLINE_ENUM_RE.test(line)) return true;
     if (line.includes('|')) continue; // table row
-    if (/^<\/?(?:table|tr|td|th|ul|ol|li|thead|tbody|caption|pre|code|blockquote)\b/iu.test(line)) continue;
-    if (/[│┌┬┐└┴┘├┼┤─]/u.test(line)) continue; // boxed table
-    if (line.length > WALL_LINE_CHARS) return true;
+    if (MARKUP_LINE_RE.test(line)) continue;
+    if (BOXED_GLYPH_RE.test(line)) continue; // boxed table
+    const visible = line.replace(TAG_RE, '').replace(/&(?:#\d+|#x[\da-f]+|\w+);/giu, '&');
+    if (visible.length > WALL_LINE_CHARS) return true;
   }
   return false;
 }
@@ -108,8 +273,8 @@ function hasContextProse(body: string): boolean {
     const line = raw.trim();
     if (line === '') continue;
     if (line.includes('|')) continue; // markdown pipe / boxed table row
-    if (/^<\/?(?:table|tr|td|th|ul|ol|li|thead|tbody|caption|blockquote|pre|code)\b/iu.test(line)) continue;
-    if (/[│┌┬┐└┴┘├┼┤─]/u.test(line)) continue; // boxed-table glyphs
+    if (MARKUP_LINE_RE.test(line)) continue;
+    if (BOXED_GLYPH_RE.test(line)) continue; // boxed-table glyphs
     // Count word characters so a divider line ("-----") is not "prose".
     const words = (line.match(/[\p{L}\p{N}]/gu) ?? []).length;
     if (words >= 20) return true;
@@ -125,27 +290,51 @@ function hasContextProse(body: string): boolean {
 export function validateEscalationFormat(body: string): EscalationFormatResult {
   const missing: string[] = [];
   const text = body ?? '';
+  const sections = splitSections(text);
 
-  const hasTable = detectTableKind(text) !== 'none';
-  const hasList = LIST_RE.test(text);
-  // Options must be a genuine multi-option structure: a table, or a list with
-  // >=2 items. A single bullet (e.g. a recommendation-only <ul><li>…</li></ul>)
-  // is NOT an options section — it must not satisfy this on its own.
-  const listItemCount = (text.match(LI_RE) ?? []).length;
-  const hasOptionsStructure = hasTable || listItemCount >= 2;
-  if (!hasOptionsStructure) {
+  // Options must be ONE genuine multi-option structure (tg-cli#216): a table
+  // with >= 2 option rows, or a single top-level list of >= 2 items. When the
+  // body names an Options section, only that section counts — a table before
+  // the first heading or under "Current behavior" is not the options. Without
+  // one, any section but Context / Recommendation / Where to look qualifies. A
+  // single bullet, a single-row table, a nested sub-list under one option, or
+  // bullets scattered over unrelated sections are not options.
+  const namedOptionSections = sections.filter((s) => OPTIONS_HEADING_RE.test(s.heading));
+  const optionSections =
+    namedOptionSections.length > 0 ? namedOptionSections : sections.filter((s) => !NON_OPTIONS_HEADING_RE.test(s.heading));
+  const tables = optionSections
+    .flatMap((s) => [...tableOptionRows(s.body), ...boxedOptionRows(s.body)])
+    .filter((rows) => rows.length >= 2);
+  const hasOptionsList = optionSections.some((s) => topLevelListItemCounts(s.body).some((n) => n >= 2));
+  if (tables.length === 0 && !hasOptionsList) {
     missing.push('Options as a real table (<table> / markdown pipe grid / tg --table) or a <ul>/<ol> list of >=2 options');
   }
-  if (!PROS_CONS_RE.test(text)) {
+  // An options TABLE carries its tradeoffs in its cells: every option row of
+  // every options table needs a filled cell beyond the option's own name, or
+  // the pros/cons header is an empty promise.
+  const tradeoffsFilled =
+    hasOptionsList || tables.every((rows) => rows.every((cells) => cells.filter(Boolean).length >= 2));
+  if (!PROS_CONS_RE.test(text) || !tradeoffsFilled) {
     missing.push('Pros/cons (tradeoffs) for each option — "плюсы/минусы", pros/cons');
   }
-  if (!RECOMMENDATION_RE.test(text)) {
+  // A recommendation phrase in the prose; a Recommendation heading that states
+  // it ("I recommend A"); or a Recommendation-label heading whose section
+  // actually says something — the label alone recommends nothing.
+  const hasRecommendation =
+    sections.some((s) => RECOMMENDATION_RE.test(s.body)) ||
+    sections.some(
+      (s) =>
+        RECOMMENDATION_RE.test(s.heading) &&
+        (HAS_CONTENT_RE.test(s.body.replace(TAG_RE, '')) ||
+          s.heading.split(/\s+/u).some((w) => HAS_CONTENT_RE.test(w) && !RECOMMENDATION_LABEL_WORD_RE.test(w))),
+    );
+  if (!hasRecommendation) {
     missing.push('A recommendation (which option you’d pick and why) — "рекомендация"');
   }
-  // A concrete file / code reference is REQUIRED — a bare "where to look" phrase
-  // with no actual pointer is useless to the reviewer.
-  if (!FILE_REF_RE.test(text)) {
-    missing.push('Where to look — a concrete file reference (e.g. features/foo.ts:42) — "где смотреть"');
+  // A concrete file:line is REQUIRED — a bare "where to look" phrase or a bare
+  // path is useless to the reviewer.
+  if (!hasFileRef(text)) {
+    missing.push('Where to look — a concrete file:line reference (e.g. features/foo.ts:42) — "где смотреть"');
   }
   if (!hasContextProse(text)) {
     missing.push('Context — a sentence of prose on where the code is and what it does');
@@ -158,7 +347,7 @@ export function validateEscalationFormat(body: string): EscalationFormatResult {
   if ((text.match(HEADING_RE) ?? []).length < 2) {
     missing.push('Structure — put each section under its own <h3>/<h4> heading (needs --format html; ≥2 headings)');
   }
-  if (!hasList) {
+  if (!LIST_RE.test(text)) {
     missing.push('Structure — use <ul>/<ol> bullet lists for pros/cons and enumerations (one short item per <li>, never inline "плюсы: a, b, c")');
   }
   if (!HR_RE.test(text)) {

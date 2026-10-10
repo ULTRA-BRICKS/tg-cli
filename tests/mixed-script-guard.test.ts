@@ -146,3 +146,49 @@ test('a decomposed accented letter run stays single-script (combining marks do n
   // "e" + combining acute (U+0301) is Latin; no Cyrillic, so it passes.
   expect(findMixedScriptTokens('café deployé')).toBeNull();
 });
+
+// --- tg-cli#227: invisible format chars (\p{Cf}) ride inside a run ---
+
+test('#227: a zero-width space / ZWNJ / soft hyphen / word joiner inside a mojibake word does not hide it', () => {
+  for (const cf of ['\u200B', '\u200C', '\u00AD', '\u2060', '\uFEFF']) {
+    const garble = `поч${cf}česна`;
+    const finding = findMixedScriptTokens(`задача ${garble}`);
+    expect({ cf: cf.codePointAt(0), found: finding?.tokens[0]?.token }).toEqual({ cf: cf.codePointAt(0), found: garble });
+  }
+});
+
+test('#227: a format char between two clean words does not glue them into a garbage run', () => {
+  expect(findMixedScriptTokens('готово\u200Bdone')).toBeNull();
+});
+
+// Deliberate: invisible chars join what they sit between, so three words glued
+// by them READ as one word ("PRготовоdone") and are judged as one run.
+test('#227: three words glued only by zero-width spaces are judged as the one word they render as', () => {
+  expect(findMixedScriptTokens('PR\u200Bготово\u200Bdone')?.tokens[0]?.token).toBe('PR\u200Bготово\u200Bdone');
+});
+
+// --- tg-cli#215 / #226: Cyrillic-affixed English stems and acronyms are legit ---
+
+test('#226: Russian dev slang (Cyrillic prefix + English verb stem + Cyrillic suffix) passes', () => {
+  for (const word of ['заpushил', 'заmergeил', 'заcommitил', 'отdebugил', 'заdeployил']) {
+    expect({ word, finding: findMixedScriptTokens(`я ${word} всё`) }).toEqual({ word, finding: null });
+  }
+});
+
+test('#215: a Latin acronym island with a Cyrillic prefix AND suffix passes', () => {
+  for (const word of ['антиDDoSный', 'поSSHился', 'заCIшить']) {
+    expect({ word, finding: findMixedScriptTokens(word) }).toEqual({ word, finding: null });
+  }
+});
+
+test('#215/#226: mojibake still blocks — diacritic island, homoglyph-only island, two islands', () => {
+  // čes carries a non-ASCII Latin letter; "pe" is made only of Latin letters
+  // that look Cyrillic (homoglyph substitution); "нaсeление" has TWO islands.
+  for (const garble of ['почčesна', 'пеpeход', 'нaсeление', 'починeна']) {
+    expect({ garble, found: findMixedScriptTokens(garble)?.tokens[0]?.token }).toEqual({ garble, found: garble });
+  }
+});
+
+test('#224: the guard is bidirectional — a Cyrillic letter inside a Latin word is flagged', () => {
+  expect(findMixedScriptTokens('hello mіr')?.tokens[0]?.token).toBe('mіr');
+});

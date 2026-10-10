@@ -3,6 +3,48 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.16
+
+- **The `--tag decision` format gate checks each section by its own content (#216).** Options now
+  needs ONE table with at least two option rows (with its pros/cons cells filled) or ONE top-level
+  list of at least two items. When the body has an Options heading ("Options", "Варианты",
+  "Предлагаемые варианты"), only that section counts; otherwise any section but Context /
+  Recommendation / Where to look does. A single-option table, an empty-cells table, one option
+  with a nested pros/cons sub-list, a table above the first heading standing in for an empty
+  Options section, or one bullet under Recommendation plus one under Where to look no longer
+  pass; a table with no `<th>` row keeps all its rows as options. A `Recommendation` heading with
+  nothing under it no longer counts as a recommendation (a heading that states one, "I recommend
+  A", does). A `# comment` line inside `<pre>` or a fence no longer opens a section.
+- **"Where to look" must be a real `file:line` (#217, #221).** A bare path (`features/foo.ts`),
+  and prose like `and/or`, `A/B`, `12:30` or `step:2` no longer satisfy it; `foo.ts:42`,
+  `features/cli/args:12`, `./tg:1219`, `Makefile:12` and forge `#L42` links do. `tg help format`
+  now states that a `--file`/`--photo` attachment does not count — write the `file:line` into the
+  body.
+- **The wall-of-text check measures visible text and respects code (#259, #270).** Tags and link
+  URLs no longer count toward a paragraph's length; tag-shaped text inside `<pre>`/`<code>` no
+  longer gets a virtual line break that split the code block into "prose"; `<details>`,
+  `<summary>`, `<aside>`, `<caption>`, `<thead>`/`<tbody>`/`<tfoot>`, `<footer>`, `<figure>` and
+  `<tg-math-block>` now break lines like the other Rich Message block tags (`<aside>` and
+  `<tg-math-block>` are skipped like `<blockquote>`/`<pre>`).
+- **Mixed-script guard: Russian dev slang passes, invisible characters no longer hide garbage
+  (#215, #226, #227, #224).** One plain-ASCII English stem or acronym wrapped in a Cyrillic prefix
+  and suffix (`заpushил`, `заmergeил`, `отdebugил`, `антиDDoSный`) is no longer blocked;
+  `почčesна`, a homoglyph-only island like `пеpeход`, and two islands still are. A zero-width
+  space, ZWNJ, soft hyphen, word joiner or BOM inside a word no longer splits it into two clean
+  halves. README, `tg --help` and the JSDoc now say the guard is bidirectional (`mіr` with a
+  Cyrillic `і` is blocked too).
+
+## 1.55.16
+
+- **`/tasks` reports a task-list failure instead of an empty board (Refs #201).** A `task list`
+  that exited non-zero, printed malformed JSON or printed non-array JSON rendered the same
+  "No matching tasks." board as a clean backlog, and the only trace was a daemon log line. The
+  board fans out one `task list` per lifecycle state, so one failed call also dropped that whole
+  column silently. `/tasks` now replies `couldn't load tasks — <reason>` (exit code and stderr, or
+  the parse failure) in the same topic/reply context; blank stdout with exit 0 is still an empty
+  backlog. Rescued from the closed PR #129/#135 review finding (branch
+  `fix/tasks-noop-guard-tg129`); its selector no-match half is already on main.
+
 ## 1.55.15
 
 - **A highlighted partial reply quote reaches the agent whole (#565, HYP-907).** `tg-ctl` cut
