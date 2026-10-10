@@ -218,7 +218,9 @@ outside tmux, the **abduco session the rig wrapper runs it in**. Start any harne
 (crash → relaunch and resume the same session), writes `~/.config/tg-cli/hosts/<name>.json`,
 and exports `RIG_SESSION`. From then on `/agent <label> <text>`, a reply to its message, or a
 plain message when it is the only agent is typed into its terminal exactly once, and its `tg`
-messages carry `[<label>]` as the `[window]` bracket. `tg-ctl status` lists it under
+messages carry `[<label>]` as the `[window]` bracket. Its Claude Code / Codex question and
+permission cards reach Telegram too; a late tap or a text reply to the card, and a late hatch
+approval notice, are typed into its terminal (v1.55.6). `tg-ctl status` lists it under
 `hosted (abduco, outside tmux)`. Spec: `docs/specs/2026-09-30-harness-agnostic-control.md`.
 
 An interactive agent started from a plain terminal tab — no `$TMUX`, not under the wrapper — has

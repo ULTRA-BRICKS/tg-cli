@@ -131,6 +131,28 @@ Routing: a `host:<name>` session is an `/agent` candidate (selector: label, sess
 basename), a reply target (the route origin `tg` stamped), the sole-candidate auto-bind when no tmux
 pane hosts an agent, and a picker row. It is not a forum-topic target yet (no session-registry entry).
 
+### 4.1 Native question / permission cards (tg-cli#544, #535)
+
+`tg-ctl ask` (the installed Claude Code / Codex hook) scopes its request to the session that asked:
+`$TMUX_PANE` first (unchanged); outside tmux, `host:<name>` — the record `$RIG_SESSION` names, used only
+when that host is live (§3) AND the hook process runs under its abduco server (`hostOfPid`). The
+variable alone proves nothing: it is inherited by everything started from the session. Otherwise the
+request stays unscoped, as before.
+
+The daemon believes a `host:<name>` scope only while the registry proves that host live right now
+(any client can send a paneId); a scope it cannot prove is dropped (`ask-forward host-unverified`) and
+the ask continues unscoped. A verified host is its session's registration: no `tg`-written
+registration is needed (`tg` auto-registers only inside tmux).
+
+A scoped hosted question defers inbound for `host:<name>` only, like a pane-scoped one — other
+sessions are typed into as usual. Once its hook is gone, everything goes through `deliverToHost`:
+a late tap on a question card types the chosen label (claimed first, so once), a text reply to the
+card types the reply (ledger, once per message), a hatch grant/deny notice types the notice. A
+connection lost after bytes were written is reported in the chat, never re-sent. A late PERMISSION
+tap is queued for the reconnecting hook: a host has no pane to capture, so its menu cannot be
+re-verified before a digit is typed (tg-cli#576). Known gap: a tmux pane that shows the session
+(`abduco -a`) is a second address the host-scoped question does not hold (tg-cli#575).
+
 ## 5. Unmanaged sessions
 
 A harness in no tmux pane and no live host record stays unreachable: `tg-ctl status` lists it, `/agent`

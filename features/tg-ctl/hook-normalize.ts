@@ -24,7 +24,7 @@ import { hookPayloadRole } from '../agent-role/role';
 
 export interface HookEnv {
   agent: AgentKind; // from the --agent flag the installer wrote (default claude)
-  paneId?: string; // process.env.TMUX_PANE of the hook process
+  paneId?: string; // $TMUX_PANE of the hook process, else its verified rig-wrapper `host:<name>` (tg-cli#544)
   cwd?: string; // hook process cwd (payload.cwd wins when present)
   sessionName?: string; // tmux session of the pane
   windowName?: string; // tmux window name of the hook process

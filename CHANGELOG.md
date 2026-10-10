@@ -3,6 +3,24 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.6
+
+- **A Claude Code / Codex session hosted by the rig wrapper outside tmux forwards its question and
+  permission cards, and only its own inbound waits behind them (#544).** The ask hook took its scope
+  only from `$TMUX_PANE`, so a hosted session's ask was dropped `not-registered` (`tg` registers only
+  inside tmux) or, when a cwd registration matched, posted unscoped — and an unscoped open question
+  holds inbound for EVERY session. The hook now scopes the ask to `host:<name>`: the record
+  `$RIG_SESSION` names, used only when that host is live and the hook runs under its abduco server
+  (the variable alone is inherited by anything the session starts). The daemon re-checks the scope
+  against the live host registry (`ask-forward host-unverified` otherwise) and treats a verified host
+  as registered. Spec: `docs/specs/2026-09-30-harness-agnostic-control.md` §4.1.
+- **Late answers and hatch grant notices reach a hosted session's terminal (#535).** A tap on a
+  question card after the hook gave up, a text reply to that card, and a late hatch Approve/Deny
+  notice are typed into the session's PTY through `deliverToHost`, exactly once (a partly written
+  one is reported in the chat, never re-sent). A late permission tap for a hosted session is still
+  only queued for the reconnecting hook (#576). An unhosted claude outside tmux keeps the token
+  path on the card.
+
 ## 1.55.5
 
 - **An agent's `tg --reply-to <id>` answer to a message written inside a topic now lands in that

@@ -197,6 +197,12 @@ export function hostNameFromOriginId(id: string): string | null {
   return HOST_NAME.test(name) ? name : null;
 }
 
+// Whether `id` CLAIMS the host address space — valid name or not. A malformed `host:…` id is
+// never a tmux pane id either, so a caller that cannot resolve it must drop it, not pass it on.
+export function isHostOriginId(id: string | undefined): boolean {
+  return id?.startsWith(ORIGIN_PREFIX) ?? false;
+}
+
 // The name this host is shown under everywhere: label → cwd project → `<harness> · <short id>`
 // (the resolver's not-in-tmux tiers, session-name.ts).
 export function hostDisplayName(h: Pick<HostRecord, 'name' | 'harness' | 'label' | 'cwd'>): string {

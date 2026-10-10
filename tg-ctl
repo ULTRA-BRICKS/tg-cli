@@ -180,11 +180,12 @@ import {
   hostToCandidate,
   hostsDir,
   hostsNotShownElsewhere,
+  isHostOriginId,
   liveHosts,
   type HostRecord,
   type LiveHost,
 } from "./features/tg-ctl/host-registry"
-import { readHostRecords } from "./features/tg-ctl/host-registry-fs"
+import { readHostRecords, readOwnHostRecord } from "./features/tg-ctl/host-registry-fs"
 import {
   bindHookSessions,
   hookSightingOf,
@@ -1001,7 +1002,6 @@ const SUBPROC_ENV: Record<string, string> = (() => {
 // tmux absent / no server / ps failure → empty snapshot, never a crash:
 // discovery then degrades to the no-agent reply path.
 function snapshot(): { panes: PaneInfo[]; procs: ProcInfo[] } {
-  let procs: ProcInfo[] = []
   // Retry a transient empty/failed `tmux list-panes` before accepting "no panes". panesWithRetry is
   // a no-op on the happy path (breaks on the first non-empty read) and pure/unit-tested. The env is
   // forced UTF-8 (see SUBPROC_ENV) so tmux emits real tab separators.
@@ -1020,11 +1020,17 @@ function snapshot(): { panes: PaneInfo[]; procs: ProcInfo[] } {
     },
     { sleep: (ms) => Bun.sleepSync(ms) },
   )
+  return { panes, procs: readProcs() }
+}
+
+// The process table (`ps -axo pid,ppid,command`); empty on a ps failure, never a throw.
+function readProcs(): ProcInfo[] {
   // The ps query gets the SAME transient-empty resilience as tmux above: `ps -axo` returning an
   // empty list is impossible on a live system (system procs always exist), so an empty/failed read
   // is a launchd-runtime flake — and an empty procs list makes findAgentInPane match nothing, so
   // live agent panes report as "no agent" exactly like an empty tmux read (the gap the tmux-only
   // retry missed). Retry an exit-0-but-empty read; break on the first non-empty or a hard failure.
+  let procs: ProcInfo[] = []
   for (let i = 0; i < 3; i++) {
     if (i > 0) Bun.sleepSync(120)
     try {
@@ -1036,7 +1042,7 @@ function snapshot(): { panes: PaneInfo[]; procs: ProcInfo[] } {
       break // ps missing — never on a supported platform
     }
   }
-  return { panes, procs }
+  return procs
 }
 
 // Raw `#{pane_title}` per pane id — the harness title omp (`π > title`) and Claude Code
@@ -1438,6 +1444,18 @@ function deliverToHost(name: string, text: string, messageId: number | string | 
 function deliverHostPane(paneId: string, text: string, messageId: number | string | null | undefined): Promise<SinkResult> | null {
   const name = hostNameFromOriginId(paneId)
   return name === null ? null : deliverToHost(name, text, messageId)
+}
+
+// The `host:<name>` scope `tg-ctl ask` stamps on a question/permission asked OUTSIDE tmux (tg-cli#544,
+// spec §4.1): the session $RIG_SESSION names, believed only while that host is live AND this hook
+// process runs under its abduco server. The variable alone proves nothing — it is inherited by
+// everything started from the session, a detached worker included. undefined → the ask is unscoped.
+function hookHostScope(): string | undefined {
+  const record = readOwnHostRecord(resolveConfigDir(process.env.HOME ?? "~"), process.env.RIG_SESSION, process.getuid?.() ?? -1)
+  if (!record) return undefined
+  const procs = readProcs()
+  const { live } = liveHosts([record], procs, isUnixSocket)
+  return hostOfPid(process.pid, procs, live)?.name === record.name ? hostOriginId(record.name) : undefined
 }
 
 // `lsof -Fn` n-paths for a pid — used to find omp's primary session jsonl.
@@ -2195,28 +2213,37 @@ function queueToInbox(ctx: Ctx, key: string, entry: InboxEntry): void {
   tightenInboxModes(dir, pending)
 }
 
+// A failed delivery that may still have left its text in the agent's prompt: typed but not
+// submitted (#463), or a host PTY connection lost after bytes were written (#535). It is never
+// typed again; the caller names it in the chat.
+function mayBeInPrompt(res: { ok: boolean; error?: string; unsubmitted?: true; uncertain?: boolean }): res is { ok: false; error: string } {
+  return !res.ok && Boolean(res.unsubmitted || res.uncertain)
+}
+
 // Deliver an operation-bound grant notice to its exact origin. A recorded pane uses its
-// original route; OMP uses a verified session-bound socket and, when that is unavailable,
-// the durable scoped inbox its Stop bridge consumes at the next yield — never a cwd/name
-// guess or a spawn. Claude Code / Codex without a pane get nothing: they are tmux-only
-// (tg-cli#456), and their inbox delivered only at a turn end an idle or exited session
-// never reaches — every message stranded there was such a notice. The card then names
-// the token path.
+// original route; a rig-wrapper host (`host:<name>`, #535) its PTY; OMP uses a verified
+// session-bound socket and, when that is unavailable, the durable scoped inbox its Stop
+// bridge consumes at the next yield — never a cwd/name guess or a spawn. Claude Code /
+// Codex in no pane and no host get nothing: their inbox delivered only at a turn end an
+// idle or exited session never reaches — every message stranded there was such a notice
+// (tg-cli#456). The card then names the token path.
 async function routeGrantNotice(ctx: Ctx, req: ButtonRequest, text: string, deliveryId: string): Promise<boolean> {
   const ompOrigin = req.origin?.agent === "omp" || req.agent === "omp"
   if (req.paneId && !ompOrigin) {
+    const wrapped = wrapInbound(ctx.cfg.injectWrap, "tg", text)
     try {
-      const res = await executeInjectSteps(buildTextInjectPlan(req.paneId, wrapInbound(ctx.cfg.injectWrap, "tg", text), { sessionKey: req.sessionKey }))
-      // Typed but still in its input box (#463): name the pane and text in the chat.
-      if (!res.ok && res.unsubmitted) await sendMessage(ctx, res.error)
+      const res = await (deliverHostPane(req.paneId, wrapped, deliveryId) ??
+        executeInjectSteps(buildTextInjectPlan(req.paneId, wrapped, { sessionKey: req.sessionKey })))
+      if (!res.ok) log(`grant-notice route failed ${req.paneId}: ${res.error}`)
+      if (mayBeInPrompt(res)) await sendMessage(ctx, res.error)
       return res.ok
     } catch (err) {
-      log(`grant-notice pane route failed pane=${req.paneId}: ${err instanceof Error ? err.message : String(err)}`)
+      log(`grant-notice route failed ${req.paneId}: ${err instanceof Error ? err.message : String(err)}`)
       return false
     }
   }
   if (!ompOrigin) {
-    log(`grant-notice: ${req.agent} origin has no tmux pane — nothing queued (Claude Code/Codex are tmux-only)`)
+    log(`grant-notice: ${req.agent} origin has no tmux pane and no rig-wrapper host — nothing queued`)
     return false
   }
   await refreshOriginalHosts()
@@ -5050,6 +5077,18 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
     return
   }
 
+  // An ask's `host:<name>` scope (#544): any client can send a paneId, so the host must be live in
+  // the registry now. A verified host is that session's registration (the wrapper writes records
+  // for coordinators only, spec §3/§6) — no `tg`-written registration is needed. A scope the
+  // registry cannot prove (a malformed name included) is dropped and the ask continues unscoped
+  // (the pre-#544 behaviour) instead of holding a session it may not belong to.
+  const hostName = req.paneId ? hostNameFromOriginId(req.paneId) : null
+  const hostScoped = hostName !== null && listLiveHosts(readProcs()).some((h) => h.name === hostName)
+  if (!hostScoped && isHostOriginId(req.paneId)) {
+    log(`ask-forward host-unverified: ${req.paneId} is not a live rig-wrapper session — asking unscoped`)
+    req = { ...req, paneId: undefined }
+  }
+
   // The asking session (spec §2.6): the hook's own session id, else the
   // registry's occupant of the asking pane. Overwrites any client-sent value.
   const askReg = currentSessionRegistry()
@@ -5066,8 +5105,9 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
   const registrations = readRegistrations(ctx.paths)
   // Hatch permissions skip the pane/cwd registration set (tg-cli#333): non-tmux
   // omp sessions are never registered, and hatch is the documented exception to
-  // no-long-inline-process. canForwardButtonRequest still runs below.
-  if (!isHatchPermissionRequest(req) && !hookMatchesRegistration(registrations, req)) {
+  // no-long-inline-process. A verified host's record is its registration (#544).
+  // canForwardButtonRequest still runs below.
+  if (!isHatchPermissionRequest(req) && !hostScoped && !hookMatchesRegistration(registrations, req)) {
     log(
       `ask-forward dropped: reason=not-registered ${describeAskRequest(req)} reg=${describeRegistration(registrations)}`,
     )
@@ -5759,7 +5799,8 @@ async function askDaemon(ctx: Ctx): Promise<void> {
   // NEW process with a NEW nonce and can never collide.
   const env: HookEnv = {
     agent: hookAgentFromArgv(),
-    paneId: process.env.TMUX_PANE || undefined,
+    // A tmux pane first (unchanged); outside tmux, the rig-wrapper host this hook runs under (#544).
+    paneId: process.env.TMUX_PANE || hookHostScope(),
     cwd: process.cwd(),
     sessionName: tmuxSessionName(),
     windowName: tmuxWindowName(),
@@ -8325,8 +8366,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const res = await deliverOriginalOmp(live, wrapped, sourceMessageId ?? undefined, live.paneId)
       return res.ok ? { ok: true } : { ok: false, error: res.error }
     }
-    // A hosted session asks its questions unscoped (no TMUX_PANE), which defers every target
-    // (paneHasPendingQuestion): such a message waits in the queue below, never typed into the prompt.
+    // A hosted session's open question is scoped to its `host:<name>` (#544): a message for that
+    // host waits in the queue below, never typed into the prompt; other sessions are not held.
     const hostDelivery = shouldDeferInbound(paneId) ? null : deliverHostPane(paneId, wrapped, sourceMessageId)
     if (hostDelivery) {
       const res = await hostDelivery
@@ -11146,7 +11187,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // DIFFERENT permission's menu could appear before the digit lands —
       // the post-inject re-verify below narrows this but cannot fully close
       // it from outside the app.
-      if (paneId && retained.req.agent === "claude" && !shouldDeferInbound(paneId)) {
+      // A rig-wrapper host has no pane to capture, so its menu cannot be re-verified: queued.
+      if (paneId && hostNameFromOriginId(paneId) === null && retained.req.agent === "claude" && !shouldDeferInbound(paneId)) {
         const captured = capturePane(paneId)
         // BOTH must hold: the menu is showing, AND its BOUNDED context (never
         // the whole pane — see ParsedPermissionMenu.context) still identifies
@@ -11323,7 +11365,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       await answerCallbackQueryOrNotify(ctx, action, "agent is busy — tap again shortly")
       return true
     }
-    const refusal = paneSessionRefusal(retained.req.sessionKey, paneId)
+    // A host is addressed by its abduco session name, never reused for another session (spec §1.5);
+    // the pane guard is about a reused tmux `%N`. typeIntoHost re-verifies the host is live.
+    const refusal = hostNameFromOriginId(paneId) === null ? paneSessionRefusal(retained.req.sessionKey, paneId) : null
     if (refusal !== null) {
       log(`ask-late-deliver-refused: session left pane ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId}`)
       await answerCallbackQueryOrNotify(ctx, action, "not delivered — that session left its pane")
@@ -11354,12 +11398,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     pruneAnsweredButtons(answeredButtons, answeredAt)
     answeredButtons.set(action.requestId, { value: answer.value, label: answer.label, decision: answer.decision, at: answeredAt, delivery: "pane" })
     persistQuestions()
+    // omp: its original-process bridge. A rig-wrapper host (#535): its abduco PTY. Else the tmux
+    // pane. The claim above makes each of them once.
     const res = retained.req.agent === "omp"
-      ? await deliverOriginalOmp(liveOmpForPane(paneId) ?? { cwd: retained.req.cwd ?? "/" }, wrapInbound(ctx.cfg.injectWrap, "tg", answer.label), `answer:${action.requestId}`, paneId)
-      : await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
-    // Typed but still in the input box after the retry Enter (#463): keep the claim
-    // — a re-tap would type the answer a second time — and tell the CTO in the chat.
-    if (!res.ok && res.unsubmitted) {
+      ? await deliverOriginalOmp(liveOmpForPane(paneId) ?? { cwd: retained.req.cwd ?? "/" }, wrapped, `answer:${action.requestId}`, paneId)
+      : await (deliverHostPane(paneId, wrapped, `answer:${action.requestId}`) ?? executeInjectSteps(buildTextInjectPlan(paneId, wrapped)))
+    // Typed but still in the input box after the retry Enter (#463), or partly written into a
+    // host's PTY: keep the claim — a re-tap would type the answer a second time — and tell the CTO.
+    if (mayBeInPrompt(res)) {
       log(`ask-late-deliver-unsubmitted: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId}`)
       await answerCallbackQuery(ctx, action.callbackQueryId, "typed but not sent — see the chat")
       await sendMessage(ctx, res.error)
@@ -11449,10 +11495,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     answeredButtons.set(action.requestId, { value: answer, label: answer, at: answeredAt, delivery: "pane" })
     persistQuestions()
 
-    const res = await injectInbound(action.messageId, paneId, buildTextInjectPlan(paneId, answer, { sessionKey: retained.req.sessionKey }))
-    // Typed but still in the input box after the retry Enter (#463): keep the claim
-    // — a second reply would type the answer again — and tell the CTO.
-    if (!res.ok && res.unsubmitted) {
+    // A rig-wrapper host (#535) is typed into through its abduco PTY, once per reply (ledger).
+    const res = await (deliverHostPane(paneId, answer, action.messageId) ??
+      injectInbound(action.messageId, paneId, buildTextInjectPlan(paneId, answer, { sessionKey: retained.req.sessionKey })))
+    // Typed but still in the input box after the retry Enter (#463), or partly written into a
+    // host's PTY: keep the claim — a second reply would type the answer again — and tell the CTO.
+    if (mayBeInPrompt(res)) {
       log(`ask-post-timeout-reply-unsubmitted: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId}`)
       await sendMessage(ctx, res.error)
       return false
@@ -11462,7 +11510,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       abandonedButtons.set(action.requestId, { req: retained.req, messageId: retained.messageId, at: retained.at })
       persistQuestions()
       log(`ask-post-timeout-reply-failed: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId} err=${res.error}`)
-      await sendMessage(ctx, res.sessionMismatch ? res.error : "could not reach the terminal — reply to the question again", replyContext(action.threadId))
+      await sendMessage(ctx, "sessionMismatch" in res && res.sessionMismatch ? res.error : "could not reach the terminal — reply to the question again", replyContext(action.threadId))
       return false
     }
 

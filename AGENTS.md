@@ -140,6 +140,10 @@ opencode in NO pane and NO live host is listed by `tg-ctl status` as unreachable
 (`/agent <name> …` → one line naming `rig harness run <harness> --name <label>`), never
 queued — do not restore the Stop-hook inbox for them (#456). Only coordinators register
 (`role: "coordinator"`); tg-ctl never guesses a role from env, pane, cwd or process tree.
+A hosted session's question/permission card is scoped to `host:<name>` (#544, spec §4.1): the
+hook sets it from `$RIG_SESSION` only when it runs under that live host's abduco server, the
+daemon re-verifies it against the registry, and late answers / grant notices go through
+`deliverToHost` — never a tmux plan on a `host:` id.
 
 ### Exactly-once inbound delivery (#517, #299)
 
