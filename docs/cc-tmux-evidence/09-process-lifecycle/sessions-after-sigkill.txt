@@ -1,0 +1,9 @@
+total 16
+drwx------@  4 ultra  staff  128 Sep  5 02:10 .
+drwxr-xr-x@ 14 ultra  staff  448 Sep  5 02:10 ..
+-rw-------@  1 ultra  staff  108 Sep  5 02:10 78072.b0a7ceb2e78ff427bfc19f5307c0f85ad820ca9de1d3b4c68d1341c7f6acd1a0.key
+-rw-r--r--@  1 ultra  staff  598 Sep  5 02:10 78072.json
+srw-------@ 1 ultra  wheel  0 Sep  5 02:10 /tmp/cc-socks/78072.sock
+kill -0 78072:
+09-process-lifecycle.sh: line 30: kill: (78072) - No such process
+dead

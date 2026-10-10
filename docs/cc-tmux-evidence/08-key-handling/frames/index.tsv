@@ -1,0 +1,37 @@
+1788559417414	0001	0 0 zsh 0,2	no-session-file
+1788559418451	0002	0 0 bash 0,0	no-session-file
+1788559419497	0003	1 0 2.1.261 95,46	pid=98009 status=idle waitingFor=None statusUpdatedAt=1788559419395
+1788559420565	0004	1 0 2.1.261 2,46	pid=98009 status=busy waitingFor=None statusUpdatedAt=1788559420540
+1788559421633	0005	1 0 2.1.261 2,46	pid=98009 status=busy waitingFor=None statusUpdatedAt=1788559420540
+1788559422698	0006	1 0 2.1.261 1,19	pid=98009 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559422595
+1788559423762	0006	1 0 2.1.261 1,19	pid=98009 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559422595
+1788559424820	0007	1 0 2.1.261 1,19	pid=98009 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559422595
+1788559425883	0007	1 0 2.1.261 1,19	pid=98009 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559422595
+1788559426946	0007	1 1 2.1.261 1,19	pid=98009 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559422595
+1788559428005	0007	1 1 2.1.261 1,19	pid=98009 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559422595
+1788559429069	0008	1 0 2.1.261 2,46	pid=98009 status=busy waitingFor=None statusUpdatedAt=1788559428616
+1788559430126	0009	1 0 2.1.261 2,46	pid=98009 status=busy waitingFor=None statusUpdatedAt=1788559428616
+1788559431187	0010	1 0 2.1.261 2,46	pid=98009 status=busy waitingFor=None statusUpdatedAt=1788559428616
+1788559432248	0011	1 0 2.1.261 2,46	pid=98009 status=idle waitingFor=None statusUpdatedAt=1788559431706
+1788559433310	0011	1 0 2.1.261 2,46	pid=98009 status=idle waitingFor=None statusUpdatedAt=1788559431706
+1788559434371	0012	1 0 2.1.261 95,46	pid=98009 status=idle waitingFor=None statusUpdatedAt=1788559431706
+1788559435433	0013	1 0 2.1.261 2,46	pid=98009 status=busy waitingFor=None statusUpdatedAt=1788559434692
+1788559436495	0014	1 0 2.1.261 1,27	pid=98009 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559436461
+1788559437558	0015	1 0 2.1.261 1,27	pid=98009 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559436461
+1788559438620	0016	1 0 2.1.261 2,46	pid=98009 status=busy waitingFor=None statusUpdatedAt=1788559437724
+1788559439683	0017	1 0 2.1.261 2,46	pid=98009 status=idle waitingFor=None statusUpdatedAt=1788559439029
+1788559440744	0017	1 0 2.1.261 2,46	pid=98009 status=idle waitingFor=None statusUpdatedAt=1788559439029
+1788559441803	0018	1 0 2.1.261 95,46	pid=98009 status=busy waitingFor=None statusUpdatedAt=1788559441818
+1788559442873	0019	1 0 2.1.261 2,46	pid=98009 status=busy waitingFor=None statusUpdatedAt=1788559441818
+1788559443938	0020	1 0 2.1.261 1,35	pid=98009 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559443587
+1788559445002	0021	1 0 2.1.261 2,46	pid=98009 status=idle waitingFor=None statusUpdatedAt=1788559444901
+1788559446064	0021	1 0 2.1.261 2,46	pid=98009 status=idle waitingFor=None statusUpdatedAt=1788559444901
+1788559447122	0021	1 0 2.1.261 2,46	pid=98009 status=idle waitingFor=None statusUpdatedAt=1788559444901
+1788559448185	0022	1 0 2.1.261 95,46	pid=98009 status=idle waitingFor=None statusUpdatedAt=1788559444901
+1788559449249	0023	1 0 2.1.261 2,46	pid=98009 status=busy waitingFor=None statusUpdatedAt=1788559448927
+1788559450318	0024	1 0 2.1.261 2,46	pid=98009 status=busy waitingFor=None statusUpdatedAt=1788559448927
+1788559451399	0025	1 0 2.1.261 1,42	pid=98009 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559450871
+1788559452465	0026	1 0 2.1.261 1,44	pid=98009 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559450871
+1788559453533	0027	1 0 2.1.261 2,46	pid=98009 status=idle waitingFor=None statusUpdatedAt=1788559452985
+1788559454597	0027	1 0 2.1.261 2,46	pid=98009 status=idle waitingFor=None statusUpdatedAt=1788559452985
+1788559455654	0028	0 0 2.1.261 0,3	no-session-file

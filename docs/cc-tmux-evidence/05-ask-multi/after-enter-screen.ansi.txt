@@ -1,0 +1,49 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.261
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 4.5 · Claude API
+[38;5;174m  ▝▝ ▝▝  [39m  [38;5;246m/private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-study-62112/repo
+
+[39m  Fable 5.1 writes better code and reports progress on long tasks. Switch anytime with [38;5;153m/model[39m.
+
+[38;5;239m[48;5;237m❯ [38;5;231mCall the AskUserQuestion tool ONCE with two questions: "Which color?" (options Red, Green) and "Which size?" (options Small, Large). Do not answer them yourself.[39m                                     
+
+[38;5;246m[49m⏺ [39mUser answered Claude's questions:
+[38;5;246m  ⎿  · Which color? → Red
+[39m     [38;5;246m· Which size? → Large
+
+[38;5;231m⏺[39m Done! I've asked both questions. The user selected:
+  - [1mColor[0m: Red              
+  - [1mSize[0m: Large
+                            
+[38;5;246m✻[39m [38;5;246mSautéed for 7s · done 2:01 AM
+
+
+
+
+[39m           
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m⏸ manual mode on · ? for shortcuts · ← for agents[39m 

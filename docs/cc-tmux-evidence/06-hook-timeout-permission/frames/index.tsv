@@ -1,0 +1,73 @@
+1788559992137	0001	0 0 zsh 0,2	no-session-file
+1788559993188	0001	0 0 zsh 0,2	no-session-file
+1788559994232	0002	0 0 2.1.261 0,0	no-session-file
+1788559995278	0003	1 0 2.1.261 102,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788559994482
+1788559996363	0004	1 0 2.1.261 2,46	pid=29760 status=busy waitingFor=None statusUpdatedAt=1788559996224
+1788559997487	0005	1 0 2.1.261 2,46	pid=29760 status=busy waitingFor=None statusUpdatedAt=1788559996224
+1788559998569	0006	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788559999651	0006	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560000728	0006	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560001808	0006	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560002887	0007	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560003990	0007	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560005121	0007	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560006231	0007	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560007320	0007	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560008405	0008	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560009489	0008	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560010575	0008	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560011656	0008	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560012737	0008	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560013817	0009	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560014902	0009	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560015984	0009	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560017059	0009	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560018136	0010	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560019217	0010	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560020298	0010	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560021379	0010	1 0 2.1.261 1,19	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559998477
+1788560022458	0011	1 0 2.1.261 2,46	pid=29760 status=busy waitingFor=None statusUpdatedAt=1788560021632
+1788560023541	0012	1 0 2.1.261 2,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788560022853
+1788560024619	0012	1 0 2.1.261 2,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788560022853
+1788560025702	0012	1 0 2.1.261 2,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788560022853
+1788560026781	0013	1 0 2.1.261 104,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788560022853
+1788560027862	0014	1 0 2.1.261 2,46	pid=29760 status=busy waitingFor=None statusUpdatedAt=1788560026832
+1788560028947	0015	1 0 2.1.261 1,27	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560028556
+1788560030025	0015	1 0 2.1.261 1,27	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560028556
+1788560031105	0016	1 0 2.1.261 2,46	pid=29760 status=busy waitingFor=None statusUpdatedAt=1788560030693
+1788560032184	0017	1 0 2.1.261 2,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788560031778
+1788560033266	0017	1 0 2.1.261 2,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788560031778
+1788560034345	0017	1 0 2.1.261 2,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788560031778
+1788560035424	0017	1 0 2.1.261 2,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788560031778
+1788560036504	0017	1 0 2.1.261 2,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788560031778
+1788560037585	0017	1 0 2.1.261 2,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788560031778
+1788560038663	0017	1 0 2.1.261 2,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788560031778
+1788560039741	0018	1 0 2.1.261 104,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788560031778
+1788560040821	0019	1 0 2.1.261 2,46	pid=29760 status=busy waitingFor=None statusUpdatedAt=1788560040001
+1788560041902	0020	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560042982	0021	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560044062	0021	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560045142	0021	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560046221	0021	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560047298	0022	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560048376	0022	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560049454	0022	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560050530	0022	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560051610	0023	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560052688	0023	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560053899	0023	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560055026	0023	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560056123	0023	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560057234	0023	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560058318	0023	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560059400	0024	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560986275	0024	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560987388	0024	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560988465	0024	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560989561	0024	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560990640	0025	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560991737	0025	1 0 2.1.261 1,36	pid=29760 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788560041675
+1788560992868	0026	1 0 2.1.261 2,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788560992043
+1788560994059	0026	1 0 2.1.261 2,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788560992043
+1788560995276	0026	1 0 2.1.261 2,46	pid=29760 status=idle waitingFor=None statusUpdatedAt=1788560992043
+1788560996497	0027	0 0 2.1.261 0,3	no-session-file

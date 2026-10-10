@@ -1,0 +1,21 @@
+1788559998545	001	PermissionRequest	start pid=31237 sleep=20 reply=yes detach=0
+1788560003512	001	PermissionRequest	signal=TERM
+1788560004600	002	Notification	start pid=32462 sleep=0 reply= detach=0
+1788560004643	002	Notification	end
+1788560021734	003	PostToolUse	start pid=36814 sleep=0 reply= detach=0
+1788560021759	003	PostToolUse	end
+1788560028620	004	PermissionRequest	start pid=38463 sleep=2 reply=yes detach=0
+1788560030655	004	PermissionRequest	reply
+1788560030680	004	PermissionRequest	end
+1788560030775	005	PostToolUse	start pid=39002 sleep=0 reply= detach=0
+1788560030800	005	PostToolUse	end
+1788560041742	006	PermissionRequest	start pid=42543 sleep=20 reply=yes detach=1
+1788560042773	006	PermissionRequest	detached-child alive 1s
+1788560043804	006	PermissionRequest	detached-child alive 2s
+1788560044835	006	PermissionRequest	detached-child alive 3s
+1788560045868	006	PermissionRequest	detached-child alive 4s
+1788560046710	006	PermissionRequest	signal=TERM
+1788560046896	006	PermissionRequest	detached-child alive 5s
+1788560047740	007	Notification	start pid=44171 sleep=0 reply= detach=0
+1788560047764	007	Notification	end
+1788560047927	006	PermissionRequest	detached-child alive 6s

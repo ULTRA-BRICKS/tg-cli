@@ -1,0 +1,27 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.261[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 4.5 · Claude API[39m
+[38;5;174m  ▝▝ ▝▝  [39m  [38;5;246m/private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-study-50033/repo[39m
+
+  Fable 5.1 writes better code and reports progress on long tasks. Switch anytime with [38;5;153m/model[39m.
+
+[38;5;239m[48;5;237m❯ [38;5;231mUse the Edit tool to replace the word hello with goodbye in README.md. Do not explain, do not ask.[39m
+
+[49m  [38;5;246mRead [1m1[0m[38;5;246m file [39m
+
+[38;5;246m⏺[39m [1mUpdate[0m(]8;id=1wif56d;file:///private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-study-50033/repo/README.md\README.md]8;;\)
+
+[38;5;153m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;5;153mEdit file[0m
+ [38;5;246mREADME.md[39m
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[38;5;167m[48;5;52m 1 -[38;5;231mhello
+[38;5;77m[48;5;22m 1 +[38;5;231mgoodbye
+[2m[49m 2 [0m[38;5;231m world[39m
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m Do you want to make this edit to [1mREADME.md[0m?
+ [38;5;153m❯[39m [38;5;246m1. [38;5;153mYes[39m
+   [38;5;246m2. [39mYes, and switch to [1maccept edits (auto-approve file edits and common file commands)[0m for this session [1m(shift+tab)[0m
+   [38;5;246m3. [39mNo
+
+ [38;5;246mEsc to cancel · Tab to amend[39m

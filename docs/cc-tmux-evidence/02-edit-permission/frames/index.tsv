@@ -1,0 +1,18 @@
+1788559209066	0001	0 0 zsh 0,2	no-session-file
+1788559210107	0001	0 0 zsh 0,2	no-session-file
+1788559211149	0002	1 0 2.1.261 2,46	pid=52072 status=idle waitingFor=None statusUpdatedAt=1788559211064
+1788559212223	0003	1 0 2.1.261 100,46	pid=52072 status=idle waitingFor=None statusUpdatedAt=1788559211064
+1788559213294	0004	1 0 2.1.261 2,46	pid=52072 status=busy waitingFor=None statusUpdatedAt=1788559213133
+1788559214359	0005	1 0 2.1.261 2,46	pid=52072 status=busy waitingFor=None statusUpdatedAt=1788559213133
+1788559215426	0006	1 0 2.1.261 2,46	pid=52072 status=busy waitingFor=None statusUpdatedAt=1788559213133
+1788559216494	0007	1 0 2.1.261 2,46	pid=52072 status=busy waitingFor=None statusUpdatedAt=1788559213133
+1788559217562	0008	1 0 2.1.261 2,46	pid=52072 status=busy waitingFor=None statusUpdatedAt=1788559213133
+1788559218648	0009	1 0 2.1.261 1,22	pid=52072 status=waiting waitingFor='permission prompt' statusUpdatedAt=1788559217908
+1788559219731	0010	1 0 2.1.261 2,46	pid=52072 status=idle waitingFor=None statusUpdatedAt=1788559219356
+1788559220804	0010	1 0 2.1.261 2,46	pid=52072 status=idle waitingFor=None statusUpdatedAt=1788559219356
+1788559221868	0010	1 0 2.1.261 2,46	pid=52072 status=idle waitingFor=None statusUpdatedAt=1788559219356
+1788559222940	0010	1 0 2.1.261 2,46	pid=52072 status=idle waitingFor=None statusUpdatedAt=1788559219356
+1788559224015	0010	1 0 2.1.261 2,46	pid=52072 status=idle waitingFor=None statusUpdatedAt=1788559219356
+1788559225084	0010	1 0 2.1.261 2,46	pid=52072 status=idle waitingFor=None statusUpdatedAt=1788559219356
+1788559226150	0010	1 0 2.1.261 2,46	pid=52072 status=idle waitingFor=None statusUpdatedAt=1788559219356
+1788559227224	0011	0 0 2.1.261 0,3	no-session-file

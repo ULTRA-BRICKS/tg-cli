@@ -1,0 +1,5 @@
+
+[2mResume this session with:[0m
+[2mclaude --resume 5d993f87-b74f-4df0-ab18-6759f5d298af[0m
+
+[1m[33multra[39m in [36mrepo[39m on [38;5;244m main[39m using [38;5;26m☁️  default/gam-utility-1204[39m took [33m16.3s[39m [32m❯[39m [0m

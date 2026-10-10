@@ -1,0 +1,10 @@
+# claude pid=29760 2026-09-04T22:29:51Z
+## 29760.json
+{"pid":29760,"sessionId":"b17e551b-c094-46e3-b261-6a8f9385c0f7","cwd":"/private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-study-27750/repo","startedAt":1788559994441,"procStart":"Fri Sep  4 22:13:13 2026","version":"2.1.261","peerProtocol":1,"peerFeatures":["notify_idle","reply_across_default_dirs","artifact_yield"],"kind":"interactive","entrypoint":"cli","pidDomain":"darwin","tmux":"study:@0.%0","messagingSocketPath":"/tmp/cc-socks/29760.sock","name":"repo-5a","nameSource":"derived","nameSince":1788559994441,"status":"waiting","updatedAt":1788560041675,"statusUpdatedAt":1788560041675,"waitingFor":"permission prompt"}
+## lsof unix sockets
+2.1.261 unix ->0x9f7c6c4a219f2244 
+2.1.261 unix ->0xda2968bbf7f84ff9 
+2.1.261 unix /tmp/cc-socks/29760.sock 
+COMMAND TYPE NODE NAME
+## /tmp/cc-socks/29760.sock
+srw-------@ 1 ultra  wheel  0 Sep  5 02:13 /tmp/cc-socks/29760.sock

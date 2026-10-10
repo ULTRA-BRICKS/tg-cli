@@ -1,0 +1,5 @@
+
+[2mResume this session with:[0m
+[2mclaude --resume 6495872a-f699-49a2-b5e3-98ed1f530929[0m
+
+[1m[33multra[39m in [36mrepo[39m on [38;5;244m main[39m took [33m11.4s[39m …[32m❯[39m [0m

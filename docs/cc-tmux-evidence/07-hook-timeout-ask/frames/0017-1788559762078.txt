@@ -1,0 +1,49 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.261[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 4.5 · Claude API[39m
+[38;5;174m  ▝▝ ▝▝  [39m  [38;5;246m/private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-study-53753/repo[39m
+
+  Fable 5.1 writes better code and reports progress on long tasks. Switch anytime with [38;5;153m/model[39m.
+
+[38;5;239m[48;5;237m❯ [38;5;231mCall the AskUserQuestion tool with exactly one question "Which color?" (header "Color") and the options Red (description "r") and Green (description "g"). Do not answer it yourself.[39m
+
+[38;5;246m[49m⏺ [39mUser answered Claude's questions:
+[38;5;246m  ⎿  · Which color? → Red[39m
+
+[38;5;231m⏺[39m The user selected [1mRed[0m.
+
+[38;5;246m✻[39m [38;5;246mChurned for 9s · done 2:09 AM[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mCall the AskUserQuestion tool again with the same single question "Which color?" (header "Color", options Red/Green). Do not answer it yourself.[39m
+[49m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[38;5;174m✶[39m [38;5;216mN[38;5;174mesting… [39m
+[38;5;246m  ⎿  Tip: Working on a plan or design doc? Ask Claude to publish it as an artifact — a polished web page you can open in your browser.[39m
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;246m❯ [39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m⏸ manual mode on · esc to interrupt · ← for agents[39m

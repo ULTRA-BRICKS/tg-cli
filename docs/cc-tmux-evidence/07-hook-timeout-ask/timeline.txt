@@ -1,0 +1,3 @@
+prompt_visible_at_ms=1788559734847
+late_reply_checked_at_ms=1788559756992
+late_reply=ignored (dialog still up) -> answering with 1

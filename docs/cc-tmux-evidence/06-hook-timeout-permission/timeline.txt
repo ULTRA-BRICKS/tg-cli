@@ -1,0 +1,5 @@
+prompt_visible_at_ms=1788559999257
+late_reply_checked_at_ms=1788560021451
+late_reply=ignored (prompt still up) -> answering with 1
+detached_prompt_visible_at_ms=1788560042041
+detached_late_reply=ignored (prompt still up) -> answering with 3 (No)

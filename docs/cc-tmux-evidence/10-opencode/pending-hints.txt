@@ -1,0 +1,2 @@
+41:  ┃  △ Permission required
+47:  ┃   Allow once   Allow always   Reject                                                                       ctrl+f fullscreen  ⇆ select  enter confirm

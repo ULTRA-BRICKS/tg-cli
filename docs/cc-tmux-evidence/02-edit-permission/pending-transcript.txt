@@ -1,0 +1,14 @@
+# /private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-study-50033/home/.claude/projects/-private-var-folders-1c-d4v7-mrs4b9085f6w7w9p35c0000gn-T-cc-study-50033-repo/cf2b3d10-e21e-4d5c-a6e9-24b22be8b5ae.jsonl
+# total_records=14 showing_last=12
+3: type=atis-latch extra={"atis": ""}
+4: type=file-history-snapshot extra={"messageId": "efef015d-c10c-44ca-afa5-76771c2e54d4", "snapshot": {"messageId": "efef015d-c10c-44ca-afa5-76771c2e54d4", "trackedFileBackups": {}, "timestamp": "2026-09-04T22:00:13.113Z"}, "isSnapshotU
+5: type=user timestamp=2026-09-04T22:00:13.113Z isSidechain=False uuid=efef015d role=user text='Use the Edit tool to replace the word hello with goodbye in '
+6: type=attachment timestamp=2026-09-04T22:00:13.113Z isSidechain=False uuid=b16e368a parentUuid=efef015d extra={"attachment": {"type": "deferred_tools_delta", "addedNames": ["CronCreate", "CronDelete", "CronList", "DesignSync", "EnterPlanMode", "EnterWorktree", "ExitPlanMode", "ExitWorktree", "Monitor", "Noteb
+7: type=attachment timestamp=2026-09-04T22:00:13.113Z isSidechain=False uuid=9a36b3bc parentUuid=b16e368a extra={"attachment": {"type": "agent_listing_delta", "addedTypes": ["claude", "claude-code-guide", "Explore", "general-purpose", "Plan", "statusline-setup"], "addedLines": ["- claude: Catch-all for any task
+8: type=attachment timestamp=2026-09-04T22:00:13.113Z isSidechain=False uuid=93ddf55f parentUuid=9a36b3bc extra={"attachment": {"type": "skill_listing", "content": "- design: Create a design canvas - a multi-artboard visual design published as an Artifact that runs Claude Design's canvas editor (an early previe
+9: type=attachment timestamp=2026-09-04T22:00:13.113Z isSidechain=False uuid=65caf090 parentUuid=93ddf55f extra={"attachment": {"type": "total_tokens_reminder", "text": "<total_tokens>15000000 tokens left</total_tokens>"}, "entrypoint": "cli"}
+10: type=ai-title extra={"aiTitle": "README.md hello to goodbye"}
+11: type=assistant timestamp=2026-09-04T22:00:14.870Z isSidechain=False uuid=99795317 parentUuid=65caf090 role=assistant content=[thinking]
+12: type=assistant timestamp=2026-09-04T22:00:15.945Z isSidechain=False uuid=6b066a53 parentUuid=99795317 role=assistant content=[tool_use:Read:toolu_01MaAn]
+13: type=user timestamp=2026-09-04T22:00:16.028Z isSidechain=False uuid=24af93a2 parentUuid=6b066a53 role=user content=[tool_result:toolu_01MaAn:'1\thello\n2\tworld\n3\t']
+14: type=attachment timestamp=2026-09-04T22:00:16.035Z isSidechain=False uuid=ed2008af parentUuid=24af93a2 extra={"attachment": {"type": "total_tokens_reminder", "text": "<total_tokens>14965476 tokens left</total_tokens>"}, "session_id": "cf2b3d10-e21e-4d5c-a6e9-24b22be8b5ae", "entrypoint": "cli"}

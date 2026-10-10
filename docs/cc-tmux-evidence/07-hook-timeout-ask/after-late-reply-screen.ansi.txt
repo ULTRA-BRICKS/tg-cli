@@ -1,0 +1,49 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.261
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 4.5 · Claude API
+[38;5;174m  ▝▝ ▝▝  [39m  [38;5;246m/private/var/folders/1c/d4v7_mrs4b9085f6w7w9p35c0000gn/T/cc-study-53753/repo
+
+[39m  Fable 5.1 writes better code and reports progress on long tasks. Switch anytime with [38;5;153m/model[39m.
+
+[38;5;239m[48;5;237m❯ [38;5;231mCall the AskUserQuestion tool with exactly one question "Which color?" (header "Color") and the options Red (description "r") and Green (description "g"). Do not answer it yourself.[39m                 
+[38;5;246m[49m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;16m[48;5;153m ☐ Color 
+
+[1m[38;5;231m[49mWhich color?
+
+[0m[38;5;153m❯[39m [38;5;246m1.[39m [38;5;153mRed
+[39m     [38;5;246mr
+[39m  [38;5;246m2.[39m Green
+     [38;5;246mg
+[39m  [38;5;246m3. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  4. Chat about this
+
+[38;5;246mEnter to select · ↑/↓ to navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[39m                                                    

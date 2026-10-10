@@ -1,0 +1,13 @@
+1788559729764	001	PreToolUse	start pid=55780 sleep=20 reply=yes detach=0
+1788559734730	001	PreToolUse	signal=TERM
+1788559734796	002	PermissionRequest	start pid=56025 sleep=0 reply= detach=0
+1788559734815	002	PermissionRequest	end
+1788559740799	003	Notification	start pid=56278 sleep=0 reply= detach=0
+1788559740819	003	Notification	end
+1788559757215	004	PostToolUse	start pid=57451 sleep=0 reply= detach=0
+1788559757235	004	PostToolUse	end
+1788559763984	005	PreToolUse	start pid=60107 sleep=2 reply=yes detach=0
+1788559766023	005	PreToolUse	reply
+1788559766057	005	PreToolUse	end
+1788559766128	006	PostToolUse	start pid=61612 sleep=0 reply= detach=0
+1788559766148	006	PostToolUse	end
