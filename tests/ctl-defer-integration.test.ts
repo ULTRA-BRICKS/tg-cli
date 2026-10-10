@@ -1435,6 +1435,52 @@ test('NO-WEDGE guard, CRITICAL exception (tg-cli#403): an UNSCOPED CRITICAL hatc
   await daemon.exited;
 }, 20_000);
 
+// tg-cli#149: a generic `tg-ctl ask "<question>"` is a shell command's approval
+// gate, not a prompt open in any pane, and it may wait up to 15 minutes. It must
+// not defer every agent pane's inbound the way an unscoped HOOK question does
+// (that rule is safe only because a hook question self-clears within ~110 s).
+test('a generic `tg-ctl ask "<question>"` does not defer inbound to agent panes while it waits', async () => {
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const edits: string[] = [];
+  const server = recordingServer(updateQueue, reactions, edits);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const ask = trackProc(
+    reg,
+    Bun.spawn([process.execPath, TG_CTL, 'ask', 'deploy the release?', '--timeout', '30'], {
+      cwd: cfgDir,
+      env: {
+        PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
+        HOME: cfgDir,
+        TG_CTL_CONFIG_DIR: cfgDir,
+        TG_API_BASE: `http://127.0.0.1:${server.port}`,
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    }),
+  );
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
+    expect(server.cb()).not.toBe('');
+  }
+
+  updateQueue.push([
+    { update_id: 90, message: { message_id: 91, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'keep working meanwhile' } },
+  ]);
+  await waitForInjected(cfgDir, 'keep working meanwhile', 8000);
+  // Still waiting for the human: the ask was not merely expired first.
+  expect(ask.exitCode).toBeNull();
+
+  ask.kill(9);
+  await ask.exited;
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 20_000);
+
 // The dangerous failure mode of the #58 sweep: an unscoped question's expiry must
 // NOT flush/drop a backlog that belongs to a DIFFERENT, still-live question on
 // the same pane. The deferred queue is keyed by PANE, not question, so a naive

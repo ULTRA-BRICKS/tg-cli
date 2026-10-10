@@ -469,6 +469,19 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
   (mentioning the queued decision by name if one was pending) — both from the daemon's poll-loop
   sweep while it is up, and on restore if the window elapsed while the daemon was down.
 
+- **Generic blocking approval (`tg-ctl ask "<question>" [--timeout SEC]`, tg-cli#149):** the
+  human yes/no primitive for scripts and safety hooks (agent-tools' `agent_hooks.approval_cmd`;
+  README "Blocking approval for scripts and hooks", spec §8 of
+  `docs/specs/2026-06-10-tg-ctl-control-design.md`). `features/tg-ctl/generic-ask.ts` is the pure
+  argv/timeout/verdict logic plus `isGenericAskRequest` (origin `tg-ctl-generic`, no pane);
+  `runGenericAsk` in `tg-ctl` sends an unscoped permission ButtonRequest with a fresh UUID. Exit 0
+  ONLY on an allow the daemon decided from its own getUpdates (allowed sender, this card); every
+  other outcome exits 1 — never add a path where it exits 0 without that. The internal submodes
+  (no args, exactly `--agent <kind>`, an argv made only of the `--verify-grant` grammar) are matched
+  positively and the generic check runs before the grant client, so every other argv is a real
+  prompt, never a client's silent exit 0. The daemon accepts a generic ask without a registration
+  and never defers pane inbound behind it (it is not a prompt in a pane).
+
 - **Graceful reload — no dropped channel (`tg-ctl.<botid>.deferred.json` + cooperative SIGTERM):**
   a reload (a deliberate `tg-ctl restart`, a launchd `bootout`/`bootstrap`, or a crash-relaunch)
   used to drop the live channel two ways. (1) The **defer-while-waiting backlog** — inbound queued

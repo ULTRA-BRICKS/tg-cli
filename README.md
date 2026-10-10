@@ -290,6 +290,42 @@ the Telegram question is kept visible as an expired-timeout card: the old option
 buttons are replaced with **Close**, and you can still reply to that card with
 plain text to send the answer into the agent pane post-factum.
 
+### Blocking approval for scripts and hooks (`tg-ctl ask "<question>"`, v1.55.10)
+Any process — a safety hook, a CI step, a harness with no question hook of its own — can
+ask you a yes/no question and wait for the answer:
+
+```bash
+tg-ctl ask "Force-push feature/x to origin?" --timeout 600 && git push --force-with-lease
+```
+
+The daemon posts an **Approve / Reject** card and the command blocks. It exits **0 only when
+you approve that card** — tap Approve, or reply `yes` to it — and the decision is read from the
+daemon's own `getUpdates` stream, from an allowed sender (every call gets a fresh random
+request id; nothing in a local file, the history log or another card can approve it). Reject,
+a timeout (`--timeout` seconds, default 300, max 900), an unreachable daemon, missing
+credentials or an empty question all exit **1** with the reason on stderr and nothing on
+stdout; an approval prints `approved` (or `approved: <detail>`). It needs no tmux and no
+session registration, and while it waits your messages to agents are delivered normally
+(it does not defer inbound the way an open agent question does).
+
+**As rig's `agent_hooks.approval_cmd`:** agent-tools safety hooks (e.g. block-reset-hard,
+pin-primary-worktree) run the repo's committed `approval_cmd` and allow the blocked
+command only on exit 0 — nonzero or a timeout blocks. Point it at `tg-ctl ask` in the
+consuming repo's `rig.yaml`:
+
+```yaml
+agent_hooks:
+  # Runs in a shell; the hook passes its context as RIG_APPROVAL_* env vars.
+  # Call tg-ctl by absolute path (the live symlink), never via ambient PATH.
+  approval_cmd: '"$HOME/.files/bin/tg-ctl" ask "Allow the blocked ${RIG_APPROVAL_HOOK:-safety-hook} action in $PWD?" --timeout 600'
+  # Keep the hook's own budget ABOVE --timeout, or the hook kills the ask first.
+  approval_cmd_timeout_s: 630
+```
+
+The harness hook that runs the safety check must itself allow a wait this long (Claude
+Code's per-hook `timeout`). These keys are read by agent-tools at hook runtime; rig's
+`rig.yaml` schema does not list them yet (rig-cli#183).
+
 ### Commands
 | Command | Effect |
 |---------|--------|

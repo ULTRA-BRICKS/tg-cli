@@ -69,6 +69,17 @@ test('SKILL.md and the blurb advertise --tag / --title and the four canonical ta
   expect(blurb).not.toContain('ОТВЕТ');
 });
 
+test('SKILL.md and the blurb advertise the synchronous `tg-ctl ask "<question>"` approval (tg-cli#149)', () => {
+  installSkill();
+  const skill = readFileSync(join(TH, '.agents/skills/tg/SKILL.md'), 'utf8');
+  const blurb = readFileSync(join(TH, '.agents/skills/.blurbs/tg.md'), 'utf8');
+
+  expect(skill).toContain('tg-ctl ask "question"');
+  expect(skill).toContain('without tmux');
+  expect(skill).toContain('Exit 0 means approved');
+  expect(blurb).toContain('tg-ctl ask "question"');
+});
+
 test('blurb in CLAUDE.md is idempotent and preserves existing content', () => {
   writeFileSync(join(TH, '.claude', 'CLAUDE.md'), '# personal\n\nmy notes\n');
   installSkill();

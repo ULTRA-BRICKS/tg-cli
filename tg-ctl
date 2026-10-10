@@ -362,6 +362,14 @@ import {
 } from "./features/tg-ctl/hook-install"
 import { applyCodexHookTrustBypass, detectRig, NO_RIG_EXIT, runRigDelegate } from "./features/tg-ctl/rig-delegate"
 import { normalizeHookRequests, type HookEnv } from "./features/tg-ctl/hook-normalize"
+import {
+  GENERIC_ASK_ORIGIN_AGENT,
+  genericAskDaemonAbandonMs,
+  isGenericAskRequest,
+  parseGenericAskArgv,
+  resolveGenericAskVerdict,
+  type GenericAskTimeout,
+} from "./features/tg-ctl/generic-ask"
 import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
 import {
   aggregateUsage,
@@ -513,6 +521,11 @@ export const USAGE = `Usage:
   tg-ctl ask             # internal: hook client, reads a ButtonRequest JSON from stdin
                          # optional per-request timeoutMs field extends the wait,
                          # capped at 15 min (agent-tools sends 600000 for hatch asks)
+  tg-ctl ask <question> [--timeout SEC]
+                         # blocking human approval for any script or hook: posts an
+                         # Approve/Reject card, exit 0 ONLY on an Approve tap; reject,
+                         # timeout (default 300s, max 900s), daemon down or no creds
+                         # exit 1. Works without tmux and without a registration.
   tg-ctl ask --verify-grant <approval_id> --hook <hook_id>
                          # internal: consume a late-approval grant by its id
                          # (single-use, bound to hook + operation + cwd); stdin
@@ -4965,6 +4978,8 @@ async function forwardAndPostQuestion(
   // (the underlying process actually exits/gets killed — armPendingSocketClose's
   // 'close' handler still retires it exactly as for any other request).
   if (!req.paneId && req.critical !== true) {
+    const abandonMs = clampRequestTimeoutMs(req.timeoutMs, UNSCOPED_ABANDON_MS)
+    log(`unscoped-abandon-armed: req=${req.requestId} ms=${abandonMs}`)
     entry.timer = setTimeout(() => {
       if (rt.pending.get(pendingKey) !== entry) return
       rt.pending.delete(pendingKey)
@@ -4978,7 +4993,7 @@ async function forwardAndPostQuestion(
     // Contract §1 (tg-cli#398): a per-request timeoutMs (hatch asks carry
     // 600000) overrides the unscoped-abandon default, clamped to the 15-min
     // cap (clampRequestTimeoutMs). Absent → UNSCOPED_ABANDON_MS unchanged.
-    }, clampRequestTimeoutMs(req.timeoutMs, UNSCOPED_ABANDON_MS))
+    }, abandonMs)
   }
   rt.pending.set(pendingKey, entry)
   const conn = armPendingSocketClose(ctx, rt, entry, pendingKey)
@@ -5148,8 +5163,9 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
   const registrations = readRegistrations(ctx.paths)
   // Hatch permissions skip the pane/cwd registration set (tg-cli#333): non-tmux
   // omp sessions are never registered, and hatch is the documented exception to
-  // no-long-inline-process. canForwardButtonRequest still runs below.
-  if (!isHatchPermissionRequest(req) && !hookMatchesRegistration(registrations, req)) {
+  // no-long-inline-process. Generic `tg-ctl ask "<question>"` calls skip it too
+  // (isGenericAskRequest). canForwardButtonRequest still runs below.
+  if (!isHatchPermissionRequest(req) && !isGenericAskRequest(req) && !hookMatchesRegistration(registrations, req)) {
     log(
       `ask-forward dropped: reason=not-registered ${describeAskRequest(req)} reg=${describeRegistration(registrations)}`,
     )
@@ -5911,6 +5927,45 @@ async function askDaemon(ctx: Ctx): Promise<void> {
       `ask-forward multi-question not-completed: req=${reqs[0].requestId} n=${reqs.length} pane=${reqs[0].paneId ?? "-"} — declined, timed out, or partial; local UI takes over`,
     )
   }
+}
+
+// Generic blocking approval (tg-cli#149): `tg-ctl ask "<question>"` posts an
+// Approve/Reject card and waits. Only a verified Telegram tap exits 0; reject,
+// timeout, an unreachable daemon or a malformed reply exit 1 (fail closed).
+async function runGenericAsk(ctx: Ctx, question: string, timeout: GenericAskTimeout): Promise<number> {
+  if (timeout.warning) console.error(`tg-ctl ask: ${timeout.warning}`)
+  const req: ButtonRequest = {
+    requestId: crypto.randomUUID(),
+    agent: "claude",
+    kind: "permission",
+    question,
+    cwd: process.cwd(),
+    // The daemon keeps the card a margin past the client's own deadline, so the
+    // client's timeout is the one that fires; clamped to the daemon's 15-min cap.
+    timeoutMs: genericAskDaemonAbandonMs(timeout.seconds),
+    origin: { agent: GENERIC_ASK_ORIGIN_AGENT },
+  }
+  log(`generic-ask requested: requestId=${req.requestId} timeoutS=${timeout.seconds} cwd=${req.cwd}`)
+  const attempt = await oneAskAttempt(ctx, JSON.stringify(req), timeout.seconds * 1000)
+  if (attempt.kind === "dropped") {
+    console.error("denied: daemon unreachable — is it running? try `tg-ctl start`")
+    log(`generic-ask denied: requestId=${req.requestId} reason=daemon-unreachable`)
+    return 1
+  }
+  if (attempt.kind === "timeout") {
+    console.error(`denied: timeout after ${timeout.seconds}s`)
+    log(`generic-ask denied: requestId=${req.requestId} reason=timeout`)
+    return 1
+  }
+  const verdict = resolveGenericAskVerdict(attempt.raw)
+  if (verdict.exitCode === 0) {
+    console.log(verdict.detail ? `approved: ${verdict.detail}` : "approved")
+    log(`generic-ask approved: requestId=${req.requestId}`)
+    return 0
+  }
+  console.error(verdict.reason)
+  log(`generic-ask denied: requestId=${req.requestId} reason=${verdict.reason}`)
+  return 1
 }
 
 function codexConfigDir(home: string): string {
@@ -7747,6 +7802,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // questions.ts — hatch is structurally headless), so there is no live prompt here
       // for an inbound message to actually collide with; excluding it restores the
       // original bounded-wedge invariant for everything else, unchanged.
+      // tg-cli#149: a generic `tg-ctl ask "<question>"` is a shell command's
+      // approval gate, not a prompt in any pane, and may wait up to 15 min — it
+      // must never hold every agent's inbound behind it.
+      if (isGenericAskRequest(pb.req)) continue
       if (!pb.req.paneId && pb.req.critical !== true) return true
       if (pb.req.paneId === paneId) return true
     }
@@ -12460,6 +12519,14 @@ if (import.meta.main) {
   const configDir = resolveConfigDir(home)
   const fileEnv = loadEnv(join(configDir, ".env"))
   const env = { ...fileEnv, ...process.env }
+  // `tg-ctl ask "<question>"` (tg-cli#149) fails CLOSED on every path below; the
+  // internal hook-client shapes (parseGenericAskArgv → null) keep their exit-0
+  // fast passthrough.
+  const genericAsk = cmd === "ask" ? parseGenericAskArgv(process.argv.slice(3)) : null
+  if (genericAsk && !genericAsk.question.trim()) {
+    console.error("denied: empty question")
+    process.exit(1)
+  }
 
   // usage-schedule-check is a LOCAL date check that shells out to `rig`/`tg` directly (no
   // Bot API call via ctx) — runs before the bot-token gate, same reasoning as voice-setup.
@@ -12483,6 +12550,10 @@ if (import.meta.main) {
 
   const token = env.TG_BOT_TOKEN ?? ""
   const botId = botIdFromToken(token)
+  if (genericAsk && (!botId || !env.TG_CHAT_ID)) {
+    console.error("denied: no bot credentials configured")
+    process.exit(1)
+  }
   if ((cmd === "ask" || cmd === "codex-usage-hook") && (!botId || !env.TG_CHAT_ID)) {
     process.exit(0)
   }
@@ -12551,6 +12622,10 @@ if (import.meta.main) {
     process.exit(runAuditDelivery(ctx, process.argv.slice(3)))
   }
   if (cmd === "ask") {
+    // A generic question first: parseGenericAskArgv returns null for every
+    // internal shape, so a `--verify-grant` word inside an unquoted question can
+    // never reach the grant client below (which exits 0).
+    if (genericAsk) process.exit(await runGenericAsk(ctx, genericAsk.question, genericAsk.timeout))
     // Grant-protocol client (tg-cli#398): `--verify-grant <approval_id> --hook
     // <hook_id>` (TOKEN path) or `--verify-grant --pull --hook <hook_id>` (PULL
     // path) — stdin carries the normalized payload with the recomputed

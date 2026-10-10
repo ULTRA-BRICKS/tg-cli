@@ -67,6 +67,11 @@ tg help format                                      # what formatting is support
 - Report a finished task / status / blocker / question to the user's phone.
 - Send a generated artifact (file, photo, PDF) produced during a session.
 - Long or multi-step work — push a full status update, not a one-liner.
+- Need a SYNCHRONOUS human yes/no before a risky step (or your harness has no
+  native question hook): run \`tg-ctl ask "question"\` (optionally
+  \`--timeout <seconds>\`, default 300, max 900). It works without tmux and blocks
+  until the Telegram Approve/Reject decision arrives. Exit 0 means approved;
+  reject, timeout, a missing daemon or a malformed reply exit 1 (fail closed).
 
 ## Header tag + title (\`--tag\` / \`--title\`)
 The message header is \`✳️ [window]\`. The message BODY always stays BELOW it —
@@ -286,6 +291,8 @@ const SKILL_BLURB =
   'on iOS); `--with-original` sends both, `--no-pdf` sends the raw file. ' +
   'The user can reply by VOICE — a voice note is transcribed by a local Whisper ' +
   '(`tg voice setup`) and injected like a typed reply. ' +
+  'For a synchronous human approval (exit 0 only on Approve; fails closed on reject/timeout), ' +
+  'run `tg-ctl ask "question"` — no tmux needed. ' +
   'Use to report results/questions to the user. Never curl Telegram directly.';
 
 const HOOK_MARKER = '# agent-tools-awareness';

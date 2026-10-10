@@ -3,6 +3,19 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.10
+
+- **`tg-ctl ask "<question>" [--timeout SEC]`: a blocking human approval for any script or
+  hook (#149).** It posts an Approve / Reject card and exits 0 only when you approve that card
+  (tap, or reply `yes`), read from the daemon's own update stream from an allowed sender; reject,
+  timeout (default 300 s, max 900 s), an unreachable daemon, missing credentials or an empty
+  question exit 1. Before, `tg-ctl ask` with a question argument fell into the hook client and
+  exited 0 with no prompt at all. Every call gets a fresh request id, so nothing in the history
+  log, another card or a stranger's tap can approve it. Works without tmux or a session
+  registration, and does not hold agents' inbound messages while it waits. README documents
+  wiring it as `agent_hooks.approval_cmd` in a consuming repo's `rig.yaml`; the installed `tg`
+  skill mentions it.
+
 ## 1.55.9
 
 - **`tg-ctl restart` (and the deploy's `restart --if-stale`) no longer leaves NO daemon running

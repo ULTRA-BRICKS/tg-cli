@@ -479,6 +479,38 @@ via a registration file written by `tg-ctl`). Otherwise they passthrough with ze
 latency — a normal keyboard session, or any session with no `tg-ctl`, is never blocked,
 delayed, or hung waiting for a button tap.
 
+**Generic blocking approval — `tg-ctl ask "<question>" [--timeout SEC]` (tg-cli#149):**
+a shell-callable human yes/no for callers that are not harness hooks (agent-tools'
+`agent_hooks.approval_cmd`, CI steps, harnesses with no question hook).
+
+- *Mode selection.* The internal ask submodes are recognized POSITIVELY: no args (hook
+  client, payload on stdin), exactly `--agent <kind>`, or an argv made ENTIRELY of the
+  grant client's grammar (`--verify-grant [<id>]`, `--pull`, `--hook <id>`). Every other
+  argv is a generic question, checked before the grant client — `--timeout` first,
+  `--timeout=N`, a question that starts with `--` or contains a `--verify-grant` word must
+  never fall into a client that exits 0. The question is every token except a valid
+  `--timeout N`/`--timeout=N` or a valueless `--timeout`, joined in order (an invalid
+  timeout value or an unknown flag stays visible in the question); an empty question is
+  denied. Timeout: default 300 s, clamped to [1, 900] with a stderr warning.
+- *Request.* An unscoped `permission` ButtonRequest (agent `claude`, Approve/Reject),
+  `requestId` = a fresh random UUID per call, `origin.agent = "tg-ctl-generic"`,
+  `timeoutMs` = client timeout + 15 s (the daemon's unscoped-abandon backstop, so the
+  client's own deadline fires first; the daemon caps it at 15 min).
+- *Daemon.* A generic ask (`isGenericAskRequest`: that origin and no pane) is accepted
+  without a registration — the fast-passthrough guard above protects keyboard harness
+  sessions, and this caller is neither. It does not defer inbound to any pane: it is not a
+  prompt open in a pane and may wait 15 minutes, far past the ~110 s that makes the
+  unscoped-question defer safe.
+- *Verdict (fail closed).* Exit 0 and stdout `approved` (`approved: <detail>` when the
+  reply carries one) only for an `allow` decision the daemon produced from an update it
+  received on its own `getUpdates` stream, from an allowed sender, for this card: an
+  Approve tap on it, or a yes-token text reply to it (`parseDecisionReplyToken`, the
+  same rule every permission card uses). Exit 1 with the reason on stderr for: an
+  explicit Reject, the daemon's `null` decline, the client timeout, an unreachable or
+  dropped socket, a malformed reply, an empty question, missing bot credentials. Nothing
+  on disk (history log, questions store) is consulted, so a local writer cannot forge an
+  approval; a tap on another card or by a non-allowed sender is ignored.
+
 ## 9. Config
 
 - `~/.config/tg-cli/.env`: `TG_BOT_TOKEN`, `TG_CHAT_ID` (existing).
