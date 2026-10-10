@@ -110,7 +110,7 @@ import {
   parseEmojiHelpers,
 } from "./features/render/html"
 import { buildPrefix } from "./features/render/prefix"
-import { toTablePre, detectTableKind, pipeTableToHtml } from "./features/render/table"
+import { toTablePre, pipeTableToHtml } from "./features/render/table"
 import { formatHelp } from "./features/render/format-help"
 import { colorizeHelp, shouldColorize } from "./features/render/help-color"
 import { createTelegramTransport, TelegramSendError } from "./features/transport/telegram"
@@ -1328,18 +1328,20 @@ if (import.meta.main) {
     // suggested example, use markdown pipes, so without this they arrive broken
     // ("таблица сломана"). Non-table lines are HTML-escaped for a plain-text send
     // (the resulting <table> forces HTML mode); left untouched when the caller
-    // already asked for --format html and owns their markup.
-    if (detectTableKind(caption) === "pipe") {
-      const escaper = format === "html" ? (s: string): string => s : escapeHtml
-      const conv = pipeTableToHtml(caption, escaper)
-      if (conv.converted) {
-        caption = conv.html
-        effectiveFormat = "html"
-      }
+    // already asked for --format html and owns their markup. Every grid in the
+    // body converts, even next to an existing <table> (tg-cli#218); grids inside
+    // code fences / <pre> / <code> stay verbatim (tg-cli#210).
+    const escaper = format === "html" ? (s: string): string => s : escapeHtml
+    const conv = pipeTableToHtml(caption, escaper)
+    if (conv.converted) {
+      caption = conv.html
+      effectiveFormat = "html"
     }
   }
 
-  if (shouldWarnLongUnstructuredPlainMessage({ text: caption, format, table, items })) {
+  // Judge the body as it will be SENT: a converted pipe table makes it html
+  // (tg-cli#219), and an html body is never an "unstructured plain" message.
+  if (shouldWarnLongUnstructuredPlainMessage({ text: caption, format: effectiveFormat, table, items })) {
     console.error(LONG_UNSTRUCTURED_MESSAGE_WARNING)
   }
 

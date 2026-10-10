@@ -257,3 +257,163 @@ test('pipeTableToHtml: a pipe-bearing prose line ABOVE the grid is not absorbed 
   expect(html).toContain('Choose A | B');
   expect(html).not.toContain('<th>Choose A</th>');
 });
+
+// --- tg-cli#210: code fences / <pre> / <code> are content, not tables ---
+
+const GRID = ['| Option | Cons |', '| --- | --- |', '| A | slow |'].join('\n');
+
+test('#210: detectTableKind ignores a pipe grid inside a ``` or ~~~ fence', () => {
+  expect(detectTableKind(['```md', GRID, '```'].join('\n'))).toBe('none');
+  expect(detectTableKind(['~~~', GRID, '~~~'].join('\n'))).toBe('none');
+});
+
+test('#210: detectTableKind ignores a pipe grid inside <pre> or <code>', () => {
+  expect(detectTableKind(`<pre>${GRID}</pre>`)).toBe('none');
+  expect(detectTableKind(`<pre><code class="language-md">\n${GRID}\n</code></pre>`)).toBe('none');
+});
+
+test('#210: pipeTableToHtml leaves a fenced grid verbatim but converts a real grid after it', () => {
+  const body = ['Example:', '```', GRID, '```', 'Actual:', GRID].join('\n');
+  const { html, converted } = pipeTableToHtml(body);
+  expect(converted).toBe(true);
+  expect(html).toContain(['```', GRID, '```'].join('\n'));
+  expect(html.match(/<table>/g)).toHaveLength(1);
+});
+
+// --- tg-cli#218: every pipe grid converts, even next to an existing table ---
+
+test('#218: a pipe grid after an existing HTML <table> is converted; the HTML table is untouched', () => {
+  const existing = '<table><tr><td>a</td></tr></table>';
+  const { html, converted } = pipeTableToHtml(`${existing}\n${GRID}`);
+  expect(converted).toBe(true);
+  expect(html.startsWith(existing)).toBe(true);
+  expect(html).toContain('<tr><th>Option</th><th>Cons</th></tr>');
+});
+
+test('#218: a pipe grid after our own boxed --table <pre> is converted too', () => {
+  const { html: boxed } = toTablePre('a\tb\n1\t2');
+  const { html, converted } = pipeTableToHtml(`${boxed}\n${GRID}`);
+  expect(converted).toBe(true);
+  expect(html).toContain(boxed);
+  expect(html).toContain('<tr><td>A</td><td>slow</td></tr>');
+});
+
+test('#218: two separate pipe grids both convert', () => {
+  const { html } = pipeTableToHtml(`${GRID}\n\nand\n\n${GRID}`);
+  expect(html.match(/<table>/g)).toHaveLength(2);
+});
+
+// --- tg-cli#221: ragged rows are normalized to the header's column count ---
+
+test('#221: a short data row is padded and a long one truncated to the header width', () => {
+  const body = ['| A | B | C |', '| --- | --- | --- |', '| 1 |', '| 1 | 2 | 3 | 4 | 5 |'].join('\n');
+  const { html } = pipeTableToHtml(body);
+  expect(html).toContain('<tr><td>1</td><td></td><td></td></tr>');
+  expect(html).toContain('<tr><td>1</td><td>2</td><td>3</td></tr>');
+  expect(html).not.toContain('<td>4</td>');
+});
+
+test('#221: a degenerate empty row is skipped, not emitted as an empty <tr>', () => {
+  const body = ['| A | B |', '| --- | --- |', '| |', '|  |  |', '| 1 | 2 |'].join('\n');
+  const { html } = pipeTableToHtml(body);
+  expect(html).toBe('<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>');
+});
+
+// Review finding: the code mask must use the same offsets as the body — a
+// CRLF body with a multi-line <pre> above a real grid must still convert it.
+test('#210: a CRLF body with a multi-line <pre> above a real grid still converts the grid', () => {
+  const body = '<pre>\r\nLLLLLLLLLL\r\n</pre>\r\n| H | I |\r\n| --- | --- |\r\n| 1 | 2 |';
+  const { html, converted } = pipeTableToHtml(body);
+  expect(converted).toBe(true);
+  expect(html).toContain('<tr><th>H</th><th>I</th></tr>');
+});
+
+// Review finding: a header line that is only a border pipe has no columns —
+// it is not a table, and its rows must not be swallowed into empty <tr>s.
+test('#221: a grid whose header has no cells stays prose', () => {
+  const body = '|\n|-|\n|a|';
+  expect(pipeTableToHtml(body)).toEqual({ html: body, converted: false });
+});
+
+// Review finding: prose that MENTIONS a tag ("the <code> tag") is not an
+// unclosed code element swallowing the rest of the body.
+test('#210: a bare "<code>" / "<pre>" mention in prose does not hide a later grid', () => {
+  for (const mention of ['Wrap it in the <code> tag.', 'Use <pre> for alignment.']) {
+    const { converted } = pipeTableToHtml(`${mention}\n${GRID}`);
+    expect({ mention, converted }).toEqual({ mention, converted: true });
+  }
+});
+
+// Review finding: two grids with no line between them are two tables.
+test('#218: back-to-back grids with no separating line convert to two tables', () => {
+  const second = ['| C | D |', '| - | - |', '| 3 | 4 |'].join('\n');
+  const { html } = pipeTableToHtml(`${GRID}\n${second}`);
+  expect(html.match(/<table>/g)).toHaveLength(2);
+  expect(html).toContain('<tr><th>C</th><th>D</th></tr>');
+});
+
+// Review finding: an inline <code> element INSIDE a cell is cell content; it
+// must not turn its row into "code" and break the grid apart.
+test('#210: a grid row with an inline <code> cell still converts with the grid', () => {
+  const body = ['| Name | Snippet |', '| --- | --- |', '| init | <code>a=1</code> |', '| run | plain |'].join('\n');
+  const { html } = pipeTableToHtml(body);
+  expect(html).toContain('<tr><td>init</td><td>&lt;code&gt;a=1&lt;/code&gt;</td></tr>');
+  expect(html).toContain('<tr><td>run</td><td>plain</td></tr>');
+});
+
+// Review finding: a fence closes only on a line that is JUST the fence.
+test('#210: a ``` line with trailing text inside a fence does not close it', () => {
+  const body = ['```', '``` js -- a fence starter shown literally', GRID, '```'].join('\n');
+  expect(pipeTableToHtml(body).converted).toBe(false);
+});
+
+// Review finding: a pipe inside an inline-code cell or an escaped \| is cell
+// text, not a column divider.
+test('#221: a pipe inside `inline code` or escaped as \\| stays inside its cell', () => {
+  const body = ['| Command | Description |', '| --- | --- |', '| `a|b` | pipe cmd |', '| x \\| y | escaped |'].join('\n');
+  const { html } = pipeTableToHtml(body);
+  expect(html).toContain('<tr><td>`a|b`</td><td>pipe cmd</td></tr>');
+  expect(html).toContain('<tr><td>x | y</td><td>escaped</td></tr>');
+});
+
+// Review finding: on CRLF input a fence still closes on its `\r`-ended line.
+test('#210: a closed fence in a CRLF body does not hide a later grid', () => {
+  const body = ['```', 'code', '```', '| H | I |', '| --- | --- |', '| 1 | 2 |'].join('\r\n');
+  const { html, converted } = pipeTableToHtml(body);
+  expect(converted).toBe(true);
+  expect(html).toContain('<tr><th>H</th><th>I</th></tr>');
+});
+
+// Review finding: the code region that opens first owns its lines.
+test('#210: a ``` inside <pre> opens no fence; a <pre> inside a fence opens no element', () => {
+  const fenceInPre = `<pre>\n\`\`\`\n</pre>\n${GRID}`;
+  expect(pipeTableToHtml(fenceInPre).converted).toBe(true);
+  const preInFence = `\`\`\`\n<pre> shown literally\n\`\`\`\n${GRID}\nthe </pre> tag`;
+  expect(pipeTableToHtml(preInFence).converted).toBe(true);
+});
+
+// Review finding: a rule between every row is decoration, not a new header.
+test('#218: a decorative separator between data rows keeps one table', () => {
+  const body = ['| A | B |', '| --- | --- |', '| 1 | 2 |', '| --- | --- |', '| 3 | 4 |'].join('\n');
+  expect(pipeTableToHtml(body).html).toBe(
+    '<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr><tr><td>3</td><td>4</td></tr></table>',
+  );
+});
+
+// Review finding: a degenerate header/separator pair does not swallow a
+// valid grid later in the same pipe block.
+test('#221: a degenerate header pair does not stop a later grid in the block', () => {
+  const body = ['|', '|-|', '| A | B |', '| --- | --- |', '| 1 | 2 |'].join('\n');
+  const { html, converted } = pipeTableToHtml(body);
+  expect(converted).toBe(true);
+  expect(html).toContain('<tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr>');
+});
+
+// Review finding: the code scan is linear — a long log body and a body full
+// of unclosed <code> tags convert without a per-line rescan of the rest.
+test('#210: large bodies with many lines or unclosed code tags stay fast', () => {
+  const started = performance.now();
+  pipeTableToHtml(`${'<code>'.repeat(11000)}|\n${GRID}`);
+  pipeTableToHtml('log line | x\n'.repeat(50000));
+  expect(performance.now() - started).toBeLessThan(2000);
+});

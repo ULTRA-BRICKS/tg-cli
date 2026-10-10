@@ -3,6 +3,21 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.60.5
+
+- **Markdown pipe-table auto-conversion: every grid converts, code examples stay verbatim
+  (#210, #218, #221).** A pipe grid inside a ```` ``` ````/`~~~` fence, a `<pre>`/`<code>`
+  element, or an inline `` `code` `` span is now sent as written instead of being rewritten into a
+  `<table>` (and no longer forces an html send). A grid that follows an existing `<table>` or a
+  boxed `tg --table` block is converted too — the converter used to give up on the whole body
+  when it saw any other table — and two grids in one body, even typed back to back, convert to two
+  tables; a `| --- |` rule typed between every data row stays one table. Ragged rows are padded or
+  truncated to the header's column count, an empty `| |` row is dropped instead of becoming an
+  empty `<tr>`, and a header line with no cells is left as text without hiding a grid below it.
+  Fences in CRLF bodies close correctly, and the code scan stays linear on large bodies.
+- **No more spurious "long plain message has little visible structure" warning after a pipe table
+  was converted (#219).** The warning now judges the body in its effective (html) format.
+
 ## 1.60.4
 
 - **Property tests for the text paths, and the five bugs they found (#606).** A seeded generator

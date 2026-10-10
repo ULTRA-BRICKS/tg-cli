@@ -141,6 +141,12 @@ export function toTablePre(input: string): { html: string; hasWide: boolean } {
 //             `||`-bearing lines plus an unrelated thematic break elsewhere
 //             in the body would false-positive as a table).
 // 'none' means no literal table was found by any of the three shapes.
+//
+// CODE IS CONTENT (tg-cli#210): a pipe grid or a <table> inside a ```/~~~
+// fence, a <pre>/<code> element, or an inline `code` span is an EXAMPLE the
+// sender wants shown verbatim, not a table — those regions are ignored for the
+// 'html' and 'pipe' shapes. 'boxed' is the exception: our own boxed table IS a
+// <pre> block, so it is matched on the whole body.
 export type TableKind = 'html' | 'boxed' | 'pipe' | 'none';
 
 const HTML_TABLE_RE = /<table[\s>]/iu;
@@ -152,24 +158,107 @@ const HTML_TABLE_RE = /<table[\s>]/iu;
 // a body that never called renderTable at all. The top/bottom bar glyphs, by
 // contrast, are only ever emitted by our own box-drawn table.
 const BOXED_TABLE_RE = /[┌┬┐└┴┘]/u;
-// A markdown table separator row, e.g. `| --- | --- |` or `--- | :--:`.
-// Matched against a line that has ALREADY been confirmed to contain both '-'
-// and '|' (see hasSeparatorRow below) — this pattern alone is too loose
-// (matches a bare run of colons/spaces too) to gate on by itself.
-const PIPE_SEPARATOR_ROW_RE = /^[\s|:-]+$/u;
+// A markdown table separator row, e.g. `| --- | --- |` or `--- | :--:`: only
+// dashes/colons/pipes/whitespace, AND itself containing a '-' and a '|' — a
+// bare `---` thematic break elsewhere in the body must never count.
+const PIPE_SEP_LINE_RE = /^[\s|:-]+$/u;
+const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/u;
+// A closing fence is the fence run and nothing else (CommonMark); a CRLF
+// body's trailing `\r` is line ending, not content.
+const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})[ \t\r]*$/u;
+// A CLOSED <pre>/<code> element. An unclosed one is prose that merely mentions
+// the tag ("wrap it in the <code> tag"), not code swallowing the rest. Opens
+// and closers are found separately (no lazy `[\s\S]*?` to EOF per open), so
+// a body full of unclosed tags stays linear.
+const CODE_OPEN_RE = /<(pre|code)\b/giu;
+const CODE_CLOSE_RE = { pre: /<\/pre\s*>/giu, code: /<\/code\s*>/giu } as const;
+const INLINE_CODE_RE = /`[^`\n]*`/gu;
+
+// Per line of `body.split('\n')`: is it code? A line is code when it is a
+// fence line or inside a ```/~~~ fence (an unclosed fence runs to the end, as
+// in CommonMark), or when it is touched by a <pre>/<code> element that spans
+// LINES. A one-line element (`| init | <code>a=1</code> |`) is cell or prose
+// content, not a code block — and a grid needs several lines, so a grid
+// wrapped in code always spans lines. One forward scan: whichever code region
+// opens first owns its lines, so a ``` inside a <pre> opens no fence and a
+// <pre> mentioned inside a fence opens no element. Splits `body` itself so the
+// line offsets match the element offsets exactly (a caller that strips `\r`
+// first would skew them on CRLF input).
+function codeLineMask(body: string): boolean[] {
+  const lines = body.split('\n');
+  const mask = lines.map(() => false);
+  // The next closer at/after a position, per tag. Positions only grow, so a
+  // cached hit (or a cached "none to EOF") is reused instead of rescanning.
+  const closers: Partial<Record<'pre' | 'code', { from: number; at: number; end: number }>> = {};
+  const nextClose = (tag: 'pre' | 'code', from: number): { at: number; end: number } => {
+    const hit = closers[tag];
+    if (hit && hit.from <= from && (hit.at === -1 || hit.at >= from)) return hit;
+    const re = new RegExp(CODE_CLOSE_RE[tag]);
+    re.lastIndex = from;
+    const m = re.exec(body);
+    const found = { from, at: m ? m.index : -1, end: m ? m.index + m[0].length : -1 };
+    closers[tag] = found;
+    return found;
+  };
+  const opens = new RegExp(CODE_OPEN_RE);
+  let fence: string | null = null;
+  let lineStart = 0;
+  for (let i = 0; i < lines.length; lineStart += lines[i].length + 1, i += 1) {
+    const line = lines[i];
+    if (fence !== null) {
+      mask[i] = true;
+      const close = FENCE_CLOSE_RE.exec(line)?.[1];
+      if (close && close[0] === fence[0] && close.length >= fence.length) fence = null;
+      continue;
+    }
+    const open = FENCE_RE.exec(line)?.[1];
+    if (open) {
+      mask[i] = true;
+      fence = open;
+      continue;
+    }
+    // A multi-line element opening on this line masks every line it touches;
+    // scanning resumes on the line after it ends. A one-line element is cell or
+    // prose content; scanning continues after it on the same line.
+    opens.lastIndex = 0;
+    for (let m = opens.exec(line); m; m = opens.exec(line)) {
+      const tag = m[1].toLowerCase() as 'pre' | 'code';
+      const close = nextClose(tag, lineStart + m.index + m[0].length);
+      if (close.at === -1) continue;
+      const lineEnd = lineStart + line.length;
+      if (close.end <= lineEnd) {
+        opens.lastIndex = close.end - lineStart;
+        continue;
+      }
+      mask[i] = true;
+      while (i + 1 < lines.length && lineStart + lines[i].length < close.end) {
+        lineStart += lines[i].length + 1;
+        i += 1;
+        mask[i] = true;
+      }
+      break;
+    }
+  }
+  return mask;
+}
+
+// A line that could be a pipe-table row: it carries a pipe OUTSIDE inline code
+// (`a | b` inside backticks is an example, not a cell divider).
+function isPipeLine(line: string): boolean {
+  return line.replace(INLINE_CODE_RE, '').includes('|');
+}
+function isSeparatorLine(line: string): boolean {
+  return line.includes('-') && line.includes('|') && PIPE_SEP_LINE_RE.test(line);
+}
 
 export function detectTableKind(body: string): TableKind {
   if (!body) return 'none';
-  if (HTML_TABLE_RE.test(body)) return 'html';
-  if (BOXED_TABLE_RE.test(body)) return 'boxed';
   const lines = body.split('\n');
-  const pipeRows = lines.filter((line) => (line.match(/\|/g) ?? []).length >= 1);
-  // The separator row itself MUST contain a pipe (not just dashes) — a bare
-  // `---` thematic break elsewhere in the body must never count.
-  const hasSeparatorRow = lines.some(
-    (line) => line.includes('-') && line.includes('|') && PIPE_SEPARATOR_ROW_RE.test(line),
-  );
-  if (pipeRows.length >= 2 && hasSeparatorRow) return 'pipe';
+  const code = codeLineMask(body);
+  const prose = lines.filter((_, i) => !code[i]);
+  if (HTML_TABLE_RE.test(prose.join('\n'))) return 'html';
+  if (BOXED_TABLE_RE.test(body)) return 'boxed';
+  if (prose.filter(isPipeLine).length >= 2 && prose.some(isSeparatorLine)) return 'pipe';
   return 'none';
 }
 
@@ -183,91 +272,125 @@ export function detectTableKind(body: string): TableKind {
 // only body shape Telegram renders as a real bordered table is the rich-HTML
 // `<table>`/<tr>/<th>/<td> tag (routed to sendRichMessage by isRichHtml).
 //
-// This converter upgrades every contiguous markdown pipe-table block in a body
-// to a `<table>` HTML block, leaving all non-table lines untouched (each passed
-// through `escapeText` — HTML-escape when the send was plain text, identity when
-// the caller already owns HTML markup). The FIRST data row of each block becomes
-// the header (<th>); the markdown separator row (`--- | ---`) is dropped. A run
-// of pipe lines with NO separator row is left as-is (it is ordinary prose with
-// pipes, e.g. `a || b`, not a table). Pure — no I/O.
+// This converter upgrades EVERY contiguous markdown pipe-table block in a body
+// to a `<table>` HTML block — independently, so an existing <table> or boxed
+// <pre> grid elsewhere in the body does not stop it (tg-cli#218) — leaving all
+// non-table lines untouched (each passed through `escapeText` — HTML-escape
+// when the send was plain text, identity when the caller already owns HTML
+// markup). Lines inside code (fences, <pre>/<code>) are never table rows
+// (tg-cli#210). The FIRST data row of each block becomes the header (<th>); the
+// markdown separator row (`--- | ---`) is dropped. A run of pipe lines with NO
+// separator row is left as-is (it is ordinary prose with pipes, e.g. `a || b`,
+// not a table). Pure — no I/O.
 //
 // A leading/trailing border pipe (`| a | b |`) yields empty edge cells on split;
-// those are dropped, interior empty cells are kept.
-const PIPE_SEP_LINE_RE = /^[\s|:-]+$/u;
-function isPipeLine(line: string): boolean {
-  return line.includes('|');
-}
-function isSeparatorLine(line: string): boolean {
-  return line.includes('-') && line.includes('|') && PIPE_SEP_LINE_RE.test(line);
-}
+// those are dropped, interior empty cells are kept. Data rows are normalized to
+// the header's column count — padded with empty cells or truncated — and a row
+// with no content at all (`| |`) is skipped (tg-cli#221), so Telegram never gets
+// an empty or mismatched <tr>.
+//
+// splitPipeRow: the cells of one grid row. A `|` inside an inline-code span or
+// escaped as `\|` is cell text, not a divider (GFM); `\|` renders as `|`.
 function splitPipeRow(line: string): string[] {
-  const cells = line.split('|').map((c) => c.trim());
+  const cells: string[] = [];
+  let cell = '';
+  let inCode = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (ch === '\\' && line[i + 1] === '|') {
+      cell += '|';
+      i += 1;
+    } else if (ch === '|' && !inCode) {
+      cells.push(cell.trim());
+      cell = '';
+    } else {
+      if (ch === '`') inCode = !inCode;
+      cell += ch;
+    }
+  }
+  cells.push(cell.trim());
   // Drop the empty leading/trailing cells produced by border pipes.
   if (cells.length && cells[0] === '') cells.shift();
   if (cells.length && cells[cells.length - 1] === '') cells.pop();
   return cells;
 }
-function renderHtmlTable(rows: string[][]): string {
-  const cell = (tag: 'th' | 'td', v: string): string => `<${tag}>${escapeCell(v)}</${tag}>`;
+function renderHtmlTable(header: string[], bodyRows: string[][]): string {
   const rowHtml = (cells: string[], tag: 'th' | 'td'): string =>
-    `<tr>${cells.map((c) => cell(tag, c)).join('')}</tr>`;
-  const [header, ...bodyRows] = rows;
-  const parts = [rowHtml(header, 'th'), ...bodyRows.map((r) => rowHtml(r, 'td'))];
-  return `<table>${parts.join('')}</table>`;
+    `<tr>${cells.map((v) => `<${tag}>${escapeCell(v)}</${tag}>`).join('')}</tr>`;
+  const rows = bodyRows
+    .filter((cells) => cells.some((c) => c !== ''))
+    .map((cells) => Array.from({ length: header.length }, (_, i) => cells[i] ?? ''));
+  return `<table>${[rowHtml(header, 'th'), ...rows.map((r) => rowHtml(r, 'td'))].join('')}</table>`;
 }
 
 export function pipeTableToHtml(
   body: string,
   escapeText: (s: string) => string = (s) => s,
 ): { html: string; converted: boolean } {
-  // Only touch bodies whose ONLY table-ish shape is a markdown pipe grid. A
-  // real <table>, our own boxed <pre>, or no table at all is left alone.
-  if (detectTableKind(body) !== 'pipe') return { html: escapeText(body), converted: false };
-
-  const lines = body.split('\n');
+  // No pipe, no grid: skip the line scans on the common plain send.
+  if (!body.includes('|')) return { html: escapeText(body), converted: false };
+  const code = codeLineMask(body);
+  const lines = body.split('\n').map((l) => l.replace(/\r$/, ''));
   const out: string[] = [];
   let block: string[] = [];
+  let prose: string[] = [];
   let converted = false;
 
-  const flushProse = (proseLines: string[]): void => {
-    if (proseLines.length) out.push(escapeText(proseLines.join('\n')));
+  const flushProse = (): void => {
+    if (prose.length) out.push(escapeText(prose.join('\n')));
+    prose = [];
   };
   const flushBlock = (): void => {
-    if (block.length === 0) return;
-    // A GFM table has the separator as the row DIRECTLY under the header, so the
-    // header is the line immediately before the first separator. Any pipe lines
-    // BEFORE that header are prose (e.g. a "Choose A | B" sentence just above the
-    // grid) — not table rows — and must not be absorbed as the header.
-    const sepIdx = block.findIndex(isSeparatorLine);
-    if (sepIdx >= 1) {
-      flushProse(block.slice(0, sepIdx - 1)); // pipe-prose above the header
-      const header = block[sepIdx - 1];
-      const dataRows = block.slice(sepIdx + 1).filter((l) => !isSeparatorLine(l));
-      out.push(renderHtmlTable([header, ...dataRows].map(splitPipeRow)));
-      converted = true;
-    } else {
-      // No separator in a valid header+separator position → prose, not a table.
-      flushProse(block);
-    }
+    let rest = block;
     block = [];
+    while (rest.length > 0) {
+      // A GFM table has the separator as the row DIRECTLY under the header, so
+      // the header is the line immediately before the first separator. Any pipe
+      // lines BEFORE that header are prose (e.g. a "Choose A | B" sentence just
+      // above the grid) — not table rows — and must not be absorbed as the header.
+      const sepIdx = rest.findIndex(isSeparatorLine);
+      if (sepIdx < 0) {
+        // No separator → prose with pipes, not a table.
+        prose = prose.concat(rest);
+        return;
+      }
+      const header = sepIdx >= 1 ? splitPipeRow(rest[sepIdx - 1]) : [];
+      if (header.length === 0) {
+        // A separator with no columned header above it: that pair is prose,
+        // but a valid grid later in the same block still converts.
+        prose = prose.concat(rest.slice(0, sepIdx + 1));
+        rest = rest.slice(sepIdx + 1);
+        continue;
+      }
+      prose = prose.concat(rest.slice(0, sepIdx - 1)); // pipe-prose above the header
+      flushProse();
+      // The grid runs until another header + separator pair starts the next one
+      // (two grids typed back to back are two tables). A row that itself sits
+      // under a separator is a data row followed by a decorative rule
+      // (`| 1 | 2 |` / `| --- | --- |` between every row), not a new header.
+      const startsNextGrid = (i: number): boolean =>
+        !isSeparatorLine(rest[i]) && isSeparatorLine(rest[i + 1] ?? '') && !isSeparatorLine(rest[i - 1]);
+      let end = sepIdx + 1;
+      while (end < rest.length && !startsNextGrid(end)) end += 1;
+      const dataRows = rest.slice(sepIdx + 1, end).filter((l) => !isSeparatorLine(l));
+      out.push(renderHtmlTable(header, dataRows.map(splitPipeRow)));
+      converted = true;
+      rest = rest.slice(end);
+    }
   };
 
-  let prose: string[] = [];
-  for (const raw of lines) {
-    const line = raw.replace(/\r$/, '');
-    if (isPipeLine(line)) {
-      if (prose.length) {
-        flushProse(prose);
-        prose = [];
-      }
+  lines.forEach((line, i) => {
+    if (!code[i] && isPipeLine(line)) {
       block.push(line);
     } else {
       flushBlock();
       prose.push(line);
     }
-  }
+  });
   flushBlock();
-  if (prose.length) flushProse(prose);
+  flushProse();
 
+  // Nothing converted: hand back the body exactly as the caller would have sent it.
+  if (!converted) return { html: escapeText(body), converted: false };
   return { html: out.join('\n'), converted };
 }

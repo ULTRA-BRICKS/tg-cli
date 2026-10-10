@@ -67,8 +67,12 @@ Markdown pipe grids are AUTO-CONVERTED:
       | A      | slow |
   would otherwise arrive as literal pipes and dashes. tg detects that shape and
   rewrites it to a real <table> (routed as a Rich Message), so you can type a
-  quick pipe grid and still get a rendered table. For full control, author the
-  <table> yourself with --format html.
+  quick pipe grid and still get a rendered table. Every grid in the body
+  converts; ragged rows are padded/truncated to the header's columns; write a
+  literal pipe inside a cell as \\| (a pipe inside an inline code span also
+  stays in its cell). A grid inside a triple-backtick / ~~~ fence or a
+  multi-line <pre>/<code> block is an example and is sent verbatim. For full
+  control, author the <table> yourself with --format html.
 
 HTML entities (tier-specific) — all NUMERIC entities work in both tiers. Named:
   BASIC send:  only &lt; < · &gt; > · &amp; & · &quot; "  (no others — a
