@@ -4,6 +4,7 @@ import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { buildKeyInjectPlan, buildTextInjectPlan } from '../features/tg-ctl/inject';
 import { messageStillTyped } from '../features/tg-ctl/input-box';
+import { permissionMenuUnchanged } from '../features/tg-ctl/permission-menu';
 import type { AgentKind, InjectStep } from '../features/tg-ctl/types';
 
 // Real-tmux integration (spec §11): InjectStep plans executed against a live
@@ -86,6 +87,9 @@ async function executeSteps(steps: InjectStep[], agent: AgentKind = 'claude'): P
     if (step.kind === 'verify-pane') {
       const list = tmux(['list-panes', '-a', '-F', '#{pane_id}']);
       expect(list.stdout.split('\n')).toContain(step.paneId);
+    } else if (step.kind === 'verify-permission-menu') {
+      // tg-ctl's verify-permission-menu: same `capture-pane -p -J` read, same pure check.
+      expect(permissionMenuUnchanged(tmux(['capture-pane', '-p', '-J', '-t', step.paneId]).stdout, step.target)).toBe(true);
     } else if (step.kind === 'submit-check') {
       // tg-ctl's submitCheckStep: same `capture-pane -p -J` read, same adapter call.
       const typed = messageStillTyped(agent, tmux(['capture-pane', '-p', '-J', '-t', step.paneId]).stdout, step.text);

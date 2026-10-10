@@ -8,6 +8,7 @@
 // SEPARATE Enter, then a submit check with one retry Enter (tg-cli#463).
 
 import { truncateWithEllipsis } from './text-util';
+import type { PermissionMenuTarget } from './permission-menu';
 import type { AgentKind, InjectStep } from './types';
 
 // {name}/{msg}/{id} substitution in a single pass over the TEMPLATE only, so
@@ -117,7 +118,7 @@ export function buildKeyInjectPlan(paneId: string, key: 'Escape'): InjectStep[] 
 // literal "1" with no Enter follow-up. Sending Enter afterward would risk it
 // landing on whatever prompt/input follows the now-resolved menu instead
 // (tg-cli#267's late-delivery-for-permissions path is the only caller).
-// `digit` is trusted single-character input: permission-menu.ts's OPTION_LINE
+// `target.digit` is trusted single-character input: permission-menu.ts's OPTION_LINE
 // regex captures exactly one digit at the source, so this is the only shape
 // that ever reaches here. Deliberately NOT silently truncating a longer
 // string here (an earlier version did `digit.slice(0, 1)`, framed as
@@ -127,9 +128,13 @@ export function buildKeyInjectPlan(paneId: string, key: 'Escape'): InjectStep[] 
 // contract, since it can never be distinguished from a correct single-digit
 // call — a real bug upstream would inject a plausible-looking WRONG answer
 // instead of surfacing loudly).
-export function buildDigitInjectPlan(paneId: string, digit: string, sessionKey?: string): InjectStep[] {
+// The verify-permission-menu step sits directly before the send-keys, inside the
+// pane's typing turn: the executor re-captures the pane and sends nothing unless
+// the menu `target` was resolved from is still the live one (tg-cli#309).
+export function buildDigitInjectPlan(paneId: string, target: PermissionMenuTarget, sessionKey?: string): InjectStep[] {
   return [
     sessionKey ? { kind: 'verify-pane', paneId, sessionKey } : { kind: 'verify-pane', paneId },
-    { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', paneId, '-l', digit] },
+    { kind: 'verify-permission-menu', paneId, target },
+    { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', paneId, '-l', target.digit] },
   ];
 }

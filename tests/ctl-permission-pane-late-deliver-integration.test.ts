@@ -16,6 +16,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
+import { DANGEROUS_LONG, permissionBoxFor as menuFor, SAFE_LONG, SHARED_99 } from './fixtures/permission-menu';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const PANE_ID = '%1';
@@ -64,6 +65,11 @@ case "$sub" in
     # branch at all).
     if [ -f '${cwd}/fail-post-capture' ] && [ ! -f '${cwd}/menu-text' ]; then exit 1; fi
     if [ -f '${cwd}/menu-text' ]; then cat '${cwd}/menu-text'; fi
+    # 'swap-menu-text' models the TOCTOU of tg-cli#309: the pane shows menu-text
+    # to THIS capture, then a different menu takes its place before anything else
+    # reads the pane (the human answered at the keyboard and the next permission
+    # rendered in the same spot).
+    if [ -f '${cwd}/swap-menu-text' ]; then mv '${cwd}/swap-menu-text' '${cwd}/menu-text'; fi
     ;;
   send-keys)
     while [ $# -gt 0 ]; do
@@ -76,7 +82,11 @@ case "$sub" in
         # 'resolve-strip-cursor' models the OTHER real possibility (review
         # finding): Claude Code leaves the resolved box visible in scrollback
         # instead of erasing it — text and options stay, only the cursor goes.
-        if [ -f '${cwd}/resolve-strip-cursor' ]; then
+        # 'next-menu-text' models Claude Code asking for the NEXT tool call at
+        # once: the digit resolves this menu and a different one takes its spot.
+        if [ -f '${cwd}/next-menu-text' ]; then
+          mv '${cwd}/next-menu-text' '${cwd}/menu-text'
+        elif [ -f '${cwd}/resolve-strip-cursor' ]; then
           sed -i.bak 's/❯ /  /' '${cwd}/menu-text' && rm -f '${cwd}/menu-text.bak'
         elif [ ! -f '${cwd}/keep-menu' ]; then
           rm -f '${cwd}/menu-text'
@@ -530,4 +540,103 @@ test('MISMATCHED IDENTITY: live menu showing a DIFFERENT command → never injec
   expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 6000)).toBe(true);
   expect(injected(cfgDir)).toEqual([]);
   expect(daemonLog(cfgDir)).not.toContain('ask-late-deliver-permission-pane:');
+}, 25_000);
+
+// tg-cli#309: a long command whose card carries a truncated summary; DANGEROUS_LONG
+// shares its first 99 characters (tests/fixtures/permission-menu.ts).
+const LONG_PERMISSION = {
+  requestId: 'p_long',
+  agent: 'claude',
+  kind: 'permission',
+  question: `Allow Bash? ${SHARED_99}…`,
+  toolInput: { command: SAFE_LONG },
+  permissionEvent: 'PermissionRequest',
+};
+
+test('TOCTOU #309: the menu is swapped for a DIFFERENT command sharing a 99-char prefix between the capture and send-keys → no digit is sent, the decision stays queued', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  await startDaemon(cfgDir, tg.port);
+  await abandon(cfgDir, tg, LONG_PERMISSION);
+  const allowData = tg.allowData()!;
+
+  // The first capture sees the request's own menu; every later read sees the
+  // DANGEROUS command's menu in the same spot. Sending "1" now would approve a
+  // command the human never saw.
+  writeFileSync(join(cfgDir, 'menu-text'), menuFor(SAFE_LONG));
+  writeFileSync(join(cfgDir, 'swap-menu-text'), menuFor(DANGEROUS_LONG));
+  tg.push([tap(allowData, 870, 1)]);
+
+  const queuedOrSent = (): boolean =>
+    tg.edits().some((e) => e.includes('queued') && e.includes('Approve')) || daemonLog(cfgDir).includes('ask-late-deliver-permission-pane:');
+  await until(queuedOrSent, 8000);
+  expect(injected(cfgDir)).toEqual([]);
+  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
+  expect(daemonLog(cfgDir)).toContain('permission menu changed before the digit was sent');
+  expect(daemonLog(cfgDir)).not.toContain('ask-late-deliver-permission-pane:');
+  expect(tg.answeredCbs().some((c) => c.text === '✓ sent to the agent')).toBe(false);
+}, 25_000);
+
+test('TRUNCATED IDENTITY #309: no toolInput, only a "…"-truncated question summary → never injects into a live menu sharing that prefix', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  await startDaemon(cfgDir, tg.port);
+  const { toolInput: _dropped, ...noToolInput } = LONG_PERMISSION;
+  await abandon(cfgDir, tg, noToolInput);
+  const allowData = tg.allowData()!;
+
+  writeFileSync(join(cfgDir, 'menu-text'), menuFor(DANGEROUS_LONG));
+  tg.push([tap(allowData, 871, 1)]);
+
+  await until(
+    () => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')) || daemonLog(cfgDir).includes('ask-late-deliver-permission-pane:'),
+    8000,
+  );
+  expect(injected(cfgDir)).toEqual([]);
+  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
+  expect(daemonLog(cfgDir)).toContain('reason=identity-unverifiable');
+}, 25_000);
+
+test('BUSY-PANE GUARD #268: a live pending question on the same pane → the late permission tap never injects, it stays queued', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  await startDaemon(cfgDir, tg.port);
+  await abandon(cfgDir, tg, PERMISSION);
+  const allowData = tg.allowData()!;
+
+  // A second hook is now LIVE on %1 (socket open, card posted): the agent is
+  // blocked on that prompt, so a digit typed into the pane would answer IT.
+  const live = startAsk(cfgDir, tg.port, { requestId: 'q_live', agent: 'claude', kind: 'question', question: 'Restart service?', options: [{ label: 'Yes' }] });
+  expect(await until(() => tg.cards().length === 2, 5000)).toBe(true);
+
+  writeFileSync(join(cfgDir, 'menu-text'), TWO_OPTION_MENU);
+  tg.push([tap(allowData, 872, 1)]);
+
+  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 8000)).toBe(true);
+  expect(injected(cfgDir)).toEqual([]);
+  expect(daemonLog(cfgDir)).toContain('reason=pane-busy');
+  expect(daemonLog(cfgDir)).not.toContain('ask-late-deliver-permission-pane:');
+  live.kill(9);
+  await live.exited;
+}, 25_000);
+
+test('NEXT MENU #309: the digit resolves the request and a DIFFERENT permission (same 99-char prefix) takes the spot → delivered, logged as after=next-menu, never re-answered', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  await startDaemon(cfgDir, tg.port);
+  await abandon(cfgDir, tg, LONG_PERMISSION);
+  const allowData = tg.allowData()!;
+
+  writeFileSync(join(cfgDir, 'menu-text'), menuFor(SAFE_LONG));
+  writeFileSync(join(cfgDir, 'next-menu-text'), menuFor(DANGEROUS_LONG));
+  tg.push([tap(allowData, 873, 1)]);
+
+  expect(await until(() => daemonLog(cfgDir).includes('ask-late-deliver-permission-pane:'), 8000)).toBe(true);
+  expect(daemonLog(cfgDir)).toContain('after=next-menu');
+  expect(injected(cfgDir)).toEqual(['1']); // exactly one digit — the next menu is never touched
+  expect(await until(() => tg.answeredCbs().some((c) => c.text === '✓ sent to the agent'), 4000)).toBe(true);
 }, 25_000);

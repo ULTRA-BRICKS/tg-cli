@@ -5,6 +5,7 @@
 // data. Tests construct the same data by hand.
 
 import type { TaskViewFilter, TasksCallbackKind } from './tasks-command';
+import type { PermissionMenuTarget } from './permission-menu';
 
 // --- config (spec §9) ---
 
@@ -395,6 +396,10 @@ export type InjectStep =
   // that the pane still hosts THAT session (spec §2.6 pane-reuse guard).
   | { kind: 'verify-pane'; paneId: string; sessionKey?: string }
   | { kind: 'tmux'; argv: string[]; stdin?: string } // tmux command; stdin for load-buffer -
+  // tg-cli#309: re-capture the pane and continue only if the permission menu
+  // `target` was resolved from is still the live one (permissionMenuUnchanged);
+  // otherwise the plan fails before the digit's send-keys.
+  | { kind: 'verify-permission-menu'; paneId: string; target: PermissionMenuTarget }
   | { kind: 'sleep'; ms: number }
   // tg-cli#463: is `text` still in the harness's input box after its Enter? No (or the
   // box cannot be read) → the plan ends, delivered. Yes → run the steps that follow (the

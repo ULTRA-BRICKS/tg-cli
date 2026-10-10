@@ -1,10 +1,15 @@
 import { expect, test } from 'bun:test';
 import {
+  classifyPostInjectPane,
   extractPermissionIdentity,
+  findPermissionMenuTarget,
   parsePermissionMenu,
   permissionMenuMatchesRequest,
+  permissionMenuUnchanged,
   pickPermissionMenuDigit,
 } from '../features/tg-ctl/permission-menu';
+import { truncateWithEllipsis } from '../features/tg-ctl/text-util';
+import { DANGEROUS_LONG, permissionBoxFor as boxFor, SAFE_LONG, SHARED_99 } from './fixtures/permission-menu';
 
 const TWO_OPTION_PANE = `
  Bash command
@@ -237,8 +242,20 @@ test('a manual/back-compat question with no "Allow <SingleWord>?" prefix is used
   expect(extractPermissionIdentity({ question: 'Allow bash command: pkill -f x?' })).toBe('Allow bash command: pkill -f x?');
 });
 
-test('"Allow <Tool>?" with no trailing detail strips to an empty string (nothing to bind against)', () => {
-  expect(extractPermissionIdentity({ question: 'Allow Bash?' })).toBe('');
+test('"Allow <Tool>?" with no trailing detail has no identity at all (null — nothing to bind against)', () => {
+  expect(extractPermissionIdentity({ question: 'Allow Bash?' })).toBeNull();
+});
+
+test('SECURITY #309: a question summary hook-normalize truncated ("…") is not an identity — null, never a prefix to match', () => {
+  // No toolInput survived, so the only text is the 100-char question summary;
+  // its 99-char prefix is shared by SAFE_LONG and DANGEROUS_LONG alike.
+  const question = `Allow Bash? ${truncateWithEllipsis(SAFE_LONG, 100)}`;
+  expect(extractPermissionIdentity({ question })).toBeNull();
+});
+
+test('a full command from toolInput is the identity even when the question summary was truncated', () => {
+  const question = `Allow Bash? ${truncateWithEllipsis(SAFE_LONG, 100)}`;
+  expect(extractPermissionIdentity({ question, toolInput: { command: SAFE_LONG } })).toBe(SAFE_LONG);
 });
 
 // --- permissionMenuMatchesRequest ---
@@ -286,9 +303,21 @@ test('SECURITY: a path does not match a longer path sharing its prefix', () => {
   expect(permissionMenuMatchesRequest(menu.context, '/tmp/a.txt.bak')).toBe(true);
 });
 
-test('a truncated identity (trailing "…") still matches by its verbatim prefix', () => {
-  const menu = parsePermissionMenu(TWO_OPTION_PANE)!;
-  expect(permissionMenuMatchesRequest(menu.context, 'pkill -f nonexistent-process-xyz-test…')).toBe(true);
+test('SECURITY #309: two commands sharing a 99-char prefix never match each other, truncated identity or not', () => {
+  expect(SHARED_99.length).toBe(99);
+  const live = parsePermissionMenu(boxFor(DANGEROUS_LONG))!;
+  // The truncated form a 100-char question summary carries for the SAFE command.
+  expect(permissionMenuMatchesRequest(live.context, truncateWithEllipsis(SAFE_LONG, 100))).toBe(false);
+  expect(permissionMenuMatchesRequest(live.context, SAFE_LONG)).toBe(false);
+  expect(permissionMenuMatchesRequest(live.context, DANGEROUS_LONG)).toBe(true);
+});
+
+test('SECURITY #309: a menu that renders the command TRUNCATED never matches the full identity', () => {
+  // If the box ever shortens a long command ("…"), the visible line cannot prove
+  // which of SAFE_LONG / DANGEROUS_LONG it is — refuse, the decision stays queued.
+  const live = parsePermissionMenu(boxFor(`${SHARED_99}…`))!;
+  expect(permissionMenuMatchesRequest(live.context, SAFE_LONG)).toBe(false);
+  expect(permissionMenuMatchesRequest(live.context, `${SHARED_99}…`)).toBe(false);
 });
 
 test('an empty identity never matches (avoids a vacuous true on empty context)', () => {
@@ -367,4 +396,76 @@ test('hasLiveCursor is true if the cursor sits on a later option, not just the f
   );
   const menu = parsePermissionMenu(cursorOnSecond)!;
   expect(menu.hasLiveCursor).toBe(true);
+});
+
+// --- findPermissionMenuTarget / permissionMenuUnchanged / classifyPostInjectPane (tg-cli#309) ---
+
+const PKILL = 'pkill -f nonexistent-process-xyz-test';
+
+test('findPermissionMenuTarget: a live menu for the request yields its digit and box', () => {
+  const found = findPermissionMenuTarget(TWO_OPTION_PANE, PKILL, 'deny');
+  expect(found.ok).toBe(true);
+  if (!found.ok) return;
+  expect(found.target.digit).toBe('2');
+  expect(found.target.box.split('\n')[0]).toBe(PKILL);
+  expect(found.target.box.split('\n').at(-1)).toBe('2. No');
+});
+
+test('findPermissionMenuTarget: names why nothing is injectable', () => {
+  expect(findPermissionMenuTarget(TWO_OPTION_PANE, null, 'allow')).toEqual({ ok: false, reason: 'identity-unverifiable' });
+  expect(findPermissionMenuTarget(null, PKILL, 'allow')).toEqual({ ok: false, reason: 'no-menu' });
+  expect(findPermissionMenuTarget(NO_MENU_PANE, PKILL, 'allow')).toEqual({ ok: false, reason: 'no-menu' });
+  expect(findPermissionMenuTarget(TWO_OPTION_PANE.replace('❯ 1. Yes', '  1. Yes'), PKILL, 'allow')).toEqual({ ok: false, reason: 'no-live-cursor' });
+  expect(findPermissionMenuTarget(boxFor(DANGEROUS_LONG), SAFE_LONG, 'allow')).toEqual({ ok: false, reason: 'identity-mismatch' });
+  const verboseNo = TWO_OPTION_PANE.replace('2. No', '2. No, and tell Claude what to do differently');
+  expect(findPermissionMenuTarget(verboseNo, PKILL, 'deny')).toEqual({ ok: false, reason: 'no-pickable-option' });
+});
+
+test('permissionMenuUnchanged: the same live box passes the pre-send gate', () => {
+  const found = findPermissionMenuTarget(boxFor(SAFE_LONG), SAFE_LONG, 'allow');
+  if (!found.ok) throw new Error('expected a target');
+  expect(permissionMenuUnchanged(boxFor(SAFE_LONG), found.target)).toBe(true);
+  // Scrollback ABOVE the box moving does not matter — only the box itself.
+  expect(permissionMenuUnchanged(`⏺ earlier output\n${boxFor(SAFE_LONG)}`, found.target)).toBe(true);
+});
+
+test('SECURITY #309: permissionMenuUnchanged fails when a different command took the spot, the pane is unreadable, the menu resolved, or the human moved the cursor', () => {
+  const found = findPermissionMenuTarget(boxFor(SAFE_LONG), SAFE_LONG, 'allow');
+  if (!found.ok) throw new Error('expected a target');
+  expect(permissionMenuUnchanged(boxFor(DANGEROUS_LONG), found.target)).toBe(false);
+  expect(permissionMenuUnchanged(null, found.target)).toBe(false);
+  expect(permissionMenuUnchanged(boxFor(SAFE_LONG).replace('❯ 1. Yes', '  1. Yes'), found.target)).toBe(false);
+  expect(permissionMenuUnchanged(boxFor(SAFE_LONG).replace('❯ 1. Yes', '  1. Yes').replace('   2. No', ' ❯ 2. No'), found.target)).toBe(false);
+});
+
+test('SECURITY #309: permissionMenuUnchanged fails when the SAME command is asked again with a different box', () => {
+  // Same command line, different surrounding text (a new request for the same
+  // command, e.g. a different description): not the menu the human saw.
+  const found = findPermissionMenuTarget(TWO_OPTION_PANE, PKILL, 'allow');
+  if (!found.ok) throw new Error('expected a target');
+  const reasked = TWO_OPTION_PANE.replace('Kill any process matching test pattern', 'Retry the kill after the first attempt');
+  expect(permissionMenuUnchanged(reasked, found.target)).toBe(false);
+});
+
+test('classifyPostInjectPane: unreadable / still-pending / next-menu / resolved', () => {
+  const found = findPermissionMenuTarget(boxFor(SAFE_LONG), SAFE_LONG, 'allow');
+  if (!found.ok) throw new Error('expected a target');
+  const { target } = found;
+  expect(classifyPostInjectPane(null, target)).toBe('unreadable');
+  expect(classifyPostInjectPane(boxFor(SAFE_LONG), target)).toBe('still-pending');
+  // The prefix-sharing DANGEROUS menu is a different permission, never "still ours".
+  expect(classifyPostInjectPane(boxFor(DANGEROUS_LONG), target)).toBe('next-menu');
+  expect(classifyPostInjectPane(boxFor(SAFE_LONG).replace('❯ 1. Yes', '  1. Yes'), target)).toBe('resolved');
+  expect(classifyPostInjectPane(NO_MENU_PANE, target)).toBe('resolved');
+});
+
+test('SECURITY #309: a RESOLVED box for the request left in scrollback right above a DIFFERENT live menu never matches', () => {
+  // Review finding: both boxes fit inside the live marker's 12-line context, so an
+  // identity search over the whole context finds the stale command line and
+  // would answer the live menu below it.
+  const resolvedAbove = boxFor(SAFE_LONG).replace('❯ 1. Yes', '  1. Yes');
+  const pane = `${resolvedAbove}\n${boxFor(DANGEROUS_LONG)}`;
+  expect(findPermissionMenuTarget(pane, SAFE_LONG, 'allow')).toEqual({ ok: false, reason: 'identity-mismatch' });
+  expect(permissionMenuMatchesRequest(parsePermissionMenu(pane)!.context, SAFE_LONG)).toBe(false);
+  expect(findPermissionMenuTarget(pane, DANGEROUS_LONG, 'allow').ok).toBe(true);
 });

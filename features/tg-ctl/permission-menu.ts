@@ -122,7 +122,18 @@ export function parsePermissionMenu(paneText: string): ParsedPermissionMenu | nu
   }
   if (options.length === 0) return null;
 
-  const contextStart = Math.max(0, startIdx - MENU_CONTEXT_LINES);
+  // The context never reaches back past an EARLIER menu's marker or option
+  // lines: a resolved box Claude Code leaves in scrollback directly above the
+  // live one fits inside MENU_CONTEXT_LINES, and its command line would
+  // otherwise bind a stale tap for THAT request to the live menu below it
+  // (tg-cli#309 review finding).
+  let contextStart = Math.max(0, startIdx - MENU_CONTEXT_LINES);
+  for (let i = startIdx - 1; i >= contextStart; i--) {
+    if (lines[i].includes(PROCEED_MARKER) || OPTION_LINE.test(lines[i])) {
+      contextStart = i + 1;
+      break;
+    }
+  }
   return { options, context: lines.slice(contextStart, endIdx + 1).join('\n'), hasLiveCursor };
 }
 
@@ -148,7 +159,7 @@ export function pickPermissionMenuDigit(
   return found?.digit ?? null;
 }
 
-// Best-effort identifying text for a permission request — the same fields
+// The identifying text for a permission request — the same fields
 // hook-normalize.ts's summarizeInput prioritizes (command > file_path > path
 // > url) when the original tool_input survived, else the `question` field
 // with its "Allow <Tool>? " boilerplate prefix stripped. Used to bind a
@@ -159,14 +170,24 @@ export function pickPermissionMenuDigit(
 // `[^?]*` would also gobble a multi-word manual/back-compat question like
 // "Allow bash command: pkill -f x?" down to an empty string, destroying the
 // one piece of identifying text it had.
-export function extractPermissionIdentity(req: { question: string; toolInput?: Record<string, unknown> }): string {
+//
+// null = no EXACT identity exists, so the caller must not inject at all:
+// nothing after the prefix, or a question summary hook-normalize cut at 100
+// chars ("…"). A truncated summary names every command that shares its first
+// 99 chars — the long-command class this feature exists for — so treating it
+// as a prefix could approve a different command than the one on the card
+// (tg-cli#309).
+export function extractPermissionIdentity(req: { question: string; toolInput?: Record<string, unknown> }): string | null {
   const input = req.toolInput;
   if (input) {
     const field = ['command', 'file_path', 'path', 'url'].find((k) => typeof input[k] === 'string');
     if (field) return input[field] as string;
   }
-  return req.question.replace(/^Allow \S+\?\s*/, '');
+  const summary = req.question.replace(/^Allow \S+\?\s*/, '').trim();
+  return summary === '' || summary.endsWith('…') ? null : summary;
 }
+
+const normalizeLine = (s: string): string => s.replace(/\s+/g, ' ').trim();
 
 // Does the captured menu's BOUNDED context (never the whole pane — see
 // ParsedPermissionMenu.context) still identify THIS request, not a newer,
@@ -176,33 +197,99 @@ export function extractPermissionIdentity(req: { question: string; toolInput?: R
 // Approve/Reject for — a permission-escalation-shaped bug, worse than the
 // pre-existing queue-and-wait behavior (which never touches a live pane).
 //
-// LINE-EXACT, not a substring/blob search: Claude Code renders the command as
-// its OWN physical line in the box (every real capture confirms this), so
-// matching is done per-line — does ANY line of the context, whitespace-
-// normalized, equal the identity exactly? This is what actually closes the
-// escalation case a naive substring/boundary check cannot: a stale "git
-// push" tap must NOT match a live menu whose command line is "git push
-// --force" — as whole lines they are simply not equal, whereas ANY
-// substring-style check (even boundary-aware) still finds "git push" sitting
-// at the start of "git push --force" (review finding, confirmed by two
-// independent reviewers as the concrete residual risk of a boundary-only
-// fix). `tmux capture-pane -pJ` (capturePane) joins tmux's internal line-wrap
-// breaks first, so a long command that LOOKS wrapped in the terminal is
-// still one logical line by the time it reaches here.
+// LINE-EXACT, not a substring/blob/prefix search: Claude Code renders the
+// command as its OWN physical line in the box (every real capture confirms
+// this), so matching is done per-line — does ANY line of the context,
+// whitespace-normalized, equal the FULL identity exactly? A stale "git push"
+// tap must NOT match a live menu whose command line is "git push --force", and
+// a command must not match another that shares its first 100 chars (tg-cli#309)
+// — any prefix-style check, even boundary-aware, accepts both. `tmux
+// capture-pane -pJ` (capturePane) joins tmux's internal line-wrap breaks first,
+// so a long command that LOOKS wrapped in the terminal is still one logical
+// line by the time it reaches here.
 //
-// For a TRUNCATED identity (hook-normalize.ts's 100-char cap, trailing "…"),
-// only a prefix is known — falls back to a prefix-of-line match, still
-// requiring the prefix to end at a line-internal word boundary so "rm" (as a
-// truncated prefix, which can't happen at 100 chars but is defensive anyway)
-// doesn't prefix-match "rm -rf /tmp/abc" as a different, longer command.
+// An identity ending in "…" never matches: whether it is a truncated summary or
+// the box rendering a long command shortened, the visible line cannot prove
+// which full command it stands for — refuse, the caller keeps the decision
+// queued.
 export function permissionMenuMatchesRequest(context: string, identity: string): boolean {
-  const normalizeLine = (s: string): string => s.replace(/\s+/g, ' ').trim();
-  const truncated = identity.trim().endsWith('…');
-  const needle = normalizeLine(identity).replace(/…$/, '').trim();
-  if (!needle) return false;
-  const lines = context.split('\n').map(normalizeLine).filter(Boolean);
-  if (!truncated) return lines.includes(needle);
-  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const prefixMatch = new RegExp(`^${escaped}(\\s|$)`);
-  return lines.some((line) => prefixMatch.test(line));
+  return identityLineIndex(context.split('\n').map(normalizeLine), identity) !== -1;
+}
+
+function identityLineIndex(lines: string[], identity: string): number {
+  const needle = normalizeLine(identity);
+  if (!needle || needle.endsWith('…')) return -1;
+  return lines.lastIndexOf(needle);
+}
+
+// What a pane-inject is about to answer: the digit for the decision, plus the
+// menu's own BOX — the whitespace-normalized lines from the request's command
+// line through the last option (cursor position included). The box is the
+// fingerprint re-checked immediately before the digit is sent and after it:
+// a different permission, the same command re-asked with different text, or a
+// human moving the cursor at the keyboard all change it.
+export interface PermissionMenuTarget {
+  identity: string;
+  decision: 'allow' | 'deny';
+  digit: string;
+  box: string;
+}
+
+export type PermissionMenuSkipReason = 'identity-unverifiable' | 'no-menu' | 'no-live-cursor' | 'identity-mismatch' | 'no-pickable-option';
+
+export type PermissionMenuLookup = { ok: true; target: PermissionMenuTarget } | { ok: false; reason: PermissionMenuSkipReason };
+
+// Find the live menu for THIS request in a capture and the digit answering
+// `decision`. Each failure carries its own reason so field logs tell "menu
+// already resolved" (no-live-cursor) from "a live menu shows a different
+// command" (identity-mismatch) from "nothing exact to bind to"
+// (identity-unverifiable). hasLiveCursor gates the match: text alone does not
+// prove the menu is the currently-answerable widget (see
+// ParsedPermissionMenu.hasLiveCursor).
+export function findPermissionMenuTarget(
+  paneText: string | null,
+  identity: string | null,
+  decision: 'allow' | 'deny',
+): PermissionMenuLookup {
+  if (identity === null) return { ok: false, reason: 'identity-unverifiable' };
+  const menu = paneText === null ? null : parsePermissionMenu(paneText);
+  if (!menu) return { ok: false, reason: 'no-menu' };
+  if (!menu.hasLiveCursor) return { ok: false, reason: 'no-live-cursor' };
+  const lines = menu.context.split('\n').map(normalizeLine);
+  const at = identityLineIndex(lines, identity);
+  if (at === -1) return { ok: false, reason: 'identity-mismatch' };
+  const digit = pickPermissionMenuDigit(menu.options, decision);
+  if (digit === null) return { ok: false, reason: 'no-pickable-option' };
+  const box = lines.slice(at).filter(Boolean).join('\n');
+  return { ok: true, target: { identity, decision, digit, box } };
+}
+
+// The pre-send gate, run inside the pane's typing turn IMMEDIATELY before the
+// digit's send-keys: is the very menu `target` was resolved from still the
+// live one — same identity line, same digit for the decision, same box? The
+// first capture can be seconds old by then (the typing turn may wait behind
+// another plan), and the human may have answered at the keyboard and let a
+// different permission render in the same spot (tg-cli#309).
+export function permissionMenuUnchanged(paneText: string | null, target: PermissionMenuTarget): boolean {
+  const now = findPermissionMenuTarget(paneText, target.identity, target.decision);
+  return now.ok && now.target.digit === target.digit && now.target.box === target.box;
+}
+
+// After the digit is sent, what does the pane say about it?
+//   unreadable    — the re-capture failed; proves nothing, never "delivered"
+//   still-pending — a live menu still shows THIS request's command: the key was
+//                   swallowed (e.g. copy-mode), or the same command is being
+//                   asked again — either way delivery is not confirmed
+//   next-menu     — THIS request's menu is gone and a live menu for a
+//                   DIFFERENT command now occupies the spot (Claude Code asks
+//                   for the next tool call at once): resolved, and the log
+//                   names it so it is never mistaken for the original
+//   resolved      — no live menu
+export type PostInjectPaneState = 'unreadable' | 'still-pending' | 'next-menu' | 'resolved';
+
+export function classifyPostInjectPane(paneText: string | null, target: PermissionMenuTarget): PostInjectPaneState {
+  if (paneText === null) return 'unreadable';
+  const menu = parsePermissionMenu(paneText);
+  if (!menu?.hasLiveCursor) return 'resolved';
+  return permissionMenuMatchesRequest(menu.context, target.identity) ? 'still-pending' : 'next-menu';
 }

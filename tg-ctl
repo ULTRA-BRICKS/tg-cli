@@ -88,10 +88,12 @@ import { isBareWindowName, resolveSessionName } from "./features/tg-ctl/session-
 import { buildDigitInjectPlan, buildKeyInjectPlan, buildTextInjectPlan, paneTypingKey, unsubmittedNotice, wrapInbound } from "./features/tg-ctl/inject"
 import { messageStillTyped } from "./features/tg-ctl/input-box"
 import {
+  classifyPostInjectPane,
   extractPermissionIdentity,
-  parsePermissionMenu,
-  permissionMenuMatchesRequest,
-  pickPermissionMenuDigit,
+  findPermissionMenuTarget,
+  permissionMenuUnchanged,
+  type PermissionMenuLookup,
+  type PostInjectPaneState,
 } from "./features/tg-ctl/permission-menu"
 import { buildGitStateBanner, buildPaneGitState, type PaneGitState } from "./features/tg-ctl/git-state"
 import {
@@ -2648,6 +2650,13 @@ async function runInjectStepsLocked(steps: InjectStep[]): Promise<{ ok: true } |
   }
 }
 
+// tg-cli#309: the verify-permission-menu step found a different menu (or none) where
+// the plan's target was — the digit is never sent.
+const PERMISSION_MENU_CHANGED: InjectFailure = {
+  ok: false,
+  error: "permission menu changed before the digit was sent — nothing typed",
+}
+
 async function runInjectSteps(steps: InjectStep[]): Promise<{ ok: true } | InjectFailure> {
   let hosted: HostedAgent | null = null
   for (const step of steps) {
@@ -2655,6 +2664,8 @@ async function runInjectSteps(steps: InjectStep[]): Promise<{ ok: true } | Injec
       const verified = verifyPaneStep(step)
       if (!verified.ok) return verified
       hosted = verified.hosted
+    } else if (step.kind === "verify-permission-menu") {
+      if (!permissionMenuUnchanged(capturePane(step.paneId), step.target)) return PERMISSION_MENU_CHANGED
     } else if (step.kind === "submit-check") {
       const checked = submitCheckStep(step, hosted)
       if (checked !== "retry-enter") return checked
@@ -2692,6 +2703,8 @@ function runInjectStepsSync(steps: InjectStep[]): { ok: true } | InjectFailure {
       const verified = verifyPaneStep(step)
       if (!verified.ok) return verified
       hosted = verified.hosted
+    } else if (step.kind === "verify-permission-menu") {
+      if (!permissionMenuUnchanged(capturePane(step.paneId), step.target)) return PERMISSION_MENU_CHANGED
     } else if (step.kind === "submit-check") {
       const checked = submitCheckStep(step, hosted)
       if (checked !== "retry-enter") return checked
@@ -11295,39 +11308,29 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // never line-match in permissionMenuMatchesRequest and always falls
       // through to queuing (tracked separately as tg-cli#283, needing live
       // verification of how Claude Code actually renders a multi-line
-      // command's box before a fix can be trusted — see that issue); and
-      // there is a millisecond TOCTOU between the
-      // pre-inject capture/identity-check and the actual `send-keys` where
-      // the human could resolve THIS menu at the keyboard and a genuinely
-      // DIFFERENT permission's menu could appear before the digit lands —
-      // the post-inject re-verify below narrows this but cannot fully close
-      // it from outside the app.
-      if (paneId && retained.req.agent === "claude" && !shouldDeferInbound(paneId)) {
-        const captured = capturePane(paneId)
-        // BOTH must hold: the menu is showing, AND its BOUNDED context (never
-        // the whole pane — see ParsedPermissionMenu.context) still identifies
-        // THIS request's own command/question — not a newer, unrelated
-        // permission the harness has since moved on to within the retention
-        // window. Skipping the identity check, or checking it against the
-        // whole pane instead of the menu's own context, would let a stale tap
-        // inject "Yes" into whatever happens to be pending right now (review
-        // finding — two independent reviewers found the whole-pane version of
-        // this check bypassable via an older command's leftover scrollback).
-        // hasLiveCursor gates injection the same way it gates the post-inject
-        // confirmation below: text alone doesn't prove this menu is the
-        // currently-answerable one — the cursor does (see
-        // ParsedPermissionMenu.hasLiveCursor). Injecting a digit at a menu
-        // that's already resolved (text still visible in scrollback, cursor
-        // gone) would land the keypress on whatever's actually focused now,
-        // not this request.
-        const menu = captured ? parsePermissionMenu(captured) : null
-        const menuIsLive = menu?.hasLiveCursor ?? false
-        const identityMatches = menuIsLive ? permissionMenuMatchesRequest(menu.context, extractPermissionIdentity(retained.req)) : false
-        const digit = menu && identityMatches ? pickPermissionMenuDigit(menu.options, answer.decision) : null
-        if (digit !== null) {
+      // command's box before a fix can be trusted — see that issue).
+      //
+      // The first capture only SELECTS the target (findPermissionMenuTarget:
+      // a live cursor, the request's FULL identity as its own line in the
+      // menu's bounded context — never a prefix, tg-cli#309 — and an exact
+      // Yes/No option). The digit plan then re-captures INSIDE the pane's
+      // typing turn, directly before send-keys, and sends nothing unless the
+      // same box is still live (verify-permission-menu): the turn can wait
+      // seconds behind another plan, and the human may answer at the keyboard
+      // and let a different permission render in the same spot meanwhile.
+      // What stays open is the gap between that re-capture and send-keys —
+      // two tmux spawns, not closable from outside the app.
+      if (paneId && retained.req.agent === "claude") {
+        // A live question on this pane owns its prompt (shouldDeferInbound): a
+        // digit typed now would answer THAT, so the tap stays queued (#268).
+        const lookup: PermissionMenuLookup | { ok: false; reason: "pane-busy" } = shouldDeferInbound(paneId)
+          ? { ok: false, reason: "pane-busy" }
+          : findPermissionMenuTarget(capturePane(paneId), extractPermissionIdentity(retained.req), answer.decision)
+        if (lookup.ok) {
+          const { target } = lookup
           let deliveryFailure: string | null = null
           try {
-            const res = await executeInjectSteps(buildDigitInjectPlan(paneId, digit, retained.req.sessionKey))
+            const res = await executeInjectSteps(buildDigitInjectPlan(paneId, target, retained.req.sessionKey))
             deliveryFailure = res.ok ? null : res.error
           } catch (err) {
             // Bun.spawnSync can throw (missing tmux binary, broken PATH) —
@@ -11340,46 +11343,39 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           // Code actually consumed it as the menu choice — e.g. the pane is
           // in tmux copy-mode (scrolled up), where a literal digit is
           // swallowed by copy-mode's own key table instead of reaching the
-          // app underneath (review finding). Re-capture after a short pace
-          // and require the SAME identified menu to still be LIVE (its
-          // cursor glyph still present, see ParsedPermissionMenu.hasLiveCursor)
-          // before claiming non-delivery — this is what actually verifies the
-          // tap worked. Gating on the marker/option TEXT being gone (an
-          // earlier version) is unsound: we have no confirmed evidence
-          // Claude Code erases a resolved menu from the pane rather than
-          // leaving it visible as scrollback history, and a real terminal
-          // that retains it would make every successful delivery misread as
-          // "still pending" forever (review finding). The cursor is specific
-          // to the currently-answerable widget either way — gone means
-          // resolved, whether or not the surrounding text sticks around. A
-          // FAILED re-capture (tmux error, dead pane) proves NOTHING about
-          // the menu and must be treated as NOT confirmed, never as
-          // confirmed-by-default (review finding: an earlier version was
-          // fail-open here — a null capture made `stillPending` false, which
-          // read as "confirmed delivered").
+          // app underneath (review finding). Re-capture after a short pace;
+          // classifyPostInjectPane gates on the live cursor, not on the
+          // marker/option TEXT being gone: nothing confirms Claude Code erases
+          // a resolved menu rather than leaving it as scrollback (review
+          // finding). A live menu still showing THIS command is not confirmed
+          // (swallowed key, or the same command asked again); a live menu for
+          // a DIFFERENT command means this one resolved and Claude Code moved
+          // on to the next tool call — the pre-send verify proved the digit
+          // went to this request's box, so that counts as delivered and is
+          // logged as `after=next-menu`. A FAILED re-capture proves nothing
+          // and is never confirmed-by-default (review finding: an earlier
+          // version was fail-open here).
+          let after: PostInjectPaneState | null = null
           if (deliveryFailure === null) {
             await Bun.sleep(400)
-            const after = capturePane(paneId)
-            if (after === null) {
-              deliveryFailure = "post-inject re-capture failed — cannot confirm delivery"
-            } else {
-              const afterMenu = parsePermissionMenu(after)
-              const stillPending =
-                afterMenu !== null &&
-                afterMenu.hasLiveCursor &&
-                permissionMenuMatchesRequest(afterMenu.context, extractPermissionIdentity(retained.req))
-              if (stillPending) deliveryFailure = "delivery not confirmed — the same menu is still showing after inject"
-            }
+            after = classifyPostInjectPane(capturePane(paneId), target)
+            if (after === "unreadable") deliveryFailure = "post-inject re-capture failed — cannot confirm delivery"
+            else if (after === "still-pending") deliveryFailure = "delivery not confirmed — the same menu is still showing after inject"
           }
           if (deliveryFailure === null) {
             // Confirmed delivered — UPGRADE the already-queued entry to
             // answered/pane-delivered (never a rollback needed on this path:
             // nothing was ever recorded as "answered" before this point).
+            // The answeredButtons record never replays: the hook-side replay
+            // read is question-only (a permission re-fire forwards a fresh
+            // card, see the `req.kind === "question"` guard in the ask
+            // forward path) — it exists so a re-tap on this card reports
+            // "already answered" instead of "expired".
             abandonedButtons.delete(action.requestId)
             pruneAnsweredButtons(answeredButtons, Date.now())
             answeredButtons.set(action.requestId, { value: answer.value, label: answer.label, decision: answer.decision, at: Date.now(), delivery: "pane" })
             persistQuestions()
-            log(`ask-late-deliver-permission-pane: ${describeAskRequest(retained.req)} key=${action.requestId} label=${answer.label} pane=${paneId} digit=${digit}`)
+            log(`ask-late-deliver-permission-pane: ${describeAskRequest(retained.req)} key=${action.requestId} label=${answer.label} pane=${paneId} digit=${target.digit} after=${after}`)
             await answerCallbackQuery(ctx, action.callbackQueryId, "✓ sent to the agent")
             const cardId = retained.messageId ?? action.messageId
             if (cardId !== null) {
@@ -11398,14 +11394,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           // WHY, so a genuinely-dead pane-inject path (e.g. an unverified
           // real-world deny label, tg-cli#268) is distinguishable in the
           // field from "menu already resolved" instead of reading identical
-          // to the ordinary queuing case (review finding). `no-live-cursor`
-          // is its own reason, not folded into `identity-mismatch` — a
-          // resolved-but-retained menu box (text present, cursor gone) is a
-          // DIFFERENT cause than "a live menu is showing a different
-          // command," and conflating them points field debugging at the
-          // wrong one (review finding).
-          const reason = !menu ? "no-menu" : !menuIsLive ? "no-live-cursor" : !identityMatches ? "identity-mismatch" : "no-pickable-option"
-          log(`ask-late-deliver-permission-pane-skip: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId} reason=${reason}`)
+          // to the ordinary queuing case (review finding).
+          log(`ask-late-deliver-permission-pane-skip: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId} reason=${lookup.reason}`)
         }
       }
 

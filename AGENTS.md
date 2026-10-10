@@ -400,20 +400,34 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
   for `claude` specifically, a disconnected permission's hook has already fallen back to Claude
   Code's OWN numbered terminal "Do you want to proceed?" menu — answerable directly by
   `tmux capture-pane -pJ`, re-verifying the menu still identifies THIS request (LINE-EXACT match
-  against `extractPermissionIdentity`, never a raw substring — a boundary-only check still lets a
-  stale "git push" tap match a live "git push --force" menu, since both genuinely continue at a
-  space; only comparing whole lines tells them apart). A multi-line command (a heredoc, or several
+  of the FULL identity from `extractPermissionIdentity`, never a substring or prefix — a boundary-only
+  check still lets a stale "git push" tap match a live "git push --force" menu, and a prefix lets one
+  long command match another that shares its first 100 chars, tg-cli#309). The menu's context window
+  (12 lines above the marker) stops at an earlier menu's marker/option lines, so a resolved box left
+  in scrollback directly above the live one cannot lend it its command line. No exact identity → no
+  inject: a request with no `toolInput` whose question summary hook-normalize cut at 100 chars
+  ("…"), and a box that renders the command shortened ("…"), both stay queued
+  (`reason=identity-unverifiable` / `identity-mismatch`). A multi-line command (a heredoc, or several
   statements written across lines) still cannot match here — tracked as tg-cli#283, needing live
   verification of how Claude Code actually renders a multi-line command's box before a fix can be
   trusted (a real incident, 2026-08-25, confirmed this class of command gets permanently stranded in
   the queue-and-wait path below with no way to ever resolve — the fix attempted for it was reverted
   after a 3-round review surfaced an unresolved escalation risk and unverified rendering assumption,
-  see tg-cli#283 for the full history). The daemon injects the matching digit (bare,
-  no Enter — Claude Code's menu submits instantly) and re-captures after a pace to CONFIRM the menu is
-  actually gone before claiming delivery (a tmux exit code alone doesn't prove the app consumed the
-  key — e.g. copy-mode swallows it). No waiting process, no dependency on a hook reconnect that may
-  never come for a terminal-fallback permission. Every other agent kind, and claude when the menu
-  can't be re-verified live, falls through unchanged to the queuing mechanism below.
+  see tg-cli#283 for the full history). A live question on the same pane (`shouldDeferInbound`)
+  skips the inject (`reason=pane-busy`, tg-cli#268). The daemon injects the matching digit (bare,
+  no Enter — Claude Code's menu submits instantly) through a plan whose `verify-permission-menu`
+  step re-captures the pane INSIDE the pane's typing turn, directly before `send-keys`, and sends
+  nothing unless the same box (command line through the options, cursor included) is still live —
+  the first capture can be seconds old by then, and a different permission may have rendered in the
+  same spot (tg-cli#309). It then re-captures after a pace to CONFIRM before claiming delivery
+  (`classifyPostInjectPane`; a tmux exit code alone doesn't prove the app consumed the key — e.g.
+  copy-mode swallows it): THIS command still live → not confirmed; a live menu for a DIFFERENT
+  command → resolved, Claude Code moved on (`after=next-menu`); no live menu → resolved; a failed
+  capture → not confirmed. The pane-delivered `answeredButtons` record is never replayed to a hook
+  (the replay read is question-only); it makes a re-tap answer "already answered". No waiting
+  process, no dependency on a hook reconnect that may never come for a terminal-fallback
+  permission. Every other agent kind, and claude when the menu can't be re-verified live, falls
+  through unchanged to the queuing mechanism below.
 - **Queued permission decisions (never drop a tap on a disconnected permission, and never expire it
   on the SHORT question timer — Alex tg#9982):** the pane-inject path above covers claude when its
   menu is live and verifiable; every other case (a permission has no pane-text-injection fallback in

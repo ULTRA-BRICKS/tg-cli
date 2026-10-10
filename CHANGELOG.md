@@ -3,6 +3,22 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.11
+
+- **A late Telegram Approve/Reject on a permission can no longer type its digit into a DIFFERENT
+  command's menu (#309).** The pane-inject path matched a request whose question summary had been
+  cut at 100 characters by its prefix, so a long command could be approved through a live menu for
+  another command sharing those first 100 characters. Matching is now line-exact over the FULL
+  command only; with no exact identity (a truncated summary, or a box that shows the command
+  shortened) the decision stays queued, and the command line must sit in the live menu's own box —
+  a resolved box left in scrollback right above it no longer counts. The digit plan also re-captures
+  the pane inside the pane's typing turn, directly before `send-keys`, and sends nothing unless the
+  very same menu box is still live — the first capture could be seconds old, with another permission
+  rendered in its place. The post-inject check tells "this command is still asking" (not confirmed)
+  from "a different permission now shows" (resolved, logged `after=next-menu`).
+- **A live question on the same pane now logs why a late permission tap was not typed
+  (`reason=pane-busy`), with an integration test for that guard (#268).**
+
 ## 1.55.10
 
 - **`tg-ctl ask "<question>" [--timeout SEC]`: a blocking human approval for any script or
