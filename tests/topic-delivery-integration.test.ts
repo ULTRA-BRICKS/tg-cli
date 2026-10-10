@@ -73,7 +73,7 @@ exit 0
     `#!/bin/sh
 "${realPs}" "$@"
 code=$?
-if [ "$*" = "-axo pid=,ppid=,command=" ]; then cat "${cfgDir}/procs.txt"; fi
+if [ "$*" = "-axo pid=,ppid=,command=" ]; then cat "${cfgDir}/procs.txt"; echo >> "${cfgDir}/ps.calls"; fi
 exit $code
 `,
     { mode: 0o755 },
@@ -219,8 +219,9 @@ function topicMsg(text: string): unknown {
 
 // A cc session `alpha` that exited earlier but owns topic 50 comes back in pane %5, in a tmux
 // window named `windowName`, and is re-adopted: its first hook names the session id, the next
-// scan binds it to the new process.
-async function readoptedSession(windowName = 'alpha'): Promise<{ fx: Fixture; api: FakeApi }> {
+// scan binds it to the new process. `afterFirstScan`: the session appears only once the daemon
+// has read the (empty) process table; `within`: how soon the re-adoption must land.
+async function readoptedSession(windowName = 'alpha', opts: { afterFirstScan?: boolean; within?: number } = {}): Promise<{ fx: Fixture; api: FakeApi }> {
   const fx = makeFixture([
     ccEntry('sess1', {
       state: 'gone',
@@ -230,13 +231,14 @@ async function readoptedSession(windowName = 'alpha'): Promise<{ fx: Fixture; ap
   ]);
   const api = startApi();
   await startDaemon(fx, api.port);
+  if (opts.afterFirstScan) await waitFor('first discovery pass', () => existsSync(join(fx.cfgDir, 'ps.calls')));
   writeFileSync(join(fx.cfgDir, 'panes.txt'), `main\t0\t%5\t99990\tclaude\t${windowName}\t\t${fx.cfgDir}\n`);
   writeFileSync(join(fx.cfgDir, 'procs.txt'), '99990 1 -zsh\n99991 99990 claude\n');
   const ask = startAsk(fx, api.port, 'sess1', '%5');
   await waitFor('re-adoption', () => {
     const e = entryOf(fx, 'cc:sess1');
     return e?.state === 'live' && e.locators.tmux?.paneId === '%5';
-  });
+  }, opts.within);
   ask.kill(9);
   await ask.exited;
   return { fx, api };
@@ -289,6 +291,14 @@ test('a topic message is logged for `tg replies` under the topic\'s session, wit
   expect(rows).toHaveLength(1);
   expect(rows[0]).toMatchObject({ pane: '%5', targetAgent: 'alpha', sessionKey: 'cc:sess1', threadId: THREAD });
 }, 120_000);
+
+test('a hook sighting right after a discovery pass is bound by the next scan, not the 30 s periodic one', async () => {
+  // The daemon's first discovery pass read no panes and is still young enough to be reused when
+  // the session's pane appears and its hook names the session id. The scan that sighting asks for
+  // must read the panes again: with the stale pass it binds nothing, and the sighting then waits
+  // for the periodic scan, 30 s later.
+  await readoptedSession('alpha', { afterFirstScan: true, within: 10_000 });
+}, 60_000);
 
 // A permission hook of the live session in pane %5. Its stdout is the hook's reply to the agent.
 function startPermissionAsk(fx: Fixture, port: number): Subprocess {

@@ -1648,7 +1648,9 @@ function listLiveOmpAgents(): LiveOmpAgent[] {
 let lastDiscovery: DiscoveryScan | null = null
 let discoveryInFlight: Promise<DiscoveryScan> | null = null
 function refreshDiscovery(): Promise<DiscoveryScan> {
-  if (lastDiscovery && Date.now() - lastDiscovery.at < UNREACHABLE_SCAN_TTL_MS) return Promise.resolve(lastDiscovery)
+  if (lastDiscovery && Date.now() - lastDiscovery.at < UNREACHABLE_SCAN_TTL_MS && !discoveryPredatesSighting(lastDiscovery.at)) {
+    return Promise.resolve(lastDiscovery)
+  }
   discoveryInFlight ??= (async (): Promise<DiscoveryScan> => {
     const at = Date.now()
     const wantServerPid = sessionScanWanted()
@@ -1888,6 +1890,9 @@ let sessionScanAt = 0
 // is the persisted file, which may predate a tmux restart during downtime.
 let sessionRegistryScanned = false
 let sessionScanDue = true
+// When a hook sighting made the scan due: a discovery pass read before it cannot see the pane
+// the sighting names, so the scan it asks for waits for a newer pass (see discoveryPredatesSighting).
+let sessionScanDueAt = 0
 let sessionScanInFlight = false
 // Set by runDaemon before its poll loop: CLI one-shots that list omp never scan, so they
 // never pay for the server-pid reads.
@@ -1961,6 +1966,12 @@ function recordHookSession(req: ButtonRequest): void {
   pendingHookSessions.push(sighting)
   if (pendingHookSessions.length > MAX_PENDING_HOOK_SESSIONS) pendingHookSessions.shift()
   sessionScanDue = true // bind it while the asking process is still alive
+  sessionScanDueAt = Date.now()
+}
+
+// A pass taken before the pending hook sighting: binding against it would drop the sighting.
+function discoveryPredatesSighting(at: number): boolean {
+  return sessionScanDue && at < sessionScanDueAt
 }
 
 // tmux `#{pid}` of the server `list-panes` read — part of every pane locator, so a
@@ -2026,7 +2037,7 @@ function describeRegistryEvent(ev: RegistryEvent): string {
 function kickSessionRegistryScan(ctx: Ctx): void {
   if (!sessionScanWanted()) return
   const discovery = liveOmpCache
-  if (!discovery || discovery.serverPid === undefined) return
+  if (!discovery || discovery.serverPid === undefined || discoveryPredatesSighting(discovery.at)) return
   const { serverPid } = discovery
   sessionScanInFlight = true
   sessionScanDue = false
