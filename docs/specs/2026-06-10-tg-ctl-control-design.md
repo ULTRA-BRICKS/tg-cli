@@ -166,6 +166,44 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
   "restart with channels" reply is dropped — media was never channel-only.
   Channel mode's residual advantages are only: works without tmux, and native
   event delivery instead of keystroke fragility.
+- **Albums are one inbound message (tg-cli#280):** Telegram sends an album (photos or
+  files picked together, the caption typed once) as one message per item, all sharing a
+  `media_group_id`, and the items land in one `getUpdates` batch or in consecutive ones.
+  The daemon delivers the album ONCE: one `download-media` action whose `files` list
+  every photo/document item, and one receipt — `sent 3 photos:` (`sent 3 files:` when
+  any item is a document) followed by one local path per line, then the caption. A
+  caption on several items is kept whole: each, in item order, one per line. A video or
+  audio item of an album keeps its own handling (videos are not delivered; audio is
+  transcribed note by note). The album's id is its lead item's `message_id` — the lowest
+  of its items within the 20 MB limit (else its first item): the wrap shows it, `/agent`
+  routing reads the caption, reply-route follows the first item that is a reply, and the
+  👀 lands on the lead. An item over 20 MB is left out with the too-large reply and is
+  not among the album's delivered ids in the ledger; the rest still go. Both the hold and
+  the grouping use one predicate (`isAlbumItem`, updates.ts).
+  - **Holding the items.** A photo/document carrying a `media_group_id` is not stepped
+    when it arrives: the daemon holds it, in memory and in the album journal
+    `tg-ctl.<botid>.pending-albums.json` (atomic write, written before the batch's
+    actions run). A held album is released when (a) a later message from the same chat
+    that is not part of it arrives — a client sends an album's items back to back, so
+    that message proves the album complete, and the album is stepped BEFORE it so the
+    agent reads them in order — or (b) 1.5 s passed since its last item arrived. While
+    an album is held the long-poll timeout shrinks to the time left (at least 1 s); an
+    album already due skips the poll.
+  - **Exactly once, across restarts.** A released album is written to the delivery
+    ledger as `{event: "album", chat, msg: <first id>, parts: [<every id>]}` before it
+    is delivered. Every sink keys the delivery on the first id, and its claim and outcome
+    (and a hold or failure) are recorded for every part id, so `tg-ctl audit-delivery`
+    counts each item delivered and an item replayed on its own later is suppressed as a
+    duplicate. The album leaves the journal only after its actions ran and its updates
+    were recorded `processed`. A restart reloads the journal, drops an album whose
+    updates are all `processed`, and gives each other album a fresh hold window — the
+    daemon was not polling while it was down, so items still queued at Telegram join it
+    on the first poll. A kill mid-delivery replays the album and the ledger suppresses
+    the second send; the CTO hears of a delivery the kill interrupted once, under the
+    album's first id. An item Telegram
+    redelivers (or the pending-batch journal replays) is merged by `update_id`, never
+    held twice. An item that arrives after its album was already released is delivered
+    on its own, under its own id.
 - **No-agent guard:** inbound arrives but no live agent session is found → reply
   in TG with ONE harness-neutral line: "No live agent found → not delivered. Start
   Claude Code / Codex in a tmux window or under the rig wrapper (`rig harness run

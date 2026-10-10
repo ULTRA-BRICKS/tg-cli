@@ -251,6 +251,8 @@ export function buildAuditReport(input: AuditInput): AuditReport {
       suppressedDuplicates += 1;
       continue;
     }
+    // An album's items each carry their own claim/outcome records (withAlbumParts).
+    if (e.event === 'album') continue;
     const prior = outcome.get(e.msg);
     // A hold never hides a delivery that already happened (a replay re-queued it).
     if (e.event === 'queued' && prior && prior.state !== 'failed' && prior.state !== 'queued') continue;

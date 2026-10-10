@@ -11,7 +11,8 @@
 // topic yet) and from the flat `/new` private-topic spawn. A message in a topic with no
 // binding is HELD (queued per topic) while the attach picker asks which live session gets it.
 
-import type { AgentKind, TopicBinding, TopicPayload, TopicStatus } from './types';
+import { isRecord } from './guards';
+import type { AgentKind, MediaFile, TopicBinding, TopicPayload, TopicStatus } from './types';
 
 // Far above any real per-chat topic count; keeps the file bounded on a long-lived bot.
 export const MAX_TOPICS = 500;
@@ -310,23 +311,29 @@ function parsePayload(v: unknown): TopicPayload | null {
   if (p.type === 'text' && typeof p.text === 'string') {
     return { type: 'text', text: p.text, from: p.from, messageId: p.messageId };
   }
-  if (typeof p.fileId !== 'string' || typeof p.suggestedName !== 'string') return null;
-  if (p.type === 'media' && (p.mediaKind === 'photo' || p.mediaKind === 'document')) {
-    return {
-      type: 'media',
-      mediaKind: p.mediaKind,
-      fileId: p.fileId,
-      suggestedName: p.suggestedName,
-      ...opt('caption'),
-      ...opt('anchor'),
-      from: p.from,
-      messageId: p.messageId,
-    };
+  if (p.type === 'media') {
+    const files = parseMediaFiles(p);
+    if (!files) return null;
+    return { type: 'media', files, ...opt('caption'), ...opt('anchor'), from: p.from, messageId: p.messageId };
   }
-  if (p.type === 'voice') {
+  if (p.type === 'voice' && typeof p.fileId === 'string' && typeof p.suggestedName === 'string') {
     return { type: 'voice', fileId: p.fileId, suggestedName: p.suggestedName, ...opt('anchor'), from: p.from, messageId: p.messageId };
   }
   return null;
+}
+
+// A held media payload's files. A hold written before albums (tg-cli#280) carries ONE file as
+// flat `fileId`/`suggestedName`/`mediaKind` fields; it restores as a one-file list.
+function parseMediaFiles(p: Record<string, unknown>): MediaFile[] | null {
+  const raw: unknown[] = Array.isArray(p.files) ? p.files : [p];
+  const files: MediaFile[] = [];
+  for (const f of raw) {
+    if (!isRecord(f)) return null;
+    const { fileId, suggestedName, mediaKind, fileSize } = f;
+    if (typeof fileId !== 'string' || typeof suggestedName !== 'string' || (mediaKind !== 'photo' && mediaKind !== 'document')) return null;
+    files.push({ fileId, suggestedName, mediaKind, ...(isFiniteNumber(fileSize) ? { fileSize } : {}) });
+  }
+  return files.length > 0 ? files : null;
 }
 
 function isFiniteNumber(v: unknown): v is number {

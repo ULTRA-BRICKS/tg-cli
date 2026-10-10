@@ -154,6 +154,8 @@ export interface TgMessage {
   sticker?: { file_id: string; emoji?: string };
   rich_message?: TgRichMessage; // sendRichMessage content; such a message has no `text` (#461)
   reply_to_message?: TgMessage; // the message this one replies to (items 2,3)
+  // Shared by every item of an album: Telegram sends one message per photo/file (tg-cli#280).
+  media_group_id?: string;
   quote?: TgTextQuote; // the user's partial-quote selection from it (item 2)
   // --- forum topics (docs/specs/tg-forum-topics.md) ---
   message_thread_id?: number; // the topic id; absent in General / non-forum chats
@@ -275,13 +277,12 @@ export type Action =
   | { kind: 'ack'; messageId: number }
   | {
       kind: 'download-media';
-      fileId: string;
-      suggestedName: string; // daemon-chosen: <update_id>.<ext>
-      mediaKind: 'photo' | 'document';
-      fileSize?: number;
-      caption?: string;
+      // One file, or every photo/document of an album (tg-cli#280) — delivered as ONE message.
+      files: MediaFile[];
+      caption?: string; // an album's captions, in item order, one per line
       from: string; // display name for the wrap
-      messageId: number; // inbound Telegram message_id → surfaced as `tg#<id>` for tg --reply-to
+      // inbound Telegram message_id (an album's first item) → surfaced as `tg#<id>` for tg --reply-to
+      messageId: number;
       // Set when the photo/document itself is a reply: after download, route the
       // media receipt through reply-route with this quote anchor prepended (same
       // origin-pane semantics as typed and voice replies).
@@ -511,6 +512,7 @@ export interface CtlPaths {
   pendingBatch: string; // durable local journal of a not-yet-fully-processed getUpdates batch —
   // written BEFORE the offset advances so a crash between telling Telegram we have it and
   // finishing the work can never lose it; see runDaemon recovery-on-startup
+  pendingAlbums: string; // inbound album items held until the album is complete (tg-cli#280, album-buffer.ts)
   // Append-only, fsynced inbound delivery ledger keyed by (chat_id, message_id): every sink
   // checks it so a replayed message is never sent twice (tg-cli#299, delivery-ledger.ts)
   deliveryLedger: string;
@@ -570,12 +572,18 @@ export type TopicPayload =
   | { type: 'text'; text: string; from: string; messageId: number }
   | {
       type: 'media';
-      mediaKind: 'photo' | 'document';
-      fileId: string;
-      suggestedName: string; // daemon-chosen: <update_id>.<ext>
+      files: MediaFile[]; // one file, or every photo/document of an album (tg-cli#280)
       caption?: string;
       anchor?: string; // quote anchor when the media itself is a reply
       from: string;
-      messageId: number;
+      messageId: number; // an album's first item
     }
   | { type: 'voice'; fileId: string; suggestedName: string; anchor?: string; from: string; messageId: number };
+
+// One inbound photo/document to download: the Telegram file id and the daemon-chosen local name.
+export interface MediaFile {
+  fileId: string;
+  suggestedName: string; // daemon-chosen: <update_id>.<ext>
+  mediaKind: 'photo' | 'document';
+  fileSize?: number;
+}

@@ -430,6 +430,7 @@ import {
   parseLedger,
   serializeLedgerEvents,
   sinkOutcomeEvent,
+  withAlbumParts,
   type LedgerEvent,
   type SinkResult,
   type LedgerHold,
@@ -438,7 +439,9 @@ import {
 import { AUDIT_USAGE, buildAuditReport, formatAuditReport, logDeliveryIds, parseAuditArgs, transcriptCopies, type InjectedCopy } from "./features/tg-ctl/delivery-audit"
 import { appendHistoryFile } from "./features/replies/history-file"
 import { inboundHistoryRecords, type TopicSession } from "./features/replies/inbound"
-import { isLikelySlashCommand, parsePendingBatch, serializePendingBatch, stepUpdates } from "./features/tg-ctl/updates"
+import { albumDeliveryIds, isLikelySlashCommand, parsePendingBatch, serializePendingBatch, stepUpdates } from "./features/tg-ctl/updates"
+import { ALBUM_QUIET_MS, albumWaitMs, dropProcessedAlbums, holdAlbumParts, parseHeldAlbums, serializeHeldAlbums, type HeldAlbum } from "./features/tg-ctl/album-buffer"
+import { mediaReceipt, type ReceivedFile } from "./features/tg-ctl/media-receipt"
 import {
   appendTopic,
   attachPickerText,
@@ -509,6 +512,7 @@ import type {
   CtlPaths,
   DiscoverResult,
   InjectStep,
+  MediaFile,
   PaneInfo,
   ProcInfo,
   Registration,
@@ -1639,10 +1643,12 @@ function switchChat(ctx: Ctx, chatId: number): void {
 
 // Folds `events` into the live state, then appends and fsyncs them: a claim must be
 // on disk before the text leaves the daemon, or a kill right after the send would
-// forget the send happened. Returns whether the events reached the disk.
-function recordDelivery(events: LedgerEvent[]): boolean {
+// forget the send happened. Returns whether the events reached the disk. A record of an
+// album's delivery (keyed by its first item) is written for every item of it (tg-cli#280).
+function recordDelivery(given: LedgerEvent[]): boolean {
   const ledger = deliveryLedger
-  if (!ledger || events.length === 0) return true
+  if (!ledger || given.length === 0) return true
+  const events = given.flatMap((e) => withAlbumParts(ledger.state, e))
   applyLedgerEvents(ledger.state, events)
   try {
     const fd = openSync(ledger.path, "a", 0o600)
@@ -4729,6 +4735,14 @@ function pruneAnsweredButtons(answered: Map<string, AnsweredButton>, now: number
 const ABANDONED_RETAIN_MS = (() => {
   const raw = Number(process.env.TG_CTL_ABANDONED_RETAIN_MS)
   return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60_000
+})()
+
+// How long an inbound album waits for its next item before it is stepped (tg-cli#280).
+// Env-overridable so an integration test can stop the daemon while an album is held;
+// production never sets it.
+const ALBUM_HOLD_MS = (() => {
+  const raw = Number(process.env.TG_CTL_ALBUM_QUIET_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : ALBUM_QUIET_MS
 })()
 
 // PERMISSIONS get a MUCH longer retention window than questions before the
@@ -9816,9 +9830,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const out = replyContext(threadId)
     let body: string
     if (payload.type === "media") {
-      const dest = await downloadFileToCache(payload.fileId, payload.suggestedName, out)
-      if (dest === null) return null
-      body = mediaReceipt(payload.mediaKind, dest, payload.caption)
+      const received = await downloadMediaFiles(payload.files, out)
+      if (received === null) return null
+      body = mediaReceipt(received, payload.caption)
     } else {
       const transcript = await transcribeVoiceNote(payload.fileId, payload.suggestedName, payload.messageId, out)
       if (transcript === null) return null
@@ -10995,16 +11009,23 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
   }
 
-  // The agent-facing receipt for a downloaded photo/file: its local path plus the caption.
-  // Shared by the flat media path and topic delivery so both read the same.
-  const mediaReceipt = (mediaKind: "photo" | "document", dest: string, caption: string | undefined): string =>
-    `sent ${mediaKind === "photo" ? "photo" : "file"}: ${dest}` + (caption ? `\n${caption}` : "")
+  // Every file of one inbound photo/document or album (tg-cli#280), downloaded concurrently and
+  // listed in item order. A file that fails is answered ("media download failed") and left out;
+  // the rest still go. null: nothing could be downloaded.
+  const downloadMediaFiles = async (files: MediaFile[], out: Record<string, unknown> = {}): Promise<ReceivedFile[] | null> => {
+    const paths = await Promise.all(files.map((f) => downloadFileToCache(f.fileId, f.suggestedName, out)))
+    const received = files.flatMap((f, i): ReceivedFile[] => {
+      const path = paths[i]
+      return path === null ? [] : [{ mediaKind: f.mediaKind, path }]
+    })
+    return received.length > 0 ? received : null
+  }
 
   const downloadMedia = async (action: Extract<Action, { kind: "download-media" }>): Promise<boolean> => {
-    const dest = await downloadFileToCache(action.fileId, action.suggestedName)
-    if (dest === null) return false
+    const received = await downloadMediaFiles(action.files)
+    if (received === null) return false
     const routedCaption = action.agentRoute ? action.agentRoute.rest : action.caption
-    const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, mediaReceipt(action.mediaKind, dest, routedCaption), action.messageId)
+    const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, mediaReceipt(received, routedCaption), action.messageId)
     if (action.agentRoute) {
       return routePrewrappedAgentMessage(action.agentRoute, wrapped, action.messageId)
     }
@@ -12273,6 +12294,30 @@ async function runDaemon(ctx: Ctx): Promise<never> {
 
   // A chat `tg auth` bound in the previous batch (claimAuthBinding); applied between batches.
   let authChatSwitch: number | null = null
+
+  // Album items held across polls until the album is complete (tg-cli#280), restored from
+  // the album journal. An album whose every update the ledger shows `processed` was fully
+  // handled before a kill removed it from the journal. The rest get a fresh hold window: the
+  // daemon was not polling while it was down, so items still queued at Telegram must have a
+  // poll to join their album in.
+  let albumJournal = readFileOrNull(ctx.paths.pendingAlbums) ?? ""
+  const restoredAt = Date.now()
+  let heldAlbums: HeldAlbum[] = dropProcessedAlbums(parseHeldAlbums(albumJournal), deliveryLedger?.state.processedUpdates ?? new Set()).map(
+    (a) => ({ ...a, lastPartAtMs: restoredAt }),
+  )
+  if (heldAlbums.length > 0) log(`holding ${heldAlbums.length} album(s) restored from the album journal`)
+  const journalAlbums = (albums: HeldAlbum[]): void => {
+    const next = albums.length > 0 ? serializeHeldAlbums(albums) : ""
+    if (next === albumJournal) return
+    if (next) atomicWrite(ctx.paths.pendingAlbums, next)
+    else {
+      try {
+        unlinkSync(ctx.paths.pendingAlbums)
+      } catch {}
+    }
+    albumJournal = next
+  }
+
   for (;;) {
     // Graceful shutdown lands here BETWEEN batches — after the previous batch's
     // actions fully executed, before the next long-poll — so a reload never drops
@@ -12513,9 +12558,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       kickSessionRegistryScan(ctx)
 
       let json: { ok: boolean; result?: TgUpdate[]; description?: string }
+      // A held album shortens the long-poll to the time it has left; one already due is
+      // stepped without polling (tg-cli#280).
+      const albumWait = albumWaitMs(heldAlbums, Date.now(), ALBUM_HOLD_MS)
       if (recoveryQueue !== null) {
         json = { ok: true, result: recoveryQueue }
         recoveryQueue = null
+      } else if (albumWait === 0) {
+        json = { ok: true, result: [] }
       } else {
       // The idle long-poll is abortable by SIGTERM (beginGracefulShutdown) so a
       // reload doesn't wait out the 50s poll; the timeout is the normal ceiling.
@@ -12528,7 +12578,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       pollAbort = new AbortController()
       if (shuttingDown) pollAbort.abort()
       const resp = await fetch(
-        `${api(ctx)}/getUpdates?timeout=50&offset=${offset}&allowed_updates=${encodeURIComponent('["message","callback_query"]')}`,
+        `${api(ctx)}/getUpdates?timeout=${albumWait === null ? 50 : Math.max(1, Math.ceil(albumWait / 1000))}&offset=${offset}&allowed_updates=${encodeURIComponent('["message","callback_query"]')}`,
         { signal: AbortSignal.any([AbortSignal.timeout(60_000), pollAbort.signal]) },
       )
       if (resp.status === 409) {
@@ -12590,7 +12640,25 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // it (no update-id gap) and the offset still advances past it (batchOffset).
       const auth = daemonAuthStep(received, () => readFileOrNull(ctx.paths.authPending), Date.now())
       if (auth.claim && claimAuthBinding(ctx, auth.claim)) authChatSwitch = auth.claim.chat.id
-      const updates = auth.drop.size > 0 ? received.filter((u) => !auth.drop.has(u.update_id)) : received
+      const authed = auth.drop.size > 0 ? received.filter((u) => !auth.drop.has(u.update_id)) : received
+
+      // An album's items are held until the album is complete, then stepped together as ONE
+      // delivery (tg-cli#280). The journal keeps a released album until its actions ran, so a
+      // kill mid-delivery replays it — the ledger, which records the album's every id under its
+      // first, suppresses the second send.
+      const isOwner = (m: TgMessage): boolean =>
+        m.chat.id === ctx.chatId && m.from?.id !== undefined && (m.from.id === ctx.chatId || ctx.cfg.allowedSenders.includes(m.from.id))
+      const albumStep = holdAlbumParts(heldAlbums, authed, Date.now(), ALBUM_HOLD_MS, isOwner)
+      heldAlbums = albumStep.held
+      journalAlbums([...albumStep.held, ...albumStep.released])
+      recordDelivery(
+        albumStep.released.flatMap((a): LedgerEvent[] => {
+          // The items its delivery covers: an item over 20 MB is answered "too large", never delivered.
+          const parts = albumDeliveryIds(a.updates.flatMap((u) => (u.message ? [u.message] : [])))
+          return a.chat === ctx.chatId && parts.length > 1 ? [{ ts: Date.now(), event: "album", chat: ctx.chatId, msg: parts[0], parts }] : []
+        }),
+      )
+      const updates = albumStep.ready
 
       await refreshOriginalHosts()
       const step = stepUpdates(updates, {
@@ -12785,8 +12853,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       )
 
       // Every action for these updates ran: a later replay of any of them is skipped whole
-      // (a dropped tg auth Start tap included — it is finished, not pending).
-      recordDelivery(received.map((u): LedgerEvent => ({ ts: Date.now(), event: "processed", update: u.update_id })))
+      // (a dropped tg auth Start tap included — it is finished, not pending). Held album items
+      // stay unprocessed; the album journal carries them.
+      const authDropped = auth.drop.size > 0 ? received.filter((u) => auth.drop.has(u.update_id)) : []
+      recordDelivery([...updates, ...authDropped].map((u): LedgerEvent => ({ ts: Date.now(), event: "processed", update: u.update_id })))
+      journalAlbums(heldAlbums)
 
       // The batch fully completed — the journal is no longer needed. Best-effort:
       // if this unlink fails the next startup replays the same batch (idempotent/dedupe-tolerant

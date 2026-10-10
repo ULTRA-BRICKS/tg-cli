@@ -15,7 +15,7 @@
 // dropped by age (#183): if Telegram delivered the update after daemon downtime,
 // it is still a real instruction and must reach the agent.
 
-import type { Action, ControlConfig, StepResult, TgMessage, TgPhotoSize, TgUpdate, TopicPayload, TopicStatus } from './types';
+import type { Action, ControlConfig, MediaFile, StepResult, TgMessage, TgPhotoSize, TgUpdate, TopicPayload, TopicStatus } from './types';
 import { parseButtonCallback, parseQuestionCloseCallback, parseDecisionReplyToken } from './questions';
 import { isAgentCommand, parseAgentCallback, parseAgentCancelCallback, parseAgentCommand } from './agent-match';
 import { parseTopicAttachCallback } from './topics';
@@ -144,6 +144,17 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
   const callbackActions: Action[] = [];
   const actions: Action[] = [];
   let maxId = -1;
+
+  // The photos/files of one album (tg-cli#280). The daemon holds an album's items until all of
+  // them are in one batch (album-buffer.ts); here they become ONE delivery, stepped at — and
+  // keyed by the message id of — the album's lead item (albumLead).
+  const albums = new Map<string, StepItem[]>();
+  for (const u of updates) {
+    const m = u.message;
+    if (!m || !isAlbumItem(m)) continue;
+    const key = `${m.chat.id}:${m.media_group_id}`;
+    albums.set(key, [...(albums.get(key) ?? []), { updateId: u.update_id, m }]);
+  }
 
   for (const u of updates) {
     if (u.update_id > maxId) maxId = u.update_id;
@@ -322,13 +333,19 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
     // request and must reach the agent, not vanish behind a "skipped N stale"
     // notice.
     const name = m.from?.first_name || m.from?.username || 'tg';
+    // An album is stepped once, at its lead item, which goes first in `items` — the message the
+    // delivery is wrapped, acked and keyed under. A video item of an album is not grouped.
+    const album = isAlbumItem(m) ? albums.get(`${m.chat.id}:${m.media_group_id}`) : undefined;
+    const lead = album ? albumLead(album) : undefined;
+    if (lead && lead.m !== m) continue; // delivered with the album's lead item
+    const items = album && lead ? [lead, ...album.filter((i) => i !== lead)] : [{ updateId: u.update_id, m }];
 
     // Forum-topics mode: a topic service message or ANY message inside a forum topic is
     // triaged here and the flat dispatch is skipped (§4.4). topicActionFor returns null ONLY
     // when this is not a topic message (General, or a non-forum reply-thread) → the normal
     // flat handling, unchanged. Every topic message either delivers or answers in its topic.
     if (opts.topicsEnabled) {
-      const topicActions = topicActionFor(u.update_id, m, name, opts);
+      const topicActions = topicActionFor(items, name, opts);
       if (topicActions) {
         actions.push(...topicActions);
         // Delivery receipt, as in the flat path: not for a service message (nothing was sent)
@@ -404,8 +421,12 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
               );
       }
     } else if (m.voice ?? m.audio) action = voiceAction(u.update_id, m, name, opts);
-    else if (m.photo?.length) action = photoAction(u.update_id, m, name, opts);
-    else if (m.document) action = documentAction(u.update_id, m, name, opts);
+    else if (m.photo?.length || m.document) {
+      // A too-large reply (an item over 20 MB) goes out ahead of the delivery of the rest.
+      const media = mediaActions(items, name, opts);
+      action = media.pop() ?? null;
+      actions.push(...media);
+    }
     // Anything else (sticker, …) → advance silently.
     if (action) {
       actions.push(action);
@@ -562,7 +583,8 @@ const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks', '/limi
 // the bound/unknown decision uses the injected `topicStatusOf`; whether a bound session is still
 // alive is I/O, so the entrypoint answers "not running" for a gone one. No branch returns an
 // empty list for a user message: each delivers, holds, or replies in the topic.
-function topicActionFor(updateId: number, m: TgMessage, name: string, opts: StepOpts): Action[] | null {
+function topicActionFor(items: StepItem[], name: string, opts: StepOpts): Action[] | null {
+  const m = items[0].m;
   const event = forumEventOf(m);
   if (event) {
     // The service message's thread id IS the topic id (its own message_id as a fallback).
@@ -583,15 +605,18 @@ function topicActionFor(updateId: number, m: TgMessage, name: string, opts: Step
   // the session's topic, so the answer arrives here (tg-cli#551).
   const cardReply = cardReplyAction(m, name, opts, threadId);
   if (cardReply) return [cardReply];
-  const payload = topicPayloadOf(updateId, m, name, opts);
+  const payload = topicPayloadOf(items, name, opts);
   if (typeof payload === 'string') return [{ kind: 'reply', text: payload, threadId }];
+  // An album item too large to download is left out of the payload; the CTO is told, the rest still go.
+  const tooLarge: Action[] = payload.type === 'media' && payload.files.length < items.length ? [{ kind: 'reply', text: TOO_LARGE_REPLY, threadId }] : [];
   return (opts.topicStatusOf?.(threadId) ?? null) === null
-    ? [{ kind: 'topic-hold', threadId, payload }]
-    : [{ kind: 'topic-route', threadId, payload }];
+    ? [...tooLarge, { kind: 'topic-hold', threadId, payload }]
+    : [...tooLarge, { kind: 'topic-route', threadId, payload }];
 }
 
 // The deliverable form of a topic message, or the reply text when it cannot be delivered.
-function topicPayloadOf(updateId: number, m: TgMessage, name: string, opts: StepOpts): TopicPayload | string {
+function topicPayloadOf(items: StepItem[], name: string, opts: StepOpts): TopicPayload | string {
+  const { updateId, m } = items[0];
   const messageId = m.message_id;
   if (m.text) {
     const text = m.text;
@@ -620,17 +645,14 @@ function topicPayloadOf(updateId: number, m: TgMessage, name: string, opts: Step
     if ((voice.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return TOO_LARGE_REPLY;
     return { type: 'voice', fileId: voice.file_id, suggestedName: `${updateId}.ogg`, ...anchor, from: name, messageId };
   }
-  const file = m.photo?.length ? largestPhoto(m.photo) : m.document;
-  if (file) {
-    if ((file.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return TOO_LARGE_REPLY;
-    const isPhoto = !!m.photo?.length;
+  if (m.photo?.length || m.document) {
+    const media = mediaOf(items, opts);
+    if (media.files.length === 0) return TOO_LARGE_REPLY;
     return {
       type: 'media',
-      mediaKind: isPhoto ? 'photo' : 'document',
-      fileId: file.file_id,
-      suggestedName: `${updateId}.${isPhoto ? 'jpg' : sanitizedExt(m.document?.file_name)}`,
-      ...(m.caption ? { caption: m.caption } : {}),
-      ...anchor,
+      files: media.files,
+      ...(media.caption ? { caption: media.caption } : {}),
+      ...(media.replyAnchor ? { anchor: media.replyAnchor } : {}),
       from: name,
       messageId,
     };
@@ -650,41 +672,98 @@ function largestPhoto(photos: TgPhotoSize[]): TgPhotoSize {
   return best;
 }
 
-function attachMediaReplyRoute(
-  action: Extract<Action, { kind: 'download-media' }>,
-  m: TgMessage,
-  opts: StepOpts,
-): Extract<Action, { kind: 'download-media' }> {
-  if (m.caption && isAgentCommand(m.caption)) {
-    return { ...action, agentRoute: parseAgentCommand(m.caption) };
-  }
-  if (m.reply_to_message) {
-    return {
-      ...action,
-      replyToMessageId: m.reply_to_message.message_id,
-      replyAnchor: buildReplyAnchor(m, opts),
-    };
-  }
-  return action;
+// One message to step, with its update id (the downloaded file is named after it). An album
+// is stepped as the list of its items, first item first.
+interface StepItem {
+  updateId: number;
+  m: TgMessage;
 }
 
-function photoAction(updateId: number, m: TgMessage, name: string, opts: StepOpts): Action {
-  const best = largestPhoto(m.photo!);
-  if ((best.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return { kind: 'reply', text: TOO_LARGE_REPLY };
-  return attachMediaReplyRoute(
-    {
-      kind: 'download-media',
-      fileId: best.file_id,
-      suggestedName: `${updateId}.jpg`,
-      mediaKind: 'photo',
-      fileSize: best.file_size,
-      caption: m.caption,
-      from: name,
-      messageId: m.message_id,
-    },
-    m,
-    opts,
-  );
+// The download list of a photo/document message or of a whole album (tg-cli#280): the
+// largest rendition of each photo, every document, under a daemon-chosen name. An item over
+// the Bot API limit is left out (`tooLarge`). The album's captions are kept in item order;
+// the first item that is a reply gives the quote anchor.
+function mediaOf(items: StepItem[], opts: StepOpts): { files: MediaFile[]; tooLarge: boolean; caption?: string; replyTo?: number; replyAnchor?: string } {
+  const ordered = [...items].sort((a, b) => a.m.message_id - b.m.message_id);
+  const files: MediaFile[] = [];
+  let tooLarge = false;
+  for (const { updateId, m } of ordered) {
+    const isPhoto = !!m.photo?.length;
+    const file = isPhoto ? largestPhoto(m.photo!) : m.document;
+    if (!file) continue;
+    if (!downloadable(m)) {
+      tooLarge = true;
+      continue;
+    }
+    files.push({
+      fileId: file.file_id,
+      suggestedName: `${updateId}.${isPhoto ? 'jpg' : sanitizedExt(m.document?.file_name)}`,
+      mediaKind: isPhoto ? 'photo' : 'document',
+      ...(file.file_size !== undefined ? { fileSize: file.file_size } : {}),
+    });
+  }
+  const caption = ordered.flatMap(({ m }) => (m.caption ? [m.caption] : [])).join('\n');
+  const replying = ordered.find(({ m }) => m.reply_to_message)?.m;
+  return {
+    files,
+    tooLarge,
+    ...(caption ? { caption } : {}),
+    ...(replying?.reply_to_message ? { replyTo: replying.reply_to_message.message_id, replyAnchor: buildReplyAnchor(replying, opts) } : {}),
+  };
+}
+
+// An item of an album (tg-cli#280): a photo or document carrying a media_group_id. A video or
+// audio item keeps its own handling (videos are not delivered; audio is transcribed note by
+// note). THE predicate both the daemon's album hold (album-buffer.ts) and stepUpdates' grouping
+// use — an item one holds and the other does not group would be dropped or split.
+export function isAlbumItem(m: TgMessage): m is TgMessage & { media_group_id: string } {
+  return !!m.media_group_id && !!(m.photo?.length || m.document);
+}
+
+// Whether a photo/document is within the Bot API download limit.
+function downloadable(m: TgMessage): boolean {
+  const file = m.photo?.length ? largestPhoto(m.photo) : m.document;
+  return !!file && (file.file_size ?? 0) <= MAX_DOWNLOAD_BYTES;
+}
+
+// The album's lead item: its first downloadable item (else its first item). The album is
+// stepped, acked and wrapped under the lead's message id, and the delivery ledger keys the
+// album on it — an item over 20 MB is never delivered, so it never carries the delivery.
+function albumLead(items: StepItem[]): StepItem {
+  const ordered = [...items].sort((a, b) => a.m.message_id - b.m.message_id);
+  return ordered.find((i) => downloadable(i.m)) ?? ordered[0];
+}
+
+// The message ids the delivery of an album covers, its lead first, for the ledger's `album`
+// event: every downloadable item. An item over 20 MB is answered "too large", not delivered.
+export function albumDeliveryIds(album: TgMessage[]): number[] {
+  return album
+    .filter(downloadable)
+    .map((m) => m.message_id)
+    .sort((a, b) => a - b);
+}
+
+// A photo/document — or a whole album, as ONE delivery keyed by its lead item (items[0]) —
+// becomes a download-media action. A caption starting with `/agent` routes it by that selector instead of
+// the replied-to origin; otherwise a reply carries the quote anchor for reply-routing after the
+// download. An item over 20 MB gets the too-large reply (before the delivery of the rest).
+function mediaActions(items: StepItem[], name: string, opts: StepOpts): Action[] {
+  const media = mediaOf(items, opts);
+  const tooLarge: Action[] = media.tooLarge ? [{ kind: 'reply', text: TOO_LARGE_REPLY }] : [];
+  if (media.files.length === 0) return tooLarge;
+  const action: Extract<Action, { kind: 'download-media' }> = {
+    kind: 'download-media',
+    files: media.files,
+    ...(media.caption ? { caption: media.caption } : {}),
+    from: name,
+    messageId: items[0].m.message_id,
+  };
+  if (media.caption && isAgentCommand(media.caption)) action.agentRoute = parseAgentCommand(media.caption);
+  else if (media.replyTo !== undefined) {
+    action.replyToMessageId = media.replyTo;
+    action.replyAnchor = media.replyAnchor;
+  }
+  return [...tooLarge, action];
 }
 
 // A voice/audio note → transcribe-voice. The OGG is downloaded under a
@@ -709,25 +788,6 @@ function voiceAction(updateId: number, m: TgMessage, name: string, opts: StepOpt
     action.replyAnchor = buildReplyAnchor(m, opts);
   }
   return action;
-}
-
-function documentAction(updateId: number, m: TgMessage, name: string, opts: StepOpts): Action {
-  const doc = m.document!;
-  if ((doc.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return { kind: 'reply', text: TOO_LARGE_REPLY };
-  return attachMediaReplyRoute(
-    {
-      kind: 'download-media',
-      fileId: doc.file_id,
-      suggestedName: `${updateId}.${sanitizedExt(doc.file_name)}`,
-      mediaKind: 'document',
-      fileSize: doc.file_size,
-      caption: m.caption,
-      from: name,
-      messageId: m.message_id,
-    },
-    m,
-    opts,
-  );
 }
 
 // The saved filename is ALWAYS daemon-chosen — <update_id>.<ext> — and only

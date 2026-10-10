@@ -177,6 +177,23 @@ describe('buildAuditReport', () => {
     expect(report.received).toBe(1);
     expect(report.unverified.map((m) => m.msg)).toEqual([2]);
   });
+
+  // tg-cli#280: one album delivery, keyed by its first item, writes its claim/outcome for
+  // every item — the audit counts each photo delivered and the album event itself as nothing.
+  test('an album delivered once counts every item delivered', () => {
+    const report = buildAuditReport(
+      input({
+        history: [row(10, '[photo]'), row(11, '[photo]'), row(12, '[photo]')],
+        ledger: [
+          { ts: 1, event: 'album', chat: CHAT, msg: 10, parts: [10, 11, 12] },
+          ...[10, 11, 12].map((msg) => ({ ts: 2, event: 'delivered' as const, chat: CHAT, msg, target: '%1' })),
+        ],
+      }),
+    );
+    expect(report.received).toBe(3);
+    expect(report.delivered).toBe(3);
+    expect(report.unverified).toEqual([]);
+  });
 });
 
 // With no inbound history left (trimmed, or a fresh box) there is no window start: the scan

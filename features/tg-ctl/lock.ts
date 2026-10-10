@@ -33,6 +33,7 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     usageSchedule: join(configDir, `${base}.usage-schedule.json`),
     dailyPending: join(configDir, `${base}.daily-pending.txt`),
     pendingBatch: join(configDir, `${base}.pending-batch.json`),
+    pendingAlbums: join(configDir, `${base}.pending-albums.json`),
     deliveryLedger: join(configDir, `${base}.delivery.jsonl`),
     awarenessNudge: join(configDir, `${base}.awareness-nudge.json`),
     unansweredReminder: join(configDir, `${base}.unanswered-reminder.json`),

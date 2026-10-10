@@ -13,6 +13,7 @@ import {
   parseLedger,
   serializeLedgerEvents,
   sinkOutcomeEvent,
+  withAlbumParts,
   type LedgerEvent,
 } from '../features/tg-ctl/delivery-ledger';
 
@@ -87,6 +88,48 @@ describe('restart bookkeeping', () => {
     const state = fold([{ ts: 1, event: 'processed', update: 700 }]);
     expect(state.processedUpdates.has(700)).toBe(true);
     expect(state.processedUpdates.has(701)).toBe(false);
+  });
+});
+
+// An album (tg-cli#280) is delivered once, keyed by its first message id; every part id
+// shares that delivery's record so the audit and a later replay of one part see it delivered.
+describe('albums', () => {
+  const album: LedgerEvent = { ts: 1, event: 'album', chat: CHAT, msg: 10, parts: [10, 11, 12] };
+
+  test('the album event survives the file round-trip', () => {
+    expect(parseLedger(serializeLedgerEvents([album]))).toEqual([album]);
+    expect(parseLedger('{"ts":1,"event":"album","chat":5,"msg":10,"parts":[10,"x"]}\n')).toEqual([]);
+  });
+
+  test("a per-message event for the album's first id expands to every part; any other id stays single", () => {
+    const state = fold([album]);
+    const delivered: LedgerEvent = { ts: 2, event: 'delivered', chat: CHAT, msg: 10, target: '%1' };
+    expect(withAlbumParts(state, delivered)).toEqual([10, 11, 12].map((msg) => ({ ...delivered, msg })));
+    const other: LedgerEvent = { ts: 2, event: 'delivered', chat: CHAT, msg: 99, target: '%1' };
+    expect(withAlbumParts(state, other)).toEqual([other]);
+    // Another chat's message 10 is not this album.
+    expect(withAlbumParts(state, { ...delivered, chat: CHAT + 1 })).toEqual([{ ...delivered, chat: CHAT + 1 }]);
+    // One suppressed copy of the album is one duplicate, not one per item.
+    const duplicate: LedgerEvent = { ts: 3, event: 'duplicate', chat: CHAT, msg: 10, target: '%1', prior: 'delivered' };
+    expect(withAlbumParts(state, duplicate)).toEqual([duplicate]);
+  });
+
+  test('once the album is delivered, a part replayed on its own is suppressed', () => {
+    const state = fold([
+      album,
+      ...withAlbumParts(fold([album]), { ts: 2, event: 'delivered', chat: CHAT, msg: 10, target: '%1' }),
+    ]);
+    expect(decideDelivery(state.messages.get(ledgerKey(CHAT, 12))).kind).toBe('suppress');
+  });
+
+  test('a restart reports an interrupted or lost album once, under its first id', () => {
+    const claimed = fold([album, ...[10, 11, 12].map((msg): LedgerEvent => ({ ts: 2, event: 'claimed', chat: CHAT, msg, target: '%1' }))]);
+    expect(orphanedClaims(claimed)).toEqual([{ chat: CHAT, msg: 10, target: '%1' }]);
+    const held = fold([
+      album,
+      ...[10, 11, 12].map((msg): LedgerEvent => ({ ts: 2, event: 'queued', chat: CHAT, msg, target: '%1', hold: 'picker' })),
+    ]);
+    expect(lostPickerHolds(held)).toEqual([{ chat: CHAT, msg: 10, target: '%1' }]);
   });
 });
 

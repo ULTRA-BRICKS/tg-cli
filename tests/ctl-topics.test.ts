@@ -275,10 +275,20 @@ test('hold: FIFO per topic, the expiry clock runs from the FIRST item', () => {
 
 test('hold store: survives a restart — round-trips payloads, picker id and first-item time', () => {
   let holds = holdPayload([], 50, text('hi', 1), NOW);
-  holds = holdPayload(holds, 50, { type: 'media', mediaKind: 'photo', fileId: 'F', suggestedName: '9.jpg', caption: 'c', from: 'Alex', messageId: 2 }, NOW);
+  holds = holdPayload(holds, 50, { type: 'media', files: [{ fileId: 'F', suggestedName: '9.jpg', mediaKind: 'photo' }], caption: 'c', from: 'Alex', messageId: 2 }, NOW);
   holds = holdPayload(holds, 50, { type: 'voice', fileId: 'V', suggestedName: '10.ogg', anchor: '↩ tg#1 «…»', from: 'Alex', messageId: 3 }, NOW);
   holds = setHoldPicker(holds, 50, 900);
   expect(parseHolds(serializeHolds(holds))).toEqual(holds);
+});
+
+test('hold store: a media payload written before albums (one file, flat fields) restores as a one-file list', () => {
+  const legacy = JSON.stringify({
+    version: 1,
+    holds: [{ threadId: 50, firstAt: NOW, payloads: [{ type: 'media', mediaKind: 'document', fileId: 'F', suggestedName: '9.pdf', caption: 'c', from: 'Alex', messageId: 2 }] }],
+  });
+  expect(findHold(parseHolds(legacy), 50)?.payloads).toEqual([
+    { type: 'media', files: [{ fileId: 'F', suggestedName: '9.pdf', mediaKind: 'document' }], caption: 'c', from: 'Alex', messageId: 2 },
+  ]);
 });
 
 test('hold store: corrupt input degrades to no holds; an invalid payload is skipped, not the hold', () => {
@@ -444,7 +454,7 @@ test('row 2: photo, document and voice in a bound topic are delivered, not silen
     {
       kind: 'topic-route',
       threadId: 50,
-      payload: { type: 'media', mediaKind: 'photo', fileId: 'big', suggestedName: '12.jpg', caption: 'look', from: 'Alex', messageId: 12 },
+      payload: { type: 'media', files: [{ fileId: 'big', suggestedName: '12.jpg', mediaKind: 'photo', fileSize: 99 }], caption: 'look', from: 'Alex', messageId: 12 },
     },
     { kind: 'ack', messageId: 12 },
   ]);
@@ -452,10 +462,37 @@ test('row 2: photo, document and voice in a bound topic are delivered, not silen
   expect(doc).toEqual({
     kind: 'topic-route',
     threadId: 50,
-    payload: { type: 'media', mediaKind: 'document', fileId: 'D', suggestedName: '13.pdf', from: 'Alex', messageId: 13 },
+    payload: { type: 'media', files: [{ fileId: 'D', suggestedName: '13.pdf', mediaKind: 'document' }], from: 'Alex', messageId: 13 },
   });
   const voice = stepUpdates([inTopic(14, { voice: { file_id: 'V' } })], bound).actions[0];
   expect(voice).toEqual({ kind: 'topic-route', threadId: 50, payload: { type: 'voice', fileId: 'V', suggestedName: '14.ogg', from: 'Alex', messageId: 14 } });
+});
+
+test('row 2: an album in a topic is ONE payload listing every photo, keyed by its first message (tg-cli#280)', () => {
+  const r = stepUpdates(
+    [
+      inTopic(21, { photo: [{ file_id: 'a', file_size: 5 }], media_group_id: 'g', caption: 'both' }),
+      inTopic(22, { photo: [{ file_id: 'b', file_size: 5 }], media_group_id: 'g' }),
+    ],
+    bound,
+  );
+  expect(r.actions).toEqual([
+    {
+      kind: 'topic-route',
+      threadId: 50,
+      payload: {
+        type: 'media',
+        files: [
+          { fileId: 'a', suggestedName: '21.jpg', mediaKind: 'photo', fileSize: 5 },
+          { fileId: 'b', suggestedName: '22.jpg', mediaKind: 'photo', fileSize: 5 },
+        ],
+        caption: 'both',
+        from: 'Alex',
+        messageId: 21,
+      },
+    },
+    { kind: 'ack', messageId: 21 },
+  ]);
 });
 
 test('row 2/3: a topic whose session is gone or whose spawn never finished is routed — the entrypoint decides', () => {

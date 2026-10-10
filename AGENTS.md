@@ -193,7 +193,12 @@ outcome (`delivered`; `failed` when the sink proved nothing arrived; `uncertain`
 AFTER writing text — `sinkOutcomeEvent`, never re-sent). New delivery paths must reach one of
 these sinks with the source message id, never
 call `executeInjectSteps` directly for inbound text. Updates already processed are skipped on
-replay (Telegram redelivery, pending-batch journal). A claim a kill left open is reported to the
+replay (Telegram redelivery, pending-batch journal). An album (photos/files sharing a
+`media_group_id`, tg-cli#280) is held across polls in `tg-ctl.<bot>.pending-albums.json`
+(`features/tg-ctl/album-buffer.ts`) until a later message or a 1.5 s quiet window proves it
+complete, then stepped as ONE `download-media` with every file; the ledger's `album` event maps
+every item id to the first, and `recordDelivery` writes each record of that delivery for every
+item (`withAlbumParts`). A claim a kill left open is reported to the
 CTO at startup ("may not have reached"), never re-sent; picker holds lost by a restart, expired
 pickers and failed deferred flushes are reported too. `tg-ctl audit-delivery` reports
 delivered / not delivered / duplicated / held messages and update-id gaps over the ledger, the

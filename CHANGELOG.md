@@ -3,6 +3,24 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.61.0
+
+- **An inbound Telegram album arrives as ONE message (#280).** Alex sent two screenshots with one
+  caption as an album and the agent got two unrelated deliveries — `tg#13106` with the caption and
+  `tg#13107` with none. Telegram sends an album as one message per photo sharing a `media_group_id`,
+  often across two `getUpdates` batches, and `tg-ctl` stepped each photo on its own. The daemon now
+  holds an album's photos/files (in memory and in `tg-ctl.<bot>.pending-albums.json`) until a later
+  message from the chat or a 1.5 s quiet window proves the album complete, then delivers one
+  `sent 3 photos:` receipt listing every local path, followed by the caption, under the first
+  photo's id — in the flat chat and in forum topics alike, through `/agent` captions and reply-route.
+  The long-poll shortens while an album is held. Exactly once across restarts: the delivery ledger
+  records an `album` event mapping every item id to the first, each claim and outcome is written for
+  every item (so `tg-ctl audit-delivery` counts them delivered and an item replayed alone is
+  suppressed), the album leaves its journal only after its actions ran, and a restart gives a
+  restored album a fresh hold window so items still queued at Telegram join it. An item over 20 MB
+  is left out with the too-large reply; the rest still go. A topic hold written before this release
+  (one media file in flat fields) still restores. A `tg auth` Start tap is never held as an album item.
+
 ## 1.60.2
 
 - **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on

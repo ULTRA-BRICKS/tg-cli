@@ -46,7 +46,11 @@ export type LedgerEvent =
   | { ts: number; event: 'uncertain'; chat: number; msg: number; target: string }
   // Typed into the pane but still in its input box after the retry Enter (tg-cli#463); the
   // CTO was told. Never re-sent: the text is already in the box.
-  | { ts: number; event: 'unsubmitted'; chat: number; msg: number; target: string };
+  | { ts: number; event: 'unsubmitted'; chat: number; msg: number; target: string }
+  // An album (tg-cli#280): one delivery keyed by its first item `msg`; `parts` is every item's
+  // id, `msg` first. Written before the album is stepped, so every per-message record of that
+  // delivery (withAlbumParts) covers each item.
+  | { ts: number; event: 'album'; chat: number; msg: number; parts: number[] };
 
 export type LedgerHold = 'deferred' | 'picker' | 'topic-hold';
 
@@ -58,6 +62,8 @@ export type MessageState =
 export interface LedgerState {
   messages: Map<string, MessageState>;
   processedUpdates: Set<number>;
+  // Every album item's key → the album's ids, its first (delivery-key) id first.
+  albums: Map<string, number[]>;
 }
 
 export function ledgerKey(chat: number, msg: number): string {
@@ -111,6 +117,11 @@ export function parseLedgerLine(line: string): LedgerEvent | null {
       return isStr(r.target) && isHold(r.hold) ? { ts, event: 'queued', chat, msg, target: r.target, hold: r.hold } : null;
     case 'duplicate':
       return isStr(r.target) && isStr(r.prior) ? { ts, event: 'duplicate', chat, msg, target: r.target, prior: r.prior } : null;
+    case 'album': {
+      const parts: unknown = r.parts;
+      if (!Array.isArray(parts) || !parts.every(isInt) || parts[0] !== msg) return null;
+      return { ts, event: 'album', chat, msg, parts };
+    }
     default:
       return null;
   }
@@ -131,7 +142,7 @@ export function serializeLedgerEvents(events: LedgerEvent[]): string {
 }
 
 export function emptyLedgerState(): LedgerState {
-  return { messages: new Map(), processedUpdates: new Set() };
+  return { messages: new Map(), processedUpdates: new Set(), albums: new Map() };
 }
 
 // Fold events (in file order) into `state`, mutating it. `received` and `duplicate`
@@ -160,6 +171,9 @@ export function applyLedgerEvents(state: LedgerState, events: LedgerEvent[]): Le
         state.messages.set(key, { state: 'queued', target: e.target, at: e.ts, hold: e.hold });
         break;
       }
+      case 'album':
+        for (const part of e.parts) state.albums.set(ledgerKey(e.chat, part), e.parts);
+        break;
       case 'received':
       case 'duplicate':
         break;
@@ -196,12 +210,31 @@ export function sinkOutcomeEvent(ts: number, base: { chat: number; msg: number; 
   return { ts, event: 'failed', ...base, error: res.error };
 }
 
+// One per-message record (claim, outcome, hold, failure) of an album's delivery, written for
+// every item of the album (tg-cli#280): the delivery is keyed on the first item, and recording
+// the rest with it lets the audit count each item delivered and suppresses an item replayed on
+// its own later. Any other message — and an album item addressed by its own id — stays single,
+// and so does a suppressed copy (`duplicate`): one copy of the album was stopped, not N.
+export function withAlbumParts<E extends LedgerEvent>(state: LedgerState, e: E): E[] {
+  if (e.event === 'received' || e.event === 'processed' || e.event === 'album' || e.event === 'duplicate') return [e];
+  const parts = state.albums.get(ledgerKey(e.chat, e.msg));
+  if (!parts || parts[0] !== e.msg) return [e];
+  return parts.map((msg) => ({ ...e, msg }));
+}
+
+// A later item of an album: reported to the CTO under the album's first id only.
+function isLaterAlbumItem(state: LedgerState, key: string, msg: number): boolean {
+  const parts = state.albums.get(key);
+  return parts !== undefined && parts[0] !== msg;
+}
+
 // Claims a dead daemon left without an outcome — each needs an `uncertain` notice.
 export function orphanedClaims(state: LedgerState): Array<{ chat: number; msg: number; target: string }> {
   const out: Array<{ chat: number; msg: number; target: string }> = [];
   for (const [key, s] of state.messages) {
     if (s.state !== 'claimed') continue;
     const [chat, msg] = key.split(':').map(Number);
+    if (isLaterAlbumItem(state, key, msg)) continue;
     out.push({ chat, msg, target: s.target });
   }
   return out;
@@ -215,6 +248,7 @@ export function lostPickerHolds(state: LedgerState): Array<{ chat: number; msg: 
   for (const [key, s] of state.messages) {
     if (s.state !== 'queued' || s.hold !== 'picker') continue;
     const [chat, msg] = key.split(':').map(Number);
+    if (isLaterAlbumItem(state, key, msg)) continue;
     out.push({ chat, msg, target: s.target });
   }
   return out;

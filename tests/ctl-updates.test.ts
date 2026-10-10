@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { stepUpdates, buildReplyInject, type StepOpts } from '../features/tg-ctl/updates';
+import { albumDeliveryIds, stepUpdates, buildReplyInject, type StepOpts } from '../features/tg-ctl/updates';
 import { DEFAULT_CONTROL, type ControlConfig, type TgMessage, type TgUpdate } from '../features/tg-ctl/types';
 import { wrapInbound } from '../features/tg-ctl/inject';
 
@@ -762,10 +762,7 @@ test('photo picks the LARGEST file_size, names it <update_id>.jpg', () => {
   expect(r.actions).toEqual([
     {
       kind: 'download-media',
-      fileId: 'big',
-      suggestedName: '77.jpg',
-      mediaKind: 'photo',
-      fileSize: 50_000,
+      files: [{ fileId: 'big', suggestedName: '77.jpg', mediaKind: 'photo', fileSize: 50_000 }],
       caption: 'look at this',
       from: 'Alex',
       messageId: 77,
@@ -776,7 +773,7 @@ test('photo picks the LARGEST file_size, names it <update_id>.jpg', () => {
 
 test('photo renditions without file_size → last entry wins (Telegram is size-ascending)', () => {
   const r = stepUpdates([upd(5, { photo: [{ file_id: 'a' }, { file_id: 'b' }] })], makeOpts());
-  expect(r.actions[0]).toMatchObject({ kind: 'download-media', fileId: 'b', suggestedName: '5.jpg' });
+  expect(r.actions[0]).toMatchObject({ kind: 'download-media', files: [{ fileId: 'b', suggestedName: '5.jpg' }] });
 });
 
 test('photo over 20MB → reply instead of download', () => {
@@ -867,10 +864,7 @@ test('document name = <update_id>.<sanitized ext>, NEVER the Telegram basename',
   expect(r.actions).toEqual([
     {
       kind: 'download-media',
-      fileId: 'doc1',
-      suggestedName: '88.pdf',
-      mediaKind: 'document',
-      fileSize: 1234,
+      files: [{ fileId: 'doc1', suggestedName: '88.pdf', mediaKind: 'document', fileSize: 1234 }],
       caption: 'q2',
       from: 'Alex',
       messageId: 88,
@@ -889,13 +883,13 @@ test('document extension defaults to bin: missing file_name, no dot, junk ext', 
   ];
   for (const [fileName, expected] of cases) {
     const r = stepUpdates([upd(3, { document: { file_id: 'x', file_name: fileName } })], makeOpts());
-    expect(r.actions[0]).toMatchObject({ kind: 'download-media', suggestedName: expected });
+    expect(r.actions[0]).toMatchObject({ kind: 'download-media', files: [{ suggestedName: expected }] });
   }
 });
 
 test('document ext is sanitized to lowercase alphanumerics', () => {
   const r = stepUpdates([upd(4, { document: { file_id: 'x', file_name: 'archive.tar.gz' } })], makeOpts());
-  expect(r.actions[0]).toMatchObject({ suggestedName: '4.gz' });
+  expect(r.actions[0]).toMatchObject({ files: [{ suggestedName: '4.gz' }] });
 });
 
 test('document over 20MB → reply; exactly 20MB still downloads (strict >)', () => {
@@ -948,6 +942,105 @@ test('a document caption starting with /agent carries an agent route instead of 
     rest: 'attached trace',
     all: 'rig attached trace',
   });
+});
+
+// --- albums (media_group_id, tg-cli#280): one delivery for every item ---
+
+const albumPhoto = (id: number, extra: Partial<TgMessage> = {}): TgUpdate =>
+  upd(id, { photo: [{ file_id: `small${id}`, file_size: 1 }, { file_id: `p${id}`, file_size: 100 }], media_group_id: 'alb', ...extra });
+
+test('an album is ONE download-media listing every item, keyed and acked by its first message', () => {
+  const r = stepUpdates([albumPhoto(51, { caption: 'two screenshots of one bug' }), albumPhoto(52), albumPhoto(53)], makeOpts());
+  expect(r.actions).toEqual([
+    {
+      kind: 'download-media',
+      files: [
+        { fileId: 'p51', suggestedName: '51.jpg', mediaKind: 'photo', fileSize: 100 },
+        { fileId: 'p52', suggestedName: '52.jpg', mediaKind: 'photo', fileSize: 100 },
+        { fileId: 'p53', suggestedName: '53.jpg', mediaKind: 'photo', fileSize: 100 },
+      ],
+      caption: 'two screenshots of one bug',
+      from: 'Alex',
+      messageId: 51,
+    },
+    { kind: 'ack', messageId: 51 },
+  ]);
+  expect(r.newOffset).toBe(54);
+});
+
+test('album items keep message order whatever the batch order; the caption may sit on any item', () => {
+  const r = stepUpdates([albumPhoto(53), albumPhoto(51), albumPhoto(52, { caption: 'middle' })], makeOpts());
+  const a = r.actions[0] as Extract<(typeof r.actions)[number], { kind: 'download-media' }>;
+  expect(a.files.map((f) => f.fileId)).toEqual(['p51', 'p52', 'p53']);
+  expect(a.caption).toBe('middle');
+  expect(a.messageId).toBe(51);
+  expect(r.actions).toHaveLength(2);
+});
+
+test('several captions in one album are all kept, in item order', () => {
+  const r = stepUpdates([albumPhoto(51, { caption: 'first' }), albumPhoto(52, { caption: 'second' })], makeOpts());
+  expect((r.actions[0] as Extract<(typeof r.actions)[number], { kind: 'download-media' }>).caption).toBe('first\nsecond');
+});
+
+test('an album around other messages keeps the batch order: text, album, text', () => {
+  const r = stepUpdates([upd(50, { text: 'before' }), albumPhoto(51), albumPhoto(52), upd(53, { text: 'after' })], makeOpts());
+  expect(r.actions.map((a) => a.kind)).toEqual(['inject-text', 'ack', 'download-media', 'ack', 'inject-text', 'ack']);
+});
+
+test('an album caption /agent routes the whole album; a reply album reply-routes on its first replying item', () => {
+  const routed = stepUpdates([albumPhoto(51, { caption: '/agent ext look' }), albumPhoto(52)], makeOpts());
+  expect(routed.actions[0]).toMatchObject({ kind: 'download-media', agentRoute: { selector: 'ext', rest: 'look' } });
+  const replyTo = { message_id: 42, chat: { id: CHAT_ID }, date: NOW, text: 'agent report' };
+  const reply = stepUpdates([albumPhoto(51), albumPhoto(52, { reply_to_message: replyTo })], makeOpts());
+  expect(reply.actions[0]).toMatchObject({ kind: 'download-media', replyToMessageId: 42, messageId: 51 });
+});
+
+test('an album item over 20MB is left out with the too-large reply; the rest are still delivered', () => {
+  const r = stepUpdates(
+    [albumPhoto(51), upd(52, { photo: [{ file_id: 'huge', file_size: 20 * 1024 * 1024 + 1 }], media_group_id: 'alb' })],
+    makeOpts(),
+  );
+  expect(r.actions.map((a) => a.kind)).toEqual(['reply', 'download-media', 'ack']);
+  expect((r.actions[1] as Extract<(typeof r.actions)[number], { kind: 'download-media' }>).files.map((f) => f.fileId)).toEqual(['p51']);
+});
+
+test('a document album lists every file', () => {
+  const doc = (id: number): TgUpdate => upd(id, { document: { file_id: `d${id}`, file_name: 'log.txt' }, media_group_id: 'docs' });
+  const r = stepUpdates([doc(61), doc(62)], makeOpts());
+  expect(r.actions[0]).toMatchObject({
+    kind: 'download-media',
+    files: [
+      { fileId: 'd61', suggestedName: '61.txt', mediaKind: 'document' },
+      { fileId: 'd62', suggestedName: '62.txt', mediaKind: 'document' },
+    ],
+  });
+});
+
+// Review F2: an item over 20 MB is never delivered, so it never carries the album's delivery
+// (wrap id, 👀, ledger key) and is not among the ids the ledger records as delivered.
+test('an album whose first item is over 20MB is keyed and acked by its first downloadable item; its caption is kept', () => {
+  const huge = upd(51, { photo: [{ file_id: 'huge', file_size: 21 * 1024 * 1024 }], media_group_id: 'alb', caption: 'see both' });
+  const r = stepUpdates([huge, albumPhoto(52), albumPhoto(53)], makeOpts());
+  expect(r.actions).toEqual([
+    { kind: 'reply', text: 'file too large for Bot API (>20 MB)' },
+    {
+      kind: 'download-media',
+      files: [
+        { fileId: 'p52', suggestedName: '52.jpg', mediaKind: 'photo', fileSize: 100 },
+        { fileId: 'p53', suggestedName: '53.jpg', mediaKind: 'photo', fileSize: 100 },
+      ],
+      caption: 'see both',
+      from: 'Alex',
+      messageId: 52,
+    },
+    { kind: 'ack', messageId: 52 },
+  ]);
+  expect(albumDeliveryIds([huge, albumPhoto(53), albumPhoto(52)].map((u) => u.message!))).toEqual([52, 53]);
+});
+
+test('a media_group_id from a stranger is still dropped whole', () => {
+  const stranger = (id: number): TgUpdate => ({ ...albumPhoto(id), message: { ...albumPhoto(id).message!, from: { id: 999, first_name: 'X' } } });
+  expect(stepUpdates([stranger(51), stranger(52)], makeOpts()).actions).toEqual([]);
 });
 
 // --- voice inbound (inbound STT: transcribe-voice action) ---

@@ -79,7 +79,9 @@ must fetch the file before it knows the local path to inject. The action still
 carries the same `replyToMessageId` + `replyAnchor`; after download the executor
 wraps `sent photo: <path>` / `sent file: <path>` plus the caption, prepends the
 anchor, and hands it to the same `reply-route` handler. A screenshot reply to an
-`ext` report therefore reaches `ext`, not the last active/default pane.
+`ext` report therefore reaches `ext`, not the last active/default pane. An album sent as a
+reply is one `sent N photos:` receipt anchored on the first of its items that is a reply
+(tg-cli#280).
 Exception: when the media caption itself starts with `/agent ...`, the explicit
 agent selector wins over the replied-to origin. In that case the daemon routes
 the media receipt as a `/agent` command and does not prepend the reply anchor.

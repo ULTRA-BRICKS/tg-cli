@@ -49,7 +49,8 @@ the daemon downloads the file, it injects the pre-wrapped
 `sent photo: <local-path>` / `sent file: <local-path>` receipt plus the caption
 body into the selected agent. The `/agent <selector>` command line itself is not
 injected. Explicit caption routing wins over default last-active auto-bind and
-over reply-route metadata.
+over reply-route metadata. An album routes whole: its caption's `/agent` line moves every
+file of the album, delivered as one `sent N photos:` receipt (tg-cli#280).
 
 ## Phonetic normalization
 
