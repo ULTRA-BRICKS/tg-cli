@@ -518,6 +518,7 @@ export interface CtlPaths {
   unansweredReminder: string; // which open questions got their one reminder + the live reminder message (tg-cli#464)
   runInfo: string; // which commit the running daemon loaded (pid + sha), for stale-code detection (tg-cli#279)
   sessions: string; // session registry keyed by harness session id; the daemon is its ONLY writer (#487)
+  authPending: string; // `tg auth` one-time /start binding the daemon claims (docs/specs/tg-auth.md §4)
 }
 
 // --- forum topics (docs/specs/session-registry-and-topics.md §4) ---

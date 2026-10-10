@@ -93,7 +93,9 @@ test('an empty HOME with no TG_CTL_CONFIG_DIR still hard-fails on missing creden
     HOME: home,
     TG_API_BASE: `http://127.0.0.1:${server.port}`,
   });
-  expect(exitCode).toBe(1);
+  // 78 = not configured (docs/specs/tg-auth.md §7), with the `tg auth` hint and the resolved path.
+  expect(exitCode).toBe(78);
+  expect(stderr).toContain(join(home, '.config', 'tg-cli', '.env'));
   expect(stderr).toContain('TG_BOT_TOKEN and TG_CHAT_ID must be set');
   expect(received).toHaveLength(0);
 });

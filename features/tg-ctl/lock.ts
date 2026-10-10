@@ -38,6 +38,7 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     unansweredReminder: join(configDir, `${base}.unanswered-reminder.json`),
     runInfo: join(configDir, `${base}.run.json`),
     sessions: join(configDir, `${base}.sessions.json`),
+    authPending: join(configDir, `${base}.auth-pending.json`),
   };
 }
 

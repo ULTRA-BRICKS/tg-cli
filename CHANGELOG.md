@@ -3,6 +3,28 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.56.0
+
+- **`tg auth` connects tg to Telegram in one step (#561).** Paste the BotFather token (or pass
+  `--token <token>` / `--token -`), tap **Start** on the one-time `https://t.me/<bot>?start=…`
+  link it prints (a terminal QR too when `qrencode` is installed), and `TG_BOT_TOKEN` +
+  `TG_CHAT_ID` are written to the config `.env` (atomic, 0600, every other line kept) — no
+  numeric chat-id lookup. Only an exact `/start <nonce>` from a private chat, before the link
+  expires, binds; the pending file stores only the nonce's hash. `tg auth status` shows the bot
+  (@username, name, id), the target chat by name/@username/id, the config path and whether
+  tg-ctl runs; `tg auth logout` removes the two keys; `tg help auth` lists the exit codes
+  (3 rejected token, 4 timed out, 5 another consumer/webhook, 78 not configured). Nothing is
+  sent to the chat unless `--test`.
+- **A running tg-ctl takes the Start tap itself — tg auth never competes for `getUpdates`.**
+  The daemon claims the `/start` in its poll loop, writes `TG_CHAT_ID`, and switches to that chat
+  without a restart. Without a daemon tg auth reads the tap itself, and when a chat is already
+  bound it only peeks, so a stopped daemon loses no pending message. A 409 hands over to a daemon
+  that appeared mid-flow, else stops with exit 5. Deep-link Start taps are never typed into an
+  agent's pane.
+- **`tg` without credentials now says how to fix it:** the error names the resolved `.env` path
+  and `tg auth`, and exits **78** (was 1) so scripts can tell "not set up" from a failed send.
+  `tg-ctl` started without a chat names `tg auth` too.
+
 ## 1.55.17
 
 - **CodeQL passes on main again.** The format gate added in 1.55.16 strips tags from a message

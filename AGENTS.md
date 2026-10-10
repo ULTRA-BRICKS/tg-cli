@@ -9,7 +9,9 @@ Agent-facing documentation. English only.
 `tg` is a single-file Bun/TypeScript CLI (`#!/usr/bin/env bun`, entrypoint: `tg` at repo root,
 no build step) that sends curated agent reports to Telegram via the Bot API.
 
-Credentials: `~/.config/tg-cli/.env` — must contain `TG_BOT_TOKEN` and `TG_CHAT_ID`.
+Credentials: `~/.config/tg-cli/.env` — must contain `TG_BOT_TOKEN` and `TG_CHAT_ID`, written by
+`tg auth` (one Start tap binds the chat; never ask a user to look up a numeric id). A send without
+them exits 78 with the `tg auth` hint.
 
 ---
 
@@ -302,6 +304,23 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
   (`rm -rf`, `sudo rm`, force-push, a fork bomb, `curl | sh`, …) layered on top of the existing
   identity-only sender-allowlist gate — a match is replied to instead of injected, with a `!!`
   doubled-bang override to confirm and run anyway. Shared shapes in `types.ts`.
+- `features/auth/` — `tg auth` (docs/specs/tg-auth.md): one-action connection. `env-file.ts`
+  (`mergeEnvContent`: the `.env` writer — replaces/appends/removes keys, keeps every other line),
+  `binding.ts` (32-char base64url `/start` nonce, `t.me/<bot>?start=` link, the per-bot pending
+  file `tg-ctl.<botId>.auth-pending.json` holding only the nonce's sha256, `matchStart` — exact
+  text, PRIVATE chat, live unexpired hash — and `daemonAuthStep`), `args.ts` (exact-match
+  `auth` dispatch + `AUTH_USAGE`), `status.ts` (bot/chat/config/daemon block), `cli.ts`
+  (`runAuth`, every effect injected as `AuthDeps`; `tg` wires real I/O). Only ONE `getUpdates`
+  consumer per bot: with a live `tg-ctl` for the configured token, tg auth never polls — the
+  daemon claims the `/start` in its poll loop (before routing; every nonce-shaped deep-link
+  `/start` is dropped from routing but stays in the delivery ledger), writes `TG_CHAT_ID`, marks
+  the pending file `bound` and switches `ctx.chatId` + the ledger chat in memory from the NEXT
+  batch (no restart; the tap's own batch stays on the chat it was received for). One login per
+  bot at a time: the pending check-and-write runs under `<pending>.lock` (`withRoutesLock`).
+  Without a daemon tg auth polls itself: confirming offsets only when no chat is bound yet
+  (first-time setup), short peeks without an offset when one is (a stopped daemon still owns
+  those updates). Never pass `allowed_updates` from tg auth — Telegram stores it server-side.
+  The daemon still refuses to start without `TG_CHAT_ID`; its error names `tg auth`.
 - `features/replies/` — the `tg replies` subcommand (message recall). All PURE except `cli.ts`,
   which is effectful-via-DI like `features/hooks/cli.ts` (the I/O — history read, `$TMUX_PANE`
   detection, stdout — is injected as `RepliesCliDeps`, so the orchestration is unit-tested without

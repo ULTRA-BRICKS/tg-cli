@@ -266,6 +266,8 @@ import {
 } from "./features/tg-ctl/tg-awareness-nudge"
 import { normalizeRichHtml, validateRichHtml } from "./features/render/rich"
 import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
+import { daemonAuthStep, markAuthBound, markAuthFailed, serializePending, type AuthChat, type PendingAuth } from "./features/auth/binding"
+import { mergeEnvContent } from "./features/auth/env-file"
 import { botIdFromToken, ctlPaths, daemonRunState, daemonStatusLine, flockPidsForInode, ownsPidFile, planLegacyLastUserTargetMigration, readPidFile, type DaemonRunState } from "./features/tg-ctl/lock"
 import {
   assessCodeFreshness,
@@ -1553,6 +1555,42 @@ function openDeliveryLedger(path: string, chat: number): LedgerState {
   const state = applyLedgerEvents(emptyLedgerState(), kept ?? events)
   deliveryLedger = { path, chat, state }
   return state
+}
+
+// tg auth's `/start <nonce>` claim (docs/specs/tg-auth.md §4): persist the chat into the .env and
+// report it to the waiting `tg auth` through the pending file. Returns whether the chat was
+// saved; the caller switches to it (switchChat) only from the NEXT batch, so the batch that
+// carried the tap is routed and ledgered against the one chat it was received for. A failed
+// .env write is reported as `failed` and changes nothing.
+function claimAuthBinding(ctx: Ctx, claim: { chat: AuthChat; pending: PendingAuth }): boolean {
+  const envPath = join(ctx.configDir, ".env")
+  try {
+    atomicWrite(envPath, mergeEnvContent(readFileOrNull(envPath), { TG_CHAT_ID: String(claim.chat.id) }))
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    log(`tg auth: cannot save chat ${claim.chat.id} to ${envPath}: ${message}`)
+    try {
+      atomicWrite(ctx.paths.authPending, serializePending(markAuthFailed(claim.pending, message)))
+    } catch (reportErr) {
+      log(`tg auth: cannot report the failure: ${reportErr instanceof Error ? reportErr.message : String(reportErr)}`)
+    }
+    return false
+  }
+  try {
+    atomicWrite(ctx.paths.authPending, serializePending(markAuthBound(claim.pending, claim.chat, Date.now())))
+  } catch (err) {
+    log(`tg auth: chat saved, but cannot report it to tg auth: ${err instanceof Error ? err.message : String(err)}`)
+  }
+  log(`tg auth: bound chat ${claim.chat.id}${claim.chat.id === ctx.chatId ? " (unchanged)" : ` (was ${ctx.chatId})`}`)
+  return true
+}
+
+// The daemon keeps running on a chat `tg auth` just bound — no restart (tg-cli#561).
+function switchChat(ctx: Ctx, chatId: number): void {
+  if (chatId === ctx.chatId) return
+  log(`now serving chat ${chatId} (was ${ctx.chatId})`)
+  ctx.chatId = chatId
+  if (deliveryLedger) deliveryLedger.chat = chatId
 }
 
 // Folds `events` into the live state, then appends and fsyncs them: a claim must be
@@ -11929,6 +11967,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
   }
 
+  // A chat `tg auth` bound in the previous batch (claimAuthBinding); applied between batches.
+  let authChatSwitch: number | null = null
   for (;;) {
     // Graceful shutdown lands here BETWEEN batches — after the previous batch's
     // actions fully executed, before the next long-poll — so a reload never drops
@@ -11936,6 +11976,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // an answered-question backlog is drained, not wedged/dropped (codex #198);
     // cleanExit then persists the durable backlog on its way out.
     if (shuttingDown) await cleanExitAfterFlushDrain()
+    if (authChatSwitch !== null) {
+      switchChat(ctx, authChatSwitch)
+      authChatSwitch = null
+    }
     try {
       // Idle TTL first, so even an error-backoff loop eventually exits. A
       // newer registration file also counts as agent activity (the daemon may
@@ -12223,12 +12267,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // only half-processed runs again; the sinks' ledger gate keeps whatever already went out
       // from going out twice. The offset still advances past the whole raw batch.
       const processedUpdates = deliveryLedger?.state.processedUpdates
-      const updates = processedUpdates ? json.result.filter((u) => !processedUpdates.has(u.update_id)) : json.result
-      if (updates.length < json.result.length) log(`skipping ${json.result.length - updates.length} already-processed update(s)`)
+      const received = processedUpdates ? json.result.filter((u) => !processedUpdates.has(u.update_id)) : json.result
+      if (received.length < json.result.length) log(`skipping ${json.result.length - received.length} already-processed update(s)`)
       const batchOffset = json.result.reduce((next, u) => Math.max(next, u.update_id + 1), offset)
       const receivedAt = Math.floor(Date.now() / 1000)
       recordDelivery(
-        updates.map((u): LedgerEvent => {
+        received.map((u): LedgerEvent => {
           const m = u.message
           const sender = m?.from?.id
           if (m && m.chat.id === ctx.chatId && sender !== undefined && (sender === ctx.chatId || ctx.cfg.allowedSenders.includes(sender))) {
@@ -12237,6 +12281,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           return { ts: Date.now(), event: "received", update: u.update_id, date: m?.date ?? receivedAt }
         }),
       )
+      // tg auth (docs/specs/tg-auth.md §4): claim a live `/start <nonce>` and keep every deep-link
+      // Start tap out of routing so it is never typed into a pane. The ledger above still records
+      // it (no update-id gap) and the offset still advances past it (batchOffset).
+      const auth = daemonAuthStep(received, () => readFileOrNull(ctx.paths.authPending), Date.now())
+      if (auth.claim && claimAuthBinding(ctx, auth.claim)) authChatSwitch = auth.claim.chat.id
+      const updates = auth.drop.size > 0 ? received.filter((u) => !auth.drop.has(u.update_id)) : received
 
       await refreshOriginalHosts()
       const step = stepUpdates(updates, {
@@ -12430,8 +12480,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         }),
       )
 
-      // Every action for these updates ran: a later replay of any of them is skipped whole.
-      recordDelivery(updates.map((u): LedgerEvent => ({ ts: Date.now(), event: "processed", update: u.update_id })))
+      // Every action for these updates ran: a later replay of any of them is skipped whole
+      // (a dropped tg auth Start tap included — it is finished, not pending).
+      recordDelivery(received.map((u): LedgerEvent => ({ ts: Date.now(), event: "processed", update: u.update_id })))
 
       // The batch fully completed — the journal is no longer needed. Best-effort:
       // if this unlink fails the next startup replays the same batch (idempotent/dedupe-tolerant
@@ -12525,7 +12576,7 @@ if (import.meta.main) {
     process.exit(0)
   }
   if (!botId || !env.TG_CHAT_ID) {
-    console.error(`Error: TG_BOT_TOKEN and TG_CHAT_ID must be set in ${join(configDir, ".env")}`)
+    console.error(`Error: TG_BOT_TOKEN and TG_CHAT_ID must be set in ${join(configDir, ".env")} — run \`tg auth\` to connect.`)
     process.exit(1)
   }
 

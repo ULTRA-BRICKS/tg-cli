@@ -14,23 +14,28 @@ import { readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 
-export function loadEnv(filePath: string): Record<string, string> {
+/** Parse `.env` content (the rules above). Pure — `tg auth` parses content it already read. */
+export function parseEnvContent(content: string): Record<string, string> {
   const env: Record<string, string> = {};
-  try {
-    const lines = readFileSync(filePath, 'utf8').split('\n');
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const eq = trimmed.indexOf('=');
-      if (eq === -1) continue;
-      const key = trimmed.slice(0, eq).trim();
-      const value = trimmed.slice(eq + 1).trim();
-      if (key) env[key] = value;
-    }
-  } catch {
-    // file doesn't exist — skip
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const value = trimmed.slice(eq + 1).trim();
+    if (key) env[key] = value;
   }
   return env;
+}
+
+export function loadEnv(filePath: string): Record<string, string> {
+  try {
+    return parseEnvContent(readFileSync(filePath, 'utf8'));
+  } catch {
+    // file doesn't exist — skip
+    return {};
+  }
 }
 
 /** Absolute path to the tg config `.env` (respects $HOME). */

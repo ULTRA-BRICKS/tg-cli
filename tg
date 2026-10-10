@@ -1,10 +1,12 @@
 #!/usr/bin/env bun
-import { accessSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
+import { accessSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
-import { join, resolve } from "path"
+import { dirname, join, resolve } from "path"
 // Explicit import (not the global `crypto`) so the multi-part groupId token
 // doesn't depend on a runtime global being present — review: tg-cli#131 f/u.
-import { randomUUID } from "node:crypto"
+import { randomBytes, randomUUID } from "node:crypto"
+import { AUTH_USAGE, parseAuthArgs } from "./features/auth/args"
+import { runAuth, type AuthDeps } from "./features/auth/cli"
 import { BOM_MAX_BYTES, maybeAddBom } from "./features/auto-attach/encoding"
 import { checkAttachmentFile, type FileCheckDeps } from "./features/auto-attach/file-check"
 import { findStrayCjk, formatStrayCjkError } from "./features/cli/cjk-guard"
@@ -53,7 +55,7 @@ import {
   type HintKind,
 } from "./features/autolink-tasks/state"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
-import { botIdFromToken, ctlPaths } from "./features/tg-ctl/lock"
+import { botIdFromToken, ctlPaths, readPidFile } from "./features/tg-ctl/lock"
 import {
   appendRoute,
   fsRoutesLockIo,
@@ -156,6 +158,8 @@ export const USAGE = `Usage:
   tg --reply-to 1234 --tag answer "answer"  # thread under inbound message 1234
   tg --topic 7 "status"         # post INTO forum topic 7 (else TG_TOPIC)
   printf 'task\\tstatus\\nship\\tdone' | tg --table   # aligned <pre> table
+  tg auth                       # connect to Telegram in one step (token + one Start tap)
+  tg auth status                # which bot sends, to which chat (tg help auth)
   tg voice setup                # configure inbound voice→text (local Whisper STT)
   tg report --title <t> --ticket <id> --impact <t> --verify-cmd <c> --verify-result <r>
                                  # structured result report → Telegram (tg help report)
@@ -166,6 +170,8 @@ toggles) apply to ANY of the above forms — see Options below.
 
 Help topics (\`tg help <topic>\`):
   format   what Telegram message formatting supports (HTML tags / entities)
+  report   the structured result report (tg report)
+  auth     connecting to Telegram: tg auth login / status / logout, exit codes
 
 Readable long messages:
   For longer status reports, avoid one dense plain-text block. Use headings,
@@ -411,6 +417,11 @@ HTML tags supported by Telegram Bot API:
 
 Only those HTML tags are supported. Escape raw <, >, and & outside tags as
 &lt;, &gt;, and &amp;.
+
+Exit codes (send):
+  0   sent        1   failed (Telegram/network error, a guard blocked it)
+  78  not connected to Telegram (no bot token or chat configured) — run \`tg auth\`
+  (tg auth has its own codes: tg help auth)
 `
 
 // The human AGENT NAME for THIS shell's tmux pane — the SAME derivation the
@@ -458,6 +469,87 @@ function ownSessionKey(reg: Registry, ancestor: { agent: string; pid: number } |
   return callerSessionKey(reg, { agentPid: ancestor?.pid ?? null, locator })
 }
 
+// Real I/O for `tg auth` (features/auth/cli.ts owns the flow). Ctrl-C runs the cleanups runAuth
+// registered (its guarded pending-file release) — runAuth's own `finally` never runs on SIGINT.
+function authDeps(configDir: string): AuthDeps {
+  const interruptCleanups = new Set<() => void>()
+  process.on("SIGINT", () => {
+    for (const cleanup of interruptCleanups) {
+      try {
+        cleanup()
+      } catch {
+        // best effort on the way out — an expired record is harmless
+      }
+    }
+    process.exit(130)
+  })
+  const lines = (async function* () {
+    for await (const line of console) yield line
+  })()
+  return {
+    configDir,
+    env: process.env,
+    apiBase: process.env.TG_API_BASE || "https://api.telegram.org",
+    fetch: (url, init) => fetch(url, init),
+    readFile: (p) => {
+      try {
+        return readFileSync(p, "utf8")
+      } catch {
+        return null
+      }
+    },
+    writeFileAtomic: (p, content) => {
+      mkdirSync(dirname(p), { recursive: true, mode: 0o700 })
+      const tmp = `${p}.${process.pid}.tmp`
+      writeFileSync(tmp, content, { mode: 0o600 })
+      renameSync(tmp, p)
+    },
+    // Same O_EXCL + pid-liveness lock as routes/history; a live holder → undefined (busy).
+    withLock: (lockPath, body) => {
+      mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 })
+      return withRoutesLock(fsRoutesLockIo(lockPath), body, { onContended: "skip" })
+    },
+    removeFile: (p) => rmSync(p, { force: true }),
+    onInterrupt: (cleanup) => {
+      interruptCleanups.add(cleanup)
+      return () => void interruptCleanups.delete(cleanup)
+    },
+    now: () => Date.now(),
+    sleep: (ms) => Bun.sleep(ms),
+    randomBytes: (n) => new Uint8Array(randomBytes(n)),
+    stdinIsTTY: Boolean(process.stdin.isTTY),
+    readLine: async () => {
+      const next = await lines.next()
+      return next.done ? null : next.value
+    },
+    // The daemon's pidfile names a live pid → it is polling that bot (same probe as tg-ctl status's cheap path).
+    daemonPid: (botId) => {
+      if (!botId) return null
+      let pid: number | null = null
+      try {
+        pid = readPidFile(readFileSync(ctlPaths(configDir, botId).pid, "utf8"))
+      } catch {
+        return null
+      }
+      if (pid === null) return null
+      try {
+        process.kill(pid, 0)
+        return pid
+      } catch (e) {
+        return e instanceof Error && "code" in e && e.code === "EPERM" ? pid : null
+      }
+    },
+    // A phone-scannable QR of the deep link, only when `qrencode` is installed and a human is looking.
+    renderQr: (text) => {
+      if (!process.stdout.isTTY || !Bun.which("qrencode")) return null
+      const r = Bun.spawnSync(["qrencode", "-t", "UTF8", "-m", "1", text], { stdout: "pipe", stderr: "ignore", timeout: 5000 })
+      return r.exitCode === 0 ? r.stdout.toString().trimEnd() : null
+    },
+    out: (line) => console.log(line),
+    err: (line) => console.error(line),
+  }
+}
+
 // --- CLI entrypoint (only runs when executed directly, not when imported) ---
 if (import.meta.main) {
   const rawArgs = process.argv.slice(2)
@@ -476,6 +568,18 @@ if (import.meta.main) {
   // either fail to find credentials or send with the WRONG bot's (review
   // finding — this send path used to hardcode the default dir, unlike `replies`).
   const configDir = process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli")
+
+  // `tg auth …` — one-action Telegram connection (docs/specs/tg-auth.md). Runs before every
+  // credential gate: it is how the credentials get there. Exact-match leading token
+  // (parseAuthArgs → null for prose like `tg auth is broken`, which still sends).
+  const authCmd = parseAuthArgs(rawArgs)
+  if (authCmd !== null) {
+    if ("error" in authCmd) {
+      console.error(`Error: ${authCmd.error}`)
+      process.exit(2)
+    }
+    process.exit(await runAuth(authCmd, authDeps(configDir)))
+  }
 
   // `tg hooks ...` — list / trust / untrust for pre-send-photo hooks. Hooks are
   // trust-by-default (they run with no trust step), so `trust` is a no-op unless
@@ -532,13 +636,17 @@ if (import.meta.main) {
       console.log(colorizeHelp(REPORT_USAGE, shouldColorize()))
       process.exit(0)
     }
+    if (topic === "auth") {
+      console.log(colorizeHelp(AUTH_USAGE, shouldColorize()))
+      process.exit(0)
+    }
     if (topic === undefined) {
       console.log(colorizeHelp(USAGE, shouldColorize()))
       process.exit(0)
     }
     // A `tg help <unknown>` names a topic that does not exist — say so (3-part:
     // WHAT/WHY/HOW) on stderr and exit non-zero, rather than silently sending it.
-    console.error(`Error: unknown help topic '${topic}'. Available topics: format, report. See \`tg help\`.`)
+    console.error(`Error: unknown help topic '${topic}'. Available topics: format, report, auth. See \`tg help\`.`)
     process.exit(1)
   }
 
@@ -1092,8 +1200,12 @@ if (import.meta.main) {
   // agent can iterate against the escalation-format gate (or any other guard
   // below) without TG_BOT_TOKEN/TG_CHAT_ID configured.
   if (!parsed.dryRun && (!BOT_TOKEN || !CHAT_ID)) {
-    console.error("Error: TG_BOT_TOKEN and TG_CHAT_ID must be set in ~/.config/tg-cli/.env")
-    process.exit(1)
+    // 78 = EX_CONFIG: distinct from a failed send (1) so a script can tell "set me up" apart.
+    console.error(
+      `Error: tg is not connected to Telegram — TG_BOT_TOKEN and TG_CHAT_ID must be set in ${join(configDir, ".env")}.\n` +
+        "Run `tg auth` to connect in one step (BotFather token + one Start tap).",
+    )
+    process.exit(78)
   }
 
   // Honor TG_API_BASE (default api.telegram.org) — same as the tg-ctl daemon — so a test

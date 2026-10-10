@@ -69,11 +69,18 @@ blocks). Run automatically by the installer.
 
 **Requirements:** [Bun](https://bun.sh)
 
-**Config** — create `~/.config/tg-cli/.env`:
+**Connect to Telegram** — one command:
+```bash
+tg auth                 # paste the token from @BotFather, then tap Start in Telegram
+tg auth status          # which bot sends, to which chat (name / @username / id)
 ```
-TG_BOT_TOKEN=<your bot token from @BotFather>
-TG_CHAT_ID=<your chat or user ID>
-```
+`tg auth` validates the token, prints a one-time `https://t.me/<bot>?start=…` link, and
+once you tap **Start** writes `TG_BOT_TOKEN` and `TG_CHAT_ID` to `~/.config/tg-cli/.env`
+(0600; `$TG_CTL_CONFIG_DIR/.env` when set) — no chat-id lookup. Non-interactive:
+`tg auth login --token <token>` (or `--token -` from stdin). A running `tg-ctl` reads the
+Start tap itself and switches to the bound chat without a restart. `tg auth logout`
+removes the two keys. A `tg` send without them exits `78` and points at `tg auth`.
+Details and exit codes: `tg help auth`, [docs/specs/tg-auth.md](docs/specs/tg-auth.md).
 
 ### Update / deploy a merged change
 
