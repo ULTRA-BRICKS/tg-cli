@@ -347,7 +347,9 @@ and the bottom inline keyboard provides quick filters
 (`Needs`, `Active`, `Ready`, `Done`, `All`) plus pagination when there is more
 than one page. Status-specific commands such as `/tasks done` still work; tapping
 a quick filter switches back to the full lifecycle view. Old task-board buttons
-expire after a daemon restart.
+expire after a daemon restart. When `task list` fails, prints malformed or
+non-array JSON (for any of the lifecycle-state calls behind the board), `/tasks`
+replies `couldn't load tasks — <reason>` instead of an empty board.
 
 Photos and documents sent from Telegram are downloaded to `~/.cache/tg-cli/inbound/` and the local path is injected for the agent to read.
 

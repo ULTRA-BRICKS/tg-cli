@@ -6074,42 +6074,58 @@ function resolveTasksScopeDir(ctx: Ctx, action: Pick<Extract<Action, { kind: "ta
   return null
 }
 
-async function loadTasks(scopeDir: string | null, status: string | null, includeUnfiltered: boolean): Promise<TaskItem[]> {
+// A failed or unparsable `task list` is an ERROR, never an empty backlog: both used to
+// render the same "No matching tasks." board, so a broken task-cli looked like a clean
+// slate (tg-cli#201).
+type TaskListLoad = { ok: true; tasks: TaskItem[] } | { ok: false; error: string }
+
+async function loadTasks(scopeDir: string | null, status: string | null, includeUnfiltered: boolean): Promise<TaskListLoad> {
   if (status) return loadTaskList(scopeDir, status)
   // task-cli scoped JSON does not provide a reliable "all lifecycle states" view, so the board fans out by canonical state.
   // The explicit All view also merges an unfiltered call so custom states stay visible when task-cli reports them.
   const states: Array<string | null> = includeUnfiltered ? [null, ...TASK_STATES] : [...TASK_STATES]
-  const lists = await Promise.all(states.map((state) => loadTaskList(scopeDir, state)))
+  const loads = await Promise.all(states.map((state) => loadTaskList(scopeDir, state)))
   const out: TaskItem[] = []
   const seen = new Set<string>()
-  for (const task of lists.flat()) {
-    const key = taskKey(task)
-    if (seen.has(key)) continue
-    seen.add(key)
-    out.push(task)
+  for (const load of loads) {
+    // One failed state call would silently drop that whole column from the board.
+    if (!load.ok) return load
+    for (const task of load.tasks) {
+      const key = taskKey(task)
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push(task)
+    }
   }
-  return out
+  return { ok: true, tasks: out }
 }
 
-async function loadTaskList(scopeDir: string | null, status: string | null): Promise<TaskItem[]> {
+async function loadTaskList(scopeDir: string | null, status: string | null): Promise<TaskListLoad> {
   const argv = ["task", "list", "--json", "--no-pager", "-n", "100"]
   if (status) argv.push("--state", status)
   if (scopeDir) argv.push("-C", scopeDir)
   const r = await spawnGuarded(argv, 15_000)
-  if (r.exitCode !== 0) {
-    log(`/tasks: 'task list' failed (${r.exitCode}): ${r.stderr.slice(0, 200)}`)
-    return []
+  // Name the state: the board fans out one call per state, so "which column failed" matters.
+  const call = status ? `'task list --state ${status}'` : "'task list'"
+  const failed = (error: string): TaskListLoad => {
+    log(`/tasks: ${error}`)
+    return { ok: false, error }
   }
+  if (r.exitCode !== 0) return failed(`${call} failed (exit ${r.exitCode}): ${r.stderr.trim().slice(0, 200) || "(no stderr)"}`)
+  // Blank stdout on success is an empty backlog, not a parse failure.
+  const stdout = r.stdout.trim()
+  if (stdout === "") return { ok: true, tasks: [] }
+  let parsed: unknown
   try {
-    const parsed = JSON.parse(r.stdout)
-    return flattenTaskListJson(parsed)
+    parsed = JSON.parse(stdout)
   } catch {
-    return []
+    return failed(`${call} returned malformed JSON`)
   }
+  if (!Array.isArray(parsed)) return failed(`${call} returned non-array JSON`)
+  return { ok: true, tasks: flattenTaskListJson(parsed) }
 }
 
-function flattenTaskListJson(parsed: unknown): TaskItem[] {
-  if (!Array.isArray(parsed)) return []
+function flattenTaskListJson(parsed: unknown[]): TaskItem[] {
   const out: TaskItem[] = []
   for (const item of parsed) {
     if (!item || typeof item !== "object") continue
@@ -6215,7 +6231,12 @@ async function runTasksCommand(ctx: Ctx, action: Extract<Action, { kind: "tasks"
     return
   }
   const viewOptions = tasksViewOptions(action, status)
-  const [tasks, prs] = await Promise.all([loadTasks(scopeDir, status, viewOptions.view === "all" && status === null), scopeDir ? loadPrRefs(scopeDir) : Promise.resolve([])])
+  const [load, prs] = await Promise.all([loadTasks(scopeDir, status, viewOptions.view === "all" && status === null), scopeDir ? loadPrRefs(scopeDir) : Promise.resolve([])])
+  if (!load.ok) {
+    await sendMessage(ctx, `couldn't load tasks — ${load.error}`, messageContext)
+    return
+  }
+  const tasks = load.tasks
   const prsByTask = matchPrsToTasks(tasks, prs)
   const view = composeTasksView(annotateTasksWithAgents(tasks, agent), prsByTask, { agent, status }, viewOptions)
   const sent = await sendRich(ctx, view.html, { ...messageContext, reply_markup: view.reply_markup })

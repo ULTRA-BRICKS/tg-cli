@@ -3,6 +3,17 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.16
+
+- **`/tasks` reports a task-list failure instead of an empty board (Refs #201).** A `task list`
+  that exited non-zero, printed malformed JSON or printed non-array JSON rendered the same
+  "No matching tasks." board as a clean backlog, and the only trace was a daemon log line. The
+  board fans out one `task list` per lifecycle state, so one failed call also dropped that whole
+  column silently. `/tasks` now replies `couldn't load tasks — <reason>` (exit code and stderr, or
+  the parse failure) in the same topic/reply context; blank stdout with exit 0 is still an empty
+  backlog. Rescued from the closed PR #129/#135 review finding (branch
+  `fix/tasks-noop-guard-tg129`); its selector no-match half is already on main.
+
 ## 1.55.15
 
 - **A highlighted partial reply quote reaches the agent whole (#565, HYP-907).** `tg-ctl` cut
