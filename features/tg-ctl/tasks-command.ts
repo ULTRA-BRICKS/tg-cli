@@ -81,7 +81,7 @@ export interface TaskItem {
   agent?: string;
 }
 
-// A PR as `gh pr list --json number,title,url,body,state,statusCheckRollup,reviewDecision,isDraft`
+// A PR as `gh pr list --json number,title,url,body,statusCheckRollup,reviewDecision,isDraft`
 // emits it, after the daemon normalizes the CI rollup to a verdict and the review
 // decision to a lifecycle verdict.
 export interface PrRef {

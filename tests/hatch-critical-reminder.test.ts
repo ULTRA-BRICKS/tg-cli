@@ -77,9 +77,10 @@ test('a fresh critical request (never reminded) is due once the interval elapses
 
 test('a reminder that fires resets the cadence clock for the next one', () => {
   const t0 = at(12, 0);
-  const sent = markCriticalReminderSent(t0, 501);
+  const sent = markCriticalReminderSent(t0, 501, -100777);
   expect(sent.lastReminderAt).toBe(t0);
   expect(sent.lastReminderMessageId).toBe(501);
+  expect(sent.lastReminderChatId).toBe(-100777); // #518: the next reminder deletes it in THIS chat
   const next = planCriticalReminder(sent, t0 + CRITICAL_REMINDER_INTERVAL_MS - MIN);
   expect(next.due).toBe(false);
   const nextDue = planCriticalReminder(sent, t0 + CRITICAL_REMINDER_INTERVAL_MS);
@@ -118,7 +119,7 @@ test('a reminder due DURING quiet hours defers to exactly one reminder at the bo
   expect(atBoundary.due).toBe(true);
 
   // The send succeeds — commit it. The deferral is cleared and normal cadence resumes.
-  const committed = markCriticalReminderSent(at(8, 0, 16), 900);
+  const committed = markCriticalReminderSent(at(8, 0, 16), 900, 1);
   expect(committed.quietHoursDeferredUntil).toBeUndefined();
 
   // Immediately after the boundary fire: not due again until a full interval passes —

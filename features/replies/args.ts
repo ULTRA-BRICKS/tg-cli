@@ -61,10 +61,12 @@ export function parseDateArg(value: string, nowSec?: number): number | null {
     return now - n * unit;
   }
 
-  // ISO datetime: YYYY-MM-DDTHH:MM or YYYY-MM-DDTHH:MM:SS (UTC assumed)
-  const dtMatch = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.exec(value);
+  // ISO datetime: YYYY-MM-DDTHH:MM[:SS[.fff]] with an optional Z or ±HH:MM
+  // offset. Without a zone it means UTC, so machine-generated `…Z` timestamps
+  // and hand-typed bare ones name the same moment.
+  const dtMatch = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?)(Z|[+-]\d{2}:\d{2})?$/.exec(value);
   if (dtMatch) {
-    const ms = Date.parse(value + 'Z'); // append Z to treat as UTC
+    const ms = Date.parse(dtMatch[1] + (dtMatch[2] ?? 'Z'));
     return isNaN(ms) ? null : Math.floor(ms / 1000);
   }
 

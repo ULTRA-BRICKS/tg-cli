@@ -120,11 +120,9 @@ export type Decision = 'allow' | 'block';
 // The gate_* / body_sha256 fields are an OPTIONAL, generic extension: any
 // hook may report structured "gate" context about what it checked, and the
 // runner copies it straight through into that hook's audit.jsonl line (see
-// AuditLine in runner.ts). They carry no meaning to the runner itself — only
-// the escalation-format gate
-// (features/hooks/escalation-format-descriptor/pre_send_text_gate.ts) uses
-// them today, but they are not named after it so any future gate can reuse
-// the same audit shape instead of inventing its own.
+// AuditLine in runner.ts). They carry no meaning to the runner itself and no
+// shipped hook uses them today; any gate can report them to share one audit
+// shape instead of inventing its own.
 export interface HookOutput {
   hook_api?: string;
   decision?: Decision;

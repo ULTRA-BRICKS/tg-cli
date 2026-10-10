@@ -28,6 +28,22 @@ ON by default, toggled like any feature: `--no-feature autolink-tasks` or
 - Detection runs on the decoded caption (after `\n` escapes), BEFORE extraction/render.
   The tmux `[window]` prefix is NOT scanned (metadata, not message text).
 
+## `--title` guard
+
+`--title` is a one-line header (`✳️ [window] <title>`) that is never linkified, so a
+ticket code there is inert and only duplicates a reference the reader can follow in the
+body. `tg` refuses such a send at parse time (usage error, exit 1, nothing sent):
+`Refusing: --title contains a ticket reference (HYP-1234) — move it into the message body.`
+
+- Detection is the SAME `detectTicketCodesExpanded` the body linkifies with (exactly
+  `[A-Z]{3}-[0-9]+`), so a compound list such as `HYP-1/2/3` is caught too; the FIRST
+  detected code names the offender.
+- Coupled to this feature's flag: with `--no-feature autolink-tasks` (or
+  `features: { autolink-tasks: false }`) a code is inert plain text in title AND body, so
+  the title guard is off as well — never banned in one place and allowed in the other.
+- GitHub-style `#N` is not a ticket code and stays allowed (`closes #42` is a legitimate
+  title). The sibling `tg#<id>` title refusal is coupled to `autolink-msgrefs` the same way.
+
 ## Verification (linear CLI)
 
 One live Linear probe per send, only when detection found codes. The probe runs

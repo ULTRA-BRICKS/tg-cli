@@ -131,6 +131,7 @@ import {
   serializeInboxEntry,
   splitStrandedLines,
   strandedReportMarker,
+  strandedReportSendIsTransient,
   strandedReportText,
   type InboxEntry,
   type StrandedGroup,
@@ -164,7 +165,7 @@ import {
   pickPrimaryOmpSessionFile,
   preferOmpApiOverTmux,
   withOmpSession,
-  ompLiveLoaderSources,
+  bridgeCodeChangedAtMs,
   parsePidStartList,
   type BridgeCodeAge,
   type LiveOmpAgent,
@@ -321,7 +322,6 @@ import {
   planUnansweredReminder,
   serializeUnansweredReminderState,
   unansweredReminderText,
-  UNANSWERED_REMINDER_AFTER_MS,
   type OpenQuestion,
   type UnansweredReminderState,
 } from "./features/tg-ctl/unanswered-reminder"
@@ -910,10 +910,11 @@ async function clearMessageKeyboard(ctx: Ctx, messageId: number): Promise<void> 
 // chat; when Telegram refuses the delete (message too old for a bot delete, already
 // gone, …) edit it to `placeholder` instead. Never throws (botPostResult swallows
 // transport/HTTP failures like every botPost* helper). Only ever called on a reminder's
-// own message id — never on an original request card.
-async function retireReminderMessage(ctx: Ctx, messageId: number, placeholder: string): Promise<void> {
-  const result = await botPostResult(ctx, "deleteMessage", { chat_id: ctx.chatId, message_id: messageId })
-  if (!result.ok) void editMessageText(ctx, messageId, placeholder)
+// own message id — never on an original request card. `chatId` is the chat the reminder
+// was POSTED in (tg-cli#518): after a TG_CHAT_ID change it is not ctx.chatId.
+async function retireReminderMessage(ctx: Ctx, chatId: number, messageId: number, placeholder: string): Promise<void> {
+  const result = await botPostResult(ctx, "deleteMessage", { chat_id: chatId, message_id: messageId })
+  if (!result.ok) void botPost(ctx, "editMessageText", { chat_id: chatId, message_id: messageId, text: placeholder })
 }
 const REMINDER_SUPERSEDED_TEXT = "⏰ reminder superseded by a newer one"
 // Every card the reminder listed left the open set — answered, or expired by retention.
@@ -1280,18 +1281,7 @@ function readPidTtyMap(): Map<number, string> {
 // file URL, any missing file or a `ps` failure degrades to no verdict, never a crash.
 function readBridgeCodeAge(home: string, pids: number[]): BridgeCodeAge | undefined {
   const loaderPath = join(home, ".omp", "agent", "extensions", "tg-omp-live.ts")
-  const loader = readFileOrNull(loaderPath)
-  const sources = loader === null ? [] : ompLiveLoaderSources(loader)
-  let codeChangedAtMs: number | null = null
-  if (sources.length > 0) {
-    let latest = 0
-    for (const path of [loaderPath, ...sources]) {
-      const mtime = fileMtimeMs(path)
-      if (mtime === null) { latest = -1; break }
-      latest = Math.max(latest, mtime)
-    }
-    codeChangedAtMs = latest < 0 ? null : latest
-  }
+  const codeChangedAtMs = bridgeCodeChangedAtMs(loaderPath, readFileOrNull(loaderPath), fileMtimeMs)
   try {
     const ps = Bun.spawnSync(["ps", "-o", "pid=,etime=", "-p", pids.join(",")], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
     return { codeChangedAtMs, startedAtMs: parsePidStartList(ps.stdout.toString(), Date.now()) }
@@ -2404,9 +2394,7 @@ async function reportStrandedInbox(ctx: Ctx): Promise<void> {
   const { text, count, complete, files } = strandedReportUnsent
   if (text !== null) {
     const sent = await botPostResult(ctx, "sendMessage", { chat_id: ctx.chatId, text })
-    // Transient: no answer from Telegram at all, or a 429 / 5xx. Anything else is its verdict.
-    const transient = sent.ok ? false : sent.status === undefined ? sent.json === undefined : sent.status === 429 || sent.status >= 500
-    if (transient) {
+    if (strandedReportSendIsTransient(sent)) {
       log("inbox: the stranded-message report did not send — retrying the send next poll")
       return
     }
@@ -12071,9 +12059,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           }
           const priorMessageId = state.lastReminderMessageId ?? null
           // Replace, never accumulate (acceptance criterion (c)). The ORIGINAL request
-          // card is never touched here — only prior reminder pings.
-          if (priorMessageId !== null) await retireReminderMessage(ctx, priorMessageId, REMINDER_SUPERSEDED_TEXT)
-          setState(markCriticalReminderSent(sweepNow, sentId))
+          // card is never touched here — only prior reminder pings, in the chat they were
+          // posted in (state from before tg-cli#518 has no chat: the current one).
+          if (priorMessageId !== null) await retireReminderMessage(ctx, state.lastReminderChatId ?? ctx.chatId, priorMessageId, REMINDER_SUPERSEDED_TEXT)
+          setState(markCriticalReminderSent(sweepNow, sentId, ctx.chatId))
           criticalChanged = true
           log(`hatch-critical-reminder-sent: key=${key} hookId=${hookId ?? "-"} messageId=${sentId}`)
         }
@@ -12102,14 +12091,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // the previous one, and a reminder whose cards were all answered is withdrawn.
       // Open = a live card (pendingButtons) or a retained one no tap has decided yet
       // (abandonedButtons without queuedDecision). Critical requests are skipped:
-      // #403's own cadence above already reminds them.
-      if (UNANSWERED_REMINDER_AFTER_MS > 0) {
+      // #403's own cadence above already reminds them. Runs with reminders off too
+      // (AFTER_MS=0): the plan then only withdraws a reminder an earlier run left live
+      // (tg-cli#518). A reminder is retired in the chat it was posted in.
+      {
         const sweepNow = Date.now()
         const open: OpenQuestion[] = []
         const collect = (key: string, req: ButtonRequest, messageId: number | null, openedAt: number): void => {
           if (req.critical === true) return
           const label = resolveSessionName({ tmuxWindow: req.windowName, cwd: req.cwd }).primary
-          open.push({ key, openedAt, label, question: req.question, messageId })
+          open.push({ key, openedAt, label, question: req.question, html: hatchParseMode(req) === "HTML", messageId })
         }
         for (const [key, e] of pendingButtons) collect(key, e.req, e.messageId, e.at)
         for (const [key, e] of abandonedButtons) if (!e.queuedDecision) collect(key, e.req, e.messageId, e.at)
@@ -12117,20 +12108,21 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         unansweredReminderState = plan.state
         let changed = plan.changed
         const prior = unansweredReminderState.messageId
+        const priorChat = unansweredReminderState.chatId ?? ctx.chatId
         if (plan.send) {
           const sentId = await sendMessage(ctx, unansweredReminderText(plan.overdue, sweepNow))
           if (sentId === null) {
             // A failed send is never marked: the same questions stay due next sweep.
             log(`unanswered-reminder-send-failed: open=${plan.overdue.length}`)
           } else {
-            if (prior !== null) await retireReminderMessage(ctx, prior, REMINDER_SUPERSEDED_TEXT)
-            unansweredReminderState = markUnansweredReminderSent(unansweredReminderState, plan.overdue, sentId)
+            if (prior !== null) await retireReminderMessage(ctx, priorChat, prior, REMINDER_SUPERSEDED_TEXT)
+            unansweredReminderState = markUnansweredReminderSent(unansweredReminderState, plan.overdue, sentId, ctx.chatId)
             changed = true
             log(`unanswered-reminder-sent: messageId=${sentId} open=${plan.overdue.length} replaced=${prior ?? "-"}`)
           }
         } else if (plan.withdraw && prior !== null) {
-          await retireReminderMessage(ctx, prior, REMINDER_CLOSED_TEXT)
-          unansweredReminderState = { ...unansweredReminderState, messageId: null }
+          await retireReminderMessage(ctx, priorChat, prior, REMINDER_CLOSED_TEXT)
+          unansweredReminderState = { ...unansweredReminderState, messageId: null, chatId: null }
           changed = true
           log(`unanswered-reminder-withdrawn: messageId=${prior}`)
         }

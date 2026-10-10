@@ -193,6 +193,8 @@ function parseCriticalState(value: unknown, now: number): RetainedQuestionRecord
       : rec.lastReminderMessageId === null
         ? null
         : undefined;
+  const lastReminderChatId =
+    typeof rec.lastReminderChatId === 'number' && Number.isInteger(rec.lastReminderChatId) ? rec.lastReminderChatId : undefined;
   // A future-dated deferral is nonsensical (same reasoning as parseQueuedDecision's
   // `at > now` rejection) but, unlike that field, dropping it is harmless: the next
   // sweep's planCriticalReminder just re-derives a fresh deferral if it's still
@@ -207,6 +209,7 @@ function parseCriticalState(value: unknown, now: number): RetainedQuestionRecord
   return {
     ...(lastReminderAt !== undefined ? { lastReminderAt } : {}),
     ...(lastReminderMessageId !== undefined ? { lastReminderMessageId } : {}),
+    ...(lastReminderChatId !== undefined ? { lastReminderChatId } : {}),
     ...(quietHoursDeferredUntil !== undefined ? { quietHoursDeferredUntil } : {}),
   };
 }

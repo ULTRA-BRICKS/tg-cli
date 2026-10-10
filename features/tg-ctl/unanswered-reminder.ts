@@ -48,7 +48,8 @@ export interface OpenQuestion {
   key: string; // callbackRequestId — stable across pending ↔ abandoned and daemon restarts
   openedAt: number; // the entry's own `at` (ms epoch) — a fallback for `firstSeen`, see header
   label: string; // session name the question came from
-  question: string; // card text (a hatch card's is HTML)
+  question: string; // card text — HTML only when `html` (a hatch card), else plain text
+  html: boolean; // the card was posted with parse_mode HTML: strip its tags for the plain reminder
   messageId: number | null; // the card's Telegram message id, null if posting failed
 }
 
@@ -56,10 +57,14 @@ export interface UnansweredReminderState {
   firstSeen: Record<string, number>; // open card key → ms epoch the daemon first saw it open
   remindedKeys: string[]; // cards that already got their one reminder
   messageId: number | null; // the live reminder message — replaced or withdrawn later
+  // The chat `messageId` lives in: a reminder posted before TG_CHAT_ID changed must still be
+  // deleted THERE. null with a null messageId, or for a file written before it was stored
+  // (the daemon then falls back to its current chat).
+  chatId: number | null;
 }
 
 export function emptyUnansweredReminderState(): UnansweredReminderState {
-  return { firstSeen: {}, remindedKeys: [], messageId: null };
+  return { firstSeen: {}, remindedKeys: [], messageId: null, chatId: null };
 }
 
 // An overdue card as the reminder lists it: `askedAt` is its first-seen time.
@@ -94,7 +99,7 @@ export function planUnansweredReminder(
   const firstSeen: Record<string, number> = {};
   for (const q of open) firstSeen[q.key] = Math.min(state.firstSeen[q.key] ?? q.openedAt, q.openedAt);
   const remindedKeys = state.remindedKeys.filter((k) => k in firstSeen);
-  const next = { firstSeen, remindedKeys, messageId: state.messageId };
+  const next = { firstSeen, remindedKeys, messageId: state.messageId, chatId: state.chatId };
   const changed =
     remindedKeys.length !== state.remindedKeys.length ||
     Object.keys(firstSeen).length !== Object.keys(state.firstSeen).length ||
@@ -107,18 +112,21 @@ export function planUnansweredReminder(
           .filter((q) => now - q.askedAt >= afterMs)
           .sort((a, b) => a.askedAt - b.askedAt);
   const send = overdue.some((q) => !remindedKeys.includes(q.key)) && !isQuietHours(now, startHour, endHour);
-  const withdraw = !send && state.messageId !== null && remindedKeys.length === 0;
+  // A zero threshold (reminders off) withdraws a reminder an earlier run left live, even
+  // while its cards stay open: nothing would ever replace or close it otherwise.
+  const withdraw = !send && state.messageId !== null && (afterMs <= 0 || remindedKeys.length === 0);
   return { send, withdraw, overdue, state: next, changed };
 }
 
-// State after the reminder listing `overdue` was posted as Telegram message `messageId`.
-// Called ONLY after the send succeeded: a failed send stays due and retries next sweep.
+// State after the reminder listing `overdue` was posted as Telegram message `messageId` in
+// `chatId`. Called ONLY after the send succeeded: a failed send stays due and retries next sweep.
 export function markUnansweredReminderSent(
   state: UnansweredReminderState,
   overdue: readonly OpenQuestion[],
   messageId: number,
+  chatId: number,
 ): UnansweredReminderState {
-  return { ...state, remindedKeys: [...new Set([...state.remindedKeys, ...overdue.map((q) => q.key)])], messageId };
+  return { ...state, remindedKeys: [...new Set([...state.remindedKeys, ...overdue.map((q) => q.key)])], messageId, chatId };
 }
 
 const LIST_MAX = 10;
@@ -139,7 +147,7 @@ export function unansweredReminderText(overdue: readonly OverdueQuestion[], now:
   const n = overdue.length;
   const oneLine = (s: string, max: number): string => truncateWithEllipsis(s.replace(/\s+/g, ' ').trim(), max);
   const lines = overdue.slice(0, LIST_MAX).map((q) => {
-    const head = oneLine(decodeHtmlEntities(stripHtmlTags(q.question)), QUESTION_HEAD_MAX);
+    const head = oneLine(q.html ? decodeHtmlEntities(stripHtmlTags(q.question)) : q.question, QUESTION_HEAD_MAX);
     const ref = q.messageId !== null ? `tg#${q.messageId}, ` : '';
     return `• ${oneLine(q.label, LABEL_MAX)} — ${head} (${ref}${formatAge(now - q.askedAt)})`;
   });
@@ -165,7 +173,8 @@ export function parseUnansweredReminderState(blob: string | null): UnansweredRem
     const remindedKeys =
       'remindedKeys' in r && Array.isArray(r.remindedKeys) ? r.remindedKeys.filter((k): k is string => typeof k === 'string') : [];
     const messageId = 'messageId' in r && typeof r.messageId === 'number' && Number.isInteger(r.messageId) ? r.messageId : null;
-    return { firstSeen, remindedKeys, messageId };
+    const chatId = messageId !== null && 'chatId' in r && typeof r.chatId === 'number' && Number.isInteger(r.chatId) ? r.chatId : null;
+    return { firstSeen, remindedKeys, messageId, chatId };
   } catch {
     return emptyUnansweredReminderState();
   }

@@ -235,7 +235,7 @@ Options:
   --reply-to <id>      thread the outbound message UNDER an inbound Telegram
                        message (sets reply_to_message_id). The id is the inbound
                        message's Telegram message_id — the tg-ctl daemon surfaces
-                       it in the injected wrap as "[TG from Alex #<id>]". The
+                       it in the injected wrap as "[TG from Alex tg#<id>]". The
                        answer tag REQUIRES this: answering means answering a
                        SPECIFIC message. The reply posts into the topic that
                        message sits in (General stays General).

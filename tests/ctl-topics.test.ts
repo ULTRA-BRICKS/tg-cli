@@ -392,6 +392,11 @@ test('row 1: /stop, /kill and harness-reserved verbs are NOT daemon verbs — th
   }
 });
 
+test('row 1: a /command with Telegram\'s group-chat @botname suffix reaches the bound session as the bare command (#298)', () => {
+  expect(stepUpdates([inTopic(20, { text: '/compact@my_tg_bot' })], bound).actions[0]).toEqual({ kind: 'topic-route', threadId: 50, payload: text('/compact', 20) });
+  expect(stepUpdates([inTopic(21, { text: '/model@my_tg_bot opus' })], bound).actions[0]).toEqual({ kind: 'topic-route', threadId: 50, payload: text('/model opus', 21) });
+});
+
 test('row 2: prose in a BOUND topic → topic-route with the wrapped text', () => {
   const r = stepUpdates([inTopic(7, { text: 'deploy now' })], bound);
   expect(r.actions).toEqual([

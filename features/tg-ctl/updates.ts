@@ -37,7 +37,7 @@ export interface StepOpts {
   nowSec: number;
   currentOffset: number; // returned as newOffset when the batch is empty
   // Wrap an inbound message for injection. `messageId` is the inbound Telegram
-  // message_id; the wrap surfaces it as `#<id>` so the agent can reply with
+  // message_id; the wrap surfaces it as `tg#<id>` so the agent can reply with
   // `tg --reply-to <id>` (threaded replies). Omitted where no id applies.
   wrap: (name: string, msg: string, messageId?: number) => string;
   // Format a reply's quote-anchor timestamp (item 3). Injected so the daemon
@@ -116,7 +116,7 @@ export function buildReplyAnchor(m: TgMessage, opts: StepOpts): string {
 
 // Build the injected text for a REPLY (items 2, 3). The agent sees which message
 // is being answered — the quote anchor — followed by the wrapped reply. The wrap
-// carries THIS reply's own message_id (`#<id>`) so the agent can in turn thread
+// carries THIS reply's own message_id (`tg#<id>`) so the agent can in turn thread
 // its answer under the reply with `tg --reply-to <id>`.
 export function buildReplyInject(m: TgMessage, name: string, opts: StepOpts): string {
   return `${buildReplyAnchor(m, opts)}\n${opts.wrap(name, m.text ?? '', m.message_id)}`;
@@ -516,9 +516,10 @@ function textAction(
 
 // A harness/daemon slash-command (`/compact`, `/stop now`) vs a path-or-prose message that
 // merely starts with `/` (`/etc/hosts is broken`). A command is `/` + a letter + word chars,
-// then a space or end — so a SECOND slash (a path) or a leading non-letter is NOT a command.
+// optionally Telegram's group-chat `@botname` suffix, then a space or end — so a SECOND slash
+// (a path) or a leading non-letter is NOT a command.
 export function isLikelySlashCommand(text: string): boolean {
-  return /^\/[a-zA-Z][\w-]*(\s|$)/.test(text);
+  return /^\/[a-zA-Z][\w-]*(@\w+)?(\s|$)/.test(text);
 }
 
 // A plain TEXT reply to a card the daemon posted — a permission/hatch card ("yes"/"no" and kin)
@@ -599,8 +600,11 @@ function topicPayloadOf(updateId: number, m: TgMessage, name: string, opts: Step
       return { type: 'text', text: buildReplyInject(m, name, opts), from: name, messageId };
     }
     // The command test is narrow (`/word` …, no second slash) so a path-like message —
-    // `/etc/hosts is broken` — is prose and gets wrapped, not injected as a command.
-    return { type: 'text', text: isLikelySlashCommand(text) ? text : opts.wrap(name, text, messageId), from: name, messageId };
+    // `/etc/hosts is broken` — is prose and gets wrapped, not injected as a command. A
+    // group-chat `@botname` suffix is Telegram's addressing, not part of the harness verb:
+    // `/compact@my_bot` reaches the harness as `/compact` (#298).
+    if (isLikelySlashCommand(text)) return { type: 'text', text: text.replace(/^(\/[a-zA-Z][\w-]*)@\w+/, '$1'), from: name, messageId };
+    return { type: 'text', text: opts.wrap(name, text, messageId), from: name, messageId };
   }
   const anchor = m.reply_to_message ? { anchor: buildReplyAnchor(m, opts) } : {};
   const voice = m.voice ?? m.audio;

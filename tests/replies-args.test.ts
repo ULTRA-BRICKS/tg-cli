@@ -169,6 +169,16 @@ test('parseDateArg: invalid string returns null', () => {
   expect(parseDateArg('yesterday')).toBeNull();
 });
 
+test('parseDateArg: ISO datetime with trailing Z or +00:00 equals the bare UTC form (#524)', () => {
+  const bare = parseDateArg('2026-09-29T16:45:00');
+  expect(bare).not.toBeNull();
+  expect(parseDateArg('2026-09-29T16:45:00Z')).toBe(bare);
+  expect(parseDateArg('2026-09-29T16:45:00+00:00')).toBe(bare);
+  expect(parseDateArg('2026-09-29T16:45Z')).toBe(parseDateArg('2026-09-29T16:45'));
+  expect(parseDateArg('2026-09-29T16:45:00.000Z')).toBe(bare);
+  expect(parseDateArg('2026-09-29T16:45:00+03:00')).toBe(bare! - 3 * 3600); // other offsets honoured, not misread as UTC
+});
+
 // parseRepliesArgs --since / --until
 
 test('parseRepliesArgs: --since ISO date sets since field', () => {

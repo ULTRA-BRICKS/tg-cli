@@ -26,14 +26,17 @@ const q = (key: string, openedAt: number, messageId: number | null = 900): OpenQ
   openedAt,
   label: 'tg-cli',
   question: `Which DB for ${key}?`,
+  html: false,
   messageId,
 });
+
+const CHAT = 1;
 
 // Run one sweep the way the daemon does and return the state it would persist.
 function sweep(open: OpenQuestion[], state: UnansweredReminderState, now: number, sentId = 1000): UnansweredReminderState {
   const p = plan(open, state, now);
-  if (p.send) return markUnansweredReminderSent(p.state, p.overdue, sentId);
-  if (p.withdraw) return { ...p.state, messageId: null };
+  if (p.send) return markUnansweredReminderSent(p.state, p.overdue, sentId, CHAT);
+  if (p.withdraw) return { ...p.state, messageId: null, chatId: null };
   return p.state;
 }
 
@@ -70,9 +73,10 @@ test('a newly overdue question triggers a reminder that lists every still-open o
   expect(p.send).toBe(true);
   expect(p.overdue.map((x) => x.key)).toEqual(['a', 'b']); // oldest first
   expect(p.state.messageId).toBe(1001); // the reminder the daemon must delete
-  const s2 = markUnansweredReminderSent(p.state, p.overdue, 1002);
+  const s2 = markUnansweredReminderSent(p.state, p.overdue, 1002, CHAT);
   expect(s2.remindedKeys).toEqual(['a', 'b']);
   expect(s2.messageId).toBe(1002);
+  expect(s2.chatId).toBe(CHAT); // the chat the reminder lives in — a later chat change still retires it there
 });
 
 test('the reminder is withdrawn only once EVERY card it listed is answered', () => {
@@ -82,7 +86,7 @@ test('the reminder is withdrawn only once EVERY card it listed is answered', () 
   expect(partly.withdraw).toBe(false);
   const done = plan([], partly.state, at(9, 45));
   expect(done.withdraw).toBe(true);
-  expect(done.state).toEqual({ firstSeen: {}, remindedKeys: [], messageId: 1001 });
+  expect(done.state).toEqual({ firstSeen: {}, remindedKeys: [], messageId: 1001, chatId: CHAT });
   // Nothing to withdraw when no reminder is live.
   expect(plan([], emptyUnansweredReminderState(), at(9, 45)).withdraw).toBe(false);
 });
@@ -100,7 +104,7 @@ test('quiet hours: a question overdue at night is held, then reminded once right
 test('closed cards are pruned from the state; `changed` flags exactly the sweeps that must persist', () => {
   const s = sweep([q('gone', at(8, 0)), q('a', at(9, 0))], emptyUnansweredReminderState(), at(9, 30), 1001);
   const p = plan([q('a', at(9, 0))], s, at(12, 0));
-  expect(p.state).toEqual({ firstSeen: { a: at(9, 0) }, remindedKeys: ['a'], messageId: 1001 });
+  expect(p.state).toEqual({ firstSeen: { a: at(9, 0) }, remindedKeys: ['a'], messageId: 1001, chatId: CHAT });
   expect(p.changed).toBe(true);
   expect(plan([q('a', at(9, 0))], p.state, at(12, 1)).changed).toBe(false);
   expect(plan([q('a', at(9, 0)), q('new', at(12, 0))], p.state, at(12, 1)).changed).toBe(true);
@@ -108,6 +112,14 @@ test('closed cards are pruned from the state; `changed` flags exactly the sweeps
 
 test('a zero threshold disables reminders', () => {
   expect(planUnansweredReminder([q('a', at(9, 0))], emptyUnansweredReminderState(), at(12, 0), 0, 23, 8).send).toBe(false);
+});
+
+test('a zero threshold withdraws a reminder persisted by an earlier run, even while its card is still open (#518)', () => {
+  const s = sweep([q('a', at(9, 0))], emptyUnansweredReminderState(), at(9, 30), 1001);
+  const p = planUnansweredReminder([q('a', at(9, 0))], s, at(12, 0), 0, 23, 8);
+  expect(p.send).toBe(false);
+  expect(p.withdraw).toBe(true);
+  expect(planUnansweredReminder([q('a', at(9, 0))], emptyUnansweredReminderState(), at(12, 0), 0, 23, 8).withdraw).toBe(false);
 });
 
 test('TG_CTL_UNANSWERED_REMINDER_AFTER_MS: blank/invalid keep the default, 0 turns reminders off', () => {
@@ -122,7 +134,7 @@ test('TG_CTL_UNANSWERED_REMINDER_AFTER_MS: blank/invalid keep the default, 0 tur
 });
 
 test('reminder text names session, plain-text question head, card ref and age; long lists and labels are capped', () => {
-  const hatch = { ...q('h', 0, 777), question: '<b>Allow</b> rig hatch &amp; push?', askedAt: at(9, 0) };
+  const hatch = { ...q('h', 0, 777), question: '<b>Allow</b> rig hatch &amp; push?', html: true, askedAt: at(9, 0) };
   const other = { ...q('x', 0, null), askedAt: at(9, 50) };
   expect(unansweredReminderText([hatch, other], at(10, 5))).toBe(
     '⏳ 2 agent questions still waiting on you:\n• tg-cli — Allow rig hatch & push? (tg#777, 1 h 5 min)\n• tg-cli — Which DB for x? (15 min)',
@@ -136,9 +148,16 @@ test('reminder text names session, plain-text question head, card ref and age; l
   expect(text.length).toBeLessThan(4096); // Telegram's sendMessage limit
 });
 
+test('a plain-text question keeps its <angle-bracket> words and entities verbatim; only HTML cards are tag-stripped (#518)', () => {
+  const plain = { ...q('p', 0, 5), question: 'merge <branch> into main &amp; push?', askedAt: at(9, 0) };
+  expect(unansweredReminderText([plain], at(9, 10))).toContain('— merge <branch> into main &amp; push? (tg#5, 10 min)');
+});
+
 test('state round-trips through disk; malformed content is "nothing seen or reminded yet"', () => {
-  const s = { firstSeen: { a: 5, b: 6 }, remindedKeys: ['a'], messageId: 1002 };
+  const s = { firstSeen: { a: 5, b: 6 }, remindedKeys: ['a'], messageId: 1002, chatId: -100123 };
   expect(parseUnansweredReminderState(serializeUnansweredReminderState(s))).toEqual(s);
+  // A file written before the chat id was stored: no chat → the daemon falls back to its current chat.
+  expect(parseUnansweredReminderState('{"firstSeen":{},"remindedKeys":[],"messageId":7}').chatId).toBeNull();
   for (const bad of [null, '', '{', '[]', '{"firstSeen":[1],"remindedKeys":"a","messageId":"x"}']) {
     expect(parseUnansweredReminderState(bad)).toEqual(emptyUnansweredReminderState());
   }

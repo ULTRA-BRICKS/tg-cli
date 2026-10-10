@@ -86,6 +86,7 @@ Flags:
 Date formats for --since / --until:
   2026-06-28            ISO date (midnight UTC)
   2026-06-28T10:00      ISO datetime (UTC)
+  2026-06-28T10:00Z     ISO datetime with a zone (Z or ±HH:MM; seconds/fractions ok)
   3d / 24h / 7d         relative — N days or hours ago from now
 
 Line format:  [YYYY-MM-DD HH:MM] #<id> [→ <agent>] <text>

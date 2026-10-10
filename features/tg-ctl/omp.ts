@@ -394,6 +394,23 @@ export function ompLiveLoaderSources(loader: string): string[] {
   return paths;
 }
 
+/**
+ * When the installed bridge last changed: the newest mtime of the loader and every source it
+ * names. No loader, a loader naming no file, or ANY missing file → null (no verdict) — a
+ * max over the files that happen to exist would be a stale, misleading timestamp.
+ */
+export function bridgeCodeChangedAtMs(loaderPath: string, loader: string | null, mtimeMs: (path: string) => number | null): number | null {
+  const sources = loader === null ? [] : ompLiveLoaderSources(loader);
+  if (sources.length === 0) return null;
+  let latest = 0;
+  for (const path of [loaderPath, ...sources]) {
+    const mtime = mtimeMs(path);
+    if (mtime === null) return null;
+    latest = Math.max(latest, mtime);
+  }
+  return latest;
+}
+
 // OMP binds an extension once per process and reuses that module for every in-process
 // subagent, and 18.3 cannot reload JS extensions. An omp started before the installed
 // bridge changed (or was first installed) keeps what it loaded — pre-#483 code dropped its

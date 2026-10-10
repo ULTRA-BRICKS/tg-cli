@@ -29,11 +29,9 @@ export const CANONICAL_TAGS = ['ANSWER', 'DECISION', 'PROBLEM', 'REPORT'] as con
 export type CanonicalTag = (typeof CANONICAL_TAGS)[number];
 
 // The lowercase-english tags that mean "this is an escalation ask needing a
-// structured reply" — used by BOTH features/cli/args.ts's TAG_GATES (Tier 1,
-// parse-time, blocking) and the pre-send-text escalation-format-gate hook
-// (features/hooks/escalation-format-descriptor/pre_send_text_gate.ts, Tier 2,
-// advisory). A single shared list so adding another escalation tag is one
-// edit instead of two lists that can silently drift apart. `decision` is the
+// structured reply" — used by features/cli/args.ts's TAG_GATES (parse-time,
+// blocking), the one escalation-format enforcement. A single shared list so
+// adding another escalation tag is one edit. `decision` is the
 // ONLY escalation tag: an open question is a decision request (tg-cli#301).
 export const ESCALATION_TAGS = ['decision'] as const;
 

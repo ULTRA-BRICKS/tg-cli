@@ -6,6 +6,7 @@ import type { PaneInfo, ProcInfo } from '../features/tg-ctl/types';
 import {
   describeLiveOmp,
   describeUnbridgedOmp,
+  bridgeCodeChangedAtMs,
   ompLiveLoaderSources,
   parsePidStartList,
   isLiveOmpOriginId,
@@ -702,4 +703,20 @@ test('ompLiveLoaderSources reads the file URLs the managed loader imports', () =
     '/Users/u/my repo/omp-live-extension.mjs',
   ]);
   expect(ompLiveLoaderSources('export default () => {};')).toEqual([]);
+});
+
+// #520: the mtime fold behind the "started before the bridge code changed" verdict.
+test('bridgeCodeChangedAtMs: newest mtime of the loader and every source it names', () => {
+  const loader = 'new URL("file:///b/ext.mjs"); new URL("file:///b/rt.mjs");';
+  const mtimes: Record<string, number> = { '/a/loader.ts': 100, '/b/ext.mjs': 300, '/b/rt.mjs': 200 };
+  expect(bridgeCodeChangedAtMs('/a/loader.ts', loader, (p) => mtimes[p] ?? null)).toBe(300);
+  expect(bridgeCodeChangedAtMs('/a/loader.ts', loader, (p) => (p === '/a/loader.ts' ? 900 : (mtimes[p] ?? null)))).toBe(900);
+});
+
+test('bridgeCodeChangedAtMs: any missing file, no sources, or no loader → null (never a stale max)', () => {
+  const loader = 'new URL("file:///b/ext.mjs"); new URL("file:///b/rt.mjs");';
+  const mtimes: Record<string, number> = { '/a/loader.ts': 100, '/b/ext.mjs': 300 };
+  expect(bridgeCodeChangedAtMs('/a/loader.ts', loader, (p) => mtimes[p] ?? null)).toBeNull();
+  expect(bridgeCodeChangedAtMs('/a/loader.ts', 'export default () => {};', () => 100)).toBeNull();
+  expect(bridgeCodeChangedAtMs('/a/loader.ts', null, () => 100)).toBeNull();
 });

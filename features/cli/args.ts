@@ -85,7 +85,7 @@ export type ParseResult =
       // Threaded reply (`--reply-to <message_id>`): sets reply_to_message_id on
       // the outbound sendMessage so it threads UNDER that inbound Telegram
       // message. The id is Telegram's own per-chat sequential message_id (the
-      // daemon surfaces it in the injected wrap as `#<id>`). Absent when the flag
+      // daemon surfaces it in the injected wrap as `tg#<id>`). Absent when the flag
       // is not given (keeps no-flag send results byte-identical).
       replyTo?: number;
       // Forum topic (`--topic <id>`): sets message_thread_id on EVERY outbound

@@ -466,7 +466,7 @@ test('trustAutoActive is false for the guarded-but-not-auto values', () => {
   expect(trustAutoActive({} as NodeJS.ProcessEnv)).toBe(false);
 });
 
-// --- gate_* passthrough (escalation-format-gate generic audit extension) ---
+// --- gate_* passthrough (generic audit extension any gate hook may report) ---
 
 test('a hook that reports gate_* fields on stdout gets them copied into its audit line', () => {
   const { deps, audits } = mkDeps({

@@ -148,11 +148,14 @@ export function planCriticalReminder(
   return { due: false, nextState: state };
 }
 
-// The daemon's persisted/in-memory scheduling state widened with the ONE
-// Telegram-artifact field this module intentionally excludes from
-// CriticalReminderState — see the file header for why.
+// The daemon's persisted/in-memory scheduling state widened with the Telegram-artifact
+// fields this module intentionally excludes from CriticalReminderState — see the file
+// header for why. `lastReminderChatId` is the chat the reminder was posted in, so the
+// next one deletes it THERE even after TG_CHAT_ID changed (tg-cli#518); absent on state
+// written before it was stored (the daemon then falls back to its current chat).
 export interface DaemonCriticalState extends CriticalReminderState {
   lastReminderMessageId?: number | null;
+  lastReminderChatId?: number;
 }
 
 // Commits a reminder as SENT — called ONLY after the daemon's actual Telegram
@@ -163,8 +166,8 @@ export interface DaemonCriticalState extends CriticalReminderState {
 // would silently skip ahead a full interval for a ping the human never saw).
 // Always clears `quietHoursDeferredUntil`: whether this commit is the ordinary
 // interval fire or the single deferred boundary fire, the deferral it may have
-// been tracking is now resolved. `messageId` is the JUST-POSTED reminder's own
-// Telegram message id — what the NEXT reminder will delete/edit-away.
-export function markCriticalReminderSent(now: number, messageId: number | null): DaemonCriticalState {
-  return { lastReminderAt: now, lastReminderMessageId: messageId };
+// been tracking is now resolved. `messageId` (in `chatId`) is the JUST-POSTED
+// reminder's own Telegram message — what the NEXT reminder will delete/edit-away.
+export function markCriticalReminderSent(now: number, messageId: number | null, chatId: number): DaemonCriticalState {
+  return { lastReminderAt: now, lastReminderMessageId: messageId, lastReminderChatId: chatId };
 }

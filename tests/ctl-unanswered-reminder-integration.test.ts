@@ -5,7 +5,7 @@
 // withdraws the reminder. Quiet hours are forced off (start === end) so the runner's local
 // clock can't land inside the default 23-8 window.
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, mkdirSync, mkdtempSync, openSync, writeFileSync } from 'fs';
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
@@ -42,14 +42,14 @@ function baseEnv(cfgDir: string, apiPort: number): Record<string, string> {
   };
 }
 
-async function startDaemon(cfgDir: string, apiPort: number): Promise<Subprocess> {
+async function startDaemon(cfgDir: string, apiPort: number, afterMs = '400'): Promise<Subprocess> {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
   const daemon = await spawnDaemon(reg, {
     tgCtlPath: TG_CTL,
     cfgDir,
     env: {
       ...baseEnv(cfgDir, apiPort),
-      TG_CTL_UNANSWERED_REMINDER_AFTER_MS: '400',
+      TG_CTL_UNANSWERED_REMINDER_AFTER_MS: afterMs,
       TG_CTL_QUIET_HOURS_START_HOUR: '0',
       TG_CTL_QUIET_HOURS_END_HOUR: '0',
     },
@@ -86,6 +86,7 @@ interface Sent {
 function mockTelegram() {
   const sent: Sent[] = [];
   const deletes: number[] = [];
+  const deleteChats: number[] = []; // chat_id of each deleteMessage, index-aligned with `deletes`
   const updates: unknown[][] = [];
   let seq = 900;
   const server = Bun.serve({
@@ -105,8 +106,9 @@ function mockTelegram() {
         return Response.json({ ok: true, result: { message_id: seq } });
       }
       if (url.pathname.endsWith('/deleteMessage')) {
-        const body: { message_id?: unknown } = await req.json();
+        const body: { message_id?: unknown; chat_id?: unknown } = await req.json();
         deletes.push(Number(body.message_id));
+        deleteChats.push(Number(body.chat_id));
         return Response.json({ ok: true, result: true });
       }
       return Response.json({ ok: true, result: true });
@@ -128,7 +130,7 @@ function mockTelegram() {
       },
     ]);
   };
-  return { port: server.port, stop: (c?: boolean) => server.stop(c), reminders, cards, tap, deletes: () => deletes };
+  return { port: server.port, stop: (c?: boolean) => server.stop(c), reminders, cards, tap, deletes: () => deletes, deleteChats: () => deleteChats };
 }
 
 // Generous: each wait spans a daemon/ask process spawn, which a loaded CI runner can slow to
@@ -191,3 +193,20 @@ test('UNANSWERED REMINDER (tg-cli#464): one reminder per overdue question; the n
   daemon.kill('SIGTERM');
   await daemon.exited;
 }, 90_000);
+
+// tg-cli#518: a reminder an earlier run left live — posted in chat 7, before TG_CHAT_ID became
+// 1 — is withdrawn on the first sweep once reminders are turned off (AFTER_MS=0), and deleted
+// in the chat it was posted in, not the current one.
+test('UNANSWERED REMINDER (tg-cli#518): AFTER_MS=0 withdraws a persisted reminder in the chat it was posted in', async () => {
+  const cfgDir = makeCfgDir();
+  const statePath = join(cfgDir, 'tg-ctl.123.unanswered-reminder.json');
+  writeFileSync(statePath, JSON.stringify({ version: 1, firstSeen: {}, remindedKeys: ['gone'], messageId: 555, chatId: 7 }));
+  const tg = mockTelegram();
+  servers.push(tg);
+  const daemon = await startDaemon(cfgDir, tg.port, '0');
+  expect(await until(() => tg.deletes().includes(555))).toBe(true);
+  expect(tg.deleteChats()[tg.deletes().indexOf(555)]).toBe(7);
+  expect(await until(() => JSON.parse(readFileSync(statePath, 'utf8')).messageId === null)).toBe(true);
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 60_000);

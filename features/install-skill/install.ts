@@ -160,7 +160,7 @@ harness kind for inbound telemetry, on a different binary.)
 To answer a SPECIFIC inbound message and have your reply thread under it in
 Telegram, pass its message_id: \`tg --reply-to <id> "answer"\` (sets
 \`reply_to_message_id\`). The \`tg-ctl\` daemon surfaces the inbound id in the
-injected wrap — \`[TG from Alex #1234] …\` — so the id to reply to is right there
+injected wrap — \`[TG from Alex tg#1234] …\` — so the id to reply to is right there
 in your pane. The id is Telegram's own per-chat message_id; nothing to compute.
 
 The **answer** tag REQUIRES \`--reply-to\` (answering means answering a

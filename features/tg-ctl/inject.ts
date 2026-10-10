@@ -33,7 +33,7 @@ import type { AgentKind, InjectStep } from './types';
 // through verbatim and must NOT be collapsed (codex review finding).
 export function wrapInbound(template: string, name: string, msg: string, messageId?: number): string {
   // No id → strip the `{id}` token (and one neighbouring space) from the
-  // template first; with an id, substitute it as `#<id>` in place.
+  // template first; with an id, substitute it as `tg#<id>` in place.
   const prepared =
     messageId === undefined ? template.replace(/ ?\{id\} ?/g, (m) => (/^ .* $/.test(m) ? ' ' : '')) : template;
   return prepared.replace(/\{name\}|\{msg\}|\{id\}/g, (m) => {

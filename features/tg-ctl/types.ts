@@ -45,7 +45,7 @@ export interface ControlConfig {
 export const DEFAULT_CONTROL: ControlConfig = {
   enabled: true,
   transport: 'auto',
-  // `{id}` renders the inbound Telegram message_id as `#<id>` — the agent passes
+  // `{id}` renders the inbound Telegram message_id as `tg#<id>` — the agent passes
   // it to `tg --reply-to <id>` to thread its answer under this exact message.
   // A `/agent <selector> <text>` route carries an id too (forwarded from
   // sourceMessageId, same as every other inbound path). Only a genuinely
@@ -281,7 +281,7 @@ export type Action =
       fileSize?: number;
       caption?: string;
       from: string; // display name for the wrap
-      messageId: number; // inbound Telegram message_id → surfaced as `#<id>` for tg --reply-to
+      messageId: number; // inbound Telegram message_id → surfaced as `tg#<id>` for tg --reply-to
       // Set when the photo/document itself is a reply: after download, route the
       // media receipt through reply-route with this quote anchor prepended (same
       // origin-pane semantics as typed and voice replies).
@@ -306,7 +306,7 @@ export type Action =
       suggestedName: string; // daemon-chosen: <update_id>.ogg
       fileSize?: number;
       from: string; // display name for the wrap
-      messageId: number; // inbound Telegram message_id → surfaced as `#<id>` for tg --reply-to
+      messageId: number; // inbound Telegram message_id → surfaced as `tg#<id>` for tg --reply-to
       // Set when the voice note itself is a reply: route via reply-route with
       // this quote anchor prepended (built from the replied-to message).
       replyToMessageId?: number;

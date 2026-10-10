@@ -111,9 +111,8 @@ export function toTablePre(input: string): { html: string; hasWide: boolean } {
 // --- Literal-table detection (escalation-format gate) ---
 //
 // A cheap, pure heuristic for "does this message body already contain a
-// literal table?" — used by both the parse-time TAG_GATES check
-// (features/cli/args.ts) and the pre-send-text escalation-format hook
-// (features/hooks/escalation-format-descriptor/pre_send_text_gate.ts). Recognizes the three shapes a
+// literal table?" — used by the parse-time TAG_GATES check
+// (features/cli/args.ts), the one escalation-format enforcement. Recognizes the three shapes a
 // literal table can take in a tg message:
 //   'html'  — a real <table> tag (--format html / a rich send).
 //   'boxed' — our own box-drawn <pre> table (tg --table / toTablePre above).

@@ -3,6 +3,29 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.12
+
+- **`tg-ctl audit-delivery --since/--until` and `tg replies --since/--until` accept standard ISO
+  timestamps with a zone (#524).** `2026-09-29T16:45:00Z` (and fractional seconds, `+00:00` or any
+  other offset) used to exit 2 with "cannot parse date"; a bare `2026-09-29T16:45:00` still means UTC.
+- **A `/command@botname` typed in a group topic reaches the bound session as the bare `/command`
+  (#298).** Telegram's group-chat suffix made it read as prose and get wrapped as chat.
+- **The stranded-inbox report is retried on a throttled or corrupt first send (#526).** A
+  200-status `{ok:false, error_code:429}` (or 5xx) answer is now transient like an HTTP 429, and an
+  archived message holding an unpaired surrogate no longer makes Telegram reject the whole report.
+- **Unanswered-question reminders (#518):** a plain-text question keeps its `<word>`s and
+  `&amp;`s verbatim (only HTML hatch cards are tag-stripped); with
+  `TG_CTL_UNANSWERED_REMINDER_AFTER_MS=0` a reminder an earlier run left in the chat is withdrawn;
+  both this reminder and the critical-hatch reminder remember the chat they were posted in and are
+  replaced/withdrawn there after `TG_CHAT_ID` changes.
+- `tg-ctl status`'s "started before the installed bridge code changed" verdict is computed by a
+  pure, tested function: any missing bridge file still gives no verdict (#520).
+- Removed the never-installed pre-send-text escalation-format hook template and its test; the
+  parse-time `--tag decision` gate is the one enforcement (#488).
+- Docs: the inbound message ref is `tg#<id>` in `tg --help`, the installed skill and code comments
+  (#277); the autolink-tasks spec documents the `--title` ticket-code refusal and its feature-flag
+  coupling, and the `PrRef` comment no longer claims a `state` field (#214).
+
 ## 1.55.11
 
 - **A late Telegram Approve/Reject on a permission can no longer type its digit into a DIFFERENT

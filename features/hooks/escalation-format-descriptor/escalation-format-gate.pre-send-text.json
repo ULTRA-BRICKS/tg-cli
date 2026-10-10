@@ -1,9 +1,0 @@
-{
-  "id": "escalation-format-gate",
-  "point": "pre-send-text",
-  "cmd": "/ABSOLUTE/PATH/TO/features/hooks/escalation-format-descriptor/pre_send_text_gate.ts",
-  "priority": 50,
-  "timeout_ms": 5000,
-  "on_error": "open",
-  "description": "TEMPLATE — `cmd` here is a non-functional placeholder (cmd MUST be an ABSOLUTE path; the runner rejects a relative/bare command, so this file is not runnable as-is). A future installer (the agent-tools skill, tracked separately) is expected to overwrite `cmd` with the absolute path of THIS repo's pre_send_text_gate.ts (the file next to this descriptor), same pattern as review-visual.pre-send-photo.json. For --tag decision, checks whether the outgoing message body already contains a literal table (the escalation form) and, if not, prints an actionable warning — but ALWAYS allows the send (WARN mode; see the script's header comment for the planned flip-to-blocking + bypass). on_error is open: a crash/timeout in this advisory check must never block a send."
-}

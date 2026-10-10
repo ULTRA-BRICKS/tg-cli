@@ -1,8 +1,7 @@
 // The pre-send-text sibling of tests/hooks-photo-integration.test.ts: exercises
 // the generic hook-firing mechanics (non-breaking guard, allow/block, trust-
 // by-default, fail-open) for run-text-hooks.ts's gateText/runPreSendTextHooks,
-// using a fake bash hook (the escalation-format-gate's own real behavior is
-// covered separately in tests/hooks-escalation-format-gate.test.ts).
+// using a fake bash hook.
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';

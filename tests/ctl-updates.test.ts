@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import { stepUpdates, buildReplyInject, type StepOpts } from '../features/tg-ctl/updates';
 import { DEFAULT_CONTROL, type ControlConfig, type TgMessage, type TgUpdate } from '../features/tg-ctl/types';
+import { wrapInbound } from '../features/tg-ctl/inject';
 
 const CHAT_ID = 1000;
 const NOW = 1_750_000_000; // unix seconds, arbitrary
@@ -228,19 +229,10 @@ test('a plain text message forwards its message_id to the wrap (for tg --reply-t
   expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #4321] do the thing', messageId: 4321 });
 });
 
-test('the default injectWrap template renders the inbound id as #<id>', () => {
-  // Using the SHIPPED template + the real wrapInbound binding the daemon uses.
-  const r = stepUpdates([upd(77, { text: 'hi' })], makeOpts());
-  // makeOpts' wrap ignores the id, so assert via a real-template wrap instead:
-  const realWrap = (name: string, msg: string, messageId?: number) =>
-    DEFAULT_CONTROL.injectWrap
-      .replace('{name}', name)
-      .replace('{msg}', msg)
-      .replace('{id}', messageId !== undefined ? `#${messageId}` : '');
-  const r2 = stepUpdates([upd(77, { text: 'hi' })], { ...makeOpts(), wrap: realWrap });
-  expect(r2.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #77] hi', messageId: 77 });
-  // r is just exercising the default path doesn't throw.
-  expect(r.actions.length).toBeGreaterThan(0);
+test('the default injectWrap template renders the inbound id as tg#<id>', () => {
+  // The SHIPPED template + the real wrapInbound binding the daemon uses.
+  const r = stepUpdates([upd(77, { text: 'hi' })], { ...makeOpts(), wrap: (name, msg, messageId) => wrapInbound(DEFAULT_CONTROL.injectWrap, name, msg, messageId) });
+  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex tg#77] hi', messageId: 77 });
 });
 
 test('text reply to a post-timeout question card is routed as the deferred answer', () => {
