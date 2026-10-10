@@ -15,7 +15,7 @@ semantic versioning.
   of the daemon goes through one helper that logs a timeout with its subcommand. A hung `tmux
   capture-pane` in the submit check reads as "box not readable" instead of freezing the daemon's
   poll loop, hook socket and taps; a hung `send-keys` is recorded `uncertain` in the delivery
-  ledger (the keys may have landed), the CTO is told it may or may not have arrived, and no path
+  ledger (the keys may have landed; a hung `load-buffer` typed nothing and stays a plain failure), the CTO is told it may or may not have arrived, and no path
   invites a re-send (late tap, post-timeout reply, deferred flush, auto-continue, grant notice
   treat it like an unsubmitted message). `tg` stops calling tmux for the rest of a send after one
   timeout, so a wedged server costs one bound, not one per query.

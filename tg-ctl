@@ -2673,12 +2673,15 @@ function runInjectStepsSync(steps: InjectStep[]): { ok: true } | InjectFailure {
 }
 
 // One `tmux` step of a plan (send-keys, load-buffer, paste-buffer), shared by both executors. A
-// step killed at its bound may already have reached the pane, so it fails `uncertain`.
+// step killed at its bound may already have reached the pane, so it fails `uncertain` — except
+// load-buffer, which only fills a tmux buffer: nothing is typed until paste-buffer runs.
 function runTmuxStep(step: Extract<InjectStep, { kind: "tmux" }>): InjectFailure | null {
   const [, ...args] = step.argv // argv[0] is "tmux" (inject.ts)
   const proc = tmuxSync(args, { write: true, stdin: step.stdin !== undefined ? new TextEncoder().encode(step.stdin) : undefined })
   if (proc.exitedDueToTimeout) {
-    return { ok: false, uncertain: true, error: `tmux did not answer within ${TMUX_WRITE_SPAWN.timeout / 1000}s — the message may or may not have reached the pane` }
+    const noAnswer = `tmux did not answer within ${TMUX_WRITE_SPAWN.timeout / 1000}s`
+    if (args[0] === "load-buffer") return { ok: false, error: `${noAnswer} — the message was not typed` }
+    return { ok: false, uncertain: true, error: `${noAnswer} — the message may or may not have reached the pane` }
   }
   if (proc.exitCode !== 0) return { ok: false, error: `${step.argv.join(" ")} failed: ${proc.stderr.toString().trim()}` }
   return null

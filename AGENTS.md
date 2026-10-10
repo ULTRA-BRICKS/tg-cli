@@ -184,7 +184,7 @@ send-keys/buffers/new-window, `ADMIN_SPAWN` 60 s for launchctl/systemctl/rig ins
 helper per entrypoint — `tmuxSync` in `tg-ctl` (logs a timeout with its subcommand), `tmuxQuery`
 in `tg` (after one timeout the rest of the run skips tmux) — and the audit test pins that. A
 timed-out probe reads as "unknown"; a timed-out tmux step of an inject plan fails `uncertain`
-(tmux may have applied it): the ledger records it, and every caller that would invite a re-send
+(tmux may have applied it; a timed-out `load-buffer` is a plain failure — nothing typed yet): the ledger records it, and every caller that would invite a re-send
 checks `mayHaveLanded` (`delivery-ledger.ts`) and reports instead. An omp's open session files and
 cwd come from procfs where it exists, else a bounded lsof (`features/tg-ctl/pid-files.ts`).
 

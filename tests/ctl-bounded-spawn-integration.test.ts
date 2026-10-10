@@ -27,14 +27,17 @@ afterAll(async () => {
   for (const s of servers.splice(0)) s.stop(true);
 });
 
-type HangOn = 'capture-pane' | 'send-keys-text';
+type HangOn = 'capture-pane' | 'send-keys-text' | 'load-buffer';
 
 // list-panes reports the claude pane; `hangOn` records the call and then hangs. Every
 // other subcommand succeeds silently.
 function writeShim(shimDir: string, callLog: string, cwd: string, hangOn: HangOn): void {
   mkdirSync(shimDir, { recursive: true });
-  const hangTest =
-    hangOn === 'capture-pane' ? '[ "$sub" = "capture-pane" ]' : '[ "$sub" = "send-keys" ] && [ "$has_literal" = "1" ]';
+  const hangTest = {
+    'capture-pane': '[ "$sub" = "capture-pane" ]',
+    'send-keys-text': '[ "$sub" = "send-keys" ] && [ "$has_literal" = "1" ]',
+    'load-buffer': '[ "$sub" = "load-buffer" ]',
+  }[hangOn];
   writeFileSync(
     join(shimDir, 'tmux'),
     `#!/bin/sh
@@ -87,7 +90,8 @@ async function runWithHang(
             result: [
               {
                 update_id: 700,
-                message: { message_id: 1, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'check the build' },
+                // A multi-line message is typed through load-buffer + paste-buffer, a single line through send-keys -l.
+                message: { message_id: 1, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: hangOn === 'load-buffer' ? 'check\nthe build' : 'check the build' },
               },
             ],
           });
@@ -162,4 +166,16 @@ test('a hung `tmux send-keys -l` does not stall the daemon and is recorded uncer
   expect(res.ledger).not.toContain('"event":"failed"');
   // The CTO hears that it may or may not have arrived — not an invitation to resend.
   expect(res.notices.some((n) => n.includes('may or may not have reached the pane'))).toBe(true);
+}, 40_000);
+
+// load-buffer only fills a tmux buffer; nothing reaches the pane until paste-buffer runs. A
+// hung one proves the message did not arrive, so it is a plain failure — resendable — not uncertain.
+test('a hung `tmux load-buffer` (multi-line message) is a plain failure: nothing reached the pane', async () => {
+  const res = await runWithHang('load-buffer');
+  expect(res.callLog).toContain('load-buffer -');
+  expect(res.callLog).not.toContain('paste-buffer');
+  expect(res.pollGapMs).not.toBeNull();
+  expect(res.pollGapMs!).toBeLessThan(RESPONSIVE_BOUND_MS);
+  expect(res.ledger).toContain('"event":"failed"');
+  expect(res.ledger).not.toContain('"event":"uncertain"');
 }, 40_000);
