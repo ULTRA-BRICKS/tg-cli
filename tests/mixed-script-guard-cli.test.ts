@@ -79,6 +79,30 @@ test('does NOT block a glued Latin-acronym + Cyrillic-suffix compound ("IDшни
   expectPassedGuardThenFailedOffline(proc);
 });
 
+// tg-cli#224: the guard is BIDIRECTIONAL — a Cyrillic letter sandwiched inside
+// a Latin word ("mіr" = Latin m + Cyrillic і U+0456 + Latin r) is blocked the
+// same way as a Latin fragment inside a Cyrillic word. Pinned at the CLI so the
+// documented contract matches what ships.
+test('blocks a Cyrillic letter sandwiched inside a Latin word ("mіr", foreign→Cyrillic→foreign)', () => {
+  const proc = run(['hello mіr'], BASE_ENV);
+  expect(proc.exitCode).toBe(1);
+  expect(proc.stderr.toString()).toContain('mіr');
+});
+
+// tg-cli#215 / #226: Russian dev slang and acronym islands glue a Cyrillic
+// prefix AND suffix onto an untouched English stem — legit, not mojibake.
+test('does NOT block Russian dev slang / acronym islands ("заpushил", "антиDDoSный")', () => {
+  const proc = run(['заpushил фикс, заmergeил PR, заcommitил, отdebugил, антиDDoSный фильтр'], OFFLINE_ENV);
+  expectPassedGuardThenFailedOffline(proc);
+});
+
+// tg-cli#227: an invisible format char must not split a garbage run in two.
+test('blocks a mojibake token split by a zero-width space ("поч\\u200Bčesна")', () => {
+  const proc = run(['задача поч\u200Bčesна'], BASE_ENV);
+  expect(proc.exitCode).toBe(1);
+  expect(proc.stderr.toString()).toContain('čes');
+});
+
 test('does NOT block a clean --title + clean body (positive pass path for --title)', () => {
   const proc = run(['--title', 'Задача починена', 'все тесты зелёные'], OFFLINE_ENV);
   expectPassedGuardThenFailedOffline(proc);

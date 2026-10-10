@@ -70,3 +70,10 @@ test('documents the --tag/--title badge and --reply-to', () => {
 test('notes the one-emoji rule for tg-emoji', () => {
   expect(FORMAT_HELP).toMatch(/EXACTLY ONE emoji|exactly one emoji|one emoji/i);
 });
+
+// tg-cli#221: the escalation gate checks the TEXT only — the help must say a
+// --file/--photo attachment does not satisfy "where to look".
+test('the decision-format help states that an attachment does not count as where-to-look', () => {
+  expect(FORMAT_HELP).toContain('attachment does not count');
+  expect(FORMAT_HELP).toContain('A bare path');
+});

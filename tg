@@ -360,10 +360,13 @@ Stray-CJK / mixed-script guard (feature cjk-guard, ON by default — toggle with
   so a genuinely CJK message, a bilingual word (Deploy到生产), and a CJK suffix
   (iOS版) pass untouched.
   The SAME feature flag also hard-blocks a mixed-script "garbage word" token —
-  a single contiguous run of letters where a foreign alphabet (Latin, Greek, …)
-  is sandwiched inside Cyrillic (e.g. "почčesна"), the homoglyph/mojibake shape
-  an LLM occasionally emits. Two SEPARATE words (влил PR), a hyphen-joined
-  compound (PR-ревью), and a glued acronym+suffix (IDшник) pass untouched.
+  a single contiguous run of letters whose script switches between Cyrillic and
+  a foreign alphabet (Latin, Greek, …) twice or more, in EITHER direction: a
+  foreign fragment inside Cyrillic ("почčesна") or a Cyrillic letter inside a
+  foreign word ("mіr"). Invisible format characters (zero-width space, soft
+  hyphen) do not split a run. Two SEPARATE words (влил PR), a hyphen-joined
+  compound (PR-ревью), a glued acronym+suffix (IDшник), and dev slang wrapping
+  one English stem in Cyrillic (заpushил, антиDDoSный) pass untouched.
   Override either check with --no-feature cjk-guard or features.cjk-guard: false.
 
 Screenshot-attach gate (feature screenshot-guard, ON by default — toggle with

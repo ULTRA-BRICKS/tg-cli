@@ -106,9 +106,15 @@ Header badge (--tag / --title), composes with BOTH basic and rich sends:
   send (exit 1) and lists what's missing. Required sections (skill:
   decision-request-discipline):
     • Context — one line: where the code is (file:line) and what it does.
-    • Options — a real <table> (or <ul>/<ol>) with pros/cons per option.
-    • Recommendation — which option you'd pick and why.
-    • Where to look — a file:line reference.
+    • Options — ONE real <table> with ≥2 option rows and filled pros/cons
+      cells, or ONE <ul>/<ol> of ≥2 options (not bullets from the
+      Recommendation / Where-to-look sections).
+    • Recommendation — which option you'd pick and why (a heading alone with
+      nothing under it does not count).
+    • Where to look — a file:line in the TEXT (features/foo.ts:42, ./tg:1219,
+      or a #L42 link). A bare path, "and/or", "12:30" do not count, and a
+      --file/--photo attachment does not count either — write the file:line
+      into the body (a path:line in the body is also auto-attached).
   Plus STRUCTURE: each section under its own <h3>/<h4>, enumerations as short
   <ul>/<li> items (never inline "плюсы: a, b, c"), <hr> dividers between
   sections, short lines. Use --format html.
