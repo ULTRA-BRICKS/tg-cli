@@ -319,7 +319,11 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
   PreToolUse→`permissionDecision`, PermissionRequest→`decision.behavior`), `hook-install.ts`
   (idempotent q→buttons hook merge for `tg-ctl install-hooks` — PreToolUse matches `AskUserQuestion`,
   plus a `PermissionRequest *` catch-all that also carries plan-approval; ExitPlanMode gets NO
-  dedicated matcher to avoid double-forwarding, since both events fire for it), `question-store.ts`
+  dedicated matcher to avoid double-forwarding, since both events fire for it), `codex-hooks-migration.ts`
+  (PURE, #316: Codex loads hooks from BOTH `hooks.json` and the `[hooks]` table of `config.toml`;
+  `codexUsageHookInConfigToml` parses it (`Bun.TOML.parse`, so comments, multi-line strings and every Stop-table spelling are handled) and
+  `planCodexHooksJsonMigration` plans removing the legacy `hooks.json` entry — the entrypoint backs up
+  and migrates only right after a successful `rig apply`, and `status` reads config.toml first), `question-store.ts`
   (PURE (de)serialization for the durable forwarded-question state — the on-disk envelope +
   age/count pruning; the entrypoint owns the atomic file I/O and the authoritative req
   normalization), `defer.ts` (defer-while-waiting queue model: inbound text is

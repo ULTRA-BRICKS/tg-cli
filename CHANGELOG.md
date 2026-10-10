@@ -3,6 +3,31 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.60.9
+
+- **`tg-ctl install-hooks` retires the legacy Codex `hooks.json` usage-telemetry entry once rig
+  provisions the same Stop hook in `config.toml` (Refs #316).** It already skipped writing
+  `hooks.json` in that case, but skipping a write never removed what an earlier install put there,
+  so Codex kept warning `loading hooks from both …/hooks.json and …/config.toml` until the file was
+  deleted by hand. After a successful `rig apply`, the entry is now migrated away: the file is backed
+  up first to `hooks.json.pre-migration.bak` (distinct from the installer's own `.bak`; that earliest
+  snapshot is never replaced — a later migration of different content gets its own
+  `hooks.json.pre-migration-<ms>.bak`; a failed backup aborts the migration and `install-hooks`
+  exits 1), other hooks in the file are kept, and the file is deleted when ours was all it held.
+  Re-running prints `nothing to migrate`. Without rig the `hooks.json` fallback is never touched —
+  an old `config.toml` may name a path an uninstalled rig left behind.
+- **The `config.toml` check parses the file instead of substring-matching it.** It used a plain
+  `includes` test, so a commented-out `# Stop = [… tg-ctl codex-usage-hook …]` line counted as a
+  provisioned hook and telemetry was silently never installed. `config.toml` is now parsed as TOML
+  and only the `[hooks]` Stop table counts, in any spelling (`Stop = […]` under `[hooks]`, dotted
+  `hooks.Stop`, `[hooks.Stop]` / `[[hooks.Stop]]`); comments, multi-line strings and
+  `…codex-usage-hook-canary` or `… codex-usage-hook && other.sh` look-alikes do not. An unparseable
+  file counts as not installed.
+- **`tg-ctl status` finds the Codex telemetry hook in `config.toml`.** It read `hooks.json` only and
+  reported `NOT installed` for a hook that was live in `config.toml`. It now checks `config.toml`
+  first, falls back to the legacy `hooks.json`, names the file it found the hook in, and flags the
+  hook living in both files — the state Codex warns about.
+
 ## 1.60.2
 
 - **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on

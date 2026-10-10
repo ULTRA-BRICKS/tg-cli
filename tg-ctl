@@ -388,7 +388,6 @@ import {
 import {
   claudeHooksInstalled,
   claudeStatusLineTelemetryInstalled,
-  codexUsageHookInstalled,
   harnessHooksInstalled,
   reconcileClaudeHooks,
   runClaudeHookSelfHeal,
@@ -397,6 +396,7 @@ import {
   withCodexUsageHook,
 } from "./features/tg-ctl/hook-install"
 import { applyCodexHookTrustBypass, detectRig, NO_RIG_EXIT, runRigDelegate } from "./features/tg-ctl/rig-delegate"
+import { codexUsageHookInConfigToml, planCodexHooksJsonMigration } from "./features/tg-ctl/codex-hooks-migration"
 import { normalizeHookRequests, type HookEnv } from "./features/tg-ctl/hook-normalize"
 import {
   GENERIC_ASK_ORIGIN_AGENT,
@@ -619,6 +619,10 @@ const CLAUDE_HARNESS_HOOK_CMD = "tg-ctl harness-event"
 const CLAUDE_STATUSLINE_TELEMETRY_CMD = "tg-ctl harness-event --agent claude"
 const CODEX_USAGE_HOOK_CMD = "tg-ctl codex-usage-hook"
 const CODEX_TRANSCRIPT_TAIL_BYTES = 500_000
+// Backup suffix for the one-way migration of the LEGACY Codex hooks.json entry (tg-cli#316).
+// Deliberately NOT the installer's own `.bak`: that one holds the pre-INSTALL file, and a
+// migration must not overwrite it.
+const CODEX_HOOKS_MIGRATION_BACKUP_SUFFIX = ".pre-migration.bak"
 
 // Spec §5.2 no-agent guard: harness-neutral, one line. Never claims "Claude Code"
 // for whatever was addressed (tg#17036: it was sent for an omp that WAS in tmux).
@@ -3378,7 +3382,6 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
   let questionHooksOk = false
   let harnessHooksOk = false
   let statusLineTelemetryOk = false
-  let codexUsageTelemetryOk = false
   let shadowingStatusLine: string | null = null
   if (hooksRaw) {
     try {
@@ -3389,13 +3392,6 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
       if (statusLineTelemetryOk) {
         shadowingStatusLine = findShadowingClaudeStatusLine(ctx.home, statusScopeCwd, CLAUDE_STATUSLINE_TELEMETRY_CMD)
       }
-    } catch {}
-  }
-  const codexHooksRaw = readFileOrNull(join(codexConfigDir(ctx.home), "hooks.json"))
-  if (codexHooksRaw) {
-    try {
-      const codexHooksSettings = JSON.parse(codexHooksRaw)
-      codexUsageTelemetryOk = codexUsageHookInstalled(codexHooksSettings, CODEX_USAGE_HOOK_CMD)
     } catch {}
   }
   lines.push(
@@ -3415,11 +3411,7 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
         ? "usage telemetry: installed (Claude Code statusLine)"
         : "usage telemetry: NOT installed — run `tg-ctl install-hooks`",
   )
-  lines.push(
-    codexUsageTelemetryOk
-      ? "Codex usage telemetry: installed (Stop hook transcript collector)"
-      : "Codex usage telemetry: NOT installed — run `tg-ctl install-hooks`, then trust it via Codex `/hooks`",
-  )
+  lines.push(composeCodexTelemetryLine(ctx.home))
   // Autostart (the shared service-management lifecycle): an installed unit means the daemon
   // comes back at login. Mirrors the q→buttons line — installed reports the kind/label, absent
   // gets a hint. On the no-op fallback (no launchd/systemd) there's no unit to find.
@@ -3432,6 +3424,43 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
   const kind = autostartKind(env)
   lines.push(composeAutostartLine(env, kind))
   return lines.join("\n")
+}
+
+// The `Codex usage telemetry:` line. Codex reads hooks from TWO files and rig provisions our Stop
+// hook into `config.toml`, so config.toml is checked FIRST and the legacy `hooks.json` only as a
+// fallback — reading hooks.json alone reported "NOT installed" for a hook that was live in
+// config.toml (tg-cli#316). The line names the file it was found in, because the two differ in what
+// the user must still do: a hook rig manages in config.toml is already trusted, while a legacy
+// hooks.json entry needs a manual Codex `/hooks` trust review AND should be migrated away.
+function composeCodexTelemetryLine(home: string): string {
+  const codexDir = codexConfigDir(home)
+  const configTomlPath = join(codexDir, "config.toml")
+  const configToml = readFileOrNull(configTomlPath)
+  const inConfigToml = configToml !== null && codexUsageHookInConfigToml(configToml, CODEX_USAGE_HOOK_CMD)
+  const hooksJsonPath = join(codexDir, "hooks.json")
+  const inHooksJson = codexUsageHookInLegacyHooksJson(hooksJsonPath)
+  if (inConfigToml) {
+    const line = `Codex usage telemetry: installed (Stop hook transcript collector, ${configTomlPath})`
+    // BOTH files carrying the hook is the exact state codex warns about (`loading hooks from both
+    // …`) — the one `status` exists to make visible, so it must not read as simply "installed".
+    return inHooksJson
+      ? `${line} — but the legacy ${hooksJsonPath} still carries it too (codex warns about loading hooks from both); with rig installed, \`tg-ctl install-hooks\` migrates it away`
+      : line
+  }
+  if (inHooksJson) {
+    return (
+      `Codex usage telemetry: installed (Stop hook transcript collector, legacy ${hooksJsonPath}) — ` +
+      "trust it via Codex `/hooks`; `tg-ctl install-hooks` moves it into config.toml once rig provisions it there"
+    )
+  }
+  return "Codex usage telemetry: NOT installed — run `tg-ctl install-hooks`, then trust it via Codex `/hooks`"
+}
+
+// Does the LEGACY Codex hooks file still carry our usage-telemetry Stop hook? Asks the migration
+// planner itself, so `status` flags exactly the entries `install-hooks` would migrate (including an
+// absolute-path invocation). A missing or hand-broken file simply answers no.
+function codexUsageHookInLegacyHooksJson(hooksJsonPath: string): boolean {
+  return planCodexHooksJsonMigration(readFileOrNull(hooksJsonPath), CODEX_USAGE_HOOK_CMD).action !== "none"
 }
 
 // The three Claude Code hook commands the daemon owns, as one unit. Shared by
@@ -3537,6 +3566,86 @@ function installCodexUsageTelemetryDirect(codexHooksPath: string, codexRaw: stri
   }
 }
 
+// Retire the LEGACY `hooks.json` usage-telemetry entry once the same Stop hook is provisioned in
+// `config.toml` (tg-cli#316). PR #200 taught install-hooks to SKIP writing hooks.json in that case,
+// but skipping a write never removes what an EARLIER install already put there — so codex kept
+// warning `loading hooks from both …` until the file was deleted by hand. Backs the file up before
+// touching it (a distinct suffix from the installer's own `.bak`; the earliest pre-migration
+// snapshot is never replaced), removes the file outright when our hook was the only thing in it,
+// and prints exactly what it did. Idempotent: a second run finds nothing to migrate and says so.
+// Returns whether the legacy entry is gone (also true when there was nothing to migrate).
+function migrateLegacyCodexHooksJson(codexHooksPath: string): boolean {
+  const raw = readFileOrNull(codexHooksPath)
+  const plan = planCodexHooksJsonMigration(raw, CODEX_USAGE_HOOK_CMD)
+  if (raw === null) {
+    console.log(`tg-ctl: no legacy Codex hooks file at ${codexHooksPath} — nothing to migrate.`)
+    return true
+  }
+  if (plan.action === "none") {
+    console.log(`tg-ctl: no legacy Codex usage-telemetry Stop entry in ${codexHooksPath} — nothing to migrate.`)
+    return true
+  }
+  // The backup is the migration's ENTIRE safety story, so a failed backup ABORTS it — never
+  // "swallow the error and delete anyway", which would destroy the file while the success message
+  // pointed at a backup that was never written. The canonical backup holds the EARLIEST
+  // pre-migration snapshot and is never replaced; when a later migration finds DIFFERENT content
+  // (our entry re-added beside the user's own hooks), that content gets its own timestamped copy.
+  const canonicalBackup = `${codexHooksPath}${CODEX_HOOKS_MIGRATION_BACKUP_SUFFIX}`
+  // existsSync, not a failed read: an earlier backup that is present but unreadable (root-owned
+  // after a sudo run) must still never be overwritten.
+  const earlierBackup = existsSync(canonicalBackup) ? readFileOrNull(canonicalBackup) ?? "" : null
+  // Three cases: no backup yet → write the canonical one; an identical one exists → keep it; a
+  // different one exists → snapshot this content beside it.
+  const alreadySaved = earlierBackup === raw
+  const savedAt =
+    alreadySaved || earlierBackup === null
+      ? canonicalBackup
+      : canonicalBackup.replace(/\.bak$/, `-${Date.now()}.bak`)
+  if (!alreadySaved) {
+    try {
+      // Atomic, so the copy the messages below point at is never a torn half-write.
+      atomicWrite(savedAt, raw)
+    } catch (err) {
+      console.error(`tg-ctl: could not back up ${codexHooksPath} to ${savedAt} (${err}) — leaving the legacy entry in place.`)
+      return false
+    }
+  }
+  const backupNote = alreadySaved ? ` (earlier identical backup kept: ${savedAt})` : ` (backup: ${savedAt})`
+  try {
+    if (plan.action === "delete") {
+      unlinkSync(codexHooksPath)
+      console.log(`tg-ctl: migrated the legacy Codex usage-telemetry Stop entry out of ${codexHooksPath} — it held nothing else, so the file was removed${backupNote}.`)
+      return true
+    }
+    writeFileSync(codexHooksPath, plan.json)
+    console.log(`tg-ctl: removed the legacy Codex usage-telemetry Stop entry from ${codexHooksPath}; its other hooks were kept${backupNote}.`)
+  } catch (err) {
+    const verb = plan.action === "delete" ? "remove" : "rewrite"
+    console.error(`tg-ctl: could not ${verb} ${codexHooksPath} (${err}) — the pre-migration copy is at ${savedAt}.`)
+    return false
+  }
+  return true
+}
+
+// Did the rig apply we just ran leave our Stop hook in the AUTHORITATIVE artifact rig owns
+// (`config.toml`)? When it did, the direct hooks.json write must be skipped (that write is what
+// recreates the dual source codex warns about) AND any legacy hooks.json entry is migrated away.
+//
+// This is deliberately reachable ONLY from the path where a PRESENT rig just applied successfully.
+// Trusting an arbitrarily OLD config.toml would be unsafe: rig writes a RESOLVED absolute
+// invocation, so a config.toml left behind by an uninstalled rig can name a path that no longer
+// exists — and migrating on the strength of it would delete the still-working hooks.json fallback
+// and leave the machine with no telemetry hook at all. Right after rig itself wrote the file, the
+// invocation is current by construction.
+// `not-provisioned` tells the caller to write hooks.json itself.
+function settleCodexTelemetryFromConfigToml(codexHooksPath: string): "not-provisioned" | "migrated" | "migration-failed" {
+  const configTomlPath = join(dirname(codexHooksPath), "config.toml")
+  const configToml = readFileOrNull(configTomlPath)
+  if (!configToml || !codexUsageHookInConfigToml(configToml, CODEX_USAGE_HOOK_CMD)) return "not-provisioned"
+  console.log(`tg-ctl: rig now provisions the codex usage-telemetry Stop hook (${configTomlPath}) — skipping the direct hooks.json write.`)
+  return migrateLegacyCodexHooksJson(codexHooksPath) ? "migrated" : "migration-failed"
+}
+
 // Rig-aware Codex hook provisioning (tg#8672). When rig is present it owns the codex hook
 // bridge (writes ~/.codex/config.toml), so writing tg-ctl's own hook straight into
 // ~/.codex/hooks.json makes codex warn about loading hooks from both files. Delegate to
@@ -3589,12 +3698,11 @@ function installCodexUsageTelemetry(codexHooksPath: string, codexRaw: string | n
   }
   // rig succeeded. Check the AUTHORITATIVE artifact rig actually writes (~/.codex/config.toml),
   // re-read from disk — NOT the pre-delegation snapshot — to see whether rig now provisions the
-  // usage-telemetry Stop hook itself.
-  const codexConfigToml = readFileOrNull(join(dirname(codexHooksPath), "config.toml"))
-  if (codexConfigToml && codexConfigToml.includes(CODEX_USAGE_HOOK_CMD)) {
-    console.log("tg-ctl: rig now provisions the codex usage-telemetry Stop hook (~/.codex/config.toml) — skipping the direct hooks.json write.")
-    return 0
-  }
+  // usage-telemetry Stop hook itself; if it does, any legacy hooks.json entry is migrated away.
+  const settled = settleCodexTelemetryFromConfigToml(codexHooksPath)
+  // A failed migration is a failure, not a quiet success that leaves the dual source behind.
+  if (settled === "migrated") return 0
+  if (settled === "migration-failed") return 1
   // rig does not fold in the telemetry hook yet — write it directly so telemetry is not lost.
   // Re-read hooks.json FRESH (rig apply may have touched ~/.codex) rather than reusing the stale
   // pre-delegation snapshot.
