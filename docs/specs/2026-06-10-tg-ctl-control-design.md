@@ -185,10 +185,18 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
   `libc.so.6` (linux), symbol `flock(i32, i32)`, `LOCK_EX|LOCK_NB = 6`, fd kept
   open for the daemon's lifetime — the kernel releases the lock on ANY exit,
   including SIGKILL (verified working on this machine, contention included).
-  A second start fails the `flock` → exits 0 (idempotent no-op). PID file
+  A second start fails the `flock` → retries for `DAEMON_LOCK_GRACE_MS` (1 s) → exits 0
+  (idempotent no-op). The grace exists because a lock probe on a platform without a
+  readable kernel lock table (macOS) takes the flock for an instant; a start landing in
+  that instant must not become the no-op (tg-cli#490). PID file
   `tg-ctl.<botid>.pid` is purely informational; stale pidfile cleared via `kill -0`.
   `tg-ctl status` must not treat a missing/stale pidfile as "not running" while the
   flock is held or a launchd job supervises this binary (tg-cli#316).
+- **Who holds the flock** is read, never taken, where the kernel allows it: on Linux
+  `/proc/locks` (FLOCK entries on the lock file's inode, each pid confirmed to have the
+  file open via `/proc/<pid>/fd`); elsewhere `lsof -t` names the processes with the file
+  open and "does pid P hold it" — asked only for such a P — falls back to taking the flock
+  for an instant (absorbed by the grace above).
 
 - **Launcher/daemon split (review F1, blocker):** `tg-ctl start` (and the lazy
   auto-start from `tg`) spawns the daemon with
@@ -226,8 +234,9 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
     Exit 1 when the process is still alive after the wait.
   - `tg-ctl restart [--if-stale]` — `stop`, then relaunch: a launchd-owned daemon via
     `launchctl kickstart <domain>/<label>` (it stays under launchd), otherwise the detached
-    `start` spawn. Exit 0 only when the old pid is dead AND a new pid is in the pidfile and
-    alive within 15 s; never launches a replacement over a still-alive old process.
+    `start` spawn. Exit 0 only when the old pid is dead AND a new pid is in the pidfile,
+    alive and holding the flock within 15 s; never launches a replacement over a still-alive
+    old process. `--if-stale` probes the run state once and stops exactly what it probed.
     `--if-stale` (the deploy step, tg-cli#279): no-op when nothing runs or the loaded code
     is current; restarts when the checkout HEAD moved with daemon-code changes (any path
     except docs/tests/scripts/CI/`*.md`/`tg`) or the code identity is unknown.

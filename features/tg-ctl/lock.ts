@@ -177,6 +177,25 @@ export function ownsPidFile(content: string | null, ownPid: number): boolean {
   return readPidFile(content) === ownPid;
 }
 
+// Pids holding a flock(2) on the inode `ino` (decimal string — a u64 can outgrow a JS number),
+// read from a Linux /proc/locks table: "<n>: FLOCK  ADVISORY  WRITE <pid> <maj>:<min>:<ino> 0 EOF".
+// Reading the table never touches the lock, unlike taking it for an instant (tg-cli#490). Waiters
+// ("<n>: -> FLOCK …") hold nothing; POSIX/OFD record locks are a different lock. The device is not
+// matched — /proc/locks prints the superblock device, which differs from stat's st_dev on btrfs —
+// so the caller confirms each pid really has the file open before trusting it. A 0 in the result
+// is a holder the kernel cannot name to this reader (its pid lives in another pid namespace, or
+// the locking process exited while a child that inherited the fd keeps the lock).
+export function flockPidsForInode(procLocks: string, ino: string): number[] {
+  const pids = new Set<number>();
+  for (const line of procLocks.split('\n')) {
+    const fields = line.trim().split(/\s+/);
+    if (fields[1] !== 'FLOCK' || fields[5]?.split(':')[2] !== ino) continue;
+    const pid = Number(fields[4]);
+    if (Number.isInteger(pid) && pid >= 0) pids.add(pid);
+  }
+  return [...pids];
+}
+
 // Lazy auto-start gate (spec §7): inside tmux AND control.enabled. Deliberately
 // NO TTY check — agents call tg through a piped Bash tool, so isatty is false
 // in exactly the scenario that must fire; the TMUX check alone excludes

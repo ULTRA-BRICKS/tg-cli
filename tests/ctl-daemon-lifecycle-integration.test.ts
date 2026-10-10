@@ -9,7 +9,7 @@
 // the #279 case runs the daemon from a throwaway git checkout (a copy of this tree) so
 // commits can move its HEAD. Never touches the developer's live daemon or LaunchAgent.
 import { afterEach, expect, test } from 'bun:test';
-import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from 'fs';
+import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackCfgDir, trackProc } from './helpers/daemon-lifecycle';
@@ -130,9 +130,9 @@ test('restart replaces a live daemon whose pidfile vanished and reports the veri
   expect(res.stdout).toContain(`restarted (pid ${oldPid} → ${holders[0]})`);
 }, 40_000);
 
-test('restart fails loudly and launches nothing when the lock holder survives SIGTERM', async () => {
-  const { cfgDir, env } = prepareCfg('tgctl-restart-wedged-');
-  // A wedged "daemon": holds the flock, has no pidfile, ignores SIGTERM.
+// A foreign process holding the daemon's flock (no pidfile), resolved once it holds it. It ignores
+// SIGTERM, so only SIGKILL releases the lock.
+async function spawnLockHolder(cfgDir: string) {
   const holderSrc = join(cfgDir, 'holder.ts');
   writeFileSync(
     holderSrc,
@@ -148,6 +148,13 @@ test('restart fails loudly and launches nothing when the lock holder survives SI
   );
   const holder = trackProc(reg, Bun.spawn([process.execPath, holderSrc, join(cfgDir, 'tg-ctl.123.lock')], { stdio: ['ignore', 'ignore', 'ignore'] }));
   expect(await waitFor(() => lockHolders(cfgDir).includes(holder.pid), 5000)).toBe(true);
+  return holder;
+}
+
+test('restart fails loudly and launches nothing when the lock holder survives SIGTERM', async () => {
+  const { cfgDir, env } = prepareCfg('tgctl-restart-wedged-');
+  // A wedged "daemon": holds the flock, has no pidfile, ignores SIGTERM.
+  const holder = await spawnLockHolder(cfgDir);
 
   const res = await ctl(TG_CTL, ['restart'], env);
 
@@ -177,6 +184,82 @@ test('stop/restart never signal a live pidfile pid when nobody holds the flock �
   expect(stop.stdout).toContain(`not running (cleaned stale pidfile, pid ${bystander.pid})`);
   expect(alive(bystander.pid)).toBe(true);
   expect(existsSync(join(cfgDir, 'tg-ctl.123.pid'))).toBe(false);
+}, 30_000);
+
+// tg-cli#490: restart's successor poll checked "the successor holds the flock" by TAKING the flock
+// for an instant, while runDaemon tried the flock once — a successor whose attempt landed inside a
+// probe exited 0 (the idempotent no-op) and restart ended "FAILED" with NO daemon. The poll probes
+// the lock only while the pidfile names a live pid that is neither the old daemon nor the
+// successor yet — a stale pidfile pointing at a reused pid — so every round plants one.
+// TG_CTL_LOCK_PROBE_TEST_HOLD_MS stretches each lock-TAKING probe to 300 ms, turning the µs race
+// into a near-certain one per round (red before the fix). On Linux the fixed probe reads
+// /proc/locks and never takes the lock, so the knob has nothing to stretch; where the probe still
+// takes it (macOS), the daemon's lock grace has to absorb the 300 ms holds.
+test('restart leaves a live successor holding the flock every time, even while the pidfile names another live pid', async () => {
+  const { cfgDir, env } = prepareCfg('tgctl-restart-probe-');
+  trackCfgDir(reg, cfgDir, { detachedStarts: true });
+  const probeEnv = { ...env, TG_CTL_LOCK_PROBE_TEST_HOLD_MS: '300' };
+  const bystander = trackProc(reg, Bun.spawn(['sleep', '300'], { stdio: ['ignore', 'ignore', 'ignore'] }));
+  const daemon = await spawnDaemon(reg, { tgCtlPath: TG_CTL, cfgDir, env: probeEnv });
+  let current = daemon.pid;
+
+  for (let round = 1; round <= 5; round++) {
+    writeFileSync(join(cfgDir, 'tg-ctl.123.pid'), `${bystander.pid}\n`);
+
+    const res = await ctl(TG_CTL, ['restart'], probeEnv);
+
+    expect({ round, exitCode: res.exitCode, stderr: res.stderr }).toEqual({ round, exitCode: 0, stderr: '' });
+    const holders = lockHolders(cfgDir);
+    expect(holders.length).toBe(1);
+    expect(holders[0]).not.toBe(current);
+    expect(res.stdout).toContain(`restarted (pid ${current} → ${holders[0]})`);
+    current = holders[0];
+  }
+  expect(alive(bystander.pid)).toBe(true);
+}, 180_000);
+
+// Does `pid` have the daemon's lock file open? Linux reads /proc/<pid>/fd (no spawn, so it answers
+// well inside the daemon's 1 s lock grace even on a loaded box); elsewhere lsof.
+function hasLockOpen(cfgDir: string, pid: number): boolean {
+  const lock = join(cfgDir, 'tg-ctl.123.lock');
+  if (process.platform !== 'linux') return lockHolders(cfgDir).includes(pid);
+  try {
+    const { ino, dev } = statSync(lock);
+    return readdirSync(`/proc/${pid}/fd`).some((fd) => {
+      try {
+        const open = statSync(`/proc/${pid}/fd/${fd}`);
+        return open.ino === ino && open.dev === dev;
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return false;
+  }
+}
+
+// tg-cli#490, the daemon side: a lock probe that takes the flock for an instant (the fallback where
+// the kernel offers no read-only check) must not turn a starting daemon into the no-op exit — it
+// waits a short grace for the lock instead of trying exactly once.
+test('a daemon starting while another process briefly holds the flock waits it out and takes over', async () => {
+  const { cfgDir, env } = prepareCfg('tgctl-lock-grace-');
+  const holder = await spawnLockHolder(cfgDir);
+  const daemon = trackProc(reg, Bun.spawn([process.execPath, TG_CTL, 'run'], { env, stdio: ['ignore', 'ignore', 'ignore'] }));
+  trackCfgDir(reg, cfgDir);
+  // The daemon opens the lock file immediately before its flock attempt: once it has the file
+  // open (or already exited), that attempt met the held lock.
+  expect(await waitFor(() => daemon.exitCode !== null || hasLockOpen(cfgDir, daemon.pid), 10_000)).toBe(true);
+
+  holder.kill('SIGKILL');
+  await holder.exited;
+
+  const pidfile = join(cfgDir, 'tg-ctl.123.pid');
+  await waitFor(() => existsSync(pidfile) && readFileSync(pidfile, 'utf8').trim() === String(daemon.pid), 5000);
+  expect({ exitCode: daemon.exitCode, pidfile: existsSync(pidfile) ? readFileSync(pidfile, 'utf8').trim() : null }).toEqual({
+    exitCode: null,
+    pidfile: String(daemon.pid),
+  });
+  expect(lockHolders(cfgDir)).toEqual([daemon.pid]);
 }, 30_000);
 
 // --- tg-cli#279: stale-daemon detection + restart --if-stale ---

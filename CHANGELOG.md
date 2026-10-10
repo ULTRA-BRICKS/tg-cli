@@ -3,6 +3,23 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.55.9
+
+- **`tg-ctl restart` (and the deploy's `restart --if-stale`) no longer leaves NO daemon running
+  (#490).** While waiting for the successor, restart checked "does the new pid hold the lock?" by
+  taking the daemon flock for an instant, and a starting daemon tried the flock exactly once — a
+  successor whose attempt landed in that instant exited 0 as a "duplicate", and restart ended
+  `restart FAILED` with nothing serving Telegram. On Linux the check now reads the kernel's lock
+  table (`/proc/locks`) and never touches the lock; `stop`/`restart`/`status` also find the lock
+  holder there, so a vanished pidfile is handled even without `lsof` (#438). Where no lock table
+  exists (macOS) the check — now asked only for a pid `lsof` shows with the lock file open — still
+  takes the lock for an instant, so a starting daemon retries a taken lock for 1 s before the
+  duplicate no-op exit. `restart --if-stale` stops exactly the daemon it probed instead of probing
+  twice.
+- **`scripts/deploy.sh` warns that tg/tg-ctl calls run unbounded on the already-up-to-date path
+  too** when neither `timeout` nor `gtimeout` exists — that path still runs
+  `tg-ctl restart --if-stale`.
+
 ## 1.55.8
 
 - **The daemon's Claude Code hook self-heal no longer replaces a symlinked

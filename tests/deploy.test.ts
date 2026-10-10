@@ -235,6 +235,50 @@ test('an up-to-date checkout still converges the daemon (a pull done by hand lef
   expect(readFileSync(log, 'utf8').trim()).toBe('restart --if-stale');
 });
 
+// A hermetic PATH with the tools deploy.sh and the stubs need but NO timeout(1)/gtimeout (stock
+// macOS), so the script runs the checkout's binaries unbounded.
+function noTimeoutPath(): string {
+  const bin = join(root, 'no-timeout-bin');
+  mkdirSync(bin);
+  for (const tool of ['bash', 'git', 'sed', 'head', 'grep', 'dirname', 'readlink', 'cat']) {
+    const real = Bun.which(tool, { PATH: SAFE_PATH });
+    if (real) symlinkSync(real, join(bin, tool));
+  }
+  return bin;
+}
+
+const NO_TIMEOUT_NOTE = 'NOTE — no timeout(1)/gtimeout';
+
+// tg-cli#490(c): the up-to-date path runs `tg-ctl restart --if-stale` unbounded too, yet only the
+// pull path said so.
+test('without timeout/gtimeout the NOTE is printed on the already-up-to-date path too', () => {
+  const log = plantStubCtl();
+  git(checkout, 'add', 'tg-ctl');
+  git(checkout, 'commit', '-q', '-m', 'test: stub tg-ctl');
+  git(checkout, 'push', '-q', 'origin', 'main');
+
+  const proc = deployEnv({ PATH: noTimeoutPath(), HOME: root }, '--checkout', checkout);
+  expect(proc.exitCode).toBe(0);
+  expect(proc.stdout.toString()).toContain('already up to date');
+  expect(proc.stderr.toString()).toContain(NO_TIMEOUT_NOTE);
+  expect(readFileSync(log, 'utf8').trim()).toBe('restart --if-stale');
+});
+
+test('without timeout/gtimeout the NOTE is printed on the pull path', () => {
+  const log = setupDaemonDeploy();
+
+  const proc = deployEnv({ PATH: noTimeoutPath(), HOME: root }, '--checkout', checkout);
+  expect(proc.exitCode).toBe(0);
+  expect(proc.stdout.toString()).toContain('pulled');
+  expect(proc.stderr.toString()).toContain(NO_TIMEOUT_NOTE);
+  expect(readFileSync(log, 'utf8').trim()).toBe('restart --if-stale');
+});
+
+test('a box with timeout(1) prints no NOTE', () => {
+  setupDaemonDeploy();
+  expect(deploy().stderr.toString()).not.toContain(NO_TIMEOUT_NOTE);
+});
+
 test('a failed tg-ctl restart fails the deploy with exit 3 — the checkout IS deployed', () => {
   setupDaemonDeploy({ restartCode: 1 });
 

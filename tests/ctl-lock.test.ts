@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test';
 import {
   ctlPaths,
   botIdFromToken,
+  flockPidsForInode,
   readPidFile,
   ownsPidFile,
   shouldAutoStart,
@@ -141,4 +142,35 @@ test('plans removal of the legacy file when the new file already exists — neve
 
 test('plans nothing on a fresh install — neither file exists', () => {
   expect(planLegacyLastUserTargetMigration('/cfg', '123', () => false)).toBeNull();
+});
+
+// --- flockPidsForInode (tg-cli#490): who holds a flock, read from /proc/locks without
+// taking the lock. A probe that TOOK the daemon flock for an instant made a successor
+// starting in that instant exit 0, and `restart` left no daemon. ---
+const PROC_LOCKS = [
+  '1: POSIX  ADVISORY  READ 3305049 00:31:1968647 128 128',
+  '2: FLOCK  ADVISORY  WRITE 4242 103:02:8705582 0 EOF',
+  '2: -> FLOCK  ADVISORY  WRITE 5151 103:02:8705582 0 EOF',
+  '3: OFDLCK ADVISORY  WRITE -1 103:02:8705582 0 EOF',
+  '4: FLOCK  ADVISORY  WRITE 7777 00:1d:870558 0 EOF',
+  '5: FLOCK  ADVISORY  WRITE 4242 08:01:8705582 0 EOF',
+  '6: FLOCK  ADVISORY  WRITE 0 103:02:4410 0 EOF',
+  '',
+].join('\n');
+
+test('flockPidsForInode lists the pids holding a FLOCK on that inode, once each', () => {
+  expect(flockPidsForInode(PROC_LOCKS, '8705582')).toEqual([4242]);
+});
+
+test('flockPidsForInode ignores blocked waiters, POSIX/OFD locks and other inodes', () => {
+  expect(flockPidsForInode(PROC_LOCKS, '1968647')).toEqual([]);
+  expect(flockPidsForInode(PROC_LOCKS, '870558')).toEqual([7777]);
+  expect(flockPidsForInode(PROC_LOCKS, '123')).toEqual([]);
+  expect(flockPidsForInode('', '8705582')).toEqual([]);
+});
+
+// The kernel prints pid 0 for a holder outside the reader's pid namespace (or whose locker died
+// while an inherited fd keeps the lock): the lock IS held, by someone this reader cannot name.
+test('flockPidsForInode keeps an unnamed holder as 0 so the caller does not read the lock as free', () => {
+  expect(flockPidsForInode(PROC_LOCKS, '4410')).toEqual([0]);
 });

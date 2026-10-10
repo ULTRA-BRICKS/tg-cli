@@ -177,6 +177,11 @@ bounded() {
   secs="$1"; shift
   if [ -n "$timeout_bin" ]; then "$timeout_bin" "$secs" "$@"; else "$@"; fi
 }
+# Both the pull and the already-up-to-date path run the checkout's binaries (the latter at least
+# `tg-ctl restart --if-stale`); a --dry-run runs none.
+if [ -z "$timeout_bin" ] && [ "$DRY_RUN" = "0" ]; then
+  echo "deploy: NOTE — no timeout(1)/gtimeout; post-deploy tg/tg-ctl calls run unbounded." >&2
+fi
 
 if [ "$local_sha" = "$remote_sha" ]; then
   echo "deploy: already up to date ($(git_c rev-parse --short HEAD)) — nothing to pull."
@@ -203,8 +208,6 @@ else
   # exactly the commits listed above — no race window where a new push slips in.
   git_c merge --ff-only --quiet "$upstream"
   echo "deploy: pulled — now at $(git_c rev-parse --short HEAD)"
-
-  [ -z "$timeout_bin" ] && echo "deploy: NOTE — no timeout(1)/gtimeout; post-deploy tg/tg-ctl calls run unbounded." >&2
 
   # `tg` is a committed script: the symlink already points at the new file. Verify
   # the deployed `tg` reports the new commit (sanity check the script is runnable).
