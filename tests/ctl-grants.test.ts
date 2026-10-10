@@ -15,11 +15,14 @@ import {
   buildGrantRecord,
   closeDecidedCard,
   dropSettledDecided,
+  grantInboxKey,
   hatchDenyNoticeText,
   hatchGrantNoticeText,
   operationMatches,
   parseGrantStore,
   pruneGrantStore,
+  pullGrant,
+  routeForRequest,
   serializeGrantStore,
   upsertGraceRecord,
   verifyGrant,
@@ -103,6 +106,41 @@ test('operationMatches: missing operation on EITHER side never matches (deny-by-
   expect(operationMatches({ fingerprint: 'fp1', cwd: '/repo' }, undefined)).toBe(false);
   expect(operationMatches({ cwd: '/repo' }, { fingerprint: 'fp1', cwd: '/repo' })).toBe(false); // no fingerprint
   expect(operationMatches({ fingerprint: 'fp1' }, { fingerprint: 'fp1' })).toBe(false); // no cwd
+});
+
+// --- the inbox route: always cwd-scoped (tg-cli#433 item 3) ---
+
+// The omp Stop bridge (agent-tools omp_hook_bridge) drains ONLY `agent_key(None, cwd)`, so a
+// grant notice keyed by a subagent name reached no reader of its own project, and every
+// project escalating under that name shared one inbox and one pull identity.
+test('grantInboxKey: the cwd form of the shared key even when a subagent name is set (agent-tools vector)', () => {
+  const req = hatchReq({ agent: 'omp', cwd: '/Users/ultra/work/landing', subagent: 'hatch-worker', origin: { agent: 'omp', subagent: 'hatch-worker' } });
+  // Same vector as tests/ctl-unreachable.test.ts and agent-tools tests/test_tg_inbox.py.
+  expect(grantInboxKey(req)).toBe('cwd-ccfe64bae2f277d7');
+  expect(routeForRequest(req)).toBe('inbox:cwd-ccfe64bae2f277d7');
+});
+
+test('routeForRequest: two projects asking under the SAME subagent name get different inbox routes', () => {
+  const a = hatchReq({ agent: 'omp', cwd: '/home/u/work/app', origin: { agent: 'omp', subagent: 'hatch-worker' } });
+  const b = hatchReq({ agent: 'omp', cwd: '/home/u/xp/app', origin: { agent: 'omp', subagent: 'hatch-worker' } });
+  expect(routeForRequest(a)).not.toBe(routeForRequest(b));
+  expect(grantInboxKey(a)).not.toBe(grantInboxKey(b));
+});
+
+test("pullGrant: project B's pull can never take project A's grant through a shared subagent name", () => {
+  const op = { kind: 'bash', fingerprint: 'fp1', cwd: '/repo', repoRoot: '/repo' };
+  const routeA = routeForRequest(hatchReq({ cwd: '/home/u/work/app', subagent: 'hatch-worker' }));
+  const routeB = routeForRequest(hatchReq({ cwd: '/home/u/xp/app', subagent: 'hatch-worker' }));
+  const g = grant({ route: routeA, operation: op });
+  expect(pullGrant([g], HOOK_ID, op, routeB, NOW + 1000)).toEqual({ kind: 'deny', reason: 'route-mismatch' });
+  expect(pullGrant([g], HOOK_ID, op, routeA, NOW + 1000).kind).toBe('allow');
+});
+
+test('routeForRequest: a subagent name without a cwd is no inbox identity (pull denies, names the token path)', () => {
+  const req = hatchReq({ subagent: 'hatch-worker', origin: { agent: 'omp', subagent: 'hatch-worker' } });
+  expect(grantInboxKey(req)).toBeNull();
+  expect(routeForRequest(req)).toBeNull();
+  expect(grantInboxKey({ cwd: '' })).toBeNull();
 });
 
 // --- verifyGrant: single-use, 24h expiry, bound to hook_id + operation ---

@@ -19,7 +19,9 @@
 // THE INBOX KEY CONTRACT (shared with agent-tools `lib/agenttools_tg_inbox` — the two
 // implementations MUST stay byte-identical, both READMEs document it). tg-ctl still
 // derives it for the grant route identity (grants.ts `inbox:<key>`) and for omp's
-// grant-notice fallback, which the omp Stop bridge consumes at its next yield:
+// grant-notice fallback, which the omp Stop bridge consumes at its next yield — both
+// ALWAYS take the cwd form (grants.ts grantInboxKey): omp has no `--name`, and a subagent
+// label two projects share must never key a grant notice (tg-cli#433):
 //   key = sanitized(--name value)                  when the agent argv carries `--name X`
 //       = "cwd-" + sha256(cwd)[:16] (hex)          otherwise
 //   sanitized(x) = every char outside [A-Za-z0-9._-] → "_", truncated to 64 chars;

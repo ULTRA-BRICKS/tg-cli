@@ -85,27 +85,33 @@ export interface GrantStoreData {
   decided: DecidedCard[];
 }
 
+// The Stop-hook inbox a grant notice for this ask is queued to: ALWAYS the cwd form of
+// the shared key (unreachable.ts), the one agent-tools' omp Stop bridge drains
+// (`agent_key(None, cwd)` — omp has no `--name`). A subagent label never keys it: no
+// reader drains a name-keyed inbox, and every project escalating under the same label
+// would share it (tg-cli#433). null without a cwd — no project, no inbox.
+export function grantInboxKey(req: Pick<ButtonRequest, 'cwd'>): string | null {
+  return typeof req.cwd === 'string' && req.cwd ? agentInboxKey(null, req.cwd) : null;
+}
+
 // The daemon-observed stable route identity for an ask — the SAME identity the
 // daemon uses to deliver decisions/late-approval messages: the tmux pane when
 // there is one, the ACP session id when the origin is a live omp session, else
-// the Stop-hook inbox key (THE shared contract with agent-tools' inbox reader,
-// unreachable.ts). Deterministic from the ask's routing fields ONLY (never
-// probed from live process state), so the identity a grant was minted with is
-// reproducible byte-for-byte from a later pull query's payload. null when no
-// stable identity exists at all (no pane, no sessionId, no subagent name AND
-// no cwd) — pull consume then DENIES and names the token path.
+// the grant inbox key above. Deterministic from the ask's routing fields ONLY
+// (never probed from live process state), so the identity a grant was minted
+// with is reproducible byte-for-byte from a later pull query's payload (the
+// agent-tools hatch lib sends cwd + pane on both, never a subagent label). null
+// when no stable identity exists at all (no pane, no sessionId, no cwd) — pull
+// consume then DENIES and names the token path.
 export function routeForRequest(
-  req: Pick<ButtonRequest, 'paneId' | 'cwd' | 'subagent' | 'origin'>,
+  req: Pick<ButtonRequest, 'paneId' | 'cwd' | 'origin'>,
 ): string | null {
   if (req.paneId) return `pane:${req.paneId}`;
   if (req.origin?.agent === 'omp' && typeof req.origin.sessionId === 'string' && req.origin.sessionId) {
     return `acp:${req.origin.sessionId}`;
   }
-  const subagent = req.origin?.subagent ?? req.subagent;
-  if ((typeof subagent === 'string' && subagent) || (typeof req.cwd === 'string' && req.cwd)) {
-    return `inbox:${agentInboxKey(subagent ?? null, req.cwd ?? '/')}`;
-  }
-  return null;
+  const key = grantInboxKey(req);
+  return key ? `inbox:${key}` : null;
 }
 
 // The grant↔operation binding, fail-closed: fingerprint AND cwd must be

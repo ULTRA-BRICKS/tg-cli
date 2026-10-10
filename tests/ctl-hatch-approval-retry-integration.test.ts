@@ -247,7 +247,7 @@ async function exerciseRetainedLateTap(cfgDir: string, tg: MockTg): Promise<void
 
   // No Stop-hook inbox write for it.
   expect(await until(() => daemonLog(cfgDir).includes('hatch-grant-notice-failed'), 5000)).toBe(true);
-  expect(existsSync(join(cfgDir, 'inbox', SUBAGENT))).toBe(false);
+  expect(existsSync(join(cfgDir, 'inbox'))).toBe(false);
   const logText = daemonLog(cfgDir);
   expect(logText).toContain('hatch-grant-minted');
   expect(logText).not.toContain('ask-late-deliver-permission-pane-skip reason=no-menu');

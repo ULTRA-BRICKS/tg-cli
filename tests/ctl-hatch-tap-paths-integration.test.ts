@@ -38,13 +38,16 @@
 //  16. a live Deny on a critical card stays final a day later, and its no-expiry record is
 //      dropped with the card's last stored copy;
 //  17. that record is dropped as soon as the card leaves the questions store, without a restart;
-//  18. a restore whose grace record cannot be written leaves the card in the questions store.
+//  18. a restore whose grace record cannot be written leaves the card in the questions store;
+//  19. a grant notice reaches only the requester's own project: its inbox is keyed by the
+//      ask's cwd, never by a subagent name two projects can share (#433 item 3).
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
 import { tempDir } from './helpers/test-temp';
+import { agentInboxKey } from '../features/tg-ctl/unreachable';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -255,8 +258,10 @@ function grantStore(cfgDir: string): GrantStore {
   return { grants: raw.grants ?? [], grace: raw.grace ?? [], decided: raw.decided ?? [] };
 }
 
+// The requester's Stop-hook inbox: the one the omp Stop bridge in the ask's cwd drains
+// (agent-tools `agent_key(None, cwd)`) — startAsk asks from cfgDir.
 function inbox(cfgDir: string): string {
-  const p = join(cfgDir, 'inbox', SUBAGENT, 'pending.jsonl');
+  const p = join(cfgDir, 'inbox', agentInboxKey(null, cfgDir), 'pending.jsonl');
   return existsSync(p) ? readFileSync(p, 'utf8') : '';
 }
 
@@ -815,4 +820,24 @@ test('18. a restart whose grace record cannot be written leaves the card in the 
   unblock();
 
   expect(cardPersisted(cfgDir, 1)).toBe(true);
+}, 90_000);
+
+test('19. a grant notice reaches only the requester\'s project: keyed by its cwd, never by a subagent name another project shares', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  // Another project whose omp escalates under the SAME subagent name drains only its own
+  // cwd inbox; a name-keyed inbox would be one every such project shares. The requester's
+  // cwd inbox must be the ONLY inbox written.
+  const daemon = await startDaemon(cfgDir, tg.port);
+  const cardId = await expiredCard(cfgDir, tg);
+
+  tapIfShown(tg, cardId, 'approve', 901);
+  expect(await toastFor(tg, 901)).toContain('grant issued');
+  const grant = await expectMintedAndDelivered(cfgDir, tg, cardId);
+
+  expect(grant.route).toBe(`inbox:${agentInboxKey(null, cfgDir)}`);
+  expect(readdirSync(join(cfgDir, 'inbox'))).toEqual([agentInboxKey(null, cfgDir)]);
+
+  await stopDaemon(daemon);
 }, 90_000);

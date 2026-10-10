@@ -193,7 +193,10 @@ const HATCH_REQUEST_ID = `hatch-${HOOK_ID}-aaaaaaaaaaaa`;
 const SUBAGENT = 'hatch-worker';
 const FINGERPRINT = 'sha256:fp-grant-1';
 const OPERATION = { kind: 'bash', fingerprint: FINGERPRINT, cwd: '/repo' };
-const INBOX_ROUTE = `inbox:${SUBAGENT}`;
+// The project the hatch lib asks from: it carries `cwd` on the ask AND on the pull query
+// (agent-tools `_grant_payload`), so the route reproduces byte-for-byte.
+const PROJECT = '/home/u/work/app';
+const INBOX_ROUTE = 'inbox:cwd-9abec9881c146ede'; // sha256('/home/u/work/app')[:16]
 
 // The hatch ask exactly as the agent-tools lib sends it (v1.1 additive fields included).
 function hatchAsk(extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -205,6 +208,7 @@ function hatchAsk(extra: Record<string, unknown> = {}): Record<string, unknown> 
     permissionEvent: 'PermissionRequest',
     hookId: HOOK_ID,
     origin: { agent: 'claude', subagent: SUBAGENT },
+    cwd: PROJECT,
     operation: OPERATION,
     ...extra,
   };
@@ -222,6 +226,7 @@ function verifyPayload(extra: Record<string, unknown> = {}): Record<string, unkn
     permissionEvent: 'PermissionRequest',
     hookId: HOOK_ID,
     origin: { agent: 'claude', subagent: SUBAGENT },
+    cwd: PROJECT,
     operation: OPERATION,
     ...extra,
   };
@@ -286,7 +291,7 @@ test('(a)+(j) GRACE-ONLY tap after a daemon restart: grant minted from the grace
   // queued to the Stop-hook inbox; the card says the notice could not be delivered
   // and names the token path.
   expect(await until(() => daemonLog(cfgDir).includes('hatch-grant-notice-failed'), 5000)).toBe(true);
-  expect(existsSync(join(cfgDir, 'inbox', SUBAGENT))).toBe(false);
+  expect(existsSync(join(cfgDir, 'inbox'))).toBe(false);
   expect(await until(() => tg.edits().some((e) => e.includes('could NOT be delivered') && e.includes(`approved:${String(grant.approval_id)}`)), 5000)).toBe(true);
   const logText = daemonLog(cfgDir);
   expect(logText).toContain('hatch-grant-minted');
@@ -468,13 +473,13 @@ test('(i) pull-model: same-route pull consumes once; different-route and no-rout
   servers.push(tg);
   const daemon = await startDaemon(cfgDir, tg.port);
 
-  // Grant minted with the daemon-observed route inbox:hatch-worker.
+  // Grant minted with the daemon-observed route of the asking project's cwd.
   const grant = await mintGrant(cfgDir, tg);
   expect(grant.route).toBe(INBOX_ROUTE);
 
-  // Different-route pull (origin.subagent=other-worker → inbox:other-worker): denied,
-  // NOT consumed.
-  const otherRoute = await runVerify(cfgDir, tg.port, PULL_ARGS, verifyPayload({ origin: { agent: 'claude', subagent: 'other-worker' } }));
+  // Different-route pull from ANOTHER project under the SAME subagent name (tg-cli#433:
+  // a name-only route made it the same route): denied, NOT consumed.
+  const otherRoute = await runVerify(cfgDir, tg.port, PULL_ARGS, verifyPayload({ cwd: '/home/u/xp/app' }));
   expect(otherRoute.code).toBe(0);
   expect(otherRoute.stdout).toMatchObject({ hookSpecificOutput: { decision: { behavior: 'deny' } } });
   expect(grantStoreOf(cfgDir).grants?.[0]?.consumed_at).toBeNull();
@@ -484,7 +489,7 @@ test('(i) pull-model: same-route pull consumes once; different-route and no-rout
   // payload keeps its requestId (a shape the daemon can normalize) while omitting
   // every routing field — origin dropped by JSON (undefined) and no top-level cwd.
   const noRoute = await runVerify(cfgDir, tg.port, PULL_ARGS, {
-    ...verifyPayload({ origin: undefined }),
+    ...verifyPayload({ origin: undefined, cwd: undefined }),
     operation: OPERATION,
   });
   expect(noRoute.code).toBe(0);
@@ -495,7 +500,7 @@ test('(i) pull-model: same-route pull consumes once; different-route and no-rout
   expect(grantStoreOf(cfgDir).grants?.[0]?.consumed_at).toBeNull();
 
   // Token path consumes CROSS-ROUTE (the id was told to the agent out-of-band).
-  const crossRouteToken = await runVerify(cfgDir, tg.port, TOKEN_ARGS(String(grant.approval_id)), verifyPayload({ origin: { agent: 'claude', subagent: 'someone-else' } }));
+  const crossRouteToken = await runVerify(cfgDir, tg.port, TOKEN_ARGS(String(grant.approval_id)), verifyPayload({ cwd: '/home/u/elsewhere' }));
   expect(crossRouteToken.stdout).toMatchObject({ approvalId: String(grant.approval_id), ...allowEnvelope() });
 
   // After the token consume, a same-route pull finds nothing left to allow.
@@ -513,7 +518,7 @@ test('(i cont) same-route pull consumes EXACTLY once (second pull denies)', asyn
   const daemon = await startDaemon(cfgDir, tg.port);
   const grant = await mintGrant(cfgDir, tg);
 
-  // Same-route pull (identical routing fields → inbox:hatch-worker): allow, carrying
+  // Same-route pull (identical routing fields → the same cwd route): allow, carrying
   // approvalId + the ORIGINAL ask's requestId at TOP level.
   const first = await runVerify(cfgDir, tg.port, PULL_ARGS, verifyPayload());
   expect(first.code).toBe(0);

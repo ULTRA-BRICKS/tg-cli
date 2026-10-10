@@ -137,7 +137,6 @@ import {
   type StrandedGroup,
 } from "./features/tg-ctl/inbox"
 import {
-  agentInboxKey,
   describeUnreachable,
   findUnreachableAgents,
   matchUnreachable,
@@ -334,6 +333,7 @@ import {
   closeDecidedCard,
   dropSettledDecided,
   grantDenyReasonText,
+  grantInboxKey,
   hatchDenyNoticeText,
   hatchGrantNoticeText,
   isGrantableRequest,
@@ -2283,8 +2283,15 @@ async function routeGrantNotice(ctx: Ctx, req: ButtonRequest, text: string, deli
     }
     log(`grant-notice omp route failed (falling back to inbox) session=${target.sessionId ?? "-"}: ${res.error}`)
   }
+  // The requester's own project inbox (grants.ts grantInboxKey): never a subagent-name
+  // inbox another project escalating under the same name would share (tg-cli#433).
+  const inboxKey = grantInboxKey(req)
+  if (!inboxKey) {
+    log(`grant-notice: omp origin has no cwd — no project inbox to queue to session=${req.origin?.sessionId ?? "-"}`)
+    return false
+  }
   try {
-    queueToInbox(ctx, agentInboxKey(req.origin?.subagent ?? req.subagent ?? null, req.cwd ?? "/"), {
+    queueToInbox(ctx, inboxKey, {
       id: null,
       ts: new Date().toISOString(),
       from: "tg",

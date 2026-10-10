@@ -3,6 +3,20 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.57.3
+
+- **A hatch grant notice reaches only the project that asked (#433 item 3, security).** When an omp's
+  live endpoint was unreachable, the late-approval notice (approval id + consume instructions) was
+  queued to an inbox keyed by the ask's subagent label whenever it had one, dropping its cwd. No
+  reader drains such an inbox (the omp Stop bridge reads `agent_key(None, cwd)`), and every project
+  escalating under the same label shared it. The pull identity had the same flaw: `inbox:<label>`
+  let a pull from another project under that label match the grant route. The notice now goes to
+  the asking project's cwd inbox and the route is `inbox:cwd-<sha256(cwd)[:16]>` (`grants.ts`
+  `grantInboxKey`); an ask without a cwd has no inbox route, so its notice is not queued and the
+  card names the token path. The shared key and its agent-tools test vectors are unchanged. An
+  unconsumed grant minted before this release keeps its old route: its pull no longer matches, its
+  token path still works.
+
 ## 1.57.2
 
 - **A test run no longer leaves temp dirs or daemons behind (#486, #550).** Every test made its

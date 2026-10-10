@@ -278,7 +278,9 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
   path, marked done in `<config>/inbox-stranded-report.json` (an incomplete sweep records the
   archives already listed; the next start re-sweeps and reports only the rest). The inbox KEY — sanitized
   `--name`, else `cwd-<sha256(cwd)[:16]>` — stays shared byte-for-byte with agent-tools
-  `lib/agenttools_tg_inbox` (it is also the grant route identity), test vectors mirrored),
+  `lib/agenttools_tg_inbox`, test vectors mirrored; a grant notice and the grant route identity
+  always take the cwd form (`grants.ts` `grantInboxKey`), never a subagent label two projects
+  could share (tg-cli#433)),
   `last-user-target.ts` (tg-cli#78 anchor fix: the pane of the CTO's OWN last CONFIRMED
   inbound delivery — auto-bound, a recognized reply, or an explicit picker/`/agent`
   selection — distinct from the removed `lastMessagePane` mechanism, which used to track
