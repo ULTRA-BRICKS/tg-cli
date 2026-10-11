@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, mkdirSync, mkdtempSync, openSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { closeSync, mkdirSync, openSync, writeFileSync } from 'fs';
+import { tempDir } from './helpers/test-temp';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 
@@ -21,7 +21,7 @@ afterEach(async () => {
 // One registered project, no tmux panes → `/tasks` scopes to that project
 // (the no-agent → single registration path), so only the task stub varies.
 function setup(prefix: string, taskScript: string) {
-  const cfgDir = mkdtempSync(join(tmpdir(), prefix));
+  const cfgDir = tempDir(prefix);
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   const projectDir = join(cfgDir, 'project');
