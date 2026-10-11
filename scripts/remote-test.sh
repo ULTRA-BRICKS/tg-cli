@@ -38,26 +38,32 @@
 #   TG_REMOTE_TEST_BUN_VERSION  bun to run with (default: the local `bun --version`)
 #   TG_REMOTE_TEST_AVOID_DATA_CENTERS  ephemeral runs: Runpod data center ids (comma-separated)
 #                          not to rent in, e.g. one whose pods' ssh never answers from here
+#   TG_REMOTE_TEST_FLAVOR  ephemeral runs: Runpod CPU flavor <id>-<vCPUs> (default cpu3c-4,
+#                          $0.12/h; the suite is not core-bound: three full runs at once on
+#                          8 vCPUs each took as long as one alone)
 #   TG_REMOTE_TEST_SSH_WAIT  ephemeral runs: seconds a new pod gets for its ssh to answer before
 #                          it is replaced, once, in another data center (default 300)
 #
-# Two ways to get a pod. The default is an ephemeral pod: the run rents its own cpu3c 8 vCPU /
-# 16 GB pod through Runpod's REST API (key: RUNPOD_API_KEY, else `apikey` in
+# Two ways to get a pod. The default is an ephemeral pod: the run rents its own pod (cpu3c 4 vCPU /
+# 8 GB by default) through Runpod's REST API (key: RUNPOD_API_KEY, else `apikey` in
 # ~/.runpod/config.toml; needs runpodctl, curl and jq), provisions it (about 2 min), runs, and
 # deletes the pod on every exit path: pass, failure, Ctrl-C or TERM. It bills only for those
-# minutes (~$0.04 a full run, ~10 min end to end). A pod whose ssh does not answer in
+# minutes (~$0.02 a full run on cpu3c-4, ~10 min end to end). A pod whose ssh does not answer in
 # TG_REMOTE_TEST_SSH_WAIT (pods in some data centers never do from here) is deleted and
 # replaced, once, in another data center; a pod that cannot be deleted stops the run (exit 3)
 # rather than renting another. A client killed with SIGKILL cannot delete it, so three
 # backstops: every ephemeral run (and --reap-orphans) first deletes this host's pods named
 # tg-remote-test-<date>-<time>-<host>-<machine>-<pid>-<n> whose client pid is gone; once ssh answers the
-# pod is set to delete itself an hour later while it provisions, then --timeout + 1 h after
-# provisioning ends; and the pod's own start command removes it --timeout + 2 h after boot.
+# pod is set to delete itself an hour later while it provisions, then --timeout + 2 h after
+# provisioning ends (the run renews that when it starts); and the pod's own start command
+# removes it --timeout + 2 h after boot.
 #
 # Opt-in: a long-lived shared pod (TG_REMOTE_TEST_POD_ID or TG_REMOTE_TEST_HOST) is provisioned
 # once and serves every run of every checkout, up to TG_REMOTE_TEST_SLOTS at a time, without
-# the ~2 min of provisioning — but it bills while it exists, idle or not ($0.24/h, ~$5.80/day),
-# so whoever configures one must stop it (`runpodctl pod stop <id>`) when done.
+# the ~2 min of provisioning — but it bills while it exists, idle or not. Like an ephemeral pod
+# it deletes itself: each run (and --setup) moves that to --timeout + 2 h from its start, so an
+# idle shared pod bills at most 2 h past the latest run's --timeout (~2.5 h by default); stop
+# it sooner when done.
 #
 # Each run gets its own directory (~runner/runs/<run-id>) and every process it starts carries
 # TG_REMOTE_TEST_RUN=<run-id> in its environment; on exit, Ctrl-C or TERM the run's processes
@@ -232,25 +238,28 @@ find_rented_pod() {
 # an avoid list it rents only in a data center the catalog lists with cpu3c stock outside it,
 # and fails (exit 3) when there is none or the catalog cannot be read.
 create_pod() {
-  local dcs='[]' catalog body response
+  local dcs='[]' catalog body response price=""
+  # cpu3c bills $0.03 per vCPU-hour (cpu3c-4 $0.12/h); other flavors are not priced here.
+  [ "$cpu_id" = cpu3c ] && price=$(printf '%d.%02d' $((vcpus * 3 / 100)) $((vcpus * 3 % 100)))
   if [ -n "${avoid_dcs// /}" ]; then
-    catalog=$(runpod_api GET '/catalog/cpus/cpu3c?include=AVAILABILITY&product=POD')
+    catalog=$(runpod_api GET "/catalog/cpus/$cpu_id?include=AVAILABILITY&product=POD")
     dcs=$(jq -c --arg avoid "$avoid_dcs" \
       '[.dataCenters[] | select(.availability != "NONE") | .id] - ($avoid | split(" "))' <<<"$catalog" 2>/dev/null)
     if [ -z "$dcs" ] || [ "$dcs" = '[]' ]; then
-      echo "remote-test: no data center offers cpu3c outside the avoided ones (${avoid_dcs# }): $catalog" >&2
+      echo "remote-test: no data center offers $cpu_id outside the avoided ones (${avoid_dcs# }): $catalog" >&2
       exit 3
     fi
   fi
   # The pod's own start command removes it after --timeout + 2 h whatever happens to this
   # client (a SIGKILL before its ssh answers included), with the pod-scoped key Runpod puts in
   # its environment; /start.sh is runpod/base's own command (sshd).
-  body=$(jq -nc --arg name "tg-remote-test-$run_id" --argjson dcs "$dcs" --arg ttl "$((timeout_s + 7200))" '{name: $name,
-    image: "runpod/base:1.0.2-ubuntu2404", cpu: {id: "cpu3c", vcpuCount: 8}, disk: 40, ports: ["22/tcp"],
+  body=$(jq -nc --arg name "tg-remote-test-$run_id" --argjson dcs "$dcs" --arg ttl "$((timeout_s + 7200))" \
+    --arg cpu "$cpu_id" --argjson vcpus "$vcpus" '{name: $name,
+    image: "runpod/base:1.0.2-ubuntu2404", cpu: {id: $cpu, vcpuCount: $vcpus}, disk: 40, ports: ["22/tcp"],
     startSsh: true, entrypoint: ["/bin/bash", "-c"],
     cmd: ["(sleep \($ttl); runpodctl remove pod \"$RUNPOD_POD_ID\" || runpodctl pod delete \"$RUNPOD_POD_ID\") >/dev/null 2>&1 & exec /start.sh"]}
     + if $dcs == [] then {} else {dataCenterIds: $dcs} end')
-  echo "remote-test: renting pod tg-remote-test-$run_id (cpu3c 8 vCPU / 16 GB, \$0.24/h) — deleted when this run ends" >&2
+  echo "remote-test: renting pod tg-remote-test-$run_id ($flavor${price:+, \$$price/h}) — deleted when this run ends" >&2
   renting=1
   response=$(runpod_api POST /pods "$body")
   ephemeral_pod=$(jq -r '.id // empty' <<<"$response" 2>/dev/null)
@@ -301,24 +310,93 @@ delete_pod() {
   echo "remote-test: WARNING — could not delete pod $ephemeral_pod; it bills until deleted: runpodctl pod delete $ephemeral_pod" >&2
   return 1
 }
+# DEADLINE_FNS, shared by the pod's own deletion (SELF_DELETE_SCRIPT, root) and the runs
+# (RUN_SCRIPT, the unprivileged runner): each user keeps its own deadline file,
+# $TTL_DIR/delete-at.<uid>, and the pod deletes itself once the latest of them has passed.
+# $TTL_DIR is sticky and world-writable, so a run can neither replace root's file or lock nor
+# make root write through a planted link (temp files come from mktemp; the lock is only read).
+# push_delete_at SECS moves the caller's deadline to SECS from now, never earlier; it holds the
+# lock the watcher checks under, so a run renewing just as the deadline passes is not deleted
+# from under its fresh deadline, and publishes by rename, so no file is ever half-written.
+DEADLINE_FNS='
+TTL_DIR=/var/lib/tg-remote-test-ttl
+# Only delete-at.<uid> files that are plain files owned by that uid count, and a deadline
+# another user (a run, the watcher being root) set more than 26 h ahead is ignored: whatever else
+# a run leaves in the directory cannot extend the life of the pod by much. The runs are this
+# suite: these checks bound accidents (a stray file, a test gone wrong), not a hostile runner.
+# Fails, rather than report a deadline long past, when the file of the caller is missing or
+# cannot be read: a read that fails must never delete the pod.
+latest_delete_at() {
+  local f uid d own_read=0 me latest=0 cap=$(( $(date +%s) + 93600 ))
+  me=$(id -u) || return 1
+  for f in "$TTL_DIR"/delete-at.*; do
+    [[ $f =~ /delete-at\.([0-9]+)$ ]] || continue
+    uid=${BASH_REMATCH[1]}
+    [ -f "$f" ] && [ ! -L "$f" ] && [ "$(stat -c %u "$f")" = "$uid" ] || continue
+    d=$(timeout 5 cat "$f" 2>/dev/null) || continue
+    case $d in ""|*[!0-9]*) continue ;; esac
+    if [ "$uid" = "$me" ]; then own_read=1; elif [ "$d" -gt "$cap" ]; then continue; fi
+    [ "$d" -gt "$latest" ] && latest=$d
+  done
+  [ "$own_read" = 1 ] || return 1
+  echo "$latest"
+}
+push_delete_at() {
+  local deadline lock file current tmp
+  [ -f "$TTL_DIR/lock" ] || return 0
+  deadline=$(( $(date +%s) + $1 ))
+  file=$TTL_DIR/delete-at.$(id -u)
+  exec {lock}<"$TTL_DIR/lock" || return 1
+  flock "$lock" || { exec {lock}<&-; return 1; }
+  current=$(cat "$file" 2>/dev/null) || current=0
+  case $current in ""|*[!0-9]*) current=0 ;; esac
+  if [ "$current" -lt "$deadline" ]; then
+    tmp=$(mktemp "$TTL_DIR/tmp.$(id -u).XXXXXX") && echo "$deadline" >"$tmp" && mv -f "$tmp" "$file" ||
+      { exec {lock}<&-; return 1; }
+  fi
+  exec {lock}<&-
+}
+# Past the latest deadline, retries the delete every 30 s until one succeeds; it checks only
+# while holding the lock, so never against a renewal in flight.
+watch_delete_at() {
+  while :; do
+    exec 9<"$TTL_DIR/lock"
+    flock -w 60 9 || { exec 9<&-; sleep 30; continue; }
+    latest=$(latest_delete_at) && [ "$(date +%s)" -ge "$latest" ] &&
+      { timeout 120 runpodctl remove pod "$RUNPOD_POD_ID" || timeout 120 runpodctl pod delete "$RUNPOD_POD_ID"; } && exit 0
+    exec 9<&-; sleep 30
+  done
+}
+'
 # SELF_DELETE_SCRIPT SECS (root): the pod deletes itself SECS from now, so a client that dies
 # without running its trap (SIGKILL) leaves nothing billing. The runpod/base image ships
 # runpodctl, and Runpod puts a key scoped to the pod itself (RUNPOD_API_KEY, with RUNPOD_POD_ID)
-# into its environment, which /etc/rp_environment re-exports for ssh sessions. The first call
-# starts the watcher; a later one moves its deadline.
-SELF_DELETE_SCRIPT='
+# into its environment, which /etc/rp_environment re-exports for ssh sessions. Every call moves
+# root's deadline (never earlier) and starts the watcher unless it is alive; a pid reused by
+# another process after a restart does not count as alive. Calls are serialized by a root-only
+# lock: concurrent first runs on a fresh shared pod must not both set up the directory or both
+# start a watcher.
+SELF_DELETE_SCRIPT=$DEADLINE_FNS'
+# tg-remote-test-self-delete (the marker the script tests know this script by)
 . /etc/rp_environment 2>/dev/null
 command -v runpodctl >/dev/null && [ -n "${RUNPOD_API_KEY:-}" ] && [ -n "${RUNPOD_POD_ID:-}" ] || exit 1
-at=/root/tg-remote-test-delete-at
-started=0; [ -f "$at" ] && started=1
-echo "$(( $(date +%s) + $1 ))" >"$at"
-[ "$started" = 1 ] && exit 0
-nohup setsid sh -c "while [ \"\$(date +%s)\" -lt \"\$(cat $at)\" ]; do sleep 30; done
-  runpodctl remove pod \"\$RUNPOD_POD_ID\" || runpodctl pod delete \"\$RUNPOD_POD_ID\"" </dev/null >/dev/null 2>&1 &
+exec 8>/root/tg-remote-test-ttl.lock && flock 8 || exit 1
+# Created private, the lock made, and only then opened up: nothing in it predates root.
+if [ ! -f "$TTL_DIR/lock" ]; then
+  rm -rf "$TTL_DIR" && mkdir -m 700 "$TTL_DIR" && : >"$TTL_DIR/lock" && chmod 644 "$TTL_DIR/lock" &&
+    chmod 1777 "$TTL_DIR" || exit 1
+fi
+push_delete_at "$1" || exit 1
+watcher=/root/tg-remote-test-watcher.pid
+[ -f "$watcher" ] && grep -qs tg-remote-test-watcher "/proc/$(cat "$watcher")/cmdline" && exit 0
+nohup setsid bash -c "$(declare -f latest_delete_at watch_delete_at)
+  TTL_DIR=$TTL_DIR; watch_delete_at" tg-remote-test-watcher </dev/null >/dev/null 2>&1 8>&- &
+echo "$!" >"$watcher"
 '
 self_delete_after() {
+  local pod=${ephemeral_pod:-${TG_REMOTE_TEST_POD_ID:-$host}}
   remote root "$SELF_DELETE_SCRIPT" "$1" ||
-    echo "remote-test: WARNING — pod $ephemeral_pod cannot delete itself; if this client is killed, run: runpodctl pod delete $ephemeral_pod" >&2
+    echo "remote-test: WARNING — pod $pod cannot delete itself; if this client is killed, run: runpodctl pod delete $pod" >&2
 }
 # Polls until the pod has an ssh address that answers; 1 after $ssh_wait seconds without one.
 # Some data centers' ssh never answers from here at all, while a reachable pod answers within
@@ -365,6 +443,9 @@ if [ "$ephemeral" -eq 1 ]; then
   # A failed sweep does not stop a run: that run's own pod is still deleted on every exit path.
   if ! reap_orphans; then [ "$reap_only" -eq 1 ] && exit 3; fi
   [ "$reap_only" -eq 1 ] && exit 0
+  flavor=${TG_REMOTE_TEST_FLAVOR:-cpu3c-4}
+  [[ "$flavor" =~ ^(cpu[0-9]+[a-z])-([1-9][0-9]*)$ ]] || die "TG_REMOTE_TEST_FLAVOR must look like cpu3c-4, got '$flavor'"
+  cpu_id=${BASH_REMATCH[1]} vcpus=${BASH_REMATCH[2]}
   ssh_wait=${TG_REMOTE_TEST_SSH_WAIT:-300}
   [[ "$ssh_wait" =~ ^[0-9]+$ ]] || die "TG_REMOTE_TEST_SSH_WAIT must be a whole number of seconds, got '$ssh_wait'"
   avoid_dcs=${TG_REMOTE_TEST_AVOID_DATA_CENTERS:-}
@@ -375,7 +456,7 @@ if [ "$ephemeral" -eq 1 ]; then
   # A pod whose ssh never answers is replaced once, outside its data center; when the API does
   # not name that data center, or the dead pod cannot be deleted, the run stops instead (exit 3).
   # Provisioning then gets an hour before the pod deletes itself; once provisioned, the run
-  # gets --timeout + 1 h.
+  # gets --timeout + 2 h.
   for attempt in 1 2; do
     create_pod
     # A replacement pod may get the dead one's ip:port with another host key.
@@ -398,6 +479,10 @@ elif [ -z "$host" ]; then
 fi
 host=${host#*@}
 set_ssh_opts
+# A shared pod gets the same backstop as an ephemeral one: every run (and --setup) pushes its
+# self-delete deadline to --timeout + 2 h from now, so a pod left behind bills for at most that
+# long after its last run instead of until someone notices.
+[ "$ephemeral" -eq 0 ] && self_delete_after "$((timeout_s + 7200))"
 
 # --- provisioning (root, idempotent, serialized by a lock on the pod) -------------------------
 # Packages: tmux/abduco/lsof/procps for the daemon and session tests, pandoc + Chrome for the
@@ -455,7 +540,7 @@ ensure_setup() {
 
 ensure_setup
 [ "$setup_only" -eq 1 ] && exit 0
-[ "$ephemeral" -eq 1 ] && self_delete_after "$((timeout_s + 3600))"
+[ "$ephemeral" -eq 1 ] && self_delete_after "$((timeout_s + 7200))"
 
 # --- the run --------------------------------------------------------------------------------
 mkdir -p "$(dirname "$log")"
@@ -549,7 +634,7 @@ rm -f "$files"
 # CI watchdog (or plain bun under a pty for checkouts that predate it), as its own session,
 # with the run marker in its environment. The lock fd is closed for the test process so a
 # daemon a test leaks cannot keep the slot taken. Preparing the tree fails with exit 3.
-RUN_SCRIPT='
+RUN_SCRIPT=$DEADLINE_FNS'
 main() {
   run_id=$1 timeout_s=$2 slots=$3 bun_version=$4
   shift 4
@@ -567,6 +652,9 @@ main() {
     done
     [ "$waited" = 0 ] && echo "remote-test: all $slots slots busy — waiting" >&2
     waited=1
+    # A queued run keeps the pod from deleting itself under it; one that got its slot at once
+    # runs under the deadline its client set seconds ago.
+    push_delete_at "$((timeout_s + 7200))" || true
     sleep 5
   done
   echo "remote-test: slot $i/$slots on $(hostname) ($(nproc) vCPU), bun $(bun --version)" >&2

@@ -44,7 +44,7 @@ echo "$*" >>"$FAKE_LOGS/ssh"
 if [ -n "$SSH_ANSWERS" ]; then
   case "\${@: -1}" in
     true) exit 0 ;;
-    "bash -s -- "*) grep -q tg-remote-test-delete-at && { echo "$*" >>"$FAKE_LOGS/self-delete"; exit 0; } ;;
+    "bash -s -- "*) grep -q tg-remote-test-self-delete && { echo "$*" >>"$FAKE_LOGS/self-delete"; exit 0; } ;;
   esac
 fi
 exit 255`,
@@ -308,6 +308,66 @@ test('--ephemeral schedules the pod to delete itself as soon as its ssh answers'
   expect(fakeLog('runpodctl')).toContain('pod delete podeph1');
 });
 
+test('a shared pod is set to delete itself --timeout + 2 h after each run starts, like an ephemeral one', () => {
+  for (const args of [['tests/x.test.ts'], ['--setup']]) {
+    const r = run({ SSH_INFO: sshInfo({ ip: '10.0.0.1', port: '2201' }), SSH_ANSWERS: '1' }, ...args);
+    // Provisioning then fails over ssh; the pod's own timer was armed before that.
+    expect(r.code).toBe(255);
+  }
+  expect(fakeLog('self-delete').trim().split('\n')).toEqual([
+    expect.stringContaining('root@10.0.0.1 bash -s -- 9000'),
+    expect.stringContaining('root@10.0.0.1 bash -s -- 9000'),
+  ]);
+  expect(fakeLog('runpodctl')).not.toContain('pod delete');
+});
+
+// The pod-side deadline functions run here against a temp directory: they only read and write
+// files in it.
+test('pod deadlines only move later, only files a uid owns under its own name count, and an unreadable one never means expired', () => {
+  const fns = readFileSync(SCRIPT, 'utf8').match(/^DEADLINE_FNS='\n([\s\S]*?)^'$/m)![1];
+  const dir = join(root, 'ttl');
+  const script = `${fns}
+TTL_DIR=${dir}; mkdir -m 1777 "$TTL_DIR"; : >"$TTL_DIR/lock"
+me=$(id -u); now=$(date +%s)
+push_delete_at 100; push_delete_at 10
+echo "own: $(( $(cat "$TTL_DIR/delete-at.$me") - now ))"
+echo $((now + 500)) >"$TTL_DIR/delete-at.keep"
+echo $((now + 600)) >"$TTL_DIR/delete-at.$((me + 1))"
+ln -s "$TTL_DIR/delete-at.keep" "$TTL_DIR/delete-at.$((me + 2))"
+echo "latest: $(( $(latest_delete_at) - now ))"
+chmod 000 "$TTL_DIR/delete-at.$me"
+latest_delete_at >/dev/null && echo "unreadable: counted" || echo "unreadable: refused"`;
+  const proc = spawnSyncBounded(['bash', '-c', script], { env: { PATH: SAFE_PATH } });
+  const out = proc.stdout.toString();
+  expect(proc.exitCode).toBe(0);
+  // Allow a second for the clock to tick between the push and the read.
+  expect(Number(out.match(/own: (\d+)/)![1])).toBeGreaterThanOrEqual(99);
+  // Its own file counts (so the owner check works here); the others do not.
+  const latest = Number(out.match(/latest: (\d+)/)![1]);
+  expect(latest).toBeGreaterThanOrEqual(98);
+  expect(latest).toBeLessThanOrEqual(100);
+  // A deadline file of its own that cannot be read must not read as "long past" (root reads
+  // through mode 000).
+  if (process.getuid?.() !== 0) expect(out).toContain('unreadable: refused');
+});
+
+test('the pod flavor defaults to cpu3c-4 and TG_REMOTE_TEST_FLAVOR picks another', () => {
+  for (const [flavor, vcpus] of [['', 4], ['cpu3c-8', 8], ['cpu5c-2', 2]] as const) {
+    const r = run(
+      { TG_REMOTE_TEST_POD_ID: '', RUNPOD_API_KEY: FAKE_KEY, TG_REMOTE_TEST_FLAVOR: flavor, CREATE_RESPONSES: '{"error":"no capacity"}' },
+      'tests/x.test.ts',
+    );
+    expect(r.code).toBe(3);
+    const body = JSON.parse(fakeLog('curl.bodies').trim().split('\n').at(-1)!);
+    expect(body.cpu).toEqual({ id: flavor ? flavor.split('-')[0] : 'cpu3c', vcpuCount: vcpus });
+  }
+  for (const bad of ['big', 'cpu3c-08']) {
+    expect(run({ TG_REMOTE_TEST_POD_ID: '', RUNPOD_API_KEY: FAKE_KEY, TG_REMOTE_TEST_FLAVOR: bad }).stderr).toContain(
+      `TG_REMOTE_TEST_FLAVOR must look like cpu3c-4, got '${bad}'`,
+    );
+  }
+}, 60_000); // each failed create makes three name lookups, 2 s apart
+
 test('--ephemeral never rents in an avoided data center, even when no other one has stock', () => {
   for (const catalog of ['{"dataCenters":[{"availability":"HIGH","id":"EU-SE-1"}]}', 'not json']) {
     const r = run(
@@ -359,7 +419,7 @@ test('--ephemeral deletes the pod it rented when stopped with TERM, and keeps th
   expect(stderr).toContain('pod podeph1 deleted');
   expect(fakeLog('runpodctl')).toContain('pod delete podeph1');
   const [body] = fakeLog('curl.bodies').trim().split('\n').map((line) => JSON.parse(line));
-  expect(body).toMatchObject({ name: expect.stringMatching(/^tg-remote-test-/), cpu: { id: 'cpu3c', vcpuCount: 8 } });
+  expect(body).toMatchObject({ name: expect.stringMatching(/^tg-remote-test-/), cpu: { id: 'cpu3c', vcpuCount: 4 } });
   expect(body.dataCenterIds).toBeUndefined();
   // The pod's own start command removes it --timeout (1800) + 2 h after boot, then runs sshd.
   expect(body.entrypoint).toEqual(['/bin/bash', '-c']);

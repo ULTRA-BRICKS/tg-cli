@@ -668,11 +668,15 @@ prepared (provisioning, git snapshot, `bun install`, or a dead pod that could no
 255 = ssh failure.
 
 **Default: an ephemeral pod per run.** With no shared pod configured, each run rents its own
-cpu3c pod (8 vCPU / 16 GB, $0.24/h) through Runpod's REST v2 API (key from `RUNPOD_API_KEY` or
+pod — `TG_REMOTE_TEST_FLAVOR`, default `cpu3c-4` (4 vCPU / 8 GB, $0.12/h) — through Runpod's REST v2 API (key from `RUNPOD_API_KEY` or
 `apikey` in `~/.runpod/config.toml`; needs `runpodctl`, `curl`, `jq`), provisions it (apt
 packages, abduco, Chrome, Pillow, bun — about 2 min), runs, and deletes it on pass, failure,
-Ctrl-C or TERM. A full run takes **~10 min end to end and costs about $0.04**; nothing bills
-between runs (measured 2026-10-11: 3800 pass, 0 fail in 581 s including provisioning). A pod
+Ctrl-C or TERM. A full run takes **~10 min end to end and costs about $0.02** on cpu3c-4 ($0.04 on
+cpu3c-8); nothing bills between runs (measured 2026-10-11 on cpu3c-8: 3800 pass, 0 fail in 581 s
+including provisioning). The suite is not core-bound — three full runs at once on one 8-vCPU pod
+each took ~465 s, the same as one alone — hence 4 vCPUs. **Budget: Alex's Runpod budget is
+~$10/week**, i.e. ~500 ephemeral runs; a pod forgotten for a night costs more than a week of
+runs (the shared pod once billed $2.85 for 12.6 h, for ~1 h of work). A pod
 whose ssh does not answer within `TG_REMOTE_TEST_SSH_WAIT` seconds (default 300) is deleted and
 replaced, once, in another data center: pods in some data centers (EU-SE-1, as of 2026-10-11)
 never answer ssh from this workstation, so list those in `TG_REMOTE_TEST_AVOID_DATA_CENTERS`
@@ -682,8 +686,8 @@ renting another. One run = one pod. A client killed outright (SIGKILL) cannot ru
 there are three backstops: every ephemeral run — and `scripts/remote-test.sh --reap-orphans`
 alone — first deletes this machine's pods named `tg-remote-test-<date>-<time>-<host>-<machine>-<pid>-<n>`
 whose client pid is gone; as soon as ssh answers the pod is set to delete itself (with its own
-pod-scoped `RUNPOD_API_KEY`) an hour later while it provisions, then `--timeout` + 1 h after
-provisioning ends; and the pod's own start command removes it `--timeout` + 2 h after boot,
+pod-scoped `RUNPOD_API_KEY`) an hour later while it provisions, then `--timeout` + 2 h after
+provisioning ends (renewed when the run starts); and the pod's own start command removes it `--timeout` + 2 h after boot,
 whatever happens to the client.
 
 Configure in the environment or in `~/.config/tg-cli/remote-test.env` (sourced `KEY=VALUE`
@@ -696,9 +700,14 @@ the account (Runpod injects account keys at pod boot).
 on every run, so a restart needs no edit) or `TG_REMOTE_TEST_HOST` (+ `TG_REMOTE_TEST_PORT`)
 points every run at one long-lived pod: provisioned once (`--setup` does only that), it serves
 up to `TG_REMOTE_TEST_SLOTS` (default 3) runs at once — more wait for a slot — with no setup
-wait; a full run takes ~7.8 min and three at once each took the same. `--keep` (leave the run
-directory) and `--setup` need a shared pod. **A shared pod bills while it exists, idle or not:
-$0.24/h, ~$5.80/day — whoever configures one must stop it when done** (`runpodctl pod stop <pod
+wait; a full run takes ~7.8 min and three at once each took the same. Every run (and `--setup`)
+sets the shared pod to delete itself, with its pod-scoped key, `--timeout` + 2 h after that run
+starts — and again every few seconds while it waits for a slot (a later deadline only ever
+replaces an earlier one) — so a forgotten shared pod bills for at most 2 h past the latest
+run's `--timeout` (~2.5 h after its last run at the default 1800 s). `--keep` (leave the run
+directory) and `--setup` need a shared pod. **A shared pod bills while it exists, idle or not
+($0.12/h on cpu3c-4, $0.24/h on cpu3c-8) — whoever configures one should still stop it when
+done** (`runpodctl pod stop <pod
 id>`; its container disk is wiped, so the next run after `runpodctl pod start` re-provisions; if
 the restarted pod reuses an ip:port the script prints the `ssh-keygen -R` line for its changed
 host key; `runpodctl pod delete <pod id>` removes it). `--ephemeral` rents a pod for one run
@@ -708,7 +717,7 @@ ephemeral run makes:
 ```sh
 curl -X POST https://api.runpod.io/v2/pods -H "Authorization: Bearer $RUNPOD_API_KEY" \
   -H 'Content-Type: application/json' -d '{"name":"tg-cli-remote-test",
-  "image":"runpod/base:1.0.2-ubuntu2404","cpu":{"id":"cpu3c","vcpuCount":8},"disk":40,
+  "image":"runpod/base:1.0.2-ubuntu2404","cpu":{"id":"cpu3c","vcpuCount":4},"disk":40,
   "ports":["22/tcp"],"startSsh":true}'
 ```
 
