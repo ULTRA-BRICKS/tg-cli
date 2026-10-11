@@ -144,10 +144,15 @@ export function daemonRunState(
 
 // The first line of `tg-ctl status`. A live launchd-owned daemon is never "not running", even
 // when the pidfile is missing or stale (tg-cli#316 — the 2026-09-08 pid 11062 lie).
-export function daemonStatusLine(state: DaemonRunState, botId: string): string {
+// `stalePidfileCleaned`: the caller removed the stale pidfile, so the line says it is gone
+// rather than merely found (tg-cli#399).
+export function daemonStatusLine(state: DaemonRunState, botId: string, stalePidfileCleaned = false): string {
   const suffix = ` — bot ${botId}`;
   if (state.kind === 'not-running') return `tg-ctl: not running${suffix}`;
-  if (state.kind === 'stale-pidfile') return `tg-ctl: not running (stale pidfile, pid ${state.pid})${suffix}`;
+  if (state.kind === 'stale-pidfile') {
+    const cleaned = stalePidfileCleaned ? ', cleaned' : '';
+    return `tg-ctl: not running (stale pidfile${cleaned}, pid ${state.pid})${suffix}`;
+  }
   if (state.owner === 'process') return `tg-ctl: running (pid ${state.pid})${suffix}`;
   const note =
     state.note === undefined
@@ -158,6 +163,81 @@ export function daemonStatusLine(state: DaemonRunState, botId: string): string {
   return `tg-ctl: running (launchd, pid ${state.pid})${suffix} (job ${state.label}${note})`;
 }
 
+// The `log:` status line — where the daemon's log lines actually land (tg-cli#399). log()
+// writes to stderr only, so the real sink is whatever holds fd 2: launchd's
+// StandardErrorPath, the `tg-ctl start` capture (the canonical file), or a foreground
+// terminal. From 2026-08-25 to 09-10 the canonical file sat dark while the launchd-owned
+// daemon served 291 approvals logged to the plist's error file, and two agents read the
+// dark file as "daemon dead".
+// `stderrPath` is the kernel-resolved path of fd 2 (null = could not be inspected);
+// `canonicalLogPathResolved` is the canonical path after realpath(3), so a symlinked or
+// /var → /private/var aliased config dir still matches. The unresolved path is displayed.
+export function daemonLogSinkLine(
+  stderrPath: string | null,
+  canonicalLogPath: string,
+  canonicalLogPathResolved: string = canonicalLogPath,
+): string {
+  if (stderrPath === null) {
+    return `log: unknown — the daemon logs to its stderr and its destination could not be inspected (canonical file: ${canonicalLogPath})`;
+  }
+  if (stderrPath.endsWith(' (deleted)')) {
+    // Linux procfs marks an unlinked target (a log removed to "rotate" it): the daemon keeps
+    // writing to an inode no path reaches, so naming the path would send the reader to tail nothing.
+    return `log: ${stderrPath} — the daemon's stderr file was deleted; its output reaches no path until it restarts (canonical file: ${canonicalLogPath})`;
+  }
+  if (stderrPath === canonicalLogPathResolved) {
+    return `log: ${canonicalLogPath} (the daemon's stderr, captured by tg-ctl start)`;
+  }
+  if (stderrPath === '/dev/null') {
+    return `log: /dev/null (stderr discarded — the daemon's log output goes nowhere; canonical file: ${canonicalLogPath})`;
+  }
+  if (/^\/dev\/(tty|pts)/.test(stderrPath)) {
+    return `log: ${stderrPath} (foreground run — the daemon logs to this terminal, not ${canonicalLogPath})`;
+  }
+  if (!stderrPath.startsWith('/')) {
+    // Kernel object names ("pipe:[…]", "socket:[…]"): a wrapper holds stderr in memory and
+    // there is no file to tail.
+    return `log: ${stderrPath} (the daemon's stderr is a pipe/socket, not a file — no log file to tail; canonical file: ${canonicalLogPath})`;
+  }
+  return `log: ${stderrPath} (the daemon's stderr lands HERE — supervisor-captured — NOT ${canonicalLogPath})`;
+}
+
+// Remove a pidfile `status` found stale (tg-cli#399), only while it still names `pid` and no
+// process holds the daemon lock: a daemon that started since the probe rewrote it with its own
+// live pid, and deleting that would bring back the tg-cli#93 "status says not running" lie and
+// fail `restart`'s successor check, which needs the pidfile. A daemon that takes the lock in the
+// check→unlink gap gets its pidfile back from the lock holder (written only if still absent).
+// Taking the flock to close the gap would instead make a daemon starting in that instant lose the
+// lock and exit 0 — no daemon at all — which is worse for a command agents run constantly.
+// The file/flock I/O is injected (the caller owns it, like the rest of this module).
+// lockHolder: the holder's pid, null only when the probe PROVED nobody holds it, 'unknown' when
+// the lock could not be inspected — never read as free (review: a failed probe must not unlink).
+// 'cleaned': the unlink happened and nothing took the lock; 'successor': the unlink happened but a
+// daemon holds the lock now (or it can no longer be inspected), so the caller's earlier liveness
+// probe is obsolete; 'kept': no unlink.
+export interface StalePidfileOps {
+  readPid(): number | null;
+  lockHolder(): number | 'unknown' | null;
+  unlink(): void;
+  writeIfAbsent(pid: number): void;
+}
+
+export function removeStalePidfile(pid: number, ops: StalePidfileOps): 'cleaned' | 'successor' | 'kept' {
+  if (ops.readPid() !== pid || ops.lockHolder() !== null) return 'kept';
+  try {
+    ops.unlink();
+  } catch {
+    return 'kept';
+  }
+  const successor = ops.lockHolder();
+  if (successor === null) return 'cleaned';
+  if (successor !== 'unknown') {
+    try {
+      ops.writeIfAbsent(successor);
+    } catch {}
+  }
+  return 'successor';
+}
 
 // Does the pidfile on disk belong to US? `cleanExit` (and any other shutdown
 // path) MUST gate its `unlink(pidfile)` on this. The bug it guards (tg#93): on a

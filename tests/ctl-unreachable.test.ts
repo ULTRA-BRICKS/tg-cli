@@ -8,7 +8,7 @@ import {
   noAgentReplyText,
   outsideTmuxRefusalText,
   parseAgentNameFromCommand,
-  parseLsofCwd,
+  parseLsofFirstPath,
   parsePidTtyList,
   sanitizeAgentName,
   restartCommand,
@@ -74,9 +74,9 @@ test('parsePidTtyList drops tty-less rows and ignores 3-column legacy fake ps ou
   ]);
 });
 
-test('parseLsofCwd reads the n field', () => {
-  expect(parseLsofCwd('p7103\nfcwd\nn/Users/u/work/landing\n')).toBe('/Users/u/work/landing');
-  expect(parseLsofCwd('')).toBeNull();
+test('parseLsofFirstPath reads the n field', () => {
+  expect(parseLsofFirstPath('p7103\nfcwd\nn/Users/u/work/landing\n')).toBe('/Users/u/work/landing');
+  expect(parseLsofFirstPath('')).toBeNull();
 });
 
 test('parseAgentNameFromCommand handles --name X, --name=X and a missing value', () => {

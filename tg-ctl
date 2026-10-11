@@ -39,6 +39,7 @@ import {
   defaultConfigDir,
   launchdJobConfigDir,
   launchdJobIsPersistent,
+  ownUnitLoadedFromPrint,
   parseLaunchctlListJobs,
   parseLaunchctlListLabels,
   parseLaunchctlPrintArgv,
@@ -142,7 +143,7 @@ import {
   matchUnreachable,
   noAgentReplyText,
   outsideTmuxRefusalText,
-  parseLsofCwd,
+  parseLsofFirstPath,
   parsePidTtyList,
   UNREACHABLE_HINT,
   type UnreachableAgent,
@@ -298,7 +299,7 @@ import { normalizeRichHtml, validateRichHtml } from "./features/render/rich"
 import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
 import { daemonAuthStep, markAuthBound, markAuthFailed, serializePending, type AuthChat, type PendingAuth } from "./features/auth/binding"
 import { mergeEnvContent } from "./features/auth/env-file"
-import { botIdFromToken, ctlPaths, daemonRunState, daemonStatusLine, flockPidsForInode, ownsPidFile, planLegacyLastUserTargetMigration, readPidFile, type DaemonRunState } from "./features/tg-ctl/lock"
+import { botIdFromToken, ctlPaths, daemonLogSinkLine, daemonRunState, daemonStatusLine, flockPidsForInode, ownsPidFile, planLegacyLastUserTargetMigration, readPidFile, removeStalePidfile, type DaemonRunState } from "./features/tg-ctl/lock"
 import {
   assessCodeFreshness,
   codeFreshnessLine,
@@ -319,6 +320,7 @@ import {
   callbackRequestId,
   clampRequestTimeoutMs,
   collectQuestionAnswers,
+  extractAnswersFromHookReply,
   formatAgentHookOutput,
   hatchAbandonedLongOutageText,
   hatchAbandonedPermissionText,
@@ -529,7 +531,9 @@ export const USAGE = `Usage:
                          # \`code:\` names the commit the daemon loaded — STALE when its
                          # checkout has newer daemon code (merged but not restarted);
                          # also lists sessions hosted by the rig wrapper outside tmux (typed into
-                         # their abduco PTY) and agents outside tmux AND the wrapper as unreachable
+                         # their abduco PTY) and agents outside tmux AND the wrapper as unreachable;
+                         # \`log:\` names the file the daemon's stderr (its only log sink) lands on;
+                         # a stale pidfile is cleaned when nothing is alive
   tg-ctl audit-delivery [--since DATE] [--until DATE] [--json] [--transcripts DIR]...
                          # report inbound messages never delivered, delivered twice, or
                          # never received (update-id gaps), with dates; read-only
@@ -1358,7 +1362,7 @@ function cwdOfPid(pid: number): string | null {
       killSignal: "SIGKILL",
     })
     if (lsof.exitCode !== 0) return null
-    return parseLsofCwd(lsof.stdout.toString())
+    return parseLsofFirstPath(lsof.stdout.toString())
   } catch (err) {
     if (!lsofMissingWarned) {
       lsofMissingWarned = true
@@ -3306,12 +3310,33 @@ function singleRegisteredCwd(regs: Registration[]): string | null {
 
 function composeStatus(ctx: Ctx, statusCwd: string | null): string {
   const env = autostartEnv(ctx)
-  const runState = probeDaemonRunState(ctx, false)
-  const lines: string[] = [daemonStatusLine(runState, ctx.botId)]
-  // Merged ≠ deployed until the resident process restarts (tg-cli#279): name the commit it loaded.
+  let runState = probeDaemonRunState(ctx, false)
+  // A stale pidfile here means nothing is alive: the pid is dead, no process holds the flock and
+  // no launchd job runs this bot (tg-cli#399). It only misleads the next reader into chasing a
+  // phantom daemon, so remove it; `cleaned` is claimed only when the unlink happened. A daemon
+  // that took the lock meanwhile makes the earlier probe obsolete: probe again and report it.
+  const cleanup =
+    runState.kind === "stale-pidfile"
+      ? removeStalePidfile(runState.pid, {
+          readPid: () => readPidFile(readFileOrNull(ctx.paths.pid)),
+          // null only when the probe PROVED no holder; an uninspectable lock is never "free".
+          lockHolder: () => {
+            const holders = procFlockHolders(ctx.paths.lock) ?? lsofOpeners(ctx.paths.lock)
+            return holders === null ? "unknown" : (holders[0] ?? null)
+          },
+          unlink: () => unlinkSync(ctx.paths.pid),
+          writeIfAbsent: (successor) => writeFileSync(ctx.paths.pid, `${successor}\n`, { flag: "wx" }),
+        })
+      : "kept"
+  // Anything but a clean unlink may mean a daemon started after the first probe (a rewritten
+  // pidfile, a lock holder): probe again so status reports it. A failed unlink re-probes as stale.
+  if (runState.kind === "stale-pidfile" && cleanup !== "cleaned") runState = probeDaemonRunState(ctx, false)
+  const lines: string[] = [daemonStatusLine(runState, ctx.botId, cleanup === "cleaned")]
   if (runState.kind === "running") {
+    // Merged ≠ deployed until the resident process restarts (tg-cli#279): name the commit it loaded.
     const freshness = assessRunningCode(ctx, runState.pid)
     lines.push(codeFreshnessLine(freshness) + (shouldRestartForFreshness(freshness) ? " — run `tg-ctl restart`" : ""))
+    lines.push(composeDaemonLogLine(ctx.paths.log, runState.pid))
   }
 
   // Show every LIVE registered session (the per-pane set), not just one — a
@@ -4206,6 +4231,35 @@ function daemonLockHeldBy(lockPath: string, pid: number): boolean {
   return !daemonLockFree(lockPath)
 }
 
+// The `log:` status line for the running daemon `pid` (tg-cli#399): probes where its stderr — the
+// only sink log() writes to — lands, and hands the pure formatting to daemonLogSinkLine. fd 2 is
+// read from `/proc/<pid>/fd/2` where procfs exists (Linux), else `lsof -d 2` (macOS); `-n -P`
+// skip DNS/port lookups so the daemon's long-lived sockets can't stall `status`. The canonical
+// path is realpath'd for the comparison because both sources report the kernel-resolved path.
+function composeDaemonLogLine(canonicalLogPath: string, pid: number): string {
+  let stderrPath: string | null = null
+  try {
+    stderrPath = readlinkSync(`/proc/${pid}/fd/2`)
+  } catch {
+    try {
+      const r = Bun.spawnSync(["lsof", "-a", "-n", "-P", "-p", String(pid), "-d", "2", "-Fn"], {
+        stdout: "pipe",
+        stderr: "ignore",
+        env: SUBPROC_ENV,
+        timeout: LSOF_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+      })
+      // `-d 2` names one descriptor, so the first n-record is fd 2's path.
+      if (r.exitCode === 0) stderrPath = parseLsofFirstPath(r.stdout.toString())
+    } catch {}
+  }
+  let canonicalResolved = canonicalLogPath
+  try {
+    canonicalResolved = realpathSync(canonicalLogPath)
+  } catch {}
+  return daemonLogSinkLine(stderrPath, canonicalLogPath, canonicalResolved)
+}
+
 // flock(2) through bun:ffi — neither Bun nor Node expose it and macOS has no flock(1). The
 // library is opened on first use, so CLI subcommands that never touch the lock never dlopen it.
 const LOCK_EX_NB = 6 // LOCK_EX (2) | LOCK_NB (4)
@@ -4249,16 +4303,39 @@ function daemonLockFree(lockPath: string): boolean {
 }
 
 
-// The `autostart:` status line. Gathers the impure facts — own-unit file existence and (only when
-// that's absent, to skip the launchctl probe otherwise) the external-launchd-supervisor probe — then
-// hands them to the PURE autostartStatusLine for precedence + formatting (own-unit before external).
-// Keeps composeStatus slim and isolates the one impure probe behind status logic.
+// The `autostart:` status line. Gathers the impure facts — own-unit file existence, whether
+// launchd has that unit LOADED, and the external-launchd-supervisor probe — then hands them to the
+// PURE autostartStatusLine for precedence + formatting (own-unit before external).
+// Keeps composeStatus slim and isolates the impure probes behind status logic.
 function composeAutostartLine(env: AutostartEnv, kind: AutostartKind): string {
   const ownInstalled = kind !== "none" && autostartUnitInstalled(env)
-  // Only probe launchd when the own unit is absent — autostartStatusLine prefers the own unit, so the
-  // probe would be wasted work otherwise. The probe itself no-ops off launchd / on non-macOS.
-  const external = !ownInstalled && kind === "launchd" ? detectExternalLaunchdSupervisor(env) : undefined
-  return autostartStatusLine(kind, ownInstalled, external)
+  // A plist left on disk after a `bootout` is STALE, not enabled (tg-cli#399); launchd only.
+  const ownUnitLoaded = ownInstalled && kind === "launchd" ? launchdOwnUnitLoaded(env) : undefined
+  // The external probe runs when the own unit cannot answer for itself: absent, or STALE (a live
+  // external supervisor then still autostarts the daemon). The probe no-ops off macOS.
+  const external = kind === "launchd" && (!ownInstalled || ownUnitLoaded === false) ? detectExternalLaunchdSupervisor(env) : undefined
+  return autostartStatusLine(kind, ownInstalled, external, ownUnitLoaded)
+}
+
+// Is tg-ctl's own LaunchAgent loaded in the per-user gui domain? undefined when unanswerable:
+// off macOS, or as root, where launchdDomain() is `system` — a domain that never holds a per-user
+// LaunchAgent, so "not found" there proves nothing. ownUnitLoadedFromPrint owns the exit/stderr
+// truth table.
+function launchdOwnUnitLoaded(env: AutostartEnv): boolean | undefined {
+  if (env.platform !== "darwin" || (process.getuid?.() ?? 0) === 0) return undefined
+  try {
+    // Bounded like the lsof probes: a wedged launchctl must not hang `status`. A kill reads
+    // as unknown (exit non-zero, no "Could not find service"), never as STALE.
+    const r = Bun.spawnSync(["launchctl", "print", `${launchdDomain()}/${LAUNCHD_LABEL}`], {
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: 2000,
+      killSignal: "SIGKILL",
+    })
+    return ownUnitLoadedFromPrint({ exitCode: r.exitCode ?? -1, stdout: r.stdout.toString(), stderr: r.stderr.toString() })
+  } catch {
+    return undefined
+  }
 }
 
 // Run one plan command. Returns true on success. An `optional` command that fails is treated as
@@ -5906,7 +5983,9 @@ function tmuxDisplay(format: string): string | undefined {
 // reply (daemon down, restarting, or died mid-block); `timeout` is the overall
 // budget elapsing. The distinction is what makes reconnect safe: only `dropped` is
 // retried — a real "null" decline is honored, not looped.
-type AskAttempt = { kind: "response" | "dropped" | "timeout"; raw: string | null; statuses: AskStatusLine[] }
+// `neverSent`: synthetic timeout for a request never written to any socket — a multi-question
+// set shares ONE deadline and an earlier question used it up (tg-cli#399).
+type AskAttempt = { kind: "response" | "dropped" | "timeout"; raw: string | null; statuses: AskStatusLine[]; neverSent?: boolean }
 
 function parseAskStatus(line: string): AskStatusLine | null {
   try {
@@ -6112,11 +6191,12 @@ async function requestHookAnswerWithReconnect(ctx: Ctx, requestLine: string, dea
 // pane to late-deliver to), so a resend after a restart would post a duplicate
 // card.
 async function askDaemonOnce(ctx: Ctx, req: ButtonRequest, deadline: number): Promise<AskAttempt> {
+  // Checked before either path so a scoped (reconnecting) request is marked too.
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) return { kind: "timeout", raw: null, statuses: [], neverSent: true }
   const requestLine = JSON.stringify(req)
   const reconnectable = Boolean(req.paneId) && (req.kind === "question" || req.kind === "permission")
   if (reconnectable) return requestHookAnswerWithReconnect(ctx, requestLine, deadline)
-  const remaining = deadline - Date.now()
-  if (remaining <= 0) return { kind: "timeout", raw: null, statuses: [] }
   return oneAskAttempt(ctx, requestLine, remaining)
 }
 
@@ -6124,12 +6204,22 @@ type PostedStatus = Extract<AskStatusLine, { state: "posted" }>
 type DroppedStatus = Extract<AskStatusLine, { state: "dropped" }>
 type ExpiredStatus = Extract<AskStatusLine, { state: "expired" }>
 
+// The `req=… agent=… pane=…` prefix every ask-forward outcome line shares.
+function askWho(req: ButtonRequest): string {
+  return `req=${req.requestId} agent=${req.agent} pane=${req.paneId ?? "-"}`
+}
+
 // The truthful client-side verdict for a request that produced no usable reply
 // (tg-cli#317). The asking agent reads this line — the agent-tools hatch helper forwards
 // hook stderr into its deny reason — so it must say what the daemon actually did: a card
 // that WAS posted is never reported as "not-posted", and a daemon expiry is an expiry.
+// Only for attempts with NO usable reply — an answered attempt is a decision, not a failure.
 function describeAskOutcome(req: ButtonRequest, attempt: AskAttempt): string {
-  const who = `req=${req.requestId} agent=${req.agent} pane=${req.paneId ?? "-"}`
+  const who = askWho(req)
+  // Never written to a socket: the time budget ran out first (a multi-question set's earlier
+  // questions used up its shared deadline, or a tiny hook timeout). Blaming the daemon here
+  // would be the timeout-vs-failure conflation tg-cli#355 removes.
+  if (attempt.neverSent) return `ask-forward not-attempted: ${who} — the time budget was exhausted before this request was sent`
   const posted = attempt.statuses.find((s): s is PostedStatus => s.state === "posted")
   const dropped = attempt.statuses.find((s): s is DroppedStatus => s.state === "dropped")
   const expired = attempt.statuses.find((s): s is ExpiredStatus => s.state === "expired")
@@ -6262,14 +6352,36 @@ async function askDaemon(ctx: Ctx): Promise<void> {
   // with no local dialog and no manual Enter (tg#5741). ALL-OR-NOTHING: any
   // decline/timeout emits nothing and the local UI re-asks everything (a partial
   // answers record would silently skip the unanswered questions).
-  const answers = await collectQuestionAnswers(reqs, (r) => askDaemonOnce(ctx, r, deadline).then((a) => a.raw))
+  const attempts = new Map<string, AskAttempt>()
+  const answers = await collectQuestionAnswers(reqs, (r) =>
+    askDaemonOnce(ctx, r, deadline).then((a) => {
+      attempts.set(r.requestId, a)
+      return a.raw
+    }),
+  )
   const toolInput = reqs[0].toolInput
   if (answers && toolInput) {
     console.log(JSON.stringify(buildClaudeQuestionAnswerOutput(toolInput, answers)))
-  } else {
-    log(
-      `ask-forward multi-question not-completed: req=${reqs[0].requestId} n=${reqs.length} pane=${reqs[0].paneId ?? "-"} — declined, timed out, or partial; local UI takes over`,
-    )
+    return
+  }
+  log(
+    `ask-forward multi-question not-completed: req=${reqs[0].requestId} n=${reqs.length} pane=${reqs[0].paneId ?? "-"} — local UI takes over (per-question outcomes follow)`,
+  )
+  // One line per question with ITS outcome (tg-cli#355/#399). A single "declined, timed out,
+  // or partial" line let an agent mistake a dead daemon for a slow human. collectQuestionAnswers
+  // stops at the first unanswered question, so an earlier one may hold a real decision that the
+  // all-or-nothing rule discards — describeAskOutcome would misreport it as a failure.
+  for (const r of reqs) {
+    const a = attempts.get(r.requestId)
+    if (typeof extractAnswersFromHookReply(a?.raw ?? null)?.[r.question] === "string") {
+      log(
+        `ask-forward answered-discarded: ${askWho(r)} — the human answered this card; the answer is discarded because the set did not complete (all-or-nothing) and the local UI re-asks everything`,
+      )
+    } else if (a) {
+      log(describeAskOutcome(r, a))
+    } else {
+      log(`ask-forward not-attempted: ${askWho(r)} — an earlier question of the set did not complete`)
+    }
   }
 }
 

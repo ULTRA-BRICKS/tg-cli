@@ -3,6 +3,31 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.60.8
+
+- **`tg-ctl status` tells the truth about the daemon's log, its pidfile and a stale LaunchAgent
+  (Refs #399).** Rescued from the never-merged `hatch-daemon-liveness` snapshot.
+  - A running daemon gets a `log:` line naming the file its stderr — its only log sink — really
+    lands on (`/proc/<pid>/fd/2`, else `lsof -d 2`): the launchd plist's StandardErrorPath, the
+    `tg-ctl start` capture (the canonical `tg-ctl.<bot>.log`), a foreground terminal, `/dev/null`
+    or a pipe. From 2026-08-25 to 09-10 the canonical file sat dark while the launchd-owned daemon
+    served 291 approvals logged to `launchd.tg-ctl.err.log`, and agents read the dark file as
+    "daemon dead".
+  - A stale pidfile with nothing alive (dead pid, no flock holder, no launchd job) is removed and
+    reported as `not running (stale pidfile, cleaned, pid N)`. The pidfile is re-read before the
+    unlink, a lock that cannot be inspected counts as held, and `cleaned` is only claimed when the
+    unlink succeeded; a daemon that starts during the check is probed again and reported running.
+  - macOS: tg-ctl's own LaunchAgent plist on disk whose job launchd does NOT have loaded reads
+    `autostart: STALE … run tg-ctl enable` instead of "enabled". With an external supervisor
+    (rig's `ai.hyperide.tg-ctl`) still running the daemon, the line names it rather than
+    prescribing a second supervisor. A failed or headless `launchctl print` keeps "enabled".
+- **A multi-question `tg-ctl ask` that cannot complete logs each question's own outcome (#355
+  residual).** The single "declined, timed out, or partial" line is replaced by one line per
+  question: `answered-discarded` for a card the human answered but the all-or-nothing set threw
+  away, the single-question verdict (expired / dropped / unreachable / …) for the question that
+  failed, and `not-attempted` for questions never sent — including one whose shared time budget
+  ran out before it was sent, which is no longer reported as a daemon timeout.
+
 ## 1.60.2
 
 - **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on

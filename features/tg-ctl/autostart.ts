@@ -403,20 +403,50 @@ export function autostartKindLabel(kind: AutostartKind): string {
   return '';
 }
 
+// Is tg-ctl's own launchd unit loaded, from ONE `launchctl print gui/<uid>/<label>` result?
+// `false` (not loaded) only on positive evidence: the caller turns it into a STALE line that
+// prescribes an action, so a probe failure must never read as not-loaded. macOS launchctl:
+//   exit 0 with a dump                          → loaded
+//   "Could not find service <label>…" (exit 113) → the gui domain exists, the job does not
+//   "Could not find domain for user…" (exit 112) → no GUI login (headless/SSH); the plist
+//                                                  still loads at next login → unknown
+//   anything else                                → unknown
+export function ownUnitLoadedFromPrint(result: { exitCode: number; stdout: string; stderr: string }): boolean | undefined {
+  if (result.exitCode === 0 && result.stdout.trim().length > 0) return true;
+  if (result.exitCode === 113 && /Could not find service /.test(result.stderr)) return false;
+  return undefined;
+}
+
 // Render the `autostart:` status line from already-resolved facts (the I/O — file existence + the
-// launchctl probe — happens in the caller; this is the pure precedence + formatting). Precedence:
+// launchctl probes — happens in the caller; this is the pure precedence + formatting). Precedence:
 //   1. kind 'none'        → no OS autostart support (won't survive reboot)
-//   2. ownUnitInstalled   → tg-ctl's OWN `enable` unit on disk (the precise kind/label)
+//   2. ownUnitInstalled   → tg-ctl's OWN `enable` unit on disk (the precise kind/label), or STALE
+//                           when launchd reports it NOT loaded (ownUnitLoaded === false)
 //   3. externalLabel set  → an EXTERNAL launchd job supervises this binary ("via launchd: <label>")
 //   4. otherwise          → NOT enabled
 // Own-unit BEFORE external so a daemon enabled via `tg-ctl enable` keeps its precise label even if an
 // external job also happens to run it. externalLabel is only meaningful on launchd (the caller passes
-// undefined elsewhere).
-export function autostartStatusLine(kind: AutostartKind, ownUnitInstalled: boolean, externalLabel: string | undefined): string {
+// undefined elsewhere). ownUnitLoaded is probed on launchd only (undefined = not probed/unknown): a
+// plist left on disk after a `bootout` does not come back at login, so file existence alone would
+// claim "enabled" falsely (tg-cli#399). A systemd unit's file + `enable --now` IS its contract.
+export function autostartStatusLine(
+  kind: AutostartKind,
+  ownUnitInstalled: boolean,
+  externalLabel: string | undefined,
+  ownUnitLoaded?: boolean,
+): string {
   if (kind === 'none') {
     return 'autostart: not supported on this OS — `tg-ctl start` runs now but won\'t survive reboot';
   }
   if (ownUnitInstalled) {
+    if (kind === 'launchd' && ownUnitLoaded === false) {
+      // A live external supervisor still autostarts the daemon; prescribing `tg-ctl enable`
+      // there would install a second supervisor for the same daemon.
+      if (externalLabel) {
+        return `autostart: STALE own unit — ${autostartKindLabel(kind)} is on disk but NOT loaded; an external supervisor (launchd: ${externalLabel}) keeps the daemon autostarted — load the own unit only if you intend to replace it`;
+      }
+      return `autostart: STALE — ${autostartKindLabel(kind)} is on disk but NOT loaded; run \`tg-ctl enable\` to load it`;
+    }
     return `autostart: enabled (${kind}, ${autostartKindLabel(kind)})`;
   }
   if (externalLabel) {

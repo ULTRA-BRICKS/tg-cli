@@ -76,9 +76,10 @@ export function normalizeTty(tty: string | undefined): string | null {
   return tty && !NO_TTY_SENTINELS.has(tty) ? tty : null;
 }
 
-// `lsof -a -p <pid> -d cwd -Fn` prints field lines: `p<pid>`, `fcwd`, `n<path>`.
-// Returns the first `n` path, or null when lsof printed nothing usable.
-export function parseLsofCwd(out: string): string | null {
+// `lsof -a -p <pid> -d <fd> -Fn` prints field lines: `p<pid>`, `f<fd>`, `n<path>` — for
+// `-d cwd` the cwd, for `-d 2` the stderr target. Returns the first `n` path, or null when
+// lsof printed nothing usable.
+export function parseLsofFirstPath(out: string): string | null {
   for (const line of out.split('\n')) {
     if (line.startsWith('n') && line.length > 1) return line.slice(1).replace(/\r$/, '');
   }

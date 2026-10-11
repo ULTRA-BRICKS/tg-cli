@@ -7,6 +7,7 @@ import {
   ownsPidFile,
   shouldAutoStart,
   planLegacyLastUserTargetMigration,
+  removeStalePidfile,
 } from '../features/tg-ctl/lock';
 import { DEFAULT_CONTROL, type ControlConfig } from '../features/tg-ctl/types';
 
@@ -173,4 +174,79 @@ test('flockPidsForInode ignores blocked waiters, POSIX/OFD locks and other inode
 // while an inherited fd keeps the lock): the lock IS held, by someone this reader cannot name.
 test('flockPidsForInode keeps an unnamed holder as 0 so the caller does not read the lock as free', () => {
   expect(flockPidsForInode(PROC_LOCKS, '4410')).toEqual([0]);
+});
+
+// tg-cli#399 review P2: `status` deletes a stale pidfile, but a daemon may start between the
+// probe and the unlink. These fakes model each interleaving with a pidfile held in memory.
+function fakePidfile(initial: number | null, holders: Array<number | 'unknown' | null>) {
+  const state = { pid: initial, unlinks: 0 };
+  const ops = {
+    readPid: () => state.pid,
+    lockHolder: () => holders.shift() ?? null,
+    unlink: () => {
+      state.unlinks++;
+      state.pid = null;
+    },
+    writeIfAbsent: (pid: number) => {
+      if (state.pid !== null) throw new Error('EEXIST');
+      state.pid = pid;
+    },
+  };
+  return { state, ops };
+}
+
+test('removeStalePidfile removes the pidfile when it still names the dead pid and nothing holds the lock', () => {
+  const { state, ops } = fakePidfile(999999, [null, null]);
+  expect(removeStalePidfile(999999, ops)).toBe('cleaned');
+  expect(state).toEqual({ pid: null, unlinks: 1 });
+});
+
+test('removeStalePidfile keeps a pidfile a newly started daemon rewrote with its own pid', () => {
+  const { state, ops } = fakePidfile(4242, [null]);
+  expect(removeStalePidfile(999999, ops)).toBe('kept');
+  expect(state).toEqual({ pid: 4242, unlinks: 0 });
+});
+
+test('removeStalePidfile keeps the pidfile while a process holds the daemon lock', () => {
+  const { state, ops } = fakePidfile(999999, [4242]);
+  expect(removeStalePidfile(999999, ops)).toBe('kept');
+  expect(state).toEqual({ pid: 999999, unlinks: 0 });
+});
+
+// The successor outcome tells `status` its earlier "not running" probe is obsolete (review P1).
+test('removeStalePidfile writes the lock holder back when a daemon took the lock during the unlink', () => {
+  const { state, ops } = fakePidfile(999999, [null, 4242]);
+  expect(removeStalePidfile(999999, ops)).toBe('successor');
+  expect(state).toEqual({ pid: 4242, unlinks: 1 });
+});
+
+test('removeStalePidfile does not overwrite a pidfile the successor already wrote', () => {
+  const { state, ops } = fakePidfile(999999, [null, 4242]);
+  ops.unlink = () => {
+    state.unlinks++;
+    state.pid = 5151; // the successor rewrote it between our unlink and the re-check
+  };
+  expect(removeStalePidfile(999999, ops)).toBe('successor');
+  expect(state).toEqual({ pid: 5151, unlinks: 1 });
+});
+
+test('removeStalePidfile reports no cleanup when the unlink fails', () => {
+  const { state, ops } = fakePidfile(999999, [null]);
+  ops.unlink = () => {
+    throw new Error('EACCES');
+  };
+  expect(removeStalePidfile(999999, ops)).toBe('kept');
+  expect(state.pid).toBe(999999);
+});
+
+test('removeStalePidfile keeps the pidfile when the lock holder cannot be inspected', () => {
+  const { state, ops } = fakePidfile(999999, ['unknown']);
+  expect(removeStalePidfile(999999, ops)).toBe('kept');
+  expect(state).toEqual({ pid: 999999, unlinks: 0 });
+});
+
+test('removeStalePidfile asks for a re-probe, writing nothing, when the lock turns uninspectable after the unlink', () => {
+  const { state, ops } = fakePidfile(999999, [null, 'unknown']);
+  expect(removeStalePidfile(999999, ops)).toBe('successor');
+  expect(state).toEqual({ pid: null, unlinks: 1 });
 });

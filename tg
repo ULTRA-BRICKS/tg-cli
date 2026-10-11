@@ -76,7 +76,7 @@ import { detectAgentAncestry, detectAgentViaAncestry, isProcessRunning } from ".
 import { lineageParentOriginId, outboundOriginPaneId, parseLsofJsonlPaths, parseOmpSessionMeta, pickPrimaryOmpSessionFile } from "./features/tg-ctl/omp"
 import { hostDisplayName } from "./features/tg-ctl/host-registry"
 import { readOwnHostRecord } from "./features/tg-ctl/host-registry-fs"
-import { parseLsofCwd } from "./features/tg-ctl/unreachable"
+import { parseLsofFirstPath } from "./features/tg-ctl/unreachable"
 import { parseRegistry } from "./features/tg-ctl/session-registry-store"
 import { resolveRouteSession, type RouteOrigin } from "./features/tg-ctl/session-target"
 import { resolveSessionName, titleFromPaneTitle } from "./features/tg-ctl/session-name"
@@ -1784,7 +1784,7 @@ if (import.meta.main) {
           { stdout: "pipe", stderr: "pipe" },
         )
         if (result.exitCode === 0) {
-          const cwd = parseLsofCwd(new TextDecoder().decode(result.stdout))
+          const cwd = parseLsofFirstPath(new TextDecoder().decode(result.stdout))
           if (cwd) return cwd
         }
       } catch {

@@ -7,7 +7,7 @@
 // Past bugs: pidfile-only status lied "not running" for launchd pid 11062 (tg-cli#316,
 // 2026-09-08 repro); earlier cousin was cleanExit deleting a successor pidfile (tg-cli#93).
 import { expect, test } from 'bun:test';
-import { daemonRunState, daemonStatusLine } from '../features/tg-ctl/lock';
+import { daemonLogSinkLine, daemonRunState, daemonStatusLine } from '../features/tg-ctl/lock';
 import {
   launchdJobConfigDir,
   parseLaunchctlListJobs,
@@ -180,4 +180,91 @@ test('a live pidfile pid that does not hold the flock is a reused pid — the lo
   // stop/restart probe the flock even when the pidfile pid is alive; signalling the
   // pidfile's pid here would SIGTERM an unrelated process and leave the daemon running.
   expect(daemonRunState(4242, true, undefined, 11062)).toEqual({ kind: 'running', owner: 'process', pid: 11062 });
+});
+
+// --- daemon log-sink truthfulness (RC-4 reconciliation) ---------------------------------------
+//
+// The daemon's log() writes to STDERR ONLY. Whoever supervises the process decides where
+// that lands: launchd's StandardErrorPath, tg-ctl start's captured fd, or a foreground
+// terminal. The 2026-08-25→09-10 incident: the canonical log file went dark for 16 days
+// while the launchd-owned daemon served 291 approvals — all logged to the plist's
+// StandardErrorPath. `status` must NAME the real sink so nobody reads a dark canonical
+// log as "daemon dead" again.
+
+test('daemonLogSinkLine: the canonical file (tg-ctl start captured stderr there)', () => {
+  const canonical = '/Users/u/.config/tg-cli/tg-ctl.8574086668.log';
+  expect(daemonLogSinkLine(canonical, canonical)).toBe(
+    `log: ${canonical} (the daemon's stderr, captured by tg-ctl start)`,
+  );
+});
+
+test('daemonLogSinkLine: a DIFFERENT supervisor-captured file is named as the real sink, NOT the canonical one', () => {
+  const canonical = '/Users/u/.config/tg-cli/tg-ctl.8574086668.log';
+  const errPath = '/Users/u/.config/tg-cli/launchd.tg-ctl.err.log';
+  const line = daemonLogSinkLine(errPath, canonical);
+  expect(line).toBe(`log: ${errPath} (the daemon's stderr lands HERE — supervisor-captured — NOT ${canonical})`);
+});
+
+test('daemonLogSinkLine: a terminal stderr (foreground run) says so', () => {
+  const canonical = '/Users/u/.config/tg-cli/tg-ctl.8574086668.log';
+  const line = daemonLogSinkLine('/dev/ttys003', canonical);
+  expect(line).toBe(`log: /dev/ttys003 (foreground run — the daemon logs to this terminal, not ${canonical})`);
+  // Linux pty slaves are terminals too, not "supervisor-captured" files.
+  const pts = daemonLogSinkLine('/dev/pts/3', canonical);
+  expect(pts).toBe(`log: /dev/pts/3 (foreground run — the daemon logs to this terminal, not ${canonical})`);
+});
+
+test('daemonLogSinkLine: stderr on /dev/null is reported as discarded, never as a capture file', () => {
+  const canonical = '/Users/u/.config/tg-cli/tg-ctl.8574086668.log';
+  expect(daemonLogSinkLine('/dev/null', canonical)).toBe(
+    `log: /dev/null (stderr discarded — the daemon's log output goes nowhere; canonical file: ${canonical})`,
+  );
+});
+
+test('daemonLogSinkLine: a pipe/socket sink is not glossed as a supervisor-captured file', () => {
+  // Kernel object names carry no leading slash; presenting them as "supervisor-captured"
+  // would be a guess stated as fact (review finding).
+  const canonical = '/Users/u/.config/tg-cli/tg-ctl.8574086668.log';
+  expect(daemonLogSinkLine('pipe:[12345]', canonical)).toBe(
+    `log: pipe:[12345] (the daemon's stderr is a pipe/socket, not a file — no log file to tail; canonical file: ${canonical})`,
+  );
+  expect(daemonLogSinkLine('socket:[67890]', canonical)).toBe(
+    `log: socket:[67890] (the daemon's stderr is a pipe/socket, not a file — no log file to tail; canonical file: ${canonical})`,
+  );
+});
+
+test('daemonLogSinkLine: the canonical-file comparison uses the RESOLVED path (lsof reports kernel-resolved vnode paths)', () => {
+  // The configured canonical path sits behind macOS's /var → /private/var alias: lsof
+  // names the RESOLVED file while the config carries the alias. Without resolving both
+  // sides the canonical file itself would compare unequal and the line would misdirect
+  // the reader away from it — the exact misdirection this line exists to eliminate.
+  const canonical = '/var/folders/xy/tgctl/tg-ctl.123.log';
+  const resolved = '/private/var/folders/xy/tgctl/tg-ctl.123.log';
+  expect(daemonLogSinkLine(resolved, canonical, resolved)).toBe(
+    `log: ${canonical} (the daemon's stderr, captured by tg-ctl start)`,
+  );
+});
+
+test('daemonLogSinkLine: a deleted stderr file (procfs " (deleted)") is not presented as a file to tail', () => {
+  const canonical = '/home/u/.config/tg-cli/tg-ctl.123.log';
+  expect(daemonLogSinkLine(`${canonical} (deleted)`, canonical)).toBe(
+    `log: ${canonical} (deleted) — the daemon's stderr file was deleted; its output reaches no path until it restarts (canonical file: ${canonical})`,
+  );
+});
+
+test('daemonLogSinkLine: an uninspectable stderr degrades honestly instead of guessing the canonical file', () => {
+  const canonical = '/Users/u/.config/tg-cli/tg-ctl.8574086668.log';
+  expect(daemonLogSinkLine(null, canonical)).toBe(
+    `log: unknown — the daemon logs to its stderr and its destination could not be inspected (canonical file: ${canonical})`,
+  );
+});
+
+test('daemonStatusLine marks a reconciled stale pidfile as cleaned (default wording unchanged)', () => {
+  expect(daemonStatusLine(daemonRunState(4242, false, undefined), BOT, true)).toBe(
+    `tg-ctl: not running (stale pidfile, cleaned, pid 4242) — bot ${BOT}`,
+  );
+  // Back-compat: the third argument defaults to the pre-existing wording.
+  expect(daemonStatusLine(daemonRunState(4242, false, undefined), BOT)).toBe(
+    `tg-ctl: not running (stale pidfile, pid 4242) — bot ${BOT}`,
+  );
 });

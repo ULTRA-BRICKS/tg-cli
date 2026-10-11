@@ -242,7 +242,12 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
     except docs/tests/scripts/CI/`*.md`/`tg`) or the code identity is unknown.
   - `tg-ctl status` — running? (pidfile, flock holder, launchd — not pidfile alone)
     loaded code (`code:` line: current / checkout moved without daemon changes / `STALE`
-    / unknown)? mode? target pane? bot id? last update age?
+    / unknown)? mode? target pane? bot id? last update age? A stale pidfile with nothing
+    alive (dead pid, no flock holder, no launchd job) is removed and reported as `cleaned`;
+    a running daemon's `log:` line names the file its stderr — its only log sink — actually
+    lands on (the launchd StandardErrorPath, the `tg-ctl start` capture, or a foreground
+    terminal), not the canonical log next to the pidfile; an own launchd unit whose plist is
+    on disk but NOT loaded reads `autostart: STALE` (tg-cli#399).
 - **Deploy (tg-cli#279):** `scripts/deploy.sh` fast-forwards the live checkout and runs
   `tg-ctl restart --if-stale` (also when already up to date, so a hand-pulled checkout
   converges); exit 3 when that restart fails.

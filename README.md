@@ -109,8 +109,10 @@ the new file. Exit codes: `0` deployed (or up to date), `1` usage/environment er
 > from the checkout in daemon files; under launchd it comes back under the same job. It
 > exits non-zero unless the old process is gone and a successor holds the lock.
 > `tg-ctl status` shows the loaded commit on its `code:` line (`STALE` when a restart is
-> due). A plain `curl … | install.sh` re-run also refreshes a clone (it does
-> `git pull --ff-only`), but does not handle the daemon.
+> due) and, on its `log:` line, the file the daemon really logs to — its stderr, which under
+> launchd is the plist's StandardErrorPath, not the canonical `tg-ctl.<bot>.log`. A stale
+> pidfile with nothing alive is removed (`stale pidfile, cleaned`). A plain `curl … | install.sh`
+> re-run also refreshes a clone (it does `git pull --ff-only`), but does not handle the daemon.
 
 ---
 

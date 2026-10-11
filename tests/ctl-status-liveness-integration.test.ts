@@ -7,7 +7,7 @@
 // Assumptions: the daemon takes the flock before writing the pidfile; lsof can name
 // the lock holder. Does not touch the developer's live LaunchAgent.
 import { afterEach, expect, test } from 'bun:test';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
 import { spawnSyncBounded } from './helpers/spawn-sync';
@@ -162,3 +162,100 @@ test('ask is still attempted when the pidfile is gone but the process is alive',
   await ask.exited;
 }, 20_000);
 
+// RC-4 reconciliation: the daemon's log() writes to STDERR ONLY, so the REAL log sink is
+// whoever captures that fd — here the test harness's daemon.log, on the live machine the
+// launchd plist's StandardErrorPath. `status` must name the real sink so a dark canonical
+// log file is never again read as "daemon dead" (the 2026-08-25→09-10 incident: canonical
+// log dark 16 days while the launchd daemon served 291 approvals logged elsewhere).
+test('status names the file the running daemon actually logs to (its stderr)', async () => {
+  const cfgDir = tempDir('tgctl-status-logsink-');
+  const { port } = startMockBot();
+  await startDaemon(cfgDir, port);
+  const { stdout } = runStatus(cfgDir);
+  expect(stdout).toMatch(/^log: /m);
+  // startDaemon wires the daemon's stdio (stderr included) to cfgDir/daemon.log.
+  expect(stdout).toContain(join(cfgDir, 'daemon.log'));
+  // The canonical log file is a DIFFERENT path here — the line must say the real sink
+  // is NOT it, instead of letting the reader tail a dark file.
+  expect(stdout).toContain(`NOT ${join(cfgDir, 'tg-ctl.123.log')}`);
+}, 20_000);
+
+// Orphan-pid reconcile: with NOTHING alive (pid dead, no flock holder, no launchd job),
+// the pidfile is garbage bookkeeping. `status` cleans it and says so — mirroring
+// stopDaemon's cleanup — instead of leaving it to confuse the next reader.
+test('status reconciles a stale pidfile when nothing else is alive', async () => {
+  const cfgDir = tempDir('tgctl-status-stalepid-');
+  writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
+  writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
+  mkdirSync(join(cfgDir, 'bin'));
+  writeFileSync(join(cfgDir, 'bin', 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
+  const pidFile = join(cfgDir, 'tg-ctl.123.pid');
+  // Beyond macOS's pid ceiling — kill(0) can never report this alive.
+  writeFileSync(pidFile, '999999');
+  const { stdout } = runStatus(cfgDir);
+  expect(stdout).toContain('not running (stale pidfile, cleaned, pid 999999)');
+  expect(existsSync(pidFile)).toBe(false);
+}, 20_000);
+
+// Truthful `cleaned` (review finding): a swallowed unlink failure (read-only config dir)
+// must NOT be reported as a cleanup that did not happen — the wording stays at the plain
+// stale-pidfile claim and the file remains for the operator to inspect. Root ignores the
+// directory mode, so the unlink cannot be made to fail there.
+test.skipIf(process.getuid?.() === 0)('status does not claim a cleaned pidfile when the unlink fails', async () => {
+  const cfgDir = tempDir('tgctl-status-stalepid-ro-');
+  writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
+  writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
+  mkdirSync(join(cfgDir, 'bin'));
+  writeFileSync(join(cfgDir, 'bin', 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
+  const pidFile = join(cfgDir, 'tg-ctl.123.pid');
+  writeFileSync(pidFile, '999998');
+  chmodSync(cfgDir, 0o555); // no write permission on the dir → unlink fails
+  try {
+    const { stdout } = runStatus(cfgDir);
+    expect(stdout).toContain('not running (stale pidfile, pid 999998)');
+    expect(stdout).not.toContain('cleaned');
+    expect(existsSync(pidFile)).toBe(true);
+  } finally {
+    chmodSync(cfgDir, 0o755); // restore so the run's temp cleanup can remove it
+  }
+}, 20_000);
+
+// The canonical-capture case with a resolved-path twist (review finding): the daemon's
+// stderr fd IS the canonical log file, but the config dir lives under tmpdir() — on macOS
+// an alias (/var/folders → /private/var/folders). lsof reports the kernel-RESOLVED path;
+// the comparison must resolve both sides or the canonical file itself reads as "NOT the
+// sink" and the line misdirects the reader away from the very file they should tail.
+test('status recognizes the canonical log as the sink even when the config dir path is an alias', async () => {
+  const cfgDir = tempDir('tgctl-status-canonical-');
+  const { port } = startMockBot();
+  writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
+  writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
+  writeFileSync(
+    join(cfgDir, 'tg-ctl.123.registration.json'),
+    JSON.stringify({ paneId: '%1', cwd: cfgDir }),
+  );
+  mkdirSync(join(cfgDir, 'bin'));
+  writeFileSync(join(cfgDir, 'bin', 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
+  // The daemon's stderr goes to the CANONICAL log file this time (what tg-ctl start does).
+  const logFd = openSync(join(cfgDir, 'tg-ctl.123.log'), 'a');
+  const daemon = trackChild(Bun.spawn([process.execPath, TG_CTL, 'run'], {
+    env: {
+      PATH: `${join(cfgDir, 'bin')}:${process.env.PATH ?? ''}`,
+      HOME: cfgDir,
+      TG_CTL_CONFIG_DIR: cfgDir,
+      TG_API_BASE: `http://127.0.0.1:${port}`,
+    },
+    stdio: ['ignore', logFd, logFd],
+  }));
+  procs.push(daemon);
+  closeSync(logFd);
+  const pidFile = join(cfgDir, 'tg-ctl.123.pid');
+  const socket = join(cfgDir, 'tg-ctl.123.sock');
+  const t0 = Date.now();
+  while (Date.now() - t0 < 8000 && !(existsSync(pidFile) && existsSync(socket))) await Bun.sleep(50);
+  expect(existsSync(pidFile)).toBe(true);
+  const { stdout } = runStatus(cfgDir);
+  expect(stdout).toContain(`log: ${join(cfgDir, 'tg-ctl.123.log')} (the daemon's stderr, captured by tg-ctl start)`);
+  daemon.kill(9);
+  await daemon.exited;
+}, 20_000);

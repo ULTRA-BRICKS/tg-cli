@@ -18,6 +18,7 @@ import {
   externalLaunchdSupervisorLabel,
   launchdJobIsPersistent,
   launchdJobSupervisesBin,
+  ownUnitLoadedFromPrint,
   selectExternalLaunchdSupervisor,
   type ProbedLaunchdJob,
   launchdPlist,
@@ -442,4 +443,74 @@ test('autostartStatusLine: neither mechanism → NOT enabled hint', () => {
   expect(autostartStatusLine('launchd', false, undefined)).toContain('NOT enabled');
   // systemd with no unit and no external supervisor is also NOT enabled (external is launchd-only).
   expect(autostartStatusLine('systemd', false, undefined)).toContain('NOT enabled');
+});
+
+// --- stale own-unit truthfulness (RC-4 reconciliation) -----------------------------------------
+//
+// A unit file on disk whose job is NOT loaded is a STALE plist: `status` used to say
+// "autostart: enabled" from file existence alone, so an operator believed the daemon
+// would come back at login when launchd had already bootout'd it. The loaded probe is
+// only performed on launchd (undefined elsewhere → existing behavior unchanged).
+
+test('autostartStatusLine: own unit on disk but NOT loaded → STALE, with the enable fix', () => {
+  expect(autostartStatusLine('launchd', true, undefined, false)).toBe(
+    `autostart: STALE — ${LAUNCHD_LABEL} is on disk but NOT loaded; run \`tg-ctl enable\` to load it`,
+  );
+});
+
+test('autostartStatusLine: own unit on disk AND loaded → the existing enabled line', () => {
+  expect(autostartStatusLine('launchd', true, undefined, true)).toBe(`autostart: enabled (launchd, ${LAUNCHD_LABEL})`);
+});
+
+test('autostartStatusLine: loaded-state undefined (probe unavailable, or systemd) keeps the existing line', () => {
+  expect(autostartStatusLine('launchd', true, undefined, undefined)).toBe(`autostart: enabled (launchd, ${LAUNCHD_LABEL})`);
+  expect(autostartStatusLine('systemd', true, undefined, false)).toBe(`autostart: enabled (systemd, ${SYSTEMD_UNIT}.service)`);
+});
+
+test('autostartStatusLine: a STALE own unit with a LIVE external supervisor is not a dead autostart', () => {
+  // review finding: the STALE branch must not swallow the external probe — on the very
+  // machine this reconciles, rig's ai.hyperide.tg-ctl keeps the daemon autostarted while
+  // a leftover own-unit file sits unloaded. Prescribing `tg-ctl enable` alone would
+  // install a SECOND supervisor for the same daemon.
+  expect(autostartStatusLine('launchd', true, 'ai.hyperide.tg-ctl', false)).toBe(
+    `autostart: STALE own unit — ${LAUNCHD_LABEL} is on disk but NOT loaded; an external supervisor (launchd: ai.hyperide.tg-ctl) keeps the daemon autostarted — load the own unit only if you intend to replace it`,
+  );
+});
+
+// --- ownUnitLoadedFromPrint: the tri-state launchctl truth table (review finding) -----------------
+//
+// "not loaded" is claimed ONLY on positive evidence (exit 113 + "Could not find service"):
+// the STALE line prescribes an action, so a probe failure (no GUI domain, transient
+// launchctl error) misread as not-loaded would be an actionable false claim — exactly the
+// class of untruth this change exists to remove. Exit codes/messages verified live.
+
+test('ownUnitLoadedFromPrint: exit 0 with a dump → loaded', () => {
+  expect(ownUnitLoadedFromPrint({ exitCode: 0, stdout: 'gui/501/x = {\n\tstate = running\n}', stderr: '' })).toBe(true);
+});
+
+test('ownUnitLoadedFromPrint: exit 113 "Could not find service" → genuinely not loaded (the gui domain exists)', () => {
+  expect(
+    ownUnitLoadedFromPrint({
+      exitCode: 113,
+      stdout: '',
+      stderr: `Bad request.\nCould not find service "${LAUNCHD_LABEL}" in domain for user gui: 501`,
+    }),
+  ).toBe(false);
+});
+
+test('ownUnitLoadedFromPrint: "Could not find domain" (headless — no GUI login) → unknown, never STALE', () => {
+  expect(
+    ownUnitLoadedFromPrint({ exitCode: 112, stdout: '', stderr: 'Bad request.\nCould not find domain for user gui: 501' }),
+  ).toBeUndefined();
+});
+
+test('ownUnitLoadedFromPrint: transient launchctl failure → unknown, never STALE', () => {
+  expect(ownUnitLoadedFromPrint({ exitCode: 1, stdout: '', stderr: 'launchctl: some transient error' })).toBeUndefined();
+  expect(ownUnitLoadedFromPrint({ exitCode: 0, stdout: '', stderr: '' })).toBeUndefined();
+});
+
+test('ownUnitLoadedFromPrint: the missing-service text with an exit other than 113 → unknown, never STALE', () => {
+  expect(
+    ownUnitLoadedFromPrint({ exitCode: 1, stdout: '', stderr: `Could not find service "${LAUNCHD_LABEL}" in domain for user gui: 501` }),
+  ).toBeUndefined();
 });
