@@ -8,8 +8,10 @@
 //   "is the Dependency Graph on?" probe that skips the gate (always skipped on Forgejo), no
 //   install step, no PR checkout onto the workspace.
 // - leftover-grep must fetch enough history for a merge-base instead of a --depth=1 head.
+// - every setup-bun step must install an exact bun version: otherwise setup-bun resolves it
+//   through the anonymous GitHub API and fails on the runner's rate limit (tg-cli#691).
 import { afterEach, describe, expect, test } from 'bun:test';
-import { readFileSync, rmSync, writeFileSync } from 'fs';
+import { readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tempDir } from './helpers/test-temp';
 import { join } from 'path';
 
@@ -114,5 +116,36 @@ describe('leftover-grep.yml', () => {
     const fetch = onlyJobSteps(workflow('leftover-grep.yml')).find((s) => s.run?.includes('git fetch'));
     expect(fetch?.run).not.toMatch(/^\s*git fetch[^\n]*--depth=1/m);
     expect(fetch?.run).toContain('git merge-base');
+  });
+});
+
+describe('setup-bun steps', () => {
+  // An exact X.Y.Z goes straight to the release download URL. Anything else (no version,
+  // "latest", a range) makes setup-bun list bun's tags through the GitHub REST API — anonymous
+  // off github.com, so the job fails on the runner IP's rate limit (tg-cli#691).
+  const EXACT = /^\d+\.\d+\.\d+$/;
+  const pkg = JSON.parse(readFileSync(join(import.meta.dir, '..', 'package.json'), 'utf8')) as {
+    packageManager?: string;
+  };
+  const setupBun = readdirSync(WORKFLOWS)
+    .filter((f) => /\.ya?ml$/.test(f))
+    .flatMap((f) =>
+      Object.values(workflow(f).jobs).flatMap((job) =>
+        job.steps.filter((s) => s.uses?.startsWith('oven-sh/setup-bun@')).map((s) => ({ f, s })),
+      ),
+    );
+
+  test('package.json pins bun to an exact version', () => {
+    expect(pkg.packageManager ?? '').toMatch(/^bun@\d+\.\d+\.\d+$/);
+  });
+
+  test('every setup-bun step resolves an exact version, never via the GitHub API', () => {
+    expect(setupBun.length).toBeGreaterThan(0);
+    for (const { f, s } of setupBun) {
+      const version =
+        s.with?.['bun-version'] ??
+        (s.with?.['bun-version-file'] === 'package.json' ? pkg.packageManager?.replace(/^bun@/, '') : undefined);
+      expect({ f, version }).toEqual({ f, version: expect.stringMatching(EXACT) });
+    }
   });
 });

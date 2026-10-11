@@ -17,6 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # An exact X.Y.Z (package.json `packageManager`) is downloaded straight from the
+          # release URL. Without one, setup-bun lists bun's tags through the GitHub REST API,
+          # unauthenticated off github.com, and the job dies on the runner IP's rate limit (#691).
+          bun-version-file: package.json
       - name: Install dependencies
         run: bun install
       - name: Install pandoc + lsof + Chrome (md-pdf integration test; tg-ctl status lock holder)

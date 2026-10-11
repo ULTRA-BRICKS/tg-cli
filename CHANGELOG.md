@@ -3,6 +3,17 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.60.4
+
+- **CI no longer dies on GitHub's API rate limit before running a test (#691).** The `test` and
+  `dependency-review` jobs ran `setup-bun` without a version. To find "latest", it lists bun's
+  tags through the GitHub REST API, and on Forgejo that call is unauthenticated: 60 requests an
+  hour, shared by every job on the runner's IP. Once those were spent, both jobs failed in
+  ~15 s. `package.json` now pins `packageManager: bun@1.4.2`, and both setup-bun steps read it
+  (`bun-version-file`), so bun downloads straight from its release URL with no API call. CI
+  also stops silently switching to each new bun release. A test fails if a setup-bun step
+  isn't pinned to an exact version.
+
 ## 1.60.2
 
 - **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on
