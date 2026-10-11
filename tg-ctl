@@ -11617,18 +11617,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // bare-digit-submits-instantly behavior are the only ones verified
       // live (tmux capture-pane test, 2026-08-18) — every other agent kind
       // falls straight through to the existing queue-and-wait path,
-      // unchanged. KNOWN RESIDUAL LIMITATIONS, accepted rather than silently
-      // ignored (tg-cli#268 tracks broadening/verifying these further): a
-      // command containing a real newline (heredocs, multi-line strings) can
-      // never line-match in permissionMenuMatchesRequest and always falls
-      // through to queuing (tracked separately as tg-cli#283, needing live
-      // verification of how Claude Code actually renders a multi-line
-      // command's box before a fix can be trusted — see that issue).
+      // unchanged. tg-cli#268 tracks broadening/verifying the other prompt
+      // shapes; tg-cli#683 the one difference no screen check can see
+      // (whitespace the box does not draw).
       //
       // The first capture only SELECTS the target (findPermissionMenuTarget:
-      // a live cursor, the request's FULL identity as its own line in the
-      // menu's bounded context — never a prefix, tg-cli#309 — and an exact
-      // Yes/No option). The digit plan then re-captures INSIDE the pane's
+      // a live cursor, the request's FULL command — the box's own command
+      // rows, every line exactly, when Claude Code draws its dashed command
+      // rules (#283); one whole line of the box otherwise; never a prefix,
+      // #309 — and an exact Yes/No option). The digit plan then re-captures INSIDE the pane's
       // typing turn, directly before send-keys, and sends nothing unless the
       // same box is still live (verify-permission-menu): the turn can wait
       // seconds behind another plan, and the human may answer at the keyboard

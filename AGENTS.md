@@ -465,29 +465,44 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
 - **Pane-inject late-delivery for permissions (`features/tg-ctl/permission-menu.ts`, tg-cli#267):**
   for `claude` specifically, a disconnected permission's hook has already fallen back to Claude
   Code's OWN numbered terminal "Do you want to proceed?" menu — answerable directly by
-  `tmux capture-pane -pJ`, re-verifying the menu still identifies THIS request (LINE-EXACT match
-  of the FULL identity from `extractPermissionIdentity`, never a substring or prefix — a boundary-only
-  check still lets a stale "git push" tap match a live "git push --force" menu, and a prefix lets one
-  long command match another that shares its first 100 chars, tg-cli#309). The menu's context window
-  (12 lines above the marker) stops at an earlier menu's marker/option lines, so a resolved box left
-  in scrollback directly above the live one cannot lend it its command line. No exact identity → no
+  `tmux capture-pane -pJ`, re-verifying the menu still identifies THIS request. Claude Code
+  (2.1.296, measured) draws a Bash command between two dashed `╌` rules directly above the menu — one
+  unprefixed row for a short one-line command, one ` │ ` row per line (and per row it wrapped)
+  otherwise (evidence: `docs/research/2026-10-11-claude-code-bash-permission-box.md`). When those
+  rules are there, the match is STRUCTURAL (tg-cli#283): the rows between the rules attached to the
+  live marker must equal the identity's lines exactly — every line, in order, tabs expanded to
+  8-column stops, trailing whitespace ignored. It refuses when a row is shown shortened ("…"), when
+  the upper rule is off the screen (`reason=command-partly-visible`: a command taller than the pane),
+  when a dashed rule is near the menu but the block is not shaped as measured
+  (`reason=command-unrecognized` — never a fall back to the any-line match below), and when a row
+  break could be Claude Code's own word wrap rather than a newline (a long one-line
+  command and the same text split into lines look alike). The description row and the transcript
+  echo of the live command (` ⎿ $ …`) are outside the block, so a stale tap whose command equals
+  one of them no longer approves the live menu — the old any-line-of-12 match did. Without the
+  rules (older Claude Code; other tools) the old LINE-EXACT match applies: does any whitespace-
+  normalized line of the 12 lines above the marker equal the FULL one-line identity from
+  `extractPermissionIdentity` (never a substring or prefix — a boundary-only check still lets a stale
+  "git push" tap match a live "git push --force" menu, and a prefix lets one long command match
+  another that shares its first 100 chars, tg-cli#309); that window stops at an earlier menu's
+  marker/option lines, and a multi-line identity never matches there. No exact identity → no
   inject: a request with no `toolInput` whose question summary hook-normalize cut at 100 chars
   ("…"), and a box that renders the command shortened ("…"), both stay queued
-  (`reason=identity-unverifiable` / `identity-mismatch`). A multi-line command (a heredoc, or several
-  statements written across lines) still cannot match here — tracked as tg-cli#283, needing live
-  verification of how Claude Code actually renders a multi-line command's box before a fix can be
-  trusted (a real incident, 2026-08-25, confirmed this class of command gets permanently stranded in
-  the queue-and-wait path below with no way to ever resolve — the fix attempted for it was reverted
-  after a 3-round review surfaced an unresolved escalation risk and unverified rendering assumption,
-  see tg-cli#283 for the full history). A live question on the same pane (`shouldDeferInbound`)
+  (`reason=identity-unverifiable` / `identity-mismatch`). A row before the last that ends in `\`
+  never matches either (`\` continues the line; `\ ` with an undrawn space ends it). What the
+  screen cannot show, no match can check (tg-cli#683): a live command that differs from the tapped
+  one only in whitespace the box does not draw (a run of spaces that fills a row looks exactly like
+  a line break, a tab like spaces, trailing spaces like nothing) still matches. A live question on
+  the same pane (`shouldDeferInbound`)
   skips the inject (`reason=pane-busy`, tg-cli#268). The daemon injects the matching digit (bare,
   no Enter — Claude Code's menu submits instantly) through a plan whose `verify-permission-menu`
   step re-captures the pane INSIDE the pane's typing turn, directly before `send-keys`, and sends
-  nothing unless the same box (command line through the options, cursor included) is still live —
+  nothing unless the same box (from its top border — header and description included — or the
+  command line in the older shape, through the options, cursor included) is still live —
   the first capture can be seconds old by then, and a different permission may have rendered in the
   same spot (tg-cli#309). It then re-captures after a pace to CONFIRM before claiming delivery
   (`classifyPostInjectPane`; a tmux exit code alone doesn't prove the app consumed the key — e.g.
-  copy-mode swallows it): THIS command still live → not confirmed; a live menu for a DIFFERENT
+  copy-mode swallows it): THIS command still live, or a live box whose command it cannot read (top
+  scrolled off, not shaped as measured) → not confirmed; a live menu for a DIFFERENT
   command → resolved, Claude Code moved on (`after=next-menu`); no live menu → resolved; a failed
   capture → not confirmed. The pane-delivered `answeredButtons` record is never replayed to a hook
   (the replay read is question-only); it makes a re-tap answer "already answered". No waiting

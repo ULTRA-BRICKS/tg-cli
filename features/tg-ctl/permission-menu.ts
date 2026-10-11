@@ -30,11 +30,12 @@
 // pickPermissionMenuDigit's exact "No" match doesn't recognize — same safe
 // fall-through.
 //
-// KNOWN LIMITATION: a command containing a real newline (heredocs, multi-
-// line strings) can never satisfy permissionMenuMatchesRequest's per-line
-// exact match, and always falls through to queuing — fail-soft, but it
-// excludes some of the long-running commands most likely to blow the 120s
-// hook budget in the first place.
+// The command's identity is checked STRUCTURALLY when the box has the dashed
+// command rules Claude Code 2.1.296 draws (tg-cli#283, evidence in
+// docs/research/2026-10-11-claude-code-bash-permission-box.md): the rows
+// between those rules must be the command's lines, all of them, exactly. A
+// multi-line command (heredocs, several statements) can be answered that way;
+// before, it never matched and stranded in the queue.
 
 export interface PermissionMenuOption {
   digit: string;
@@ -50,7 +51,9 @@ export interface ParsedPermissionMenu {
   // whose command is still visible higher up in scrollback (e.g. its
   // execution echo, "⏺ Bash(pkill -f x)") — a stale tap for that old request
   // would then match text that has nothing to do with the CURRENT live menu
-  // (review finding: two independent reviewers found this exact bypass).
+  // (review finding: two independent reviewers found this exact bypass). A
+  // dashed-rule command block (locateCommandBlock) is included whole, however
+  // tall, back to its upper rule.
   context: string;
   // Does any option line still carry the "❯" cursor glyph? A live, currently-
   // answerable menu always has one (Claude Code's selection cursor); a
@@ -78,8 +81,83 @@ const OPTION_LINE = /^\s*(?:❯\s*)?(\d)\.\s+(.+?)\s*$/;
 // optional description + rule text): every real capture seen so far fits
 // well under this. Sized to comfortably include the CURRENT menu's own
 // identifying text while excluding an older, unrelated interaction's leftover
-// scrollback further up the pane.
+// scrollback further up the pane. A dashed-rule command block taller than this
+// is taken whole (locateCommandBlock): it is bounded by its own rules.
 const MENU_CONTEXT_LINES = 12;
+
+// Claude Code 2.1.296 draws a Bash command between two full-width rules of "╌",
+// directly above the menu: a short one-line command as ONE unprefixed row, any
+// other as one " │ " row per line — and per row Claude Code wrapped a long line
+// into, which looks the same. Between the lower rule and the marker there is at
+// most a "This command requires approval" line. Above the upper rule are the
+// tool header and the model-written description, which are NOT the command.
+const COMMAND_RULE = /^\s*╌{3,}\s*$/;
+const COMMAND_ROW = /^\s*│(?: (.*))?$/;
+const RULE_TO_MARKER_MAX_LINES = 3;
+// Measured: a row holds rule width − 4 characters (76 on an 80-column pane).
+const ROW_WIDTH_INSET = 4;
+// Spare columns when proving a row break is a newline, not a wrap: the wrap
+// rule was measured on one wrapper version; being short of it only refuses more.
+const WRAP_SAFETY_COLUMNS = 2;
+// Measured: a tab is drawn as spaces to the next multiple of 8 columns.
+const TAB_STOP = 8;
+// The permission box opens with a full-width "─" border at column 0, then the
+// tool header, a tip line and the description, then the upper "╌" rule.
+const BOX_TOP = /^─{3,}\s*$/;
+const BOX_TOP_TO_RULE_MAX_LINES = 8;
+
+// What sits between the rules above the live marker:
+//   absent       — no rule right above it: an older box shape or another tool
+//   offscreen    — the rows run up to the top of the capture; the command is
+//                  taller than the pane and its first lines are not on screen
+//   unrecognized — rules, but not one plain row or a run of " │ " rows
+//   rows         — the drawn rows, without their " │ " prefix
+// `start` is the first line of the region inspected — for `rows` the box's top
+// border when it is there (so the box fingerprint covers the header and the
+// description too: the same command asked again with another description is
+// another box), else the upper rule; otherwise the line that broke the run. A
+// context cut from `start` re-locates the same.
+type CommandBlock =
+  | { kind: 'absent' }
+  | { kind: 'offscreen' | 'unrecognized'; start: number }
+  | { kind: 'rows'; start: number; rows: string[]; rowWidth: number };
+
+function boxTopAbove(lines: string[], upperRule: number): number {
+  for (let i = upperRule - 1; i >= Math.max(0, upperRule - BOX_TOP_TO_RULE_MAX_LINES); i--) {
+    if (BOX_TOP.test(lines[i])) return i;
+    if (lines[i].includes(PROCEED_MARKER) || OPTION_LINE.test(lines[i]) || COMMAND_RULE.test(lines[i])) break;
+  }
+  return upperRule;
+}
+
+function locateCommandBlock(lines: string[], markerIdx: number): CommandBlock {
+  // The nearest rule within the whole context window: one further up than
+  // RULE_TO_MARKER_MAX_LINES (a notice wrapped in a narrow pane) still means
+  // this is the dashed shape — refuse it, never fall back to the any-line match.
+  let lower = -1;
+  for (let i = markerIdx - 1; i >= Math.max(0, markerIdx - MENU_CONTEXT_LINES); i--) {
+    if (COMMAND_RULE.test(lines[i])) {
+      lower = i;
+      break;
+    }
+  }
+  if (lower === -1) return { kind: 'absent' };
+  if (markerIdx - 1 - lower > RULE_TO_MARKER_MAX_LINES) return { kind: 'unrecognized', start: lower };
+  const rowWidth = lines[lower].trim().length - ROW_WIDTH_INSET;
+  if (lower >= 1 && COMMAND_ROW.test(lines[lower - 1])) {
+    let top = lower - 1;
+    while (top > 0 && COMMAND_ROW.test(lines[top - 1])) top--;
+    if (top === 0) return { kind: 'offscreen', start: 0 };
+    if (!COMMAND_RULE.test(lines[top - 1])) return { kind: 'unrecognized', start: top - 1 };
+    const rows = lines.slice(top, lower).map((l) => l.match(COMMAND_ROW)?.[1] ?? '');
+    return { kind: 'rows', start: boxTopAbove(lines, top - 1), rows, rowWidth };
+  }
+  const single = lines[lower - 1] ?? '';
+  if (lower >= 2 && COMMAND_RULE.test(lines[lower - 2]) && single.trim() !== '' && !COMMAND_RULE.test(single)) {
+    return { kind: 'rows', start: boxTopAbove(lines, lower - 2), rows: [single.replace(/^ /, '')], rowWidth };
+  }
+  return { kind: 'unrecognized', start: Math.max(0, lower - 2) };
+}
 
 // Returns null when the pane text doesn't currently show a menu (already
 // resolved, a different prompt, or the pane is gone). Scans from the LAST
@@ -134,6 +212,8 @@ export function parsePermissionMenu(paneText: string): ParsedPermissionMenu | nu
       break;
     }
   }
+  const block = locateCommandBlock(lines, startIdx);
+  if (block.kind !== 'absent') contextStart = Math.min(contextStart, block.start);
   return { options, context: lines.slice(contextStart, endIdx + 1).join('\n'), hasLiveCursor };
 }
 
@@ -197,37 +277,100 @@ const normalizeLine = (s: string): string => s.replace(/\s+/g, ' ').trim();
 // Approve/Reject for — a permission-escalation-shaped bug, worse than the
 // pre-existing queue-and-wait behavior (which never touches a live pane).
 //
-// LINE-EXACT, not a substring/blob/prefix search: Claude Code renders the
-// command as its OWN physical line in the box (every real capture confirms
-// this), so matching is done per-line — does ANY line of the context,
-// whitespace-normalized, equal the FULL identity exactly? A stale "git push"
-// tap must NOT match a live menu whose command line is "git push --force", and
-// a command must not match another that shares its first 100 chars (tg-cli#309)
-// — any prefix-style check, even boundary-aware, accepts both. `tmux
-// capture-pane -pJ` (capturePane) joins tmux's internal line-wrap breaks first,
-// so a long command that LOOKS wrapped in the terminal is still one logical
-// line by the time it reaches here.
-//
-// An identity ending in "…" never matches: whether it is a truncated summary or
-// the box rendering a long command shortened, the visible line cannot prove
-// which full command it stands for — refuse, the caller keeps the decision
-// queued.
+// Never a substring/blob/prefix search: a stale "git push" tap must NOT match
+// a live menu whose command is "git push --force", and a command must not
+// match another that shares its first 100 chars (tg-cli#309) — any
+// prefix-style check, even boundary-aware, accepts both. An identity ending in
+// "…" never matches: whether it is a truncated summary or the box rendering a
+// long command shortened, the visible text cannot prove which full command it
+// stands for — refuse, the caller keeps the decision queued.
 export function permissionMenuMatchesRequest(context: string, identity: string): boolean {
-  return identityLineIndex(context.split('\n').map(normalizeLine), identity) !== -1;
+  return typeof locateIdentity(context.split('\n'), identity) === 'number';
 }
 
-function identityLineIndex(lines: string[], identity: string): number {
-  const needle = normalizeLine(identity);
-  if (!needle || needle.endsWith('…')) return -1;
-  return lines.lastIndexOf(needle);
+// Where THIS request's box starts in `lines` (a menu's context), or why it
+// does not match. Two shapes:
+//
+// With the dashed command rules, only the block attached to the live marker
+// counts — not the description row above it, not the transcript echo of the
+// live command above that, not an older box (real captures show all three as
+// lines that equal some command). Its rows must equal the identity's lines:
+// the same count, each one exactly (tabs expanded as drawn, trailing
+// whitespace dropped — the screen does not show it). It refuses when the top
+// of the block is off the screen, when the dashed shape is there but not as
+// measured (command-unrecognized), when any row shows "…", when a row before
+// the last ends in a backslash ("\" continues the line, "\ " followed by an
+// undrawn space ends it — a second command), and when a row break could be
+// Claude Code's own word wrap: the next row's first word would have fit on the
+// row above, so the break must be a newline. What no screen shows, this cannot
+// check (tg-cli#683): a run of spaces wide enough to fill a row is drawn
+// exactly like a line break, a tab like spaces.
+//
+// Without the rules (older Claude Code, other tools): does ANY whitespace-
+// normalized line of the context equal the FULL one-line identity? The command
+// is its own physical line in that box; `tmux capture-pane -pJ` (capturePane)
+// joins tmux's own wrap breaks first. A multi-line identity never matches
+// there — normalizing its newlines to spaces would approve a different command.
+type IdentityLocation = number | 'identity-mismatch' | 'command-partly-visible' | 'command-unrecognized';
+
+function locateIdentity(lines: string[], identity: string): IdentityLocation {
+  const marker = lines.map((line) => line.includes(PROCEED_MARKER)).lastIndexOf(true);
+  const block: CommandBlock = marker === -1 ? { kind: 'absent' } : locateCommandBlock(lines, marker);
+  if (block.kind === 'absent') {
+    const needle = normalizeLine(identity);
+    if (!needle || needle.endsWith('…') || identity.includes('\n')) return 'identity-mismatch';
+    const at = lines.map(normalizeLine).lastIndexOf(needle);
+    return at === -1 ? 'identity-mismatch' : at;
+  }
+  if (block.kind === 'offscreen') return 'command-partly-visible';
+  if (block.kind === 'unrecognized') return 'command-unrecognized';
+  return commandRowsMatch(block.rows, block.rowWidth, identity) ? block.start : 'identity-mismatch';
+}
+
+// A tab or newline is how the command is laid out; any other control
+// character (a carriage return, an escape sequence) is drawn in ways not
+// measured — refuse rather than guess. A blank command identifies nothing.
+const UNDRAWN_CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f]/;
+
+function commandRowsMatch(rows: string[], rowWidth: number, identity: string): boolean {
+  if (identity.trim() === '' || UNDRAWN_CONTROL.test(identity)) return false;
+  const want = identity.split('\n').map((line) => expandTabs(line).trimEnd());
+  const drawn = rows.map((row) => row.trimEnd());
+  if (want.length !== drawn.length || want.some((line, i) => line !== drawn[i])) return false;
+  if (drawn.some((row) => row.includes('…'))) return false;
+  if (drawn.slice(0, -1).some((row) => row.endsWith('\\'))) return false;
+  return drawn.every((row, i) => i === drawn.length - 1 || !couldBeWordWrap(row, drawn[i + 1], rowWidth));
+}
+
+function expandTabs(line: string): string {
+  let out = '';
+  for (const ch of line) out += ch === '\t' ? ' '.repeat(TAB_STOP - (out.length % TAB_STOP)) : ch;
+  return out;
+}
+
+// Could Claude Code have broken one long line here? It moves a word down only
+// when it no longer fits, so if the next row's first word (with any indent)
+// fits after this row and a space, the break was a newline. Widths are counted
+// high (two columns for anything outside printable ASCII), so a wide character
+// can only make this refuse.
+function couldBeWordWrap(row: string, next: string, rowWidth: number): boolean {
+  const firstWord = next.match(/^\s*\S*/)?.[0] ?? '';
+  return columns(row) + 1 + columns(firstWord) > rowWidth - WRAP_SAFETY_COLUMNS;
+}
+
+function columns(text: string): number {
+  let width = 0;
+  for (const ch of text) width += ch >= ' ' && ch <= '~' ? 1 : 2;
+  return width;
 }
 
 // What a pane-inject is about to answer: the digit for the decision, plus the
 // menu's own BOX — the whitespace-normalized lines from the request's command
-// line through the last option (cursor position included). The box is the
-// fingerprint re-checked immediately before the digit is sent and after it:
-// a different permission, the same command re-asked with different text, or a
-// human moving the cursor at the keyboard all change it.
+// (its upper rule, for a dashed-rule block) through the last option (cursor
+// position included). The box is the fingerprint re-checked immediately before
+// the digit is sent and after it: a different permission, the same command
+// re-asked with different text, or a human moving the cursor at the keyboard
+// all change it.
 export interface PermissionMenuTarget {
   identity: string;
   decision: 'allow' | 'deny';
@@ -235,14 +378,23 @@ export interface PermissionMenuTarget {
   box: string;
 }
 
-export type PermissionMenuSkipReason = 'identity-unverifiable' | 'no-menu' | 'no-live-cursor' | 'identity-mismatch' | 'no-pickable-option';
+export type PermissionMenuSkipReason =
+  | 'identity-unverifiable'
+  | 'no-menu'
+  | 'no-live-cursor'
+  | 'identity-mismatch'
+  | 'command-partly-visible'
+  | 'command-unrecognized'
+  | 'no-pickable-option';
 
 export type PermissionMenuLookup = { ok: true; target: PermissionMenuTarget } | { ok: false; reason: PermissionMenuSkipReason };
 
 // Find the live menu for THIS request in a capture and the digit answering
 // `decision`. Each failure carries its own reason so field logs tell "menu
 // already resolved" (no-live-cursor) from "a live menu shows a different
-// command" (identity-mismatch) from "nothing exact to bind to"
+// command" (identity-mismatch) from "the command is taller than the pane"
+// (command-partly-visible) from "a dashed box not shaped as measured"
+// (command-unrecognized) from "nothing exact to bind to"
 // (identity-unverifiable). hasLiveCursor gates the match: text alone does not
 // prove the menu is the currently-answerable widget (see
 // ParsedPermissionMenu.hasLiveCursor).
@@ -255,12 +407,12 @@ export function findPermissionMenuTarget(
   const menu = paneText === null ? null : parsePermissionMenu(paneText);
   if (!menu) return { ok: false, reason: 'no-menu' };
   if (!menu.hasLiveCursor) return { ok: false, reason: 'no-live-cursor' };
-  const lines = menu.context.split('\n').map(normalizeLine);
-  const at = identityLineIndex(lines, identity);
-  if (at === -1) return { ok: false, reason: 'identity-mismatch' };
+  const lines = menu.context.split('\n');
+  const at = locateIdentity(lines, identity);
+  if (typeof at !== 'number') return { ok: false, reason: at };
   const digit = pickPermissionMenuDigit(menu.options, decision);
   if (digit === null) return { ok: false, reason: 'no-pickable-option' };
-  const box = lines.slice(at).filter(Boolean).join('\n');
+  const box = lines.slice(at).map(normalizeLine).filter(Boolean).join('\n');
   return { ok: true, target: { identity, decision, digit, box } };
 }
 
@@ -279,7 +431,9 @@ export function permissionMenuUnchanged(paneText: string | null, target: Permiss
 //   unreadable    — the re-capture failed; proves nothing, never "delivered"
 //   still-pending — a live menu still shows THIS request's command: the key was
 //                   swallowed (e.g. copy-mode), or the same command is being
-//                   asked again — either way delivery is not confirmed
+//                   asked again — either way delivery is not confirmed. Also a
+//                   live menu whose command block cannot be read (its top
+//                   scrolled off, or not shaped as measured): it may be this one
 //   next-menu     — THIS request's menu is gone and a live menu for a
 //                   DIFFERENT command now occupies the spot (Claude Code asks
 //                   for the next tool call at once): resolved, and the log
@@ -291,5 +445,6 @@ export function classifyPostInjectPane(paneText: string | null, target: Permissi
   if (paneText === null) return 'unreadable';
   const menu = parsePermissionMenu(paneText);
   if (!menu?.hasLiveCursor) return 'resolved';
-  return permissionMenuMatchesRequest(menu.context, target.identity) ? 'still-pending' : 'next-menu';
+  const at = locateIdentity(menu.context.split('\n'), target.identity);
+  return at === 'identity-mismatch' ? 'next-menu' : 'still-pending';
 }

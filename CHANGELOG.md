@@ -3,6 +3,24 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.60.3
+
+- **A late Telegram tap can answer a multi-line Bash permission, and a stale tap can no longer
+  answer a different one (#283).** When a permission's hook has timed out, `tg-ctl` answers
+  Claude Code's own terminal menu by typing the digit, after checking the menu shows the tapped
+  command. A heredoc or any command written across lines never passed that check, so its tap
+  stayed queued with nothing to deliver it. Claude Code 2.1.296 draws a Bash command between two
+  dashed rules (studied with the real binary; `docs/research/2026-10-11-claude-code-bash-permission-box.md`),
+  and the check now reads that block: its rows must be the command's lines, all of them, exactly.
+  It refuses when the command is taller than the pane (`reason=command-partly-visible`), when a
+  row is shown shortened, when a row before the last ends in `\`, and when a row break could be
+  Claude Code's own wrap of a long line. The old check accepted any of the 12 lines above the
+  menu, so on 2.1.296 a stale tap whose command equalled the live box's description, or one line
+  of the live command's echo, approved the live command; and a multi-line command matched a
+  one-line command with the same words. The digit is still sent only after the same box is
+  re-read live (#309). Whitespace the box does not draw (a run of spaces filling a row looks like
+  a line break) is still invisible to the check: #683.
+
 ## 1.60.2
 
 - **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on
