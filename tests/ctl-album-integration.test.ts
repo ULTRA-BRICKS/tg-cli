@@ -89,7 +89,10 @@ async function bodyField(req: Request, key: string): Promise<unknown> {
   return body && typeof body === 'object' && key in body ? Object.getOwnPropertyDescriptor(body, key)?.value : undefined;
 }
 
-function startApi(): Api {
+// `fileDelayMs`: how long each file download takes — a slow download, as on a real network. A
+// real delay: the downloader is the daemon, another process no fake clock reaches, and a test
+// that proves the text WAITS for the album cannot gate the download on the text arriving.
+function startApi(fileDelayMs = 0): Api {
   const api: Api = { port: 0, batches: [], sent: [], fetched: [], reactions: [] };
   const server = Bun.serve({
     port: 0,
@@ -106,7 +109,10 @@ function startApi(): Api {
         api.fetched.push(fileId);
         return Response.json({ ok: true, result: { file_path: `photos/${fileId}.jpg` } });
       }
-      if (url.pathname.includes('/file/bot')) return new Response('JPEGDATA');
+      if (url.pathname.includes('/file/bot')) {
+        await Bun.sleep(fileDelayMs);
+        return new Response('JPEGDATA');
+      }
       if (url.pathname.endsWith('/sendMessage')) {
         api.sent.push(String(await bodyField(req, 'text')));
         return Response.json({ ok: true, result: { message_id: 800 + api.sent.length } });
@@ -185,6 +191,8 @@ test('a 3-photo album split across two getUpdates batches is ONE injected messag
   // A later message proves nothing else was delivered for the album in between.
   api.batches.push([textUpdate(703, 13109, 'next')]);
   await waitFor('the next message', () => ledgerDelivered(cfgDir).includes(13109), cfgDir);
+  // Its 👀 follows the ledger record (the ack runs after the delivery returns).
+  await waitFor('the 👀 on the next message', () => api.reactions.includes(13109), cfgDir);
 
   const log = injectLog(cfgDir);
   expect(deliveries(cfgDir)).toBe(2);
@@ -255,4 +263,52 @@ test('a kill after the album went out, before its journals were cleared, does no
   // proves the replay already ran.
   expect(injectLog(cfgDir).split('tg#13300').length - 1).toBe(1);
   expect(existsSync(inbound(cfgDir, 720))).toBe(true);
+}, 40_000);
+
+test('a message that closes an album reaches the agent after the album, even when its download is slow', async () => {
+  const cfgDir = makeCfgDir();
+  const api = startApi(1500);
+  api.batches.push([photoUpdate(740, 13500, 'the bug'), photoUpdate(741, 13501), textUpdate(742, 13502, 'what do you see?')]);
+  await startDaemon(cfgDir, api);
+  await waitFor('both deliveries', () => ledgerDelivered(cfgDir).includes(13500) && ledgerDelivered(cfgDir).includes(13502), cfgDir);
+
+  const log = injectLog(cfgDir);
+  expect(log).toContain('tg#13500');
+  expect(log.indexOf('tg#13500')).toBeLessThan(log.indexOf('tg#13502'));
+}, 30_000);
+
+test('an item that joins a restored album whose other items already went out is still delivered', async () => {
+  const cfgDir = makeCfgDir();
+  const api = startApi();
+  const parts = [photoUpdate(750, 13600, 'first two'), photoUpdate(751, 13601)];
+  api.batches.push(parts);
+  const daemon1 = await startDaemon(cfgDir, api);
+  await waitFor('the first two items delivered', () => ledgerDelivered(cfgDir).includes(13601), cfgDir);
+  await stopDaemon(daemon1);
+
+  // What a SIGKILL right after the delivery leaves: the album still journaled, its batch still
+  // pending, no `processed` record. The album's third item arrives after the restart.
+  writeFileSync(
+    join(cfgDir, 'tg-ctl.123.pending-albums.json'),
+    `${JSON.stringify([{ chat: 1, groupId: '13106000', lastPartAtMs: Date.now(), updates: parts }])}\n`,
+  );
+  writeFileSync(join(cfgDir, 'tg-ctl.123.pending-batch.json'), `${JSON.stringify(parts)}\n`);
+  const ledgerPath = join(cfgDir, 'tg-ctl.123.delivery.jsonl');
+  writeFileSync(
+    ledgerPath,
+    readFileSync(ledgerPath, 'utf8')
+      .split('\n')
+      .filter((l) => !l.includes('"processed"'))
+      .join('\n'),
+  );
+  api.batches.push([photoUpdate(752, 13602)]);
+  await startDaemon(cfgDir, api);
+  await waitFor('the third item delivered', () => ledgerDelivered(cfgDir).includes(13602), cfgDir);
+
+  const log = injectLog(cfgDir);
+  expect(log).toContain('tg#13602');
+  expect(log).toContain(inbound(cfgDir, 752));
+  // The two items the first run delivered are not delivered again.
+  expect(log.split('tg#13600').length - 1).toBe(1);
+  expect(log).not.toContain('tg#13601');
 }, 40_000);

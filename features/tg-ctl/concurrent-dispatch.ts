@@ -20,20 +20,35 @@
 // concurrently -- Promise.allSettled means one item timing out or rejecting can never delay or
 // fail any other. `null` means "no shared state" and always runs immediately.
 
+import type { Action } from "./types";
+
 export type DispatchKey = string | null;
 
 /** Per-key async queue: `run(key, fn)` chains onto whatever is already queued for that key (so
- *  same-key work stays strictly ordered) while different keys never block each other. */
+ *  same-key work stays strictly ordered) while different keys never block each other. Work
+ *  under several keys (one message's group can touch a tap's guard and a delivery's pane) waits
+ *  for every one of them and holds each back until it finishes; no keys = runs at once. A key
+ *  whose last queued work finished is forgotten — keys name one-off request ids and tokens too,
+ *  and the daemon runs for weeks. */
 export class TargetDispatchQueues {
   private readonly tails = new Map<string, Promise<unknown>>();
 
-  run<T>(key: DispatchKey, fn: () => Promise<T>): Promise<T> {
-    if (key === null) return fn();
-    const prior = this.tails.get(key) ?? Promise.resolve();
-    const started = prior.then(fn, fn);
+  run<T>(key: DispatchKey | readonly string[], fn: () => Promise<T>): Promise<T> {
+    const keys = key === null ? [] : typeof key === "string" ? [key] : key;
+    if (keys.length === 0) return fn();
+    const prior = Promise.all(keys.map((k) => this.tails.get(k)));
+    const settle = async (): Promise<T> => {
+      try {
+        return await fn();
+      } finally {
+        for (const k of keys) if (this.tails.get(k) === tail) this.tails.delete(k);
+      }
+    };
+    const started = prior.then(settle, settle);
     // Swallow so a rejection never poisons the chain for the NEXT item queued on this key --
     // the real result/rejection still reaches the caller through `started`.
-    this.tails.set(key, started.catch(() => undefined));
+    const tail = started.catch(() => undefined);
+    for (const k of keys) this.tails.set(k, tail);
     return started;
   }
 
@@ -103,4 +118,54 @@ export function groupActionsByAckBoundary<A extends { kind: string }>(actions: r
   }
   if (current.length > 0) groups.push(current);
   return groups;
+}
+
+/** Where a flat-chat delivery would land, resolved by the daemon for one batch: the pane a
+ *  replied-to message's session is in, the pane an `/agent <selector>` confidently names (a bare
+ *  `/agent`: the sole agent it reaches directly), the pane a plain message goes to. null when it
+ *  cannot be told before the delivery runs. */
+export interface DeliveryDestinations {
+  replyPane: (replyToMessageId: number) => string | null;
+  agentPane: (selector: string | null) => string | null;
+  defaultPane: () => string | null;
+}
+
+/** The dispatch key of a flat-chat delivery (tg-cli#280): the pane it lands in, so deliveries
+ *  to one agent run in the order the CTO sent them — a typed message that closes an album must
+ *  not overtake the album's slower download — whichever way each names it (plain, a reply to any
+ *  of its messages, `/agent`, a caption). A reply or `/agent` whose pane cannot be told up front
+ *  takes the default pane's key: the delivery paths fall back there (the CTO's last target for a
+ *  gone agent, the sole agent for an unknown reply), and a picker it ends in loses nothing by
+ *  waiting. A bare `/agent` that reaches no single agent (the picker) and any other action carry
+ *  no key. */
+export function deliveryDispatchKey(action: Action, dests: DeliveryDestinations): DispatchKey {
+  const byDefault = (): string => {
+    const pane = dests.defaultPane();
+    return pane === null ? "dest:default" : `dest:${pane}`;
+  };
+  const byReply = (id: number): string => {
+    const pane = dests.replyPane(id);
+    return pane === null ? byDefault() : `dest:${pane}`;
+  };
+  const byAgent = (selector: string | null): DispatchKey => {
+    const pane = dests.agentPane(selector);
+    if (pane !== null) return `dest:${pane}`;
+    return selector === null ? null : byDefault();
+  };
+  switch (action.kind) {
+    case "inject-text":
+      return byDefault();
+    case "reply-route":
+      return byReply(action.replyToMessageId);
+    case "agent-route":
+      return byAgent(action.selector);
+    case "transcribe-voice":
+      return action.replyToMessageId === undefined ? byDefault() : byReply(action.replyToMessageId);
+    case "download-media":
+      // The same precedence downloadMedia routes by: the `/agent` caption, the reply, the default.
+      if (action.agentRoute) return byAgent(action.agentRoute.selector);
+      return action.replyToMessageId === undefined ? byDefault() : byReply(action.replyToMessageId);
+    default:
+      return null;
+  }
 }

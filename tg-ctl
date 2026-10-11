@@ -75,7 +75,7 @@ import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/conf
 import { codexUsageTranscriptPath, latestCodexUsageTelemetryPayload } from "./features/tg-ctl/codex-usage"
 import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
 import { serializeDeferredStore, parseDeferredStore } from "./features/tg-ctl/deferred-store"
-import { TargetDispatchQueues, groupActionsByAckBoundary } from "./features/tg-ctl/concurrent-dispatch"
+import { TargetDispatchQueues, deliveryDispatchKey, groupActionsByAckBoundary, type DeliveryDestinations } from "./features/tg-ctl/concurrent-dispatch"
 import {
   findAgentInPane,
   panesWithRetry,
@@ -440,7 +440,7 @@ import { AUDIT_USAGE, buildAuditReport, formatAuditReport, logDeliveryIds, parse
 import { appendHistoryFile } from "./features/replies/history-file"
 import { inboundHistoryRecords, type TopicSession } from "./features/replies/inbound"
 import { albumDeliveryIds, isLikelySlashCommand, parsePendingBatch, serializePendingBatch, stepUpdates } from "./features/tg-ctl/updates"
-import { ALBUM_QUIET_MS, albumWaitMs, dropProcessedAlbums, holdAlbumParts, parseHeldAlbums, serializeHeldAlbums, type HeldAlbum } from "./features/tg-ctl/album-buffer"
+import { ALBUM_QUIET_MS, albumWaitMs, dropProcessedAlbums, holdAlbumParts, parseHeldAlbums, serializeHeldAlbums, skipDeliveredAlbumItems, type HeldAlbum } from "./features/tg-ctl/album-buffer"
 import { mediaReceipt, type ReceivedFile } from "./features/tg-ctl/media-receipt"
 import {
   appendTopic,
@@ -11972,7 +11972,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // (tg-cli#357): actions carrying the same key still run strictly in enqueue order via
   // dispatchQueues below (preserving every existing double-tap/race guard); `null` means the
   // action touches no shared keyed state and is always safe to run fully concurrently.
-  const actionResourceKey = (action: Action): string | null => {
+  const actionResourceKey = (action: Action, dests: DeliveryDestinations): string | null => {
     switch (action.kind) {
       case "topic-route":
       case "topic-hold":
@@ -11993,7 +11993,68 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "limit-continue":
         return `pane:${action.paneId}`
       default:
-        return null
+        // A flat-chat delivery is keyed by the pane it lands in (tg-cli#280); anything else, null.
+        // Resolving it reads tmux, the routes file and the registry: a failure there costs only the
+        // ordering (the delivery resolves its own target when it runs), never the batch.
+        try {
+          return deliveryDispatchKey(action, dests)
+        } catch (err) {
+          log(`dispatch key for ${action.kind}: ${err instanceof Error ? err.message : String(err)} — unordered`)
+          return null
+        }
+    }
+  }
+
+  // Where this batch's flat-chat deliveries land, for their dispatch keys: resolved the way each
+  // delivery path resolves it (handleReplyRoute: the origin session where it is now, the origin
+  // pane while its session lives, a gone origin's live lineage parent; the /agent confident match;
+  // the selected agent then the auto-bind discovery), once per batch and only when asked. null =
+  // not known up front; deliveryDispatchKey then uses the default pane, where the paths fall back.
+  // A key only orders deliveries — each still resolves its own target when it runs — so the
+  // read-only registry snapshot is enough here.
+  const batchDestinations = (): DeliveryDestinations => {
+    const once = <T,>(f: () => T): (() => T) => {
+      let v: { value: T } | null = null
+      return () => (v ??= { value: f() }).value
+    }
+    const routes = once(() => parseRoutes(readFileOrNull(ctx.paths.routes)))
+    const candidates = once(listAgentCandidates)
+    const liveOmp = once(listLiveOmpAgents)
+    const defaultPane = once((): string | null => {
+      if (selectedAgentRoute) return selectedAgentRoute.paneId
+      const found = discoverForInject()
+      if (found.ok) return found.target.pane.paneId
+      if (found.reason !== "no-agent") return null
+      // injectViaTarget with no tmux agent: the sole candidate (an omp or a rig host outside
+      // tmux), else the CTO's last target among them.
+      const all = candidates()
+      if (all.length === 1) return all[0].paneId
+      return all.length > 1 ? (resolveLastUserTargetCandidate(ctx, all)?.paneId ?? null) : null
+    })
+    return {
+      replyPane: (id) => {
+        const route = recognizeRoute(routes(), id)
+        if (!route) return null
+        const reg = sessionRegistry
+        const key = reg ? (route.sessionKey ?? resolveRouteSession(reg, route)) : null
+        const target = reg && key !== null ? sessionDeliveryTarget(reg, key) : null
+        if (target?.kind === "live") {
+          const paneId = target.paneId ?? (target.pid !== null ? liveOmpPaneId(target.pid) : null)
+          if (paneId !== null) return paneId
+        }
+        // A session the registry knows is gone never keeps its old pane (it may host another now).
+        const gone = target?.kind === "gone" || (reg !== null && key === null && goneRouteSession(reg, route) !== null)
+        if (!gone && candidates().some((c) => c.paneId === route.paneId)) return route.paneId
+        const parent = route.parentPaneId === undefined ? null : lineageParentCandidate(route.parentPaneId, candidates(), liveOmp())
+        return parent?.paneId ?? null
+      },
+      agentPane: (selector) => {
+        // routePrewrappedAgentMessage / a bare `/agent` with one agent: delivered to it directly.
+        if (selector === null) return candidates().length === 1 ? candidates()[0].paneId : null
+        const m = matchWindows(selector, candidates())
+        return m.confident && m.matches.length > 0 ? m.matches[0].paneId : null
+      },
+      defaultPane,
     }
   }
 
@@ -12648,7 +12709,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // first, suppresses the second send.
       const isOwner = (m: TgMessage): boolean =>
         m.chat.id === ctx.chatId && m.from?.id !== undefined && (m.from.id === ctx.chatId || ctx.cfg.allowedSenders.includes(m.from.id))
-      const albumStep = holdAlbumParts(heldAlbums, authed, Date.now(), ALBUM_HOLD_MS, isOwner)
+      // An item the ledger shows already went out (delivered before a kill) is not stepped again.
+      const albumStep = skipDeliveredAlbumItems(
+        holdAlbumParts(heldAlbums, authed, Date.now(), ALBUM_HOLD_MS, isOwner),
+        (m) =>
+          deliveryLedger !== null &&
+          m.chat.id === deliveryLedger.chat &&
+          decideDelivery(deliveryLedger.state.messages.get(ledgerKey(deliveryLedger.chat, m.message_id))).kind === "suppress",
+      )
       heldAlbums = albumStep.held
       journalAlbums([...albumStep.held, ...albumStep.released])
       recordDelivery(
@@ -12833,12 +12901,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // one-after-another) is preserved because same-key groups (actionResourceKey) still run
       // through dispatchQueues in strict enqueue order. Groups with different keys (the common
       // case: different messages routed to different agents) run fully concurrently via
-      // Promise.allSettled, so one group's stuck action can never delay or fail any other.
+      // Promise.allSettled, so one group's stuck action can never delay or fail any other. A group
+      // is ordered on EVERY key its actions carry: the batch's button taps (no ack of their own)
+      // ride in the first message's group, and neither the tap's guard nor that message's
+      // delivery pane (tg-cli#280) may be dropped for the other.
       const actionGroups = groupActionsByAckBoundary(step.actions)
+      const dests = batchDestinations()
       await Promise.allSettled(
         actionGroups.map((group) => {
-          const key = group.reduce<string | null>((acc, a) => acc ?? actionResourceKey(a), null)
-          return dispatchQueues.run(key, async () => {
+          const keys = [...new Set(group.flatMap((a) => actionResourceKey(a, dests) ?? []))]
+          return dispatchQueues.run(keys, async () => {
             let ok = true
             for (const action of group) {
               try {
@@ -12856,7 +12928,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // (a dropped tg auth Start tap included — it is finished, not pending). Held album items
       // stay unprocessed; the album journal carries them.
       const authDropped = auth.drop.size > 0 ? received.filter((u) => auth.drop.has(u.update_id)) : []
-      recordDelivery([...updates, ...authDropped].map((u): LedgerEvent => ({ ts: Date.now(), event: "processed", update: u.update_id })))
+      recordDelivery(
+        [...updates, ...albumStep.skipped, ...authDropped].map((u): LedgerEvent => ({ ts: Date.now(), event: "processed", update: u.update_id })),
+      )
       journalAlbums(heldAlbums)
 
       // The batch fully completed — the journal is no longer needed. Best-effort:

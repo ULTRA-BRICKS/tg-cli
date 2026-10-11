@@ -20,6 +20,11 @@ semantic versioning.
   restored album a fresh hold window so items still queued at Telegram join it. An item over 20 MB
   is left out with the too-large reply; the rest still go. A topic hold written before this release
   (one media file in flat fields) still restores. A `tg auth` Start tap is never held as an album item.
+  A message that closes an album reaches the agent after it, never ahead of its slower download:
+  flat-chat deliveries that land in one pane (plain, a reply to any of its messages, `/agent`, a
+  caption) now run in the order they were sent. An item that joins a restored album whose other
+  items the previous run already delivered is delivered on its own — as an item arriving after its
+  album went out is — instead of being suppressed with them.
 
 ## 1.60.2
 

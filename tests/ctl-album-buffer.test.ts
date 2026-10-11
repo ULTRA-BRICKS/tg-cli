@@ -12,9 +12,12 @@ import {
   holdAlbumParts,
   parseHeldAlbums,
   serializeHeldAlbums,
+  skipDeliveredAlbumItems,
+  type AlbumStep,
   type HeldAlbum,
 } from '../features/tg-ctl/album-buffer';
-import type { TgMessage, TgUpdate } from '../features/tg-ctl/types';
+import { DEFAULT_CONTROL, type Action, type TgMessage, type TgUpdate } from '../features/tg-ctl/types';
+import { stepUpdates, type StepOpts } from '../features/tg-ctl/updates';
 
 const CHAT = 1000;
 
@@ -132,6 +135,63 @@ describe('albumWaitMs', () => {
     const held = [...holdAlbumParts([], [photo(10, 'g1')], 1_000).held, ...holdAlbumParts([], [photo(20, 'g2')], 1_300).held];
     expect(albumWaitMs(held, 1_200)).toBe(ALBUM_QUIET_MS - 200);
     expect(albumWaitMs(held, 1_000 + ALBUM_QUIET_MS + 50)).toBe(0);
+  });
+});
+
+describe('skipDeliveredAlbumItems', () => {
+  // A restored album whose items 10 and 11 the previous run delivered (a kill landed before
+  // `processed`); item 12 joined it after the restart.
+  const restored = (): AlbumStep =>
+    holdAlbumParts([{ chat: CHAT, groupId: 'g1', lastPartAtMs: 0, updates: [photo(10, 'g1'), photo(11, 'g1')] }], [photo(12, 'g1'), upd(13, { text: 'next' })], 100);
+  const delivered = (ids: number[]) => (m: TgMessage): boolean => ids.includes(m.message_id);
+
+  test('the items that already went out are skipped; the rest are released as the album', () => {
+    const r = skipDeliveredAlbumItems(restored(), delivered([10, 11]));
+    expect(ids(r.skipped)).toEqual([10, 11]);
+    expect(ids(r.ready)).toEqual([12, 13]);
+    expect(r.released.map((a) => ids(a.updates))).toEqual([[12]]);
+  });
+
+  test('an album that went out whole is not released again', () => {
+    const step = holdAlbumParts([{ chat: CHAT, groupId: 'g1', lastPartAtMs: 0, updates: [photo(10, 'g1'), photo(11, 'g1')] }], [upd(13, { text: 'next' })], 100);
+    const r = skipDeliveredAlbumItems(step, delivered([10, 11]));
+    expect(ids(r.skipped)).toEqual([10, 11]);
+    expect(ids(r.ready)).toEqual([13]);
+    expect(r.released).toEqual([]);
+  });
+
+  test('nothing delivered yet: the step is unchanged; held albums and non-album updates are never skipped', () => {
+    const step = restored();
+    expect(skipDeliveredAlbumItems(step, delivered([])).ready).toEqual(step.ready);
+    const held = holdAlbumParts([], [photo(20, 'g2'), upd(21, { text: 'x' }, 77)], 100);
+    const r = skipDeliveredAlbumItems(held, delivered([20, 21]));
+    expect(r.skipped).toEqual([]);
+    expect(r.held).toEqual(held.held);
+    expect(ids(r.ready)).toEqual([21]);
+  });
+
+  // The undelivered items are routed as an item that arrives after its album was released is —
+  // by their own captions and replies, never by text a delivered item already carried.
+  const STEP_OPTS: StepOpts = { cfg: DEFAULT_CONTROL, chatId: CHAT, nowSec: 1, currentOffset: 0, wrap: (_n, s) => s };
+  const mediaAction = (us: TgUpdate[]): Extract<Action, { kind: 'download-media' }> | undefined =>
+    stepUpdates(us, STEP_OPTS).actions.find((a): a is Extract<Action, { kind: 'download-media' }> => a.kind === 'download-media');
+  const restoredWith = (lead: Partial<TgMessage>, next: Partial<TgMessage> = {}): AlbumStep =>
+    holdAlbumParts([{ chat: CHAT, groupId: 'g1', lastPartAtMs: 0, updates: [photo(10, 'g1', lead)] }], [photo(11, 'g1', next), upd(12, { text: 'next' })], 100);
+
+  test('the undelivered items go out under the first of them, with their own caption only', () => {
+    const r = skipDeliveredAlbumItems(restoredWith({ caption: '/agent worker look at these' }, { caption: 'and this' }), delivered([10]));
+    const action = mediaAction(r.ready);
+    expect(action?.messageId).toBe(11);
+    expect(action?.files.map((f) => f.fileId)).toEqual(['p11']);
+    expect(action?.caption).toBe('and this');
+    expect(action?.agentRoute).toBeUndefined();
+  });
+
+  test('the same as when the item arrives after its album was released', () => {
+    const reply_to_message: TgMessage = { message_id: 600, chat: { id: CHAT }, date: 1, text: 'the agent asked' };
+    const late = photo(11, 'g1', { caption: '/agent beta see', reply_to_message });
+    const r = skipDeliveredAlbumItems(restoredWith({ caption: 'ordinary caption' }, { caption: '/agent beta see', reply_to_message }), delivered([10]));
+    expect(mediaAction(r.ready)).toEqual(mediaAction(holdAlbumParts([], [late, upd(12, { text: 'next' })], 100).ready));
   });
 });
 

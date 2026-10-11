@@ -203,7 +203,30 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
     album's first id. An item Telegram
     redelivers (or the pending-batch journal replays) is merged by `update_id`, never
     held twice. An item that arrives after its album was already released is delivered
-    on its own, under its own id.
+    on its own, under its own id. On release, the items the ledger shows already went
+    out (a kill after the send, before `processed`) are recorded `processed` and not
+    stepped; the rest go out as their own album, keyed by the first of them and routed
+    by their own captions and replies — what an item that arrives after its album was
+    released gets, which is what they are — so an item that joined a restored album
+    after the restart is never suppressed with them.
+  - **Order.** The flat-chat delivery actions (`inject-text`, `download-media`,
+    `transcribe-voice`, `reply-route`, `agent-route`) carry a dispatch key naming the
+    pane they land in (`deliveryDispatchKey`, concurrent-dispatch.ts) — the selected or
+    auto-bound default pane; the pane a replied-to message's session is in now, else its
+    origin pane while its session lives, else a gone origin's live lineage parent; the
+    pane an `/agent` selector confidently matches (a bare `/agent` with one live agent:
+    that agent). A reply or `/agent` whose pane cannot be told up front takes the default
+    pane's key, where those paths fall back (the CTO's last target for a gone agent, the
+    sole agent for an unknown reply) — so deliveries to one agent run in the
+    order sent: the message that closes an album reaches the agent after the album,
+    however slow its download. Deliveries to different agents stay concurrent
+    (tg-cli#357). One message's action group is ordered on every key its actions carry
+    (a same-batch button tap's guard and the delivery's pane alike), and a key is
+    forgotten once its last queued work finished. Keys are resolved once per batch,
+    before anything runs: a key only orders, never routes (each delivery resolves its
+    own target when it runs), so a fallback the snapshot cannot foresee — a last-user
+    anchor moved by an earlier delivery of the same batch — goes unordered, and a
+    failure resolving a key leaves that delivery unordered, never the batch undelivered.
 - **No-agent guard:** inbound arrives but no live agent session is found → reply
   in TG with ONE harness-neutral line: "No live agent found → not delivered. Start
   Claude Code / Codex in a tmux window or under the rig wrapper (`rig harness run

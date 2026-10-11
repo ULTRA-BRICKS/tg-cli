@@ -85,6 +85,29 @@ export function albumWaitMs(held: HeldAlbum[], nowMs: number, quietMs = ALBUM_QU
   return Math.max(0, Math.min(...held.map((a) => a.lastPartAtMs + quietMs - nowMs)));
 }
 
+// A released album can hold items an earlier run already delivered — restored from the journal
+// after a kill that landed after the send, before `processed`, then joined by an item that came
+// after the restart. Those items are not stepped again, and they must not stand for the album:
+// keyed by its delivered lead, the whole album would be suppressed as a duplicate and the new
+// item never reach the agent. The undelivered items go out as their own album, keyed by the
+// first of them and routed by their own captions and replies — exactly what an item that
+// arrives after its album was released gets, which is what they are: the album went out before
+// the kill. `skipped`: the delivered items, finished — the daemon marks them processed.
+export function skipDeliveredAlbumItems(step: AlbumStep, delivered: (m: TgMessage) => boolean): AlbumStep & { skipped: TgUpdate[] } {
+  const skipped = step.released.flatMap((a) => a.updates.filter((u) => u.message !== undefined && delivered(u.message)));
+  if (skipped.length === 0) return { ...step, skipped };
+  const skip = new Set(skipped.map((u) => u.update_id));
+  return {
+    held: step.held,
+    released: step.released.flatMap((a) => {
+      const updates = a.updates.filter((u) => !skip.has(u.update_id));
+      return updates.length > 0 ? [{ ...a, updates }] : [];
+    }),
+    ready: step.ready.filter((u) => !skip.has(u.update_id)),
+    skipped,
+  };
+}
+
 // At startup: an album whose every update the ledger already recorded `processed` was fully
 // handled before the restart (a kill landed before its journal entry was removed).
 export function dropProcessedAlbums(held: HeldAlbum[], processedUpdates: ReadonlySet<number>): HeldAlbum[] {

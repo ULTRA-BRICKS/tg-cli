@@ -4,8 +4,11 @@ import {
   TargetTimeoutError,
   withTargetTimeout,
   dispatchConcurrently,
+  deliveryDispatchKey,
   groupActionsByAckBoundary,
+  type DeliveryDestinations,
 } from '../features/tg-ctl/concurrent-dispatch';
+import type { Action } from '../features/tg-ctl/types';
 
 function neverResolves<T>(): Promise<T> {
   return new Promise(() => {});
@@ -166,4 +169,99 @@ test('groupActionsByAckBoundary keeps a trailing run with no ack as its own fina
 
 test('groupActionsByAckBoundary returns an empty array for an empty batch', () => {
   expect(groupActionsByAckBoundary([])).toEqual([]);
+});
+
+// One message's actions run as one group, and a group can touch several keys at once — a button
+// tap's `req:` guard ahead of a delivery's `dest:` pane (tg-cli#280). It is ordered on every one.
+test('TargetDispatchQueues: work under several keys waits for, and holds back, each of them', async () => {
+  const queues = new TargetDispatchQueues();
+  const seen: string[] = [];
+  let releaseSlow: () => void = () => {};
+  const slow = queues.run('dest:%1', () => new Promise<void>((r) => (releaseSlow = r)).then(() => void seen.push('album')));
+  const both = queues.run(['req:x', 'dest:%1'], async () => void seen.push('tap+text'));
+  const req = queues.run('req:x', async () => void seen.push('next tap'));
+  const other = queues.run('dest:%2', async () => void seen.push('other pane'));
+  await other;
+  expect(seen).toEqual(['other pane']);
+  releaseSlow();
+  await Promise.all([slow, both, req]);
+  expect(seen).toEqual(['other pane', 'album', 'tap+text', 'next tap']);
+  expect(await queues.run([], async () => 7)).toBe(7);
+});
+
+// Keys name one-off request ids and tokens, so a long-lived daemon must not keep one per key forever.
+test('TargetDispatchQueues: a key whose work all finished is forgotten; one still queued is kept', async () => {
+  const queues = new TargetDispatchQueues();
+  let release: () => void = () => {};
+  const first = queues.run(['dest:reply:1', 'dest:%1'], () => new Promise<void>((r) => (release = r)));
+  const second = queues.run('dest:%1', async () => {});
+  await queues.run('dest:agent:typo', async () => {});
+  expect(queues.size).toBe(2);
+  release();
+  await Promise.all([first, second]);
+  expect(queues.size).toBe(0);
+});
+
+// --- deliveryDispatchKey: deliveries to one destination share a key (tg-cli#280) ---
+
+// Pane %1 is the default, the origin of replied-to messages 100 and 101, and agent `alpha`;
+// pane %2 is the origin of 200 and agent `beta`. Message 300 and agent `gamma` resolve to none.
+const DESTS: DeliveryDestinations = {
+  replyPane: (id) => (id === 100 || id === 101 ? '%1' : id === 200 ? '%2' : null),
+  agentPane: (selector) => (selector === 'alpha' ? '%1' : selector === 'beta' ? '%2' : null),
+  defaultPane: () => '%1',
+};
+const media = (extra: Partial<Extract<Action, { kind: 'download-media' }>> = {}): Action => ({
+  kind: 'download-media',
+  files: [{ fileId: 'f', suggestedName: '1.jpg', mediaKind: 'photo' }],
+  from: 'Alex',
+  messageId: 1,
+  ...extra,
+});
+
+test('deliveryDispatchKey: every way of reaching one pane — default, reply, /agent, media, voice — shares its key', () => {
+  const keys = [
+    deliveryDispatchKey({ kind: 'inject-text', text: 'x', messageId: 2 }, DESTS),
+    deliveryDispatchKey({ kind: 'reply-route', replyToMessageId: 100, injectText: 'x', from: 'Alex', messageId: 3 }, DESTS),
+    deliveryDispatchKey({ kind: 'reply-route', replyToMessageId: 101, injectText: 'x', from: 'Alex', messageId: 4 }, DESTS),
+    deliveryDispatchKey({ kind: 'agent-route', selector: 'alpha', rest: 'x', all: 'alpha x', from: 'Alex', messageId: 5 }, DESTS),
+    deliveryDispatchKey(media(), DESTS),
+    deliveryDispatchKey(media({ replyToMessageId: 101 }), DESTS),
+    deliveryDispatchKey(media({ agentRoute: { selector: 'alpha', rest: '', all: 'alpha' } }), DESTS),
+    deliveryDispatchKey({ kind: 'transcribe-voice', fileId: 'v', suggestedName: '6.ogg', from: 'Alex', messageId: 6 }, DESTS),
+    deliveryDispatchKey({ kind: 'transcribe-voice', fileId: 'v', suggestedName: '7.ogg', from: 'Alex', messageId: 7, replyToMessageId: 100 }, DESTS),
+  ];
+  expect(new Set(keys)).toEqual(new Set(['dest:%1']));
+});
+
+test('deliveryDispatchKey: another pane gets another key; a reply or /agent whose pane is unknown takes the default pane, where the delivery paths fall back', () => {
+  expect(deliveryDispatchKey({ kind: 'reply-route', replyToMessageId: 200, injectText: 'x', from: 'Alex', messageId: 3 }, DESTS)).toBe('dest:%2');
+  expect(deliveryDispatchKey(media({ agentRoute: { selector: 'beta', rest: '', all: 'beta' } }), DESTS)).toBe('dest:%2');
+  // e.g. `/agent gone-worker` lands in the CTO's last target; an unknown reply with one agent, in it.
+  expect(deliveryDispatchKey(media({ replyToMessageId: 300 }), DESTS)).toBe('dest:%1');
+  expect(deliveryDispatchKey({ kind: 'agent-route', selector: 'gamma', rest: '', all: 'gamma', from: 'Alex', messageId: 5 }, DESTS)).toBe('dest:%1');
+  const noDefault: DeliveryDestinations = { ...DESTS, defaultPane: () => null };
+  expect(deliveryDispatchKey({ kind: 'inject-text', text: 'x', messageId: 2 }, noDefault)).toBe('dest:default');
+  expect(deliveryDispatchKey(media({ replyToMessageId: 300 }), noDefault)).toBe('dest:default');
+});
+
+test('deliveryDispatchKey: a bare /agent goes by the sole agent it reaches, else (the picker) carries no key; a non-delivery action carries none', () => {
+  const sole: DeliveryDestinations = { ...DESTS, agentPane: (selector) => (selector === null ? '%1' : null) };
+  expect(deliveryDispatchKey(media({ agentRoute: { selector: null, rest: '', all: '' } }), sole)).toBe('dest:%1');
+  expect(deliveryDispatchKey({ kind: 'agent-route', selector: null, rest: '', all: '', from: 'Alex', messageId: 5 }, DESTS)).toBeNull();
+  expect(deliveryDispatchKey(media({ agentRoute: { selector: null, rest: '', all: '' } }), DESTS)).toBeNull();
+  expect(deliveryDispatchKey({ kind: 'reply', text: 'x' }, DESTS)).toBeNull();
+  expect(deliveryDispatchKey({ kind: 'ack', messageId: 1 }, DESTS)).toBeNull();
+});
+
+test('deliveryDispatchKey: destinations are resolved only for the actions that need them', () => {
+  const calls: string[] = [];
+  const spy: DeliveryDestinations = {
+    replyPane: (id) => (calls.push(`reply:${id}`), null),
+    agentPane: (s) => (calls.push(`agent:${s}`), null),
+    defaultPane: () => (calls.push('default'), null),
+  };
+  deliveryDispatchKey({ kind: 'ack', messageId: 1 }, spy);
+  deliveryDispatchKey(media({ replyToMessageId: 300 }), spy);
+  expect(calls).toEqual(['reply:300', 'default']);
 });
