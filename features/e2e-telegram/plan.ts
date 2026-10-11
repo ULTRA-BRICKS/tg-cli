@@ -1,7 +1,9 @@
 // Live Telegram e2e harness (tg-cli#468) — PURE planning: run tokens, fixture
 // selectors that cannot resonate into a real session, the fixture agents'
-// instructions, spoken-number matching for the voice scenario, the
-// last-user-target restore decision, and the `claude auth status` reading. All I/O lives in scripts/e2e-telegram.ts.
+// instructions, which fixtures this machine can run and which text-to-speech
+// engine makes the voice note (tg-cli#563), spoken-number matching for the voice
+// scenario, the last-user-target restore decision, and the `claude auth status`
+// reading. All I/O lives in scripts/e2e-telegram.ts.
 //
 // Why selectors are checked against the live window names: `/agent <sel>`
 // matches tmux window names FUZZILY (prefix / substring / edit distance, see
@@ -19,6 +21,114 @@ export const DEFAULT_FIXTURES: readonly FixtureKind[] = ['omp', 'cc', 'omp-notmu
 
 export function isFixtureKind(value: string): value is FixtureKind {
   return FIXTURE_KINDS.some((kind) => kind === value);
+}
+
+// The binaries a fixture kind needs beyond the harness's own (tmux, tg, tg-ctl).
+const FIXTURE_BINARIES: Record<FixtureKind, readonly string[]> = {
+  omp: ['omp'],
+  'omp-notmux': ['omp', 'abduco'],
+  cc: ['claude'],
+  codex: ['codex'],
+};
+
+export interface FixtureSkip {
+  kind: FixtureKind;
+  reason: string;
+}
+
+export interface FixtureAvailability {
+  run: FixtureKind[];
+  skipped: FixtureSkip[];
+  // Set when the run must not start: a --require'd fixture lacks a binary, or nothing can run.
+  error: string | null;
+}
+
+// Which selected fixtures this machine can run. A missing harness binary skips only
+// that fixture (the runner reports it as a skip row) unless the operator passed
+// `--require <kind>`, which also adds the kind to the run when --fixtures lacked it.
+export function resolveFixtures(
+  selected: readonly FixtureKind[],
+  required: readonly FixtureKind[],
+  has: (bin: string) => boolean,
+): FixtureAvailability {
+  const kinds = [...selected, ...required.filter((kind) => !selected.includes(kind))];
+  const run: FixtureKind[] = [];
+  const skipped: FixtureSkip[] = [];
+  const absent: string[] = [];
+  const fatal: string[] = [];
+  for (const kind of kinds) {
+    const missing = FIXTURE_BINARIES[kind].filter((bin) => !has(bin)).join(', ');
+    if (!missing) run.push(kind);
+    else if (required.includes(kind)) fatal.push(`${missing} (--require ${kind})`);
+    else {
+      skipped.push({ kind, reason: `${missing} not installed (pass --require ${kind} to make this fatal)` });
+      absent.push(`${kind}: ${missing} not installed`);
+    }
+  }
+  const error = fatal.length
+    ? `missing required binaries: ${fatal.join('; ')}`
+    : run.length
+      ? null
+      : `no runnable fixture: ${absent.join('; ')}`;
+  return { run, skipped, error };
+}
+
+// ---- voice note text-to-speech (tg-cli#563) ----------------------------------
+
+export type VoiceEngine = 'say' | 'espeak-ng' | 'espeak' | 'piper' | 'ffmpeg-flite';
+
+export interface VoiceEnv {
+  platform: string; // process.platform
+  has(bin: string): boolean;
+  ffmpegFilters(): string; // `ffmpeg -hide_banner -filters` output; read only when the flite fallback is reached
+  piperModel?: string; // TG_E2E_PIPER_MODEL: piper speaks nothing without a voice model
+}
+
+export type VoicePlan =
+  | { engine: VoiceEngine; synth: { cmd: string[]; stdin?: string }; encode: string[]; ogg: string }
+  | { engine: null; reason: string };
+
+export const NO_TTS_REASON =
+  'no text-to-speech engine: install espeak-ng (brew install espeak-ng / apt install espeak-ng), espeak, ' +
+  'piper with TG_E2E_PIPER_MODEL=<voice.onnx>, or an ffmpeg built with libflite (macOS: say). ' +
+  'A generated tone is not used: the scenario checks that Whisper heard the spoken number';
+
+export function ffmpegHasFlite(filters: string): boolean {
+  return /^\s*\S+\s+flite\s/m.test(filters);
+}
+
+// How to make the voice note for `phrase` at `<base>.ogg` (Opus, as Telegram records
+// it): say on macOS, else espeak-ng / espeak / piper, else ffmpeg's own flite filter.
+// Without any of them the voice scenario is skipped with the reason, never failed.
+export function planVoice(env: VoiceEnv, phrase: string, base: string): VoicePlan {
+  if (!env.has('ffmpeg')) return { engine: null, reason: 'ffmpeg not installed (it encodes the voice note to Opus)' };
+  const wav = `${base}.wav`;
+  const espeak = (['espeak-ng', 'espeak'] as const).find((bin) => env.has(bin));
+  let engine: VoiceEngine;
+  let synth: { cmd: string[]; stdin?: string };
+  let source = wav;
+  if (env.platform === 'darwin' && env.has('say')) {
+    engine = 'say';
+    source = `${base}.aiff`;
+    synth = { cmd: ['say', '-o', source, phrase] };
+  } else if (espeak) {
+    engine = espeak;
+    synth = { cmd: [espeak, '-w', wav, phrase] };
+  } else if (env.has('piper') && env.piperModel) {
+    engine = 'piper';
+    synth = { cmd: ['piper', '--model', env.piperModel, '--output_file', wav], stdin: phrase };
+  } else if (ffmpegHasFlite(env.ffmpegFilters())) {
+    engine = 'ffmpeg-flite';
+    // The text sits inside ffmpeg's filtergraph quoting, where ' : , [ ] \ are syntax;
+    // only the spoken words matter, so everything else becomes a space.
+    const text = phrase.replace(/[^A-Za-z0-9 .]/g, ' ');
+    synth = { cmd: ['ffmpeg', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', `flite=text='${text}'`, wav] };
+  } else {
+    return { engine: null, reason: NO_TTS_REASON };
+  }
+  const ogg = `${base}.ogg`;
+  const encode = ['ffmpeg', '-loglevel', 'error', '-y', '-i', source, '-ac', '1', '-ar', '48000', '-c:a', 'libopus', '-b:a', '32k', ogg];
+  return { engine, synth, encode, ogg };
 }
 
 export interface FixtureSpec {

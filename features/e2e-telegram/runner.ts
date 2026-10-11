@@ -18,6 +18,7 @@ import {
   scenarioToken,
   transcriptHasNumber,
   type FixtureKind,
+  type FixtureSkip,
   type FixtureSpec,
 } from './plan';
 
@@ -77,7 +78,7 @@ export interface RunDeps {
   chat: ChatClient;
   host: FixtureHost;
   anchor: AnchorStore;
-  voiceFile(n: number): Promise<string>;
+  voiceFile(): Promise<string>; // the voice note saying RunOptions.voiceNumber
   now(): number; // ms
   sleep(ms: number): Promise<void>;
   log(line: string): void;
@@ -92,6 +93,10 @@ export interface RunOptions {
   botTimeoutSec: number; // the daemon's own reply / card edit
   deliveryTimeoutSec: number;
   screenshotPath?: string;
+  // Fixtures preflight could not run (a missing harness binary): reported as skip rows.
+  skippedFixtures?: FixtureSkip[];
+  // Set when the machine has no text-to-speech engine: the voice note is skipped with it.
+  voiceSkipReason?: string;
 }
 
 export type ScenarioStatus = 'pass' | 'fail' | 'skip';
@@ -176,6 +181,10 @@ export async function runE2E(deps: RunDeps, opts: RunOptions): Promise<RunReport
 
   try {
     const startId = await chat.open();
+    for (const s of opts.skippedFixtures ?? []) {
+      scenarios.push({ name: `start:${s.kind}`, status: 'skip', detail: s.reason, evidence: {} });
+      deps.log(`– start:${s.kind}: ${s.reason}`);
+    }
     for (const spec of opts.fixtures) {
       await record(`start:${spec.kind}`, async () => {
         const f = await host.start(spec);
@@ -257,8 +266,9 @@ export async function runE2E(deps: RunDeps, opts: RunOptions): Promise<RunReport
 
     // Voice/audio note → local Whisper → transcript routed into the session.
     await record('voice-note', async () => {
+      if (opts.voiceSkipReason) throw new Skip(opts.voiceSkipReason);
       const [f, replyTo] = fixture('omp', 'cc', 'omp-notmux', 'codex');
-      const file = await deps.voiceFile(opts.voiceNumber);
+      const file = await deps.voiceFile();
       const sent = await chat.replyWithFile(replyTo.id, file);
       const confirmation = await chat.wait({ after: sent.id, contains: '🎤', from: 'peer', timeoutSec: opts.agentTimeoutSec });
       if (!transcriptHasNumber(confirmation.text, opts.voiceNumber)) {
