@@ -1,8 +1,10 @@
 # Plan — msgref quoted previews: `tg#<id>` becomes a hyperlinked quote of the referenced message
 
-Status: PLAN (no implementation). Implementation ticket: #116 (carries the originating ask,
-tg#5663). Builds on the shipped `autolink-msgrefs` feature — read
-`docs/specs/autolink-msgrefs.md` first; this plan only extends its rendering.
+Status: IMPLEMENTED by tg-cli#116 — `docs/specs/autolink-msgrefs.md` §Quoted previews is the
+authoritative description now; this plan stays as the design record (carries the originating
+ask, tg#5663). Differences from the plan: the renderer lives in `render.ts` next to the plain
+marker (`preview.ts` holds the text shaping), and the length budget is option 1 by
+construction — the whole body is one text message until the transmitter splits it.
 
 ## Problem
 

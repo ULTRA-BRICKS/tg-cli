@@ -1,12 +1,7 @@
 import { expect, test } from 'bun:test';
 import { detectMsgRefs, findMsgRefMatches } from '../features/autolink-msgrefs/detect';
-import {
-  buildMsgRefEntries,
-  detectLinkableMsgRefs,
-  linkifyMsgRefs,
-  msgRefUrl,
-  MSGREF_EXCERPT_MAX,
-} from '../features/autolink-msgrefs/render';
+import { buildMsgRefEntries, detectLinkableMsgRefs, linkifyMsgRefs, msgRefUrl } from '../features/autolink-msgrefs/render';
+import { MSGREF_EXCERPT_MAX } from '../features/autolink-msgrefs/preview';
 import { applyAutolink } from '../features/autolink-tasks/render';
 import { detectRefs } from '../features/autolink-prs/detect';
 import { linkifyRefs } from '../features/autolink-prs/render';

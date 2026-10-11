@@ -3,6 +3,26 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.59.0
+
+- **A `tg#<id>` in an outbound message now quotes the message it points at (#116).** The CTO asked
+  (tg#5663) that a ref read as the beginning of that message, not as an opaque id: in the private DM
+  the styled `𝒕𝒈#5663` could not even be tapped. When the id is in this machine's
+  `tg-ctl.<bot>.history.jsonl` (same chat scoping as the excerpt block), the ref becomes
+  `«first 48 chars of that message…» (𝒕𝒈#5663)`; in a supergroup the quote is the `t.me/c` link and
+  the marker stays plain beside it. DMs get no link: `tg://openmessage` works only on Android and
+  opens the chat, not the message. The preview counts grapheme clusters (no half emoji, no lone
+  surrogate), collapses whitespace, is HTML-escaped, and quotes each id once, at its first mention.
+  At most 8 ids per message are quoted; the rest keep the marker and their bottom excerpt entry, and a
+  quoted id leaves the excerpt block. An id the history does not have renders exactly as before.
+  The `tg#` pass now runs after the ticket/`#N` linkifiers, so a quote containing `#42` or `HYP-100`
+  gains no links. The substitution happens before the transmitter, so a body that a preview pushes
+  past 4096 is split rather than rejected. Works in both the basic and the rich tier. New feature
+  `autolink-msgref-preview`, ON by default; `--no-feature autolink-msgref-preview` restores the old
+  output (plain markers plus the excerpt block). One change applies with the flag off too: when the
+  history holds two rows for one id in the same chat, the first-written row is quoted (was: the last),
+  and the bottom excerpt is cut by grapheme cluster too (it used to split a ZWJ emoji at its cut).
+
 ## 1.58.2
 
 - **The live Telegram e2e runs on Linux (#563).** `bun scripts/e2e-telegram.ts` always required

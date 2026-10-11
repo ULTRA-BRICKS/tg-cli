@@ -114,12 +114,17 @@ export interface AutolinkExtras {
   // Defaults to the legacy single-code linkifyCodes so existing callers are
   // unchanged. Receives the rendered body, returns it with tickets linked.
   linkifyTickets?: (html: string) => string;
+  // Final body pass, after every linkify above and BEFORE the reference blocks are
+  // appended: what it inserts (autolink-msgrefs' quoted previews — arbitrary user
+  // text) is never re-scanned by the ticket/#N passes, and the blocks are never
+  // rewritten by it. Runs even when there are no tickets/issues/PRs.
+  linkifyLast?: (html: string) => string;
 }
 
 /**
  * Full autolink transform of a rendered message body:
  *   1. linkify every verified code in place (and any sibling refs via
- *      `extras.linkify`);
+ *      `extras.linkify`), then the `extras.linkifyLast` pass;
  *   2. one ticket and no sibling issues → its (escaped) title on the first line:
  *      appended after the emoji/[window] prefix when one exists, otherwise as
  *      its own first line;
@@ -138,11 +143,14 @@ export function applyAutolink(
 ): string {
   const issues = extras.issues ?? [];
   const prs = extras.prs ?? [];
-  if (tickets.length === 0 && issues.length === 0 && prs.length === 0) return body;
+  if (tickets.length === 0 && issues.length === 0 && prs.length === 0) {
+    return extras.linkifyLast ? extras.linkifyLast(body) : body;
+  }
 
   const ticketMap = new Map(tickets.map((t) => [t.code, t]));
   let out = (extras.linkifyTickets ?? ((h: string) => linkifyCodes(h, ticketMap)))(body);
   if (extras.linkify) out = extras.linkify(out);
+  if (extras.linkifyLast) out = extras.linkifyLast(out);
 
   // A single ticket with no sibling issues keeps the first-line title behavior.
   // Any issue forces the block form (issues never ride the first line).

@@ -25,6 +25,10 @@ export const DEFAULT_FEATURES: FeatureMap = {
   // the inbound inject wrap renders) — distinct from a GitHub `#<id>`. Pure
   // text + an optional t.me deep link; no CLI spawn, so default-ON is free.
   'autolink-msgrefs': true,
+  // autolink-msgref-preview quotes a referenced message inline — «beginning…» (tg#<id>)
+  // — when it is in the local history (tg-cli#116). Needs autolink-msgrefs; off →
+  // the plain marker plus the bottom excerpt block (docs/specs/autolink-msgrefs.md).
+  'autolink-msgref-preview': true,
   'md-as-pdf': true,
   // code-as-pdf renders attached code/config files (.ts, .json, .yaml, …) to a
   // mobile, syntax-highlighted PDF; by default ONLY the PDF is sent (the raw

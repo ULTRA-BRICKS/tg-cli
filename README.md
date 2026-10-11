@@ -183,6 +183,8 @@ Alex keeps a machine-readable dictionary of banned words with their replacements
 
 Both features are ON by default. Both cache verdicts for 1 hour. Both degrade gracefully to plain text if the CLI is missing or not authenticated.
 
+**Telegram message refs** (`tg#5663` style — the id the inbound wrap shows) — never mistaken for a GitHub `#N`. When the referenced message is in this machine's `tg replies` history, the ref is quoted inline: `«first 48 chars of that message…» (𝒕𝒈#5663)`; in a supergroup the quote links to the message (`t.me/c/…`). A private DM gets no link — Telegram has no per-message link that works there on Desktop, macOS or iOS. Up to 8 refs per message are quoted; the rest, and every ref with `--no-feature autolink-msgref-preview`, keep the marker plus a collapsed excerpt block at the bottom. An id this machine never saw (another machine, trimmed history) stays a bare marker. Disable all of it: `--no-feature autolink-msgrefs`.
+
 ---
 
 ## Inbound — you reply from your phone

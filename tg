@@ -47,7 +47,7 @@ import { detectRefsExpanded } from "./features/autolink-prs/detect"
 import { probeRefsInRepo, probeRepo, type GhRef } from "./features/autolink-prs/resolve"
 import { buildEntries, linkifyRefsCompound } from "./features/autolink-prs/render"
 import { detectMsgRefs } from "./features/autolink-msgrefs/detect"
-import { buildMsgRefEntries, detectLinkableMsgRefs, linkifyMsgRefs, msgRefUrl } from "./features/autolink-msgrefs/render"
+import { detectLinkableMsgRefs, linkifyMsgRefs, msgRefUrl, resolveMsgRefs } from "./features/autolink-msgrefs/render"
 import {
   markHint,
   parseHintState,
@@ -64,7 +64,7 @@ import {
   serializeRoutes,
   withRoutesLock,
 } from "./features/tg-ctl/routes"
-import { parseHistory, threadOfMessageInBlob } from "./features/replies/history"
+import { type HistoryRecord, parseHistory, threadOfMessageInBlob } from "./features/replies/history"
 import { appendHistoryFile } from "./features/replies/history-file"
 import { callerSessionKey, parseRegistry } from "./features/tg-ctl/session-registry-store"
 import type { Registry } from "./features/tg-ctl/session-registry"
@@ -308,6 +308,11 @@ Message refs (feature, ON by default — toggle with --feature/--no-feature):
   issue/PR. In a supergroup it becomes a t.me link; in a private DM it is
   marked but unlinked (no public per-message URL exists). Disable with
   --no-feature autolink-msgrefs or features.autolink-msgrefs: false.
+  When the referenced message is in this machine's history, the ref is quoted
+  inline instead: «first 48 chars of that message…» (tg#1234) — in a
+  supergroup the quote is the t.me link. Up to 8 refs per message; the rest
+  keep the marker plus a collapsed excerpt block at the bottom. Disable with
+  --no-feature autolink-msgref-preview.
 
 Markdown as PDF (feature, ON by default — toggle with --feature/--no-feature):
   Attached .md/.markdown files are converted to PDF before sending (pandoc +
@@ -1724,28 +1729,24 @@ if (import.meta.main) {
 
   // --- autolink-msgrefs: detect `tg#<id>` inbound-message references (tg#28).
   // These are the convention the inbound inject wrap renders, distinct from a
-  // GitHub `#<id>`. PURE text detection — no CLI spawn — and the linkify runs
-  // FIRST in the transform below (before the #N PR pass), so a `tg#3715` is
-  // recognized as a message ref and never mis-resolved as issue/PR #3715. The
-  // deep link only materializes for a supergroup chat; in a private DM the ref
-  // is marked but unlinked (no public per-message URL exists there).
+  // GitHub `#<id>`. PURE text detection — no CLI spawn. The deep link only
+  // materializes for a supergroup chat; in a private DM the ref is marked but
+  // unlinked (no public per-message URL exists there). A ref whose message is in
+  // the local history is quoted inline instead (`autolink-msgref-preview`,
+  // tg-cli#116); the rest get a bottom excerpt entry when the history has them.
   const rawMsgRefIds =
     features["autolink-msgrefs"] !== false && caption ? detectMsgRefs(caption) : []
-  const buildMsgRefEntriesFor = (ids: number[]) => {
+  const msgRefPreviewOn = features["autolink-msgref-preview"] !== false
+  // Read only when the body has a linkable ref, so a ref-less send never parses the
+  // ~5000-line log. Missing/corrupt history → no previews, no excerpts.
+  const readMsgRefHistory = (ids: number[]): HistoryRecord[] => {
     if (ids.length === 0) return []
     const historyPath = ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).history
-    let historyRaw: string
     try {
-      historyRaw = readFileSync(historyPath, "utf8")
+      return parseHistory(readFileSync(historyPath, "utf8"))
     } catch {
       return []
     }
-    return buildMsgRefEntries(
-      parseHistory(historyRaw),
-      ids,
-      (id) => msgRefUrl(currentChatId, id),
-      currentChatId,
-    )
   }
   const hasMsgRefs = rawMsgRefIds.length > 0
   const hasAutolink = hasTickets || hasRefs || hasMsgRefs
@@ -2096,14 +2097,21 @@ if (import.meta.main) {
   // renderText, so the body is already escaped/rendered HTML here.
   if (hasAutolink && plan.textMessages.length > 0) {
     const { issues, prs } = buildEntries(autolinkRefs, autolinkRefOrder)
-    // tg#28: linkify `tg#<id>` message refs FIRST so the resulting <a>/styled
-    // span is what the ticket/#N passes then walk over (they skip inside <a>),
-    // and a `tg#3715` is never even offered to the PR resolver. Deep link only
-    // when the chat is a supergroup; otherwise the ref is marked but unlinked.
-    let body = plan.textMessages[0].text
+    // tg#28 / tg-cli#116: the `tg#<id>` pass runs LAST over the body (linkifyLast),
+    // after the ticket/#N passes — a quoted preview is arbitrary user text and must
+    // never be linkified by them. They leave a raw `tg#3715` alone (their boundary
+    // rule rejects the `g` before `#`), so it is never offered to the PR resolver.
+    // A previewed id leaves the bottom excerpt block; the others keep their entry.
+    const body = plan.textMessages[0].text
+    const msgRefUrlFor = (id: number) => msgRefUrl(currentChatId, id)
     const linkableMsgRefIds = hasMsgRefs ? detectLinkableMsgRefs(body) : []
-    const msgRefEntries = buildMsgRefEntriesFor(linkableMsgRefIds)
-    if (hasMsgRefs) body = linkifyMsgRefs(body, (id) => msgRefUrl(currentChatId, id))
+    const msgRefs = resolveMsgRefs(
+      readMsgRefHistory(linkableMsgRefIds),
+      linkableMsgRefIds,
+      msgRefUrlFor,
+      currentChatId,
+      msgRefPreviewOn,
+    )
     plan.textMessages[0] = {
       text: applyAutolink(body, autolinkTickets, prefix.present, {
         linkifyTickets: hasTickets
@@ -2111,7 +2119,8 @@ if (import.meta.main) {
               linkifyTicketsCompound(html, new Map(autolinkTickets.map((t) => [t.code, t])))
           : undefined,
         linkify: hasRefs ? (html: string): string => linkifyRefsCompound(html, autolinkRefs) : undefined,
-        issues: [...msgRefEntries, ...issues],
+        linkifyLast: hasMsgRefs ? (html: string): string => linkifyMsgRefs(html, msgRefUrlFor, msgRefs.previews) : undefined,
+        issues: [...msgRefs.entries, ...issues],
         prs,
         styleTitle: styleTaskTitle,
       }),
