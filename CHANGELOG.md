@@ -3,6 +3,13 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.58.1
+
+- **Fixed a CI flake in the queued-permission notice test (#656).** The test read the card's last
+  edit as soon as the daemon logged the still-waiting notice. The daemon writes that log line
+  before the edit reaches Telegram, so a slow runner saw the previous text. Both notice checks now
+  wait for the edit itself.
+
 ## 1.58.0
 
 - **A file path in the message text is never attached any more (#648).** `tg "see AGENTS.md"`

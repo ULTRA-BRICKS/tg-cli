@@ -1955,7 +1955,10 @@ test('PERM QUEUE STILL WAITING NOTICE: past the notice threshold with no reconne
   // long-outage sweep) — but the card must still say the decision is queued and
   // deliverable, NOT fall back to the plain "hook disconnected" text with no
   // memory of the tap.
+  // The daemon logs the notice before its editMessageText reaches the fake
+  // Telegram server, so wait for the edit itself, not just the log line.
   expect(await until(() => daemonLog(cfgDir).includes('ask-permission-decision-queue-still-waiting-notice'), 6000)).toBe(true);
+  expect(await until(() => tg.edits().at(-1)?.includes('still waiting to reconnect') ?? false, 4000)).toBe(true);
   const editsAfterNotice = tg.edits();
   expect(editsAfterNotice.at(-1)).toContain('still waiting to reconnect');
   expect(editsAfterNotice.at(-1)).toContain('NOT been discarded');
@@ -2015,6 +2018,12 @@ test('PERM QUEUE RE-TAP RESETS NOTICE: after the still-waiting notice fires, a r
   // notifiedAt was reset by the re-tap, not stuck from the first notice.
   expect(
     await until(() => (daemonLog(cfgDir).match(/ask-permission-decision-queue-still-waiting-notice/g) ?? []).length >= 2, 6000),
+  ).toBe(true);
+  expect(
+    await until(() => {
+      const e = tg.edits().at(-1) ?? '';
+      return e.includes('still waiting to reconnect') && e.includes('queued "Reject"');
+    }, 4000),
   ).toBe(true);
   const lastEdit = tg.edits().at(-1);
   expect(lastEdit).toContain('still waiting to reconnect');
