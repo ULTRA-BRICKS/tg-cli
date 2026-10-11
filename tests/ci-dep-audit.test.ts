@@ -157,6 +157,106 @@ describe('dep-audit.sh — python requirements are audited as data, never built'
   });
 });
 
+// tg-cli#674: a pyproject.toml is never audited itself (that builds it). It is covered by the
+// pinned pip-format lockfiles it installs from, which the trusted workflow names in
+// DEP_AUDIT_PY_LOCKFILES. Before this, the repo's own pyproject.toml failed every run.
+describe('dep-audit.sh — a pyproject.toml is covered by its named pinned lockfiles', () => {
+  const LOCK = 'aiohttp==3.14.3 --hash=sha256:aaaa --hash=sha256:bbbb\nqrcode==8.2 --hash=sha256:cccc\n';
+  const PYPROJECT = '[project]\nname = "x"\n[project.optional-dependencies]\ncall = ["aiohttp>=3.14,<4"]\n';
+
+  test('the named lockfiles are audited with pip disabled and no resolution, and cover pyproject.toml', () => {
+    const stubs = stubAuditors();
+    const tree = writeTree({ 'pyproject.toml': PYPROJECT, 'pkg/runtime.lock': LOCK, 'pkg/voice.lock': LOCK });
+    const r = runAudit(tree, stubs.bin, { DEP_AUDIT_PY_LOCKFILES: 'pkg/runtime.lock pkg/voice.lock' });
+    expect(calls(stubs)).toEqual([
+      expect.stringMatching(/^pip-audit --disable-pip --no-deps -r pkg\/runtime\.lock \|/),
+      expect.stringMatching(/^pip-audit --disable-pip --no-deps -r pkg\/voice\.lock \|/),
+    ]);
+    expect(r.out).toContain('PASS');
+    expect(r.exitCode).toBe(0);
+  });
+
+  test('an advisory in a named lockfile fails the gate', () => {
+    const stubs = stubAuditors({ 'pip-audit': 'echo "fsspec 2026.2.0 CVE-2026-104851" >&2; exit 1' });
+    const tree = writeTree({ 'pyproject.toml': PYPROJECT, 'pkg/runtime.lock': LOCK });
+    const r = runAudit(tree, stubs.bin, { DEP_AUDIT_PY_LOCKFILES: 'pkg/runtime.lock' });
+    expect(calls(stubs)).toHaveLength(1);
+    expect(r.out).not.toContain('PASS');
+    expect(r.exitCode).not.toBe(0);
+  });
+
+  test('a named lockfile missing from the tree fails closed, even with DEP_AUDIT_ALLOW_MISSING=1', () => {
+    for (const allow of ['0', '1']) {
+      const stubs = stubAuditors();
+      const tree = writeTree({ 'pyproject.toml': PYPROJECT, 'pkg/runtime.lock': LOCK });
+      const r = runAudit(tree, stubs.bin, {
+        DEP_AUDIT_PY_LOCKFILES: 'pkg/runtime.lock pkg/gone.lock',
+        DEP_AUDIT_ALLOW_MISSING: allow,
+      });
+      expect(calls(stubs)).toEqual([]);
+      expect(r.out).toContain('pkg/gone.lock');
+      expect(r.exitCode).not.toBe(0);
+    }
+  });
+
+  test('an unpinned named lockfile is refused without invoking pip-audit', () => {
+    const stubs = stubAuditors();
+    const tree = writeTree({ 'pyproject.toml': PYPROJECT, 'pkg/runtime.lock': 'aiohttp>=3.14\n' });
+    const r = runAudit(tree, stubs.bin, { DEP_AUDIT_PY_LOCKFILES: 'pkg/runtime.lock' });
+    expect(calls(stubs)).toEqual([]);
+    expect(r.out).toContain('pkg/runtime.lock');
+    expect(r.exitCode).not.toBe(0);
+  });
+
+  test('a symlinked lockfile or parent directory fails closed without running any auditor', () => {
+    for (const link of ['pkg/runtime.lock', 'pkg']) {
+      const stubs = stubAuditors();
+      const outside = writeTree({ 'runtime.lock': LOCK });
+      const tree = writeTree({ 'pyproject.toml': PYPROJECT });
+      if (link === 'pkg') symlinkSync(outside, join(tree, 'pkg'));
+      else {
+        mkdirSync(join(tree, 'pkg'));
+        symlinkSync(join(outside, 'runtime.lock'), join(tree, link));
+      }
+      const r = runAudit(tree, stubs.bin, { DEP_AUDIT_PY_LOCKFILES: 'pkg/runtime.lock' });
+      expect(calls(stubs)).toEqual([]);
+      expect(r.out).toContain(`${link} is a symlink`);
+      expect(r.exitCode).not.toBe(0);
+    }
+  });
+
+  test('a named path that is absolute, leaves the tree or names a directory is refused', () => {
+    for (const entry of ['/etc/passwd', '../outside.lock', 'pkg/../../outside.lock', 'pkg/']) {
+      const stubs = stubAuditors();
+      const tree = writeTree({ 'pyproject.toml': PYPROJECT, 'pkg/runtime.lock': LOCK });
+      const r = runAudit(tree, stubs.bin, { DEP_AUDIT_PY_LOCKFILES: entry });
+      expect(calls(stubs)).toEqual([]);
+      expect(r.out).toContain('not a plain tree-relative path');
+      expect(r.exitCode).not.toBe(0);
+    }
+  });
+
+  // The regression itself: main's push run and every PR head failed on this repo's own tree.
+  test("the repo's own tree passes with the lockfiles dependency-review.yml names", () => {
+    const wf = Bun.YAML.parse(
+      readFileSync(join(import.meta.dir, '..', '.github', 'workflows', 'dependency-review.yml'), 'utf8'),
+    ) as { jobs: Record<string, { steps: { run?: string; env?: Record<string, string> }[] }> };
+    const audit = Object.values(wf.jobs)
+      .flatMap((j) => j.steps)
+      .find((s) => s.run?.includes('ci/dependency-review/dep-audit.sh'));
+    const locks = audit?.env?.DEP_AUDIT_PY_LOCKFILES ?? '';
+    expect(locks).not.toBe('');
+    const stubs = stubAuditors();
+    const r = runAudit(join(import.meta.dir, '..'), stubs.bin, { DEP_AUDIT_PY_LOCKFILES: locks });
+    const pipAudits = calls(stubs).filter((c) => c.startsWith('pip-audit '));
+    expect(pipAudits.map((c) => c.split(' | ')[0])).toEqual(
+      locks.split(/\s+/).map((f) => `pip-audit --disable-pip --no-deps -r ${f}`),
+    );
+    expect(r.out).not.toContain('FAILING');
+    expect(r.exitCode).toBe(0);
+  });
+});
+
 describe('dep-audit.sh — the PR tree is data, not configuration', () => {
   test("bun audits a staged copy of the lockfile, without the PR's bunfig.toml / .npmrc", () => {
     const stubs = stubAuditors();

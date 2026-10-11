@@ -10,9 +10,11 @@
 #     .cargo/audit.toml never reach them — any of those could repoint the advisory source or
 #     ignore a finding. A symlinked manifest is refused (it could point at a runner secret that
 #     an auditor would echo into the log).
-#   - pip-audit only ever gets a fully pinned requirements file, with pip disabled and no
-#     dependency resolution (see req_file_classify). Anything it would have to BUILD to read
+#   - pip-audit only ever gets a fully pinned requirements file or lockfile, with pip disabled and
+#     no dependency resolution (see req_file_classify). Anything it would have to BUILD to read
 #     (an sdist, a VCS/URL/path requirement, an `-r` include, a foreign index) fails closed.
+#   - A pyproject.toml is never audited itself (that would build it). It is covered by the pinned
+#     pip-format lockfiles the trusted workflow names in DEP_AUDIT_PY_LOCKFILES (tg-cli#674).
 #   - A package.json with no lockfile is resolved as data (`bun install --lockfile-only
 #     --ignore-scripts` in the staging dir: no package is installed, no lifecycle script runs)
 #     and the resulting lockfile is audited — tg-cli itself tracks no lockfile.
@@ -30,6 +32,12 @@
 #   DEP_AUDIT_ALLOW_MISSING  "1" = DON'T fail when a manifest is found but can't be audited
 #                            (fail-OPEN). Default 0 = fail CLOSED: "no audit ran" must not
 #                            masquerade as "no vulns".
+#   DEP_AUDIT_PY_LOCKFILES   space-separated tree-relative paths of pinned pip-format lockfiles
+#                            (`name==version --hash=…` lines) that the tree's pyproject.toml
+#                            installs from. Set by the trusted workflow, never read from the
+#                            audited tree. Each one is staged and audited like a requirements
+#                            file; a named lockfile missing from the tree fails closed, even
+#                            under DEP_AUDIT_ALLOW_MISSING=1.
 #
 # Usage: sh ci/dependency-review/dep-audit.sh [AUDIT_DIR]   (AUDIT_DIR defaults to '.')
 set -eu
@@ -37,6 +45,7 @@ set -eu
 LEVEL="${DEP_AUDIT_LEVEL:-high}"
 ALLOW_MISSING="${DEP_AUDIT_ALLOW_MISSING:-0}"
 AUDIT_DIR="${1:-.}"
+PY_LOCKFILES="${DEP_AUDIT_PY_LOCKFILES:-}"
 rc=0
 ran=0
 missing=0
@@ -80,6 +89,34 @@ for f in package.json bun.lock bun.lockb package-lock.json npm-shrinkwrap.json p
   [ -f "$f" ] || continue
   mkdir -p "$STAGE/$(dirname "$f")"
   cp "$f" "$STAGE/$f"
+done
+# The named python lockfiles. The path comes from the trusted workflow, but the files and their
+# parent directories come from the PR: a symlink anywhere on the path could point the auditor
+# at a runner secret, so it is refused like a symlinked manifest.
+staged_py_locks=""
+for f in $PY_LOCKFILES; do
+  case "$f" in
+    /*|*/|*..*|*[!A-Za-z0-9._/-]*)
+      note "DEP_AUDIT_PY_LOCKFILES entry '$f' is not a plain tree-relative path — FAILING."
+      exit 1 ;;
+  esac
+  p="$f"
+  while [ "$p" != "." ]; do
+    if [ -L "$p" ]; then
+      note "$p is a symlink — FAILING (a lockfile and its directories must be regular in the audited tree)."
+      exit 1
+    fi
+    p="$(dirname "$p")"
+  done
+  if [ ! -f "$f" ]; then
+    # Not a `miss`: DEP_AUDIT_ALLOW_MISSING must not turn a stale trusted list into no audit.
+    note "python lockfile $f (named by DEP_AUDIT_PY_LOCKFILES) is not in the audited tree — FAILING (update the list in the workflow)."
+    exit 1
+  fi
+  [ -f "$STAGE/$f" ] && continue   # a requirements*.txt the loop above already staged
+  mkdir -p "$STAGE/$(dirname "$f")"
+  cp "$f" "$STAGE/$f"
+  staged_py_locks="$staged_py_locks $f"
 done
 cd "$STAGE"
 
@@ -170,16 +207,17 @@ fi
 
 # --- python -------------------------------------------------------------------------------
 # Never the bare `pip-audit` (that audits the RUNNER's environment, not this tree) and never a
-# resolving `-r`/`-e`/project audit (that builds PR code). Pinned requirements files only, with
-# --disable-pip (pip never runs) and --no-deps (no resolution).
+# resolving `-r`/`-e`/project audit (that builds PR code). Pinned requirements files and the
+# named lockfiles only, with --disable-pip (pip never runs) and --no-deps (no resolution).
 py_manifest=0
+[ -n "$staged_py_locks" ] && py_manifest=1
 for f in requirements*.txt requirements/*.txt; do
   [ -f "$f" ] && { py_manifest=1; break; }
 done
 if [ "$py_manifest" = "1" ] || [ -f pyproject.toml ] || [ -f poetry.lock ]; then
-  audited_py=0   # a pinned requirements file was audited
-  refused_py=0   # a requirements file was refused (already counted as a failure)
-  for f in requirements*.txt requirements/*.txt; do
+  audited_py=0   # a pinned requirements file or lockfile was audited
+  refused_py=0   # a requirements file or lockfile was refused (already counted as a failure)
+  for f in requirements*.txt requirements/*.txt $staged_py_locks; do
     [ -f "$f" ] || continue
     case "$(req_file_classify "$f")" in
       pinned)
@@ -189,17 +227,17 @@ if [ "$py_manifest" = "1" ] || [ -f pyproject.toml ] || [ -f poetry.lock ]; then
           pip-audit --disable-pip --no-deps -r "$f" || rc=1
         else
           refused_py=1
-          miss "python requirements file $f present but pip-audit not installed (pipx install pip-audit)"
+          miss "python requirements file/lockfile $f present but pip-audit not installed (pipx install pip-audit)"
         fi ;;
       empty)
         note "skipping $f — no pinned spec to audit (empty / comments / options only)" ;;
       *)
         refused_py=1
-        miss "python requirements file $f has a line that is not a pinned name==version spec (editable / URL / VCS / local path / -r or -c include / index option / unpinned) — auditing it would fetch or BUILD PR-controlled code; pin every line to name==version" ;;
+        miss "python requirements file/lockfile $f has a line that is not a pinned name==version spec (editable / URL / VCS / local path / -r or -c include / index option / unpinned) — auditing it would fetch or BUILD PR-controlled code; pin every line to name==version" ;;
     esac
   done
   if [ "$audited_py" = "0" ] && [ "$refused_py" = "0" ] && { [ -f pyproject.toml ] || [ -f poetry.lock ]; }; then
-    miss "python project (pyproject.toml/poetry.lock) present but no pinned requirements*.txt to audit as data (auditing the project would build it)"
+    miss "python project (pyproject.toml/poetry.lock) present but no pinned requirements*.txt or DEP_AUDIT_PY_LOCKFILES lockfile to audit as data (auditing the project would build it)"
   fi
 fi
 

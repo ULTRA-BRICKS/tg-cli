@@ -9,7 +9,7 @@
 //   install step, no PR checkout onto the workspace.
 // - leftover-grep must fetch enough history for a merge-base instead of a --depth=1 head.
 import { afterEach, describe, expect, test } from 'bun:test';
-import { readFileSync, rmSync, writeFileSync } from 'fs';
+import { readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tempDir } from './helpers/test-temp';
 import { join } from 'path';
 
@@ -21,6 +21,7 @@ interface Step {
   if?: string;
   uses?: string;
   run?: string;
+  env?: Record<string, string>;
   with?: Record<string, string>;
 }
 interface Workflow {
@@ -106,6 +107,28 @@ describe('dependency-review.yml', () => {
       expect(s.run ?? '').not.toMatch(/\b(bun|npm|pnpm|yarn|pip) (install|ci|i)\b/);
       expect(s.with?.ref ?? '').not.toMatch(/head|merge/);
     }
+  });
+
+  // tg-cli#674: without pip-audit on PATH every python lockfile failed closed ("no auditor").
+  // The one tool install is a version-pinned pip-audit, done before the PR head exists.
+  test('installs a pinned pip-audit before the PR head is fetched', () => {
+    const installs = steps.filter((s) => /\binstall\b/.test(s.run ?? ''));
+    expect(installs).toHaveLength(1);
+    expect(installs[0].run).toMatch(/uv tool install [^\n]*'pip-audit==\d+\.\d+\.\d+'/);
+    const fetchAt = steps.findIndex((s) => s.run?.includes('git worktree add'));
+    expect(steps.indexOf(installs[0])).toBeLessThan(fetchAt);
+  });
+
+  test('names every pinned telegram_client lockfile for the audit', () => {
+    const audit = steps.find((s) => s.run?.includes('ci/dependency-review/dep-audit.sh'));
+    const named = (audit?.env?.DEP_AUDIT_PY_LOCKFILES ?? '').split(/\s+/).filter(Boolean).sort();
+    const repo = join(import.meta.dir, '..');
+    const onDisk = readdirSync(join(repo, 'features', 'telegram_client'))
+      .filter((f) => f.endsWith('.lock'))
+      .map((f) => `features/telegram_client/${f}`)
+      .sort();
+    expect(onDisk.length).toBeGreaterThan(0);
+    expect(named).toEqual(onDisk);
   });
 });
 

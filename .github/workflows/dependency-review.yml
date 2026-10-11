@@ -50,6 +50,22 @@ jobs:
       - name: Set up bun (bun audit; resolves a lockfile-less package.json as data)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
+      # The python auditor only, version-pinned, installed from PyPI BEFORE the PR head is fetched:
+      # no PR file is read and no PR code runs. `uv` brings its own interpreter, so this does not
+      # depend on the runner having python3-venv. Without pip-audit the telegram_client
+      # lockfiles fail closed (no auditor). No cache: nothing a PR run writes is reused.
+      - name: Set up uv (installs the pinned pip-audit)
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: '0.12.24'
+          enable-cache: false
+
+      - name: Install pip-audit (pinned auditor tool; audits pinned python lockfiles as data)
+        run: |
+          set -eu
+          uv tool install --no-config --python 3.12 'pip-audit==2.10.1'
+          uv tool dir --bin >> "$GITHUB_PATH"
+
       # codeql[actions/untrusted-checkout/medium]
       # Justified: the PR head is fetched as a git OBJECT and materialized in a side worktree
       # that is never executed; dep-audit.sh copies only manifests/lockfiles out of it and
@@ -73,4 +89,8 @@ jobs:
       # Justified: runs the trusted base dep-audit.sh over the PR's lockfiles as data; no
       # PR-controlled code runs and no cache is written.
       - name: Dependency audit (fail closed on high+ advisories or an audit that could not run)
+        env:
+          # The pinned lockfiles the root pyproject.toml (telegram_client) installs from. Named
+          # here, in the trusted base copy, never discovered from the PR tree (tg-cli#674).
+          DEP_AUDIT_PY_LOCKFILES: features/telegram_client/runtime.lock features/telegram_client/voice-runtime.lock
         run: bash "$GITHUB_WORKSPACE/ci/dependency-review/dep-audit.sh" "$AUDIT_DIR"

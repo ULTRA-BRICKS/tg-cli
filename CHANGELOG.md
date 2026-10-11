@@ -3,6 +3,22 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.60.3
+
+- **`dependency-review` passes again on main and on every PR (#674).** After #326 made the gate
+  fail closed, it failed on every run because of the root `pyproject.toml` (the `telegram_client`
+  package): the gate never audits a project directly, since that would build it, and the repo
+  has no pinned `requirements*.txt` it could audit instead. The project installs from the pinned,
+  hashed `features/telegram_client/runtime.lock` and `voice-runtime.lock`. The workflow now names
+  those files in `DEP_AUDIT_PY_LOCKFILES`, and `dep-audit.sh` audits them as data under the
+  requirements-file rules: no symlinks anywhere on the path, no path outside the tree, pinned
+  lines only. A named lockfile that is missing fails closed. The workflow also installs a pinned
+  `pip-audit` (via `uv`). It had never been installed, so a python lockfile could only ever fail
+  with "no auditor".
+- **Two advisories in the call runtime lockfiles are fixed.** `fsspec` 2026.2.0 → 2026.6.0 in
+  `voice-runtime.lock` (CVE-2026-104851, high: template injection → RCE) and `multidict` 6.7.1 →
+  6.9.1 in `runtime.lock` (CVE-2026-104874, medium). The hashes come from PyPI.
+
 ## 1.60.2
 
 - **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on
