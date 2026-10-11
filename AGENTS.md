@@ -143,6 +143,23 @@ fixtures. `tg-ctl status` names every omp without a bridge. See `docs/omp-origin
 for setup, receipt semantics, and the one-time saved restart needed by already-running OMP.
 Cwd/title are not process identity.
 
+### Alert subscriptions (`tg-ctl alert`, tg-cli#636)
+
+`features/tg-ctl/alert-subscriptions.ts` (PURE: store format, binding resolution, throttle,
+rendering, argv) + `runAlertCommand` in `tg-ctl` (I/O, one-shot, no daemon). A subscription is
+keyed by the omp **session id** (the persistent session-file id, identical across resume — pid
+and instanceId are per process) and stored in `CtlPaths.alertSubscriptions`. There is NO
+register/unregister event: the omp-live extension only publishes/withdraws its metadata file,
+so bound state is resolved against `listLiveEndpoints()` at send/list time (`resolveAlertBindings`)
+— no endpoint for the session id = suspended (nothing delivered), an endpoint again = bound under
+its new pid. Do not add an extension-side hook for this. `alert send` posts through `tg`
+(`--format html --tag problem|report --subagent <source> --title …`, the footer names each bound
+session), parses `OK tg#<id>`, delivers `[alert tg#<id> · <source> · <severity>] <text>` through
+`sendLiveMessage` (never a tmux/ACP fallback), and throttles repeats of (source, key, severity)
+in `CtlPaths.alertThrottle` (`--window`, default 10 min; `--force` bypasses). Sources: rig sysmon
+(`riglib/sysmon_daemon/alert.py`) and `~/.cache/omp-supervisor/watch.sh`. Lifecycle proof:
+`tests/ctl-alert-lifecycle-integration.test.ts`.
+
 ### Harness-agnostic control: tmux panes and rig-wrapper hosts (docs/specs/2026-09-30-harness-agnostic-control.md)
 
 A harness session (omp, Claude Code, Codex, opencode) is reached through the terminal that

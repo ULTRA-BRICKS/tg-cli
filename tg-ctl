@@ -172,6 +172,37 @@ import {
 } from "./features/tg-ctl/omp"
 import { defaultRegistryRoot, listLiveEndpoints, sendLiveMessage } from "./features/tg-ctl/omp-live-runtime.mjs"
 import { selectOriginalEndpoint, originalRequestId, type OriginalOmpEndpoint, type OriginalOmpTarget } from "./features/tg-ctl/omp-live-routing"
+import {
+  alertRequestId,
+  alertTag,
+  alertTitle,
+  claimAlert,
+  formatAlertList,
+  markAlertDelivered,
+  nearestLiveAncestor,
+  parseAlertArgv,
+  parseAlertSubscriptions,
+  parseAlertThrottle,
+  parseTgSendOk,
+  removeAlertSubscription,
+  resolveAlertBindings,
+  serializeAlertSubscriptions,
+  serializeAlertThrottle,
+  sessionAlertText,
+  settleAlert,
+  telegramAlertBody,
+  throttleKey,
+  throttleVerdict,
+  upsertAlertSubscription,
+  type AlertBinding,
+  type AlertCommand,
+  type AlertMessage,
+  type AlertSubscription,
+  type AlertSubscriptionStore,
+  type AlertThrottleStore,
+  type ThrottleVerdict,
+} from "./features/tg-ctl/alert-subscriptions"
+import { formatAge } from "./features/tg-ctl/text-util"
 import { connectAbducoSocket } from "./features/tg-ctl/abduco-client"
 import { injectIntoAbducoSession } from "./features/tg-ctl/abduco-pty"
 import {
@@ -543,6 +574,19 @@ export const USAGE = `Usage:
   tg-ctl omp-live install        # install the original-process extension (the daemon also does at startup); saved stop/resume required once
   tg-ctl omp-live status --json  # verified live PIDs and exact sessions (no bot credentials)
   tg-ctl omp-live send <pid> --request-id <id> <text...>  # queued receipt, never a clone
+  tg-ctl alert subscribe [--pid N | --session ID] [--sources a,b] [--ttl 12h]
+                         # bind THIS omp session (the nearest live omp-live ancestor, or the
+                         # one named) to monitoring alerts, keyed by its omp session id: a
+                         # closed session is unbound by itself, a resumed one rebinds by
+                         # itself; --ttl 0 = no expiry (tg-cli#636)
+  tg-ctl alert unsubscribe [--pid N | --session ID | --all]
+  tg-ctl alert list [--json]
+  tg-ctl alert send --source S --severity info|warning|critical --key K --text T
+                    [--title T] [--html] [--window 10m] [--force]
+                         # post the alert to Telegram via tg (footer: "↳ также адресовано
+                         # агенту: <title> (pid N)" per bound session), then deliver
+                         # "[alert tg#<id> · S · severity] T" into every bound session;
+                         # a repeat of (source,key,severity) inside --window is throttled
   tg-ctl install-hooks   # wire q→buttons + StopFailure + Claude/Codex usage telemetry
                          #   (codex: delegates to rig when present — rig owns ~/.codex hooks)
   tg-ctl voice-setup     # discover a local Whisper (~/xp) → configure inbound voice→text
@@ -2551,6 +2595,259 @@ function runInboxCommand(ctx: Ctx, argv: string[]): number {
   if (archived > 0) lines.push(`  archived: ${archived} stranded cc/codex message(s) in ${inboxRoot(ctx.configDir)}/*/${STRANDED_PREFIX}*.jsonl`)
   console.log(lines.length > 0 ? lines.join("\n") : "inbox: nothing pending")
   return 0
+}
+
+// `tg-ctl alert …` (tg-cli#636): temporary alert subscriptions of live omp sessions and the
+// alert ingestion used by rig sysmon and the omp-supervisor watcher. Bound state is resolved
+// against the omp-live registry here — the extension publishes no events (see
+// features/tg-ctl/alert-subscriptions.ts). One-shot: no daemon involved. Both state files
+// are read-modify-written under their O_EXCL lockfile (the routes/history protocol): the
+// two documented sources fire together on an overloaded machine.
+interface AlertHost {
+  ctx: Ctx
+  now: number
+  endpoints: OriginalOmpEndpoint[]
+  registryError: string | null // the omp-live registry could not be read: no binding is trustworthy
+}
+
+async function runAlertCommand(ctx: Ctx, argv: string[]): Promise<number> {
+  const command = parseAlertArgv(argv)
+  if (command.cmd === "error") {
+    console.error(`tg-ctl alert: ${command.error}`)
+    return 1
+  }
+  const host: AlertHost = { ctx, now: Date.now(), endpoints: [], registryError: null }
+  try {
+    host.endpoints = await listLiveEndpoints(defaultRegistryRoot())
+  } catch (err) {
+    host.registryError = `omp-live registry unreadable: ${(err as { code?: string }).code ?? err}`
+    console.error(`tg-ctl alert: ${host.registryError}`)
+  }
+  switch (command.cmd) {
+    case "list":
+      return runAlertList(host, command.json)
+    case "subscribe":
+      return runAlertSubscribe(host, command)
+    case "unsubscribe":
+      return runAlertUnsubscribe(host, command)
+    case "send":
+      return runAlertSend(host, command)
+  }
+}
+
+// Run `body` over the subscription store under its lock and persist what it returns;
+// a store nobody can lock within ~2 s is reported, never written unlocked.
+function withAlertSubscriptions<T>(host: AlertHost, body: (store: AlertSubscriptionStore) => { store: AlertSubscriptionStore; result: T }): T | undefined {
+  const path = host.ctx.paths.alertSubscriptions
+  return withRoutesLock(fsRoutesLockIo(`${path}.lock`), () => {
+    const out = body(parseAlertSubscriptions(readFileOrNull(path), host.now))
+    atomicWrite(path, serializeAlertSubscriptions(out.store, host.now))
+    return out.result
+  }, { attempts: 200, onContended: "skip" })
+}
+
+function withAlertThrottle<T>(host: AlertHost, body: (store: AlertThrottleStore) => { store: AlertThrottleStore; result: T }): T | undefined {
+  const path = host.ctx.paths.alertThrottle
+  return withRoutesLock(fsRoutesLockIo(`${path}.lock`), () => {
+    const out = body(parseAlertThrottle(readFileOrNull(path), host.now))
+    atomicWrite(path, serializeAlertThrottle(out.store, host.now))
+    return out.result
+  }, { attempts: 200, onContended: "skip" })
+}
+
+const ALERT_LOCK_BUSY = "state file locked by another tg-ctl alert for over 2 s; nothing changed"
+
+function runAlertList(host: AlertHost, json: boolean): number {
+  const store = parseAlertSubscriptions(readFileOrNull(host.ctx.paths.alertSubscriptions), host.now)
+  const bindings = resolveAlertBindings(store, host.endpoints, host.now)
+  console.log(json ? JSON.stringify(bindings.map((b) => ({ ...b.subscription, state: b.state })), null, 1) : formatAlertList(bindings, host.now))
+  return host.registryError && bindings.length > 0 ? 1 : 0
+}
+
+type AlertSessionTarget = { ok: true; sessionId: string; endpoint: OriginalOmpEndpoint | null } | { ok: false; error: string }
+
+// The session a subscribe/unsubscribe names: --session, --pid (a LIVE omp), or the caller's
+// own omp (the nearest live omp-live ancestor).
+function resolveAlertSession(host: AlertHost, pid: number | null, sessionId: string | null): AlertSessionTarget {
+  if (sessionId !== null) return { ok: true, sessionId, endpoint: host.endpoints.find((e) => e.sessionId === sessionId) ?? null }
+  if (pid !== null) {
+    const endpoint = host.endpoints.find((e) => e.pid === pid)
+    return endpoint ? { ok: true, sessionId: endpoint.sessionId, endpoint } : { ok: false, error: `omp pid ${pid} has no live omp-live endpoint (tg-ctl omp-live status --json)` }
+  }
+  const endpoint = nearestLiveAncestor(ancestorPids(process.pid), host.endpoints)
+  if (endpoint) return { ok: true, sessionId: endpoint.sessionId, endpoint }
+  return { ok: false, error: "no live omp session among this process's ancestors (a tmux pane descends from the tmux server, not from omp): pass --pid <omp pid> or --session <omp session id>" }
+}
+
+function runAlertSubscribe(host: AlertHost, command: Extract<AlertCommand, { cmd: "subscribe" }>): number {
+  if (host.registryError) return 1
+  const target = resolveAlertSession(host, command.pid, command.sessionId)
+  if (!target.ok) {
+    console.error(`tg-ctl alert: ${target.error}`)
+    return 1
+  }
+  const subscription = withAlertSubscriptions(host, (store) => {
+    const prior = store.subscriptions.find((s) => s.sessionId === target.sessionId)
+    const next: AlertSubscription = {
+      sessionId: target.sessionId,
+      title: target.endpoint?.title ?? prior?.title ?? null,
+      pid: target.endpoint?.pid ?? prior?.pid ?? null,
+      cwd: target.endpoint?.cwd ?? prior?.cwd ?? null,
+      sources: command.sources,
+      createdAt: host.now,
+      expiresAt: command.ttlMs === null ? null : host.now + command.ttlMs,
+    }
+    return { store: upsertAlertSubscription(store, next), result: next }
+  })
+  if (!subscription) {
+    console.error(`tg-ctl alert: ${ALERT_LOCK_BUSY}`)
+    return 1
+  }
+  const state = target.endpoint ? "bound" : "suspended"
+  const ttl = command.ttlMs === null ? "no expiry" : `ttl ${formatAge(command.ttlMs)}`
+  console.log(`subscribed (${state}): ${subscription.title ?? "(untitled)"} · pid ${subscription.pid ?? "?"} · session ${target.sessionId} · sources: ${command.sources?.join(",") ?? "all"} · ${ttl}`)
+  return 0
+}
+
+type AlertUnsubscribeOutcome = { removed: string } | { none: string } | { error: string }
+
+function runAlertUnsubscribe(host: AlertHost, command: Extract<AlertCommand, { cmd: "unsubscribe" }>): number {
+  const outcome = withAlertSubscriptions<AlertUnsubscribeOutcome | number>(host, (store) => {
+    if (command.all) return { store: { subscriptions: [] }, result: store.subscriptions.length }
+    // --pid names a LIVE omp first (a pid the OS reused belongs to that session now); only a
+    // pid no live endpoint owns falls back to the recorded pid of a closed session.
+    const target = resolveAlertSession(host, command.pid, command.sessionId)
+    const byRecordedPid = !target.ok && command.pid !== null ? store.subscriptions.find((s) => s.pid === command.pid) : undefined
+    const sessionId = target.ok ? target.sessionId : byRecordedPid?.sessionId
+    if (sessionId === undefined) return { store, result: { error: target.ok ? "no session named" : target.error } }
+    if (!store.subscriptions.some((s) => s.sessionId === sessionId)) return { store, result: { none: sessionId } }
+    return { store: removeAlertSubscription(store, sessionId), result: { removed: sessionId } }
+  })
+  if (outcome === undefined) {
+    console.error(`tg-ctl alert: ${ALERT_LOCK_BUSY}`)
+    return 1
+  }
+  if (typeof outcome === "number") {
+    console.log(`unsubscribed ${outcome} session(s)`)
+    return 0
+  }
+  if ("error" in outcome) {
+    console.error(`tg-ctl alert: ${outcome.error}`)
+    return 1
+  }
+  console.log("none" in outcome ? `no subscription for session ${outcome.none}` : `unsubscribed session ${outcome.removed}`)
+  return 0
+}
+
+interface AlertDeliveryFailure {
+  binding: AlertBinding
+  reason: string
+}
+
+// Deliver the posted alert into every bound session among `targets`.
+async function deliverAlertToSessions(host: AlertHost, message: AlertMessage, messageId: number, targets: readonly AlertBinding[]): Promise<{ delivered: AlertBinding[]; failed: AlertDeliveryFailure[] }> {
+  const text = sessionAlertText(message, messageId)
+  const delivered: AlertBinding[] = []
+  const failed: AlertDeliveryFailure[] = []
+  for (const b of targets) {
+    if (!b.endpoint) continue
+    try {
+      await sendLiveMessage({ root: defaultRegistryRoot(), pid: b.endpoint.pid, instanceId: b.endpoint.instanceId, sessionId: b.endpoint.sessionId, requestId: alertRequestId(messageId, b.endpoint.sessionId), text })
+      delivered.push(b)
+    } catch (err) {
+      failed.push({ binding: b, reason: String((err as { code?: string }).code ?? err) })
+    }
+  }
+  for (const f of failed) console.error(`tg-ctl alert: session delivery failed — ${describeAlertBinding(f.binding)}: ${f.reason}`)
+  return { delivered, failed }
+}
+
+function describeAlertBinding(b: AlertBinding): string {
+  return `${b.subscription.title ?? "(untitled)"} (pid ${b.subscription.pid ?? "?"})`
+}
+
+async function runAlertSend(host: AlertHost, command: Extract<AlertCommand, { cmd: "send" }>): Promise<number> {
+  const { message, windowMs, force } = command
+  const key = throttleKey(message.source, message.key, message.severity)
+  const boundNow = (): AlertBinding[] => {
+    const store = parseAlertSubscriptions(readFileOrNull(host.ctx.paths.alertSubscriptions), host.now)
+    return resolveAlertBindings(store, host.endpoints, host.now, message.source).filter((b) => b.state === "bound")
+  }
+
+  // 1. Under the lock: the verdict, and a claim when this send is the one to post.
+  const verdict = withAlertThrottle(host, (store) => {
+    const v: ThrottleVerdict = force ? { kind: "send" } : throttleVerdict(store, key, host.now, windowMs)
+    return { store: v.kind === "send" ? claimAlert(store, key, host.now) : store, result: v }
+  })
+  if (verdict === undefined) {
+    console.error(`tg-ctl alert: ${ALERT_LOCK_BUSY}`)
+    return 1
+  }
+  if (verdict.kind === "in-flight") {
+    console.log(`in flight: another tg-ctl alert is posting ${message.source}/${message.key}/${message.severity} (claimed ${formatAge(host.now - verdict.entry.at)} ago)`)
+    return 0
+  }
+  if (verdict.kind === "throttled") {
+    // Posted inside the window: no second post; the sessions it did not reach get it now.
+    const messageId = verdict.entry.messageId!
+    const pending = boundNow().filter((b) => verdict.entry.pending.includes(b.subscription.sessionId))
+    const { delivered, failed } = await deliverAlertToSessions(host, message, messageId, pending)
+    if (delivered.length > 0) withAlertThrottle(host, (store) => ({ store: markAlertDelivered(store, key, delivered.map((b) => b.subscription.sessionId)), result: null }))
+    const extra = delivered.length > 0 ? `; delivered to ${delivered.length} pending session(s)` : ""
+    console.log(`throttled tg#${messageId} (${message.source}/${message.key}/${message.severity} sent ${formatAge(host.now - verdict.entry.at)} ago, window ${formatAge(windowMs)}${extra})`)
+    return failed.length > 0 ? 1 : 0
+  }
+
+  // 2. Post to Telegram (outside the lock; `tg` may take a while). `tg` has no `--`
+  //    end-of-options, so a body starting with `-` would be read as an unknown flag;
+  //    a leading space (trimmed by `tg`) keeps it text.
+  const body = telegramAlertBody(message, boundNow())
+  const tgArgv = [tgBinary(), "--format", "html", "--tag", alertTag(message.severity), "--subagent", message.source, "--title", alertTitle(message), body.startsWith("-") ? ` ${body}` : body]
+  const posted = await spawnGuarded(tgArgv, 60_000)
+  const messageId = posted.exitCode === 0 ? parseTgSendOk(posted.stdout) : null
+  if (messageId === null) {
+    // The claim is released so the monitor's retry posts again.
+    withAlertThrottle(host, (store) => ({ store: settleAlert(store, key, null, []), result: null }))
+    const why = posted.exitCode === 0 ? "tg exited 0 but printed no `OK tg#<id>` line" : `tg exit ${posted.exitCode}`
+    console.error(`tg-ctl alert: Telegram post failed (${why}): ${(posted.stderr || posted.stdout).trim().slice(-300) || "no output"}`)
+    console.log("FAILED tg#? sessions=0")
+    return 1
+  }
+
+  // 3. Deliver into the sessions bound NOW (a session resumed while `tg` ran has a new
+  //    endpoint), then settle the claim with the ones not reached.
+  try {
+    host.endpoints = await listLiveEndpoints(defaultRegistryRoot())
+  } catch {
+    /* keep the snapshot: the registry was readable a moment ago */
+  }
+  const { delivered, failed } = await deliverAlertToSessions(host, message, messageId, boundNow())
+  const settled = withAlertThrottle(host, (store) => ({ store: settleAlert(store, key, messageId, failed.map((f) => f.binding.subscription.sessionId)), result: true }))
+  if (settled === undefined) console.error(`tg-ctl alert: ${ALERT_LOCK_BUSY} (the claim expires by itself)`)
+  const names = delivered.length ? ` (${delivered.map(describeAlertBinding).join("; ")})` : ""
+  console.log(`OK tg#${messageId} sessions=${delivered.length}${names}${failed.length ? ` failed=${failed.length}` : ""}`)
+  return failed.length > 0 || host.registryError !== null ? 1 : 0
+}
+
+// The `tg` sender next to this tg-ctl (the same checkout — a worktree's alert posts with its
+// own code), else the one on PATH.
+function tgBinary(): string {
+  const sibling = join(dirname(realpathSync(import.meta.path)), "tg")
+  return existsSync(sibling) ? sibling : "tg"
+}
+
+// This process's ancestors, nearest first, from one `ps` snapshot.
+function ancestorPids(pid: number): number[] {
+  const parentOf = new Map<number, number>()
+  try {
+    const ps = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
+    for (const p of parseProcList(ps.stdout.toString())) parentOf.set(p.pid, p.ppid)
+  } catch {
+    return []
+  }
+  const out: number[] = []
+  for (let cur = parentOf.get(pid); cur !== undefined && cur > 1 && out.length < 64; cur = parentOf.get(cur)) out.push(cur)
+  return out
 }
 
 // A failed plan; `sessionMismatch`: the §2.6 guard refused (the pane hosts a
@@ -12526,7 +12823,7 @@ if (import.meta.main) {
   }
   // Internal one-shot child spawned by `harness-event`; intentionally absent
   // from USAGE and guarded by persisted retry state before it can inject text.
-  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event", "codex-usage-hook", "auto-continue-once", "usage-schedule", "usage-schedule-check", "inbox", "audit-delivery"].includes(cmd)) {
+  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event", "codex-usage-hook", "auto-continue-once", "usage-schedule", "usage-schedule-check", "inbox", "audit-delivery", "alert"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
   }
@@ -12642,6 +12939,9 @@ if (import.meta.main) {
   }
   if (cmd === "inbox") {
     process.exit(runInboxCommand(ctx, process.argv.slice(3)))
+  }
+  if (cmd === "alert") {
+    process.exit(await runAlertCommand(ctx, process.argv.slice(3)))
   }
   if (cmd === "audit-delivery") {
     process.exit(runAuditDelivery(ctx, process.argv.slice(3)))

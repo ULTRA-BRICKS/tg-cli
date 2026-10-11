@@ -3,6 +3,23 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.60.0
+
+- **Monitoring alerts reach the agent responsible (`tg-ctl alert`, #636).** A live omp
+  session binds a temporary subscription (`tg-ctl alert subscribe [--pid N | --session ID]
+  [--sources a,b] [--ttl 12h]`), keyed by its omp session id. `tg-ctl alert send --source S
+  --severity info|warning|critical --key K --text T` posts the alert to Telegram through `tg`
+  with a footer per bound session (`↳ также адресовано агенту: <title> (pid N)`) and delivers
+  `[alert tg#<id> · S · severity] T` into each bound session over omp-live, so the agent follows
+  up on that message with `tg --reply-to <id>`. Bound state is resolved against the omp-live
+  registry at send time: a closed session is suspended (nothing delivered), a resumed one (same
+  session id, new pid) is bound again with nothing to re-run; a TTL expires the record. Repeats
+  of (source, key, severity) inside `--window` (default 10 min) are throttled; `--force`
+  bypasses. `alert list [--json]`, `alert unsubscribe [--pid|--session|--all]`. State:
+  `tg-ctl.<bot>.alert-subscriptions.json`, `tg-ctl.<bot>.alert-throttle.json`. Sources: rig
+  sysmon's Telegram alert and the omp-supervisor watcher's OVERLOAD/EMERGENCY reports.
+- `formatAge` moved from `unanswered-reminder.ts` to `text-util.ts` (shared).
+
 ## 1.59.0
 
 - **A `tg#<id>` in an outbound message now quotes the message it points at (#116).** The CTO asked

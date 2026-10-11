@@ -519,6 +519,8 @@ export interface CtlPaths {
   runInfo: string; // which commit the running daemon loaded (pid + sha), for stale-code detection (tg-cli#279)
   sessions: string; // session registry keyed by harness session id; the daemon is its ONLY writer (#487)
   authPending: string; // `tg auth` one-time /start binding the daemon claims (docs/specs/tg-auth.md §4)
+  alertSubscriptions: string; // temporary alert subscriptions of live omp sessions, keyed by omp session id (tg-cli#636)
+  alertThrottle: string; // last `tg-ctl alert send` per (source,key,severity), for the dedup window (tg-cli#636)
 }
 
 // --- forum topics (docs/specs/session-registry-and-topics.md §4) ---

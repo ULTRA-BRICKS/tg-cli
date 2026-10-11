@@ -39,6 +39,8 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     runInfo: join(configDir, `${base}.run.json`),
     sessions: join(configDir, `${base}.sessions.json`),
     authPending: join(configDir, `${base}.auth-pending.json`),
+    alertSubscriptions: join(configDir, `${base}.alert-subscriptions.json`),
+    alertThrottle: join(configDir, `${base}.alert-throttle.json`),
   };
 }
 

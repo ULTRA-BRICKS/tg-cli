@@ -31,7 +31,7 @@
 
 import { decodeHtmlEntities, stripHtmlTags } from '../render/html';
 import { isQuietHours, QUIET_HOURS_END_HOUR, QUIET_HOURS_START_HOUR } from './hatch-critical-reminder';
-import { truncateWithEllipsis } from './text-util';
+import { formatAge, truncateWithEllipsis } from './text-util';
 
 // `TG_CTL_UNANSWERED_REMINDER_AFTER_MS` (ms, non-negative integer); an explicit `0` turns
 // reminders off. Unset/blank/invalid → the default (same "blank is not zero" rule as
@@ -132,13 +132,6 @@ export function markUnansweredReminderSent(
 const LIST_MAX = 10;
 const LABEL_MAX = 40;
 const QUESTION_HEAD_MAX = 80;
-
-function formatAge(ms: number): string {
-  const min = Math.floor(ms / 60_000);
-  if (min < 60) return `${min} min`;
-  const h = Math.floor(min / 60);
-  return h < 24 ? `${h} h ${min % 60} min` : `${Math.floor(h / 24)} d ${h % 24} h`;
-}
 
 // Plain-text reminder body. Each line names the session, the question head, the card's
 // `tg#<id>` (the same inbound-ref convention agents and autolink-msgrefs use) and its age.

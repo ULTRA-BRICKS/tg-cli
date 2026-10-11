@@ -64,3 +64,12 @@ export function truncateWithEllipsis(s: string, max: number): string {
 export function hasUnpairedSurrogate(s: string): boolean {
   return /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(s);
 }
+
+// A duration as a human-readable age: `5 min`, `1 h 5 min`, `1 d 2 h`. Shared by the
+// unanswered-question reminder and the alert-subscription listing.
+export function formatAge(ms: number): string {
+  const min = Math.floor(ms / 60_000);
+  if (min < 60) return `${min} min`;
+  const h = Math.floor(min / 60);
+  return h < 24 ? `${h} h ${min % 60} min` : `${Math.floor(h / 24)} d ${h % 24} h`;
+}

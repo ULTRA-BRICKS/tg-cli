@@ -243,6 +243,22 @@ original-process bridge (`tg-ctl omp-live`, see `docs/omp-original-process.md`),
 wrapper session when the bridge is not loaded. `tg-ctl inbox` shows what the inbox still holds (an
 omp grant notice waiting for that omp's next turn, and the archive).
 
+### Monitoring alerts reach the responsible agent (`tg-ctl alert`, v1.60.0)
+A live omp session binds a **temporary alert subscription**: from a shell inside the session
+`tg-ctl alert subscribe` (or `--pid <omp pid>` / `--session <omp session id>` from anywhere;
+`--sources sysmon,supervisor` narrows it, `--ttl 12h` is the default, `--ttl 0` never expires).
+A monitor then fires `tg-ctl alert send --source sysmon --severity critical --key load --text "…"`:
+the alert is posted to Telegram through `tg` with a footer line per bound session —
+`↳ также адресовано агенту: <title> (pid N)` — and delivered into each bound session as
+`[alert tg#<id> · sysmon · critical] …`, so the agent follows up on that very message with
+`tg --reply-to <id>` once the issue is fixed. The subscription is keyed by the omp **session id**
+and resolved against the omp-live registry at send time: when the session closes it is unbound
+(listed `suspended`, nothing is delivered), when the same session is resumed it is bound again
+under its new pid — nothing to re-run. A repeat of the same (source, key, severity) inside
+`--window` (default 10 min) is throttled (`throttled tg#<id>`); an escalation to another severity
+goes through. `tg-ctl alert list` / `unsubscribe [--pid|--session|--all]`. rig sysmon's Telegram
+alert and the omp-supervisor watcher's OVERLOAD/EMERGENCY reports feed it.
+
 ### Q→buttons (v1.5.0, seamless setup in v1.6.0)
 Agent questions and permission prompts are forwarded to Telegram as inline buttons — no need to touch the terminal. Tap to answer; the answer is injected back into the pane immediately. Supports Claude Code question/permission shapes, Codex `PermissionRequest`, and opencode `question.asked`/`permission.asked` events.
 
