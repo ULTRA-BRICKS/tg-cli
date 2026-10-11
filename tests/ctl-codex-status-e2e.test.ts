@@ -6,11 +6,12 @@
 //
 // rig is either a FAKE (tests/helpers/fake-rig.ts — never a real rig install) or forced ABSENT
 // (RIG_AGENT_TOOLS_SOURCE points nowhere).
-import { afterAll, expect, setDefaultTimeout, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { expect, setDefaultTimeout, test } from 'bun:test';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { BASE_PATH, fakeAgentToolsCheckout } from './helpers/fake-rig';
+import { tempDir } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const CMD = 'tg-ctl codex-usage-hook';
@@ -19,17 +20,6 @@ const NOWHERE = join(tmpdir(), 'tgctl-316-no-agent-tools');
 // Every test spawns the real `tg-ctl` (status also snapshots live sessions): well under a second
 // alone, but past bun's 5 s default when the full suite saturates the machine.
 setDefaultTimeout(30_000);
-
-// Every throwaway dir is removed after the file runs — the suite already leaks enough (#486).
-const tempDirs: string[] = [];
-function tempDir(prefix: string): string {
-  const dir = mkdtempSync(join(tmpdir(), prefix));
-  tempDirs.push(dir);
-  return dir;
-}
-afterAll(() => {
-  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
-});
 
 // The file that had to be deleted by hand on the live machine — kept verbatim as the migration
 // fixture (~/.codex/hooks.json.pre-308-migration.bak).
