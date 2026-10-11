@@ -65,7 +65,7 @@ test('a range whose endpoints lie past 2^53 terminates (no interior synthesized)
   // freezing the tg send. Run in a child so a regression fails on the deadline instead of
   // wedging the whole test process.
   const code = `const { detectRefsExpanded } = await import(${JSON.stringify(`${import.meta.dir}/../features/autolink-prs/detect.ts`)});
-console.log(JSON.stringify(detectRefsExpanded('#1,9007199254740992-9007199254741000 HYP-9007199254740992..9007199254740999')));`;
+process.stdout.write(JSON.stringify(detectRefsExpanded('#1,9007199254740992-9007199254741000 HYP-9007199254740992..9007199254740999')));`;
   const proc = spawnSyncBounded(['bun', '-e', code], { stdout: 'pipe', stderr: 'pipe' }, 10_000);
   expect(proc.stderr.toString()).toBe('');
   expect(JSON.parse(proc.stdout.toString())).toEqual([1, 9007199254740992, 9007199254741000]);
