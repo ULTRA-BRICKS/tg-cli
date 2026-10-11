@@ -3,6 +3,24 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.60.3
+
+- **The full test suite runs on a Runpod CPU pod (Refs #616).** `scripts/remote-test.sh` syncs a
+  checkout to the pod, runs `bun test` there under the CI watchdog, streams and saves the log,
+  and exits with bun's code (AGENTS.md, "Full suite on Runpod"). By default each run rents its
+  own pod and deletes it on every exit path (about $0.04 a full run, ~10 min end to end); a pod
+  whose ssh never answers is replaced once, a pod that cannot be deleted stops the run instead
+  of renting another, and if the client is killed outright the pod deletes itself an hour after
+  the run's timeout. A long-lived shared pod (`TG_REMOTE_TEST_POD_ID`) is opt-in: it bills
+  $0.24/h while it exists, so its owner must stop it.
+- The bun version it installs on the pod must be exactly `x.y.z` (a value with a path after it
+  could make the root setup install into and chmod another directory); the pod's ssh address is
+  the first `ip` and `port` in `runpodctl ssh info`, and a port that is not a number is an
+  error; a run writes its pid file only after entering its directory, so another run's
+  cleanup never mistakes a starting run for a dead one; and bash reads the whole script before
+  running it, so editing the file under a running copy (a worktree checkout) no longer ends a
+  passed run in `command not found`.
+
 ## 1.60.2
 
 - **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on
