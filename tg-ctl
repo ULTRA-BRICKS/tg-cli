@@ -9144,10 +9144,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const found = resolveGoneAgentAnchor("media-agent-route", route.selector, candidates, true)
       if (found) {
         const { anchor, label } = found
+        // injectPrewrappedToPane only returns a boolean; it queues (rather than types)
+        // exactly when a non-omp pane defers inbound, so read that state before the call
+        // — the text route's "queued for" wording, from res.deferred there (tg-cli#433).
+        const deferred = !anchor.paneId.startsWith("omp:") && shouldDeferInbound(anchor.paneId)
         const ok = await injectPrewrappedToPane(anchor.paneId, prewrappedText, sourceMessageId, anchor.panePath ?? "/")
         if (ok) {
           recordLastUserTarget(anchor.paneId, anchor.panePath)
-          await sendMessage(ctx, goneAgentFallbackReplyText(route.selector, label))
+          await sendMessage(ctx, goneAgentFallbackReplyText(route.selector, label, deferred))
         }
         return ok
       }

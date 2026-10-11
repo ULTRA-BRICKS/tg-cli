@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Server, Subprocess } from 'bun';
-import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
+import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
 import { tempDir } from './helpers/test-temp';
 
 // End-to-end "gone subagent" fallback (live report, 2026-09-18): a real daemon, a fake
@@ -32,9 +32,12 @@ const PANE_PID = 5301;
 
 // A fake tmux reporting ONE claude-hosting pane, logging every send-keys -l payload as
 // `<paneId>\t<text>` to $injectLog (mirrors ctl-topics-integration.test.ts's fakeTmux).
-function fakeTmux(cwd: string, injectLog: string): string {
+// failInject: every typing verb (send-keys / load-buffer / paste-buffer) exits 1, as when
+// the pane vanished between candidate listing and delivery.
+function fakeTmux(cwd: string, injectLog: string, failInject = false): string {
   return `#!/bin/sh
 sub="$1"; shift
+${failInject ? `case "$sub" in send-keys|load-buffer|paste-buffer) echo "can't find pane" >&2; exit 1;; esac` : ''}
 case "$sub" in
   list-panes)
     printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '${PANE}' '${PANE_PID}' 'claude' 'main' '${cwd}'
@@ -67,7 +70,7 @@ exit 0
 `;
 }
 
-function makeCfgDir(opts: { seedAnchor: boolean }): string {
+function makeCfgDir(opts: { seedAnchor: boolean; failInject?: boolean }): string {
   const cfgDir = tempDir('tgctl-gone-agent-');
   const injectLog = join(cfgDir, 'inject.log');
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
@@ -81,7 +84,7 @@ function makeCfgDir(opts: { seedAnchor: boolean }): string {
     );
   }
   mkdirSync(join(cfgDir, 'bin'));
-  writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmux(cfgDir, injectLog), { mode: 0o755 });
+  writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmux(cfgDir, injectLog, opts.failInject), { mode: 0o755 });
   writeFileSync(join(cfgDir, 'bin', 'ps'), fakePs(), { mode: 0o755 });
   return cfgDir;
 }
@@ -138,6 +141,12 @@ function makeServer(updateQueue: unknown[][]): {
       if (url.pathname.endsWith('/setMessageReaction')) {
         return Response.json({ ok: true, result: true });
       }
+      if (url.pathname.endsWith('/getFile')) {
+        return Response.json({ ok: true, result: { file_path: 'photos/shot.jpg' } });
+      }
+      if (url.pathname.includes('/file/bot')) {
+        return new Response('JPEGDATA');
+      }
       return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
     },
   });
@@ -148,6 +157,20 @@ function agentMsg(messageId: number, text: string, nowSec: number): unknown {
   return {
     update_id: messageId,
     message: { message_id: messageId, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text },
+  };
+}
+
+function photoMsg(messageId: number, caption: string, nowSec: number): unknown {
+  return {
+    update_id: messageId,
+    message: {
+      message_id: messageId,
+      from: { id: 1, first_name: 'Alex' },
+      chat: { id: 1 },
+      date: nowSec,
+      caption,
+      photo: [{ file_id: 'photo-large', file_size: 1024 }],
+    },
   };
 }
 
@@ -203,6 +226,93 @@ test('`/agent <gone-name>` with exactly one live agent but NO anchor still error
   const reply = sends[0];
   expect(reply.text as string).toContain("no agent matching 'ghost'");
 
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+// tg-cli#433 item 4: the MEDIA route's gone-agent fallback (routePrewrappedAgentMessage)
+// must mirror the text route — a photo `/agent <gone>` lands in the anchor pane and says
+// so, and when that inject FAILS the CTO gets the inject error, never silence.
+test('photo `/agent <gone-name>` with an anchor pane live delivers there and says so', async () => {
+  const cfgDir = makeCfgDir({ seedAnchor: true });
+  const updateQueue: unknown[][] = [];
+  const { server, sends } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  updateQueue.push([photoMsg(12, '/agent ghost look at this', Math.floor(Date.now() / 1000))]);
+
+  await waitFor(() => injected(cfgDir).some((l) => l.text.includes('look at this')));
+  // A media payload is multi-line → bracketed paste (load-buffer), logged without a pane prefix.
+  expect(injected(cfgDir).some((l) => l.text.includes('look at this'))).toBe(true);
+  await waitFor(() => sends.some((s) => String(s.text).includes("agent 'ghost' is gone")));
+  expect(sends.some((s) => String(s.text).includes("agent 'ghost' is gone"))).toBe(true);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('photo `/agent <gone-name>` whose anchor-pane inject fails reports the error instead of dropping silently', async () => {
+  const cfgDir = makeCfgDir({ seedAnchor: true, failInject: true });
+  const updateQueue: unknown[][] = [];
+  const { server, sends } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  updateQueue.push([photoMsg(13, '/agent ghost look at this', Math.floor(Date.now() / 1000))]);
+
+  await waitFor(() => sends.length >= 1, 5000);
+  expect(injected(cfgDir)).toHaveLength(0);
+  // Not the success wording — the delivery did not happen — but an error reply exists.
+  expect(sends.some((s) => String(s.text).includes('delivered to'))).toBe(false);
+  expect(sends.some((s) => /fail|can't find pane|error/i.test(String(s.text)))).toBe(true);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('photo `/agent <gone-name>` whose anchor pane has an open question says "queued for", never "delivered to"', async () => {
+  const cfgDir = makeCfgDir({ seedAnchor: true });
+  // The daemon only forwards asks from a registered pane.
+  writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ paneId: PANE, cwd: cfgDir }));
+  const updateQueue: unknown[][] = [];
+  const { server, sends } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  // An open question on the anchor pane defers inbound (shouldDeferInbound): the photo
+  // is queued behind it, not typed into the prompt.
+  const ask = trackProc(
+    reg,
+    Bun.spawn([process.execPath, TG_CTL, 'ask'], {
+      env: {
+        PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
+        HOME: cfgDir,
+        TG_CTL_CONFIG_DIR: cfgDir,
+        TG_API_BASE: `http://127.0.0.1:${server.port}`,
+        TMUX_PANE: PANE,
+      },
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    }),
+  );
+  ask.stdin.write(
+    `${JSON.stringify({ cwd: cfgDir, paneId: PANE, requestId: 'q_open', agent: 'claude', kind: 'question', question: 'Which?', options: [{ label: 'A' }] })}\n`,
+  );
+  ask.stdin.end();
+  await waitFor(() => sends.some((s) => s.reply_markup !== undefined));
+  expect(sends.some((s) => s.reply_markup !== undefined)).toBe(true);
+
+  updateQueue.push([photoMsg(14, '/agent ghost look at this', Math.floor(Date.now() / 1000))]);
+
+  await waitFor(() => sends.some((s) => String(s.text).includes("agent 'ghost' is gone")));
+  const reply = sends.find((s) => String(s.text).includes("agent 'ghost' is gone"));
+  expect(String(reply?.text)).toContain('queued for');
+  expect(injected(cfgDir).some((l) => l.text.includes('look at this'))).toBe(false);
+
+  ask.kill(9);
+  await ask.exited;
   daemon.kill('SIGTERM');
   await daemon.exited;
 }, 30_000);

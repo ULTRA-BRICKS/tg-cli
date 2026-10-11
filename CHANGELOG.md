@@ -3,6 +3,17 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.60.3
+
+- **A photo/document `/agent <gone>` queued behind an open question now says "queued for", not
+  "delivered to" (#433 item 4).** The media route's gone-agent fallback only got a boolean back
+  from `injectPrewrappedToPane`, so when the anchor pane had an open question and the media was
+  queued, the reply still claimed delivery. It now reads the pane's defer state first, matching
+  the text route. The item's original finding (inject failure dropped silently) was a false
+  positive: every `false` path in `injectPrewrappedToPane` already sends its error to the chat.
+  Daemon-level tests in `tests/ctl-gone-agent-fallback.test.ts` pin all three cases: delivered,
+  queued, and inject failure (error reply, no success wording).
+
 ## 1.60.2
 
 - **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on
