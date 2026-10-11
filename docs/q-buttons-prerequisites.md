@@ -91,7 +91,10 @@ question TEXT, `updatedInput` replaces wholesale — is unchanged in
      best-effort until Codex exposes a stable quota/status hook payload. The
      collector scans only the transcript tail for performance, so older quota
      samples outside that tail can be missed.
-   - **opencode**: native SSE question/permission events — no tmux hook needed.
+   - **opencode**: native — the running daemon subscribes to opencode's event stream (2.x
+     background service from `~/.local/state/opencode/service.json`; 1.x per-session servers
+     from the listening ports of `opencode` processes). No hook file; asks forward when the
+     session's directory is registered (`tg-ctl start --cwd <dir>`), like every other harness.
 5. **A per-hook timeout** (~120 s) in settings; on expiry the local dialog takes
    over and the daemon edits the TG message to "expired".
 
@@ -101,7 +104,7 @@ question TEXT, `updatedInput` replaces wholesale — is unchanged in
 |---|---|---|---|
 | Claude Code | ✅ buttons | ✅ buttons | needs the undocumented AskUserQuestion hook |
 | Codex | ❌ | ✅ buttons | manual `/hooks` trust; usage telemetry via Stop hook |
-| opencode | ✅ | ✅ | native, no tmux |
+| opencode | ✅ buttons (single-choice) | ✅ buttons | native event stream, no tmux; 2.x forms with one `custom: false` choice field |
 | omp | ✅ buttons | ✅ buttons | ACP `session/request_permission`; never tmux digit inject |
 | pi / aider / gemini | ❌ | ❌ | tmux floor only; bot replies "limited" |
 

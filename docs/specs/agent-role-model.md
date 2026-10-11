@@ -64,9 +64,10 @@ exec. Anything inside `tool_input` / tool args is model-controlled and ignored.
 2. **`tg-ctl ask` (hook-normalize)** — `ButtonRequest.subagent` = the raw payload's top-level
    `agent_id`/`agent_type` (`hookPayloadRole`, label `<type>#<last 8 id chars>` — the random tail,
    since Codex's UUIDv7 heads repeat for ~65 s), else the hook process env
-   (`envRole`: `TG_AGENT` > `RIG_AGENT_ID` > `RIG_DETACHED_AGENT=1`). The opencode adapter takes the
-   fetched session record (`opencodeSessionRole(session)`); the daemon has no opencode SSE
-   subscriber yet (tg-cli#533), so that path is adapter-only.
+   (`envRole`: `TG_AGENT` > `RIG_AGENT_ID` > `RIG_DETACHED_AGENT=1`). The daemon's opencode bridge
+   (`features/tg-ctl/opencode-bridge.ts`, tg-cli#533) fetches the asking session's record
+   (`GET /api/session/:id`, 1.x `/session/:id`) per ask and passes it to the adapter
+   (`opencodeSessionRole(session)`): a child session's title becomes `ButtonRequest.subagent`.
 3. **`tg` outbound `[subagent]` bracket** — `senderRole`: `--subagent` > `TG_AGENT` >
    `RIG_AGENT_ID` > `RIG_DETACHED_AGENT=1` (→ `detached`). The coordinator passes nothing → no
    bracket. cc/codex/opencode IN-PROCESS subagents MUST pass `--subagent` (no trusted env).

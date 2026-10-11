@@ -78,12 +78,19 @@ import { serializeDeferredStore, parseDeferredStore } from "./features/tg-ctl/de
 import { TargetDispatchQueues, groupActionsByAckBoundary } from "./features/tg-ctl/concurrent-dispatch"
 import {
   findAgentInPane,
+  matchAgentCommand,
   panesWithRetry,
   parsePaneList,
   parsePaneTitles,
   parseProcList,
   pickTargetPaneFromSet,
 } from "./features/tg-ctl/discover"
+import {
+  DEFAULT_BRIDGE_OPTIONS,
+  discoverOpencodeServers,
+  parseLsofListenUrls,
+  startOpencodeBridge,
+} from "./features/tg-ctl/opencode-bridge"
 import { isBareWindowName, resolveSessionName } from "./features/tg-ctl/session-name"
 import { buildDigitInjectPlan, buildKeyInjectPlan, buildTextInjectPlan, paneTypingKey, unsubmittedNotice, wrapInbound } from "./features/tg-ctl/inject"
 import { messageStillTyped } from "./features/tg-ctl/input-box"
@@ -6031,7 +6038,7 @@ const ASK_TOTAL_TIMEOUT_MS = (() => {
 // re-attaches instead of racing the in-flight dedup.
 const ASK_RECONNECT_BACKOFF_MS = 250
 
-function oneAskAttempt(ctx: Ctx, requestLine: string, timeoutMs: number): Promise<AskAttempt> {
+function oneAskAttempt(ctx: Ctx, requestLine: string, timeoutMs: number, signal?: AbortSignal): Promise<AskAttempt> {
   return new Promise<AskAttempt>((resolve) => {
     let done = false
     let raw = ""
@@ -6060,6 +6067,12 @@ function oneAskAttempt(ctx: Ctx, requestLine: string, timeoutMs: number): Promis
           finish("timeout")
         }, timeoutMs)
       : undefined
+    // The in-daemon opencode bridge retires its card when opencode settles the ask
+    // elsewhere: closing the socket is the hook client's own "gone" signal.
+    signal?.addEventListener("abort", () => {
+      socket.destroy()
+      finish("dropped")
+    }, { once: true })
     socket.setEncoding("utf8")
     socket.on("connect", () => socket.write(requestLine + "\n"))
     socket.on("data", (chunk) => {
@@ -6071,6 +6084,43 @@ function oneAskAttempt(ctx: Ctx, requestLine: string, timeoutMs: number): Promis
     // to retry (parseAskStream decides, so an interim status line alone is not a reply).
     socket.on("end", () => finish("end"))
     socket.on("close", () => finish("dropped"))
+  })
+}
+
+// tg-cli#533: the opencode bridge's host I/O. Every probe is an async spawn/fetch with a
+// timeout — never spawnSync — so discovery cannot stall the Telegram poll loop.
+async function spawnText(argv: string[]): Promise<string> {
+  try {
+    // SIGKILL like every other guarded spawn here: a ps/lsof stuck on a stalled mount ignores SIGTERM.
+    const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "ignore", env: SUBPROC_ENV, timeout: 5_000, killSignal: "SIGKILL" })
+    const out = await new Response(proc.stdout).text()
+    await proc.exited
+    return out
+  } catch {
+    return "" // tool missing (no lsof): nothing discovered this way
+  }
+}
+
+function startDaemonOpencodeBridge(ctx: Ctx): void {
+  // opencode 2.x announces its background service in its XDG state dir.
+  const stateHome = process.env.XDG_STATE_HOME || join(process.env.HOME ?? "", ".local", "state")
+  const servicePath = join(stateHome, "opencode", "service.json")
+  startOpencodeBridge({
+    discover: () => discoverOpencodeServers({
+      readServiceState: async () => readFileOrNull(servicePath),
+      pidAlive: kill0,
+      opencodePids: async () =>
+        parseProcList(await spawnText(["ps", "-axo", "pid=,ppid=,command="]))
+          .filter((p) => matchAgentCommand(p.command) === "opencode")
+          .map((p) => p.pid),
+      listenUrls: async (pids) =>
+        parseLsofListenUrls(await spawnText(["lsof", "-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-p", pids.join(","), "-Fn"])),
+      fetch: (url, init) => fetch(url, init),
+    }, DEFAULT_BRIDGE_OPTIONS.requestTimeoutMs),
+    fetch: (url, init) => fetch(url, init),
+    ask: async (req, signal) => (await oneAskAttempt(ctx, JSON.stringify(req), Infinity, signal)).raw,
+    log,
+    notify: (text) => void sendMessage(ctx, text),
   })
 }
 
@@ -8150,6 +8200,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // approval gate, not a prompt in any pane, and may wait up to 15 min — it
       // must never hold every agent's inbound behind it.
       if (isGenericAskRequest(pb.req)) continue
+      // tg-cli#533: a paneless opencode ask comes from the opencode bridge — its prompt is in
+      // opencode's own UI, answered over HTTP, never typed into a pane we inject into.
+      if (pb.req.agent === "opencode" && !pb.req.paneId) continue
       if (!pb.req.paneId && pb.req.critical !== true) return true
       if (pb.req.paneId === paneId) return true
     }
@@ -8489,6 +8542,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   }
 
   hookServer = startHookServer(ctx, questionRuntime)
+  // opencode asks reach Telegram through the socket just opened (tg-cli#533).
+  if (hookServer) startDaemonOpencodeBridge(ctx)
 
   if (ctx.cfg.transport === "channel") {
     log("transport 'channel' is reserved for v1.2+ — falling back to tmux")

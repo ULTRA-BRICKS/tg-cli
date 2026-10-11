@@ -221,8 +221,8 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
   `TG_AGENT` > `RIG_AGENT_ID` > `RIG_DETACHED_AGENT=1` → `detached`), `hookPayloadRole` (a Claude
   Code / Codex hook's TOP-LEVEL `agent_id`/`agent_type`, wired into `hook-normalize` so
   `ButtonRequest.subagent` comes from the payload first), `envRole` (hook process env),
-  `opencodeSessionRole` (`session.parentID`; adapter-only until the daemon subscribes to opencode
-  SSE, tg-cli#533). There is NO positive "I am the coordinator" marker
+  `opencodeSessionRole` (`session.parentID`; the daemon's opencode bridge fetches the asking
+  session's record per ask, tg-cli#533). There is NO positive "I am the coordinator" marker
   and NO guessing from `CLAUDE_CODE_CHILD_SESSION` (set on the main thread too); the old
   `features/agent-detect/` is deleted. The `[window]` label is the primary name from
   `resolveSessionName` (`features/tg-ctl/session-name.ts`).

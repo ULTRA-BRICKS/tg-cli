@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from 'bun:test';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { createConnection } from 'net';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
 import { tempDir } from './helpers/test-temp';
@@ -1477,6 +1478,43 @@ test('a generic `tg-ctl ask "<question>"` does not defer inbound to agent panes 
 
   ask.kill(9);
   await ask.exited;
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 20_000);
+
+// tg-cli#533: an opencode ask arrives from the daemon's own opencode bridge — paneless, its
+// prompt lives in opencode, not in any tmux pane we inject into. Like a generic ask it must
+// not defer every agent pane's inbound while its card is open.
+test('an opencode bridge ask does not defer inbound to agent panes while its card is open', async () => {
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const edits: string[] = [];
+  const server = recordingServer(updateQueue, reactions, edits);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const socket = createConnection(join(cfgDir, 'tg-ctl.123.sock'));
+  socket.on('connect', () => socket.write(JSON.stringify({
+    requestId: 'oc_ses_1_per_1',
+    agent: 'opencode',
+    kind: 'permission',
+    title: 'external_directory',
+    question: 'external_directory\nresources: /opt/zz/*',
+    cwd: cfgDir,
+  }) + '\n'));
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
+    expect(server.cb()).not.toBe('');
+  }
+
+  updateQueue.push([
+    { update_id: 95, message: { message_id: 96, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'keep going in claude' } },
+  ]);
+  await waitForInjected(cfgDir, 'keep going in claude', 8000);
+
+  socket.destroy();
   daemon.kill('SIGTERM');
   await daemon.exited;
 }, 20_000);

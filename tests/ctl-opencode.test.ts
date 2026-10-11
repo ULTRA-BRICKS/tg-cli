@@ -1,5 +1,7 @@
 import { expect, test } from 'bun:test';
-import { opencodeEventToButtonRequest, opencodeReplyPlan } from '../features/tg-ctl/opencode';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import { opencodeEventToButtonRequest, opencodeReplyPlan, type OpencodeEvent } from '../features/tg-ctl/opencode';
 
 test('opencodeEventToButtonRequest maps question.asked into a button request', () => {
   const req = opencodeEventToButtonRequest({
@@ -264,4 +266,70 @@ test('opencodeReplyPlan maps permission deny to reject', () => {
   ).toMatchObject({
     body: { reply: 'reject', message: 'Rejected from Telegram' },
   });
+});
+
+// opencode 2.x (recorded from 2.0.20's `GET /api/event`, tests/fixtures/opencode): the event
+// envelope carries `data`, not `properties`; questions are `form.created` forms.
+const v2Events = readFileSync(join(import.meta.dir, 'fixtures', 'opencode', 'opencode-2.0.20-events.jsonl'), 'utf8')
+  .split('\n')
+  .filter(Boolean)
+  .map((l) => JSON.parse(l) as OpencodeEvent);
+const v2Event = (type: string): OpencodeEvent => v2Events.find((e) => e.type === type)!;
+
+test('opencode 2.x permission.asked maps to a permission card replied through the session api route', () => {
+  const req = opencodeEventToButtonRequest(v2Event('permission.asked'))!;
+  expect(req).toMatchObject({
+    agent: 'opencode',
+    kind: 'permission',
+    title: 'external_directory',
+    question: 'external_directory\nresources: /opt/zz/*',
+    opencode: { sessionId: 'ses_ed6592116ffe9n2bwWhaJox73j', requestId: 'per_129a70817001cL8CAS6aA3PpGw', replyKind: 'permission-api' },
+  });
+  expect(opencodeReplyPlan('http://127.0.0.1:49374/', req, 'allow')).toEqual({
+    method: 'POST',
+    url: 'http://127.0.0.1:49374/api/session/ses_ed6592116ffe9n2bwWhaJox73j/permission/per_129a70817001cL8CAS6aA3PpGw/reply',
+    body: { decision: 'once' },
+  });
+  expect(opencodeReplyPlan('http://127.0.0.1:49374', req, 'deny')?.body).toEqual({ decision: 'reject', message: 'Rejected from Telegram' });
+});
+
+test('opencode 2.x single-choice form maps to option buttons; the tapped label replies with its value', () => {
+  const req = opencodeEventToButtonRequest(v2Event('form.created'))!;
+  expect(req).toMatchObject({
+    agent: 'opencode',
+    kind: 'question',
+    title: 'Pick one',
+    question: 'Which?',
+    options: [{ label: 'Alpha' }, { label: 'Beta' }],
+    opencode: { sessionId: 'ses_ed6592116ffe9n2bwWhaJox73j', requestId: 'frm_129a6ecea001fjH5B15p5Kvriv', replyKind: 'form' },
+  });
+  expect(opencodeReplyPlan('http://127.0.0.1:49374', req, 'Beta')).toEqual({
+    method: 'POST',
+    url: 'http://127.0.0.1:49374/api/session/ses_ed6592116ffe9n2bwWhaJox73j/form/frm_129a6ecea001fjH5B15p5Kvriv/reply',
+    body: { answer: { choice: 'b' } },
+  });
+});
+
+test('opencode 2.x forms that buttons cannot answer stay in the terminal', () => {
+  const field = { key: 'choice', title: 'Which?', type: 'string', options: [{ value: 'a', label: 'Alpha' }], custom: false };
+  const variant = (fields: Record<string, unknown>[]): OpencodeEvent => ({
+    type: 'form.created',
+    data: { form: { id: 'frm_1', sessionID: 'ses_1', title: 'Pick one', fields } },
+  });
+  expect(opencodeEventToButtonRequest(variant([field]))).not.toBeNull();
+  expect(opencodeEventToButtonRequest(variant([{ ...field, custom: true }]))).toBeNull();
+  expect(opencodeEventToButtonRequest(variant([{ ...field, type: 'multiselect' }]))).toBeNull();
+  expect(opencodeEventToButtonRequest(variant([field, { ...field, key: 'second' }]))).toBeNull();
+  expect(opencodeEventToButtonRequest(variant([{ key: 'name', type: 'string', custom: false }]))).toBeNull();
+  const twoYes = [{ value: 'a', label: 'Yes' }, { value: 'b', label: 'Yes' }];
+  expect(opencodeEventToButtonRequest(variant([{ ...field, options: twoYes }]))).toBeNull();
+});
+
+test('opencode 2.x ask from a child session carries the session title as the subagent label', () => {
+  const req = opencodeEventToButtonRequest(v2Event('permission.asked'), {
+    id: 'ses_ed6592116ffe9n2bwWhaJox73j',
+    parentID: 'ses_parent',
+    title: 'Scan repo (@explore subagent)',
+  });
+  expect(req?.subagent).toBe('Scan repo (@explore subagent)');
 });

@@ -62,7 +62,10 @@ export function clampRequestTimeoutMs(timeoutMs: number | undefined, fallbackMs:
 export interface OpencodeRequestRef {
   sessionId: string;
   requestId: string;
-  replyKind: 'question' | 'question-v2' | 'permission' | 'permission-v2';
+  // `permission-api` / `form` are opencode 2.x (`/api/session/{id}/...`); the rest 1.x.
+  replyKind: 'question' | 'question-v2' | 'permission' | 'permission-v2' | 'permission-api' | 'form';
+  // form only: the single field the card answers, and option label → value.
+  form?: { fieldKey: string; values: Record<string, string> };
 }
 
 export interface ButtonRequest {

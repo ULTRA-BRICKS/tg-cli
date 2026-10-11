@@ -740,6 +740,24 @@ until the bot has a multi-answer UI. Caveat: a user-launched TUI binds a random 
 unless started with a fixed `--port` (or discovered via `--mdns`) — so the clean path is
 "bot owns the server, clients attach", not "inject into an arbitrary TUI".
 
+**Shipped (tg-cli#533) — the daemon-owned subscription, against opencode 2.0.20.** The
+bot does not own `opencode serve`: opencode 2.x already runs one background service per
+user that every TUI attaches to, announced in `$XDG_STATE_HOME/opencode/service.json`
+(`{url, pid, password}`; `/api/*` routes, HTTP Basic `opencode:<password>`). `tg-ctl run`
+re-discovers servers every 15 s — that service, plus 1.x per-session servers found from the
+listening ports (`lsof`) of `opencode` processes and kept when `GET /session` answers a JSON
+list — and holds one `GET /api/event` (1.x `/event`) stream per server: async, reconnecting
+with 1→30 s backoff, event size and open-ask count capped. 2.x wire, recorded from the live
+service: the envelope is `{type, data}`; `permission.asked` `{id, sessionID, action,
+resources}` replies `POST /api/session/{sid}/permission/{id}/reply {decision: once|reject}`;
+questions are `form.created` forms (`data.form`), and one `custom: false` single-choice
+string field maps to buttons, replied `POST /api/session/{sid}/form/{id}/reply {answer:
+{key: optionValue}}`. Each ask enters the daemon through its own hook socket as a
+`ButtonRequest` (cwd = the session's directory, so the registration gate applies), with the
+subagent label from the fetched session record; `*.replied` / `form.cancelled` from another
+client retires the card. An unanswered card expires on the unscoped-ask bound; the ask stays
+open in opencode.
+
 **The "not supported" rule:** when a harness lacks native question-forwarding (aider,
 gemini, pi-for-now, omp), the bot does NOT silently scrape-and-hope; it forwards what tmux can
 see and replies once: "native question forwarding isn't available for `<harness>` —
@@ -798,7 +816,7 @@ round-trip): `tg` records `message_id → {paneId, cwd}` into a routing map on
 every outbound send; the daemon routes an inbound that carries
 `reply_to_message` to the mapped pane, while plain (non-reply) text keeps the
 v1 last-write-wins registration target. This turns one-bot-many-sessions into
-a usable fan-in without threads; opencode daemon-owned SSE subscription → v1.1;
+a usable fan-in without threads; opencode daemon-owned SSE subscription → v1.1 (shipped, §14, tg-cli#533);
 `/rename`, `/new`, `HarnessAdapter` → v1.2; channel mode + takeover protocol
 → v1.2+; the §10 Escape prelude is built in `inject.ts` but not wired (no
 config key yet). Each deferral is annotated at its section.

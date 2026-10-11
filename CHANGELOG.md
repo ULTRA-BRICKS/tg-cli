@@ -3,6 +3,18 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.61.0
+
+- **opencode asks reach Telegram (#533).** `tg-ctl run` now subscribes to opencode's event
+  stream — the 2.x background service from `~/.local/state/opencode/service.json` (Basic auth,
+  `/api/*`) and 1.x per-session servers found from `opencode` processes' listening ports — and
+  posts a card for each permission ask and single-choice question (2.x `form.created`). A tap
+  replies through opencode's own route; an ask raised in a child session names the subagent
+  from the session record. The stream is async and reconnects with backoff; it never blocks
+  the Telegram poll loop. A card answered in the opencode TUI meanwhile is retired. If opencode
+  refuses the reply (the ask is gone), Telegram gets a notice to answer in opencode. An open
+  opencode card does not hold back inbound messages to other agents' panes.
+
 ## 1.60.2
 
 - **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on
