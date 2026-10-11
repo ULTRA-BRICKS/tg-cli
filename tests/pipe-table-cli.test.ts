@@ -2,21 +2,15 @@
 // entrypoint (features/render/table.ts pipeTableToHtml), exercised through
 // `tg --dry-run`, which runs every local guard and the conversion, prints the
 // effective format and the assembled body, and never touches the network.
-import { afterAll, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
+import { expect, test } from 'bun:test';
 import { join } from 'path';
 import { LONG_UNSTRUCTURED_MESSAGE_WARNING } from '../features/cli/message-structure';
+import { tempDir } from './helpers/test-temp';
 
 const TG_SCRIPT = join(import.meta.dir, '..', 'tg');
-const dirs: string[] = [];
-afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
-});
 
 function dryRun(args: string[]): { exitCode: number; stdout: string; stderr: string } {
-  const home = mkdtempSync(join(tmpdir(), 'tg-pipe-table-cli-'));
-  dirs.push(home);
+  const home = tempDir('tg-pipe-table-cli-');
   const proc = Bun.spawnSync(['bun', TG_SCRIPT, '--dry-run', ...args], {
     env: { PATH: process.env.PATH ?? '', HOME: home, TMUX: '', TG_AI_MODEL: 'unknown-model', TG_AI_EMOJI: 'bot' },
   });
