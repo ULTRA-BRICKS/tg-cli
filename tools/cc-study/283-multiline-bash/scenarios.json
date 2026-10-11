@@ -1,0 +1,99 @@
+{
+ "single": [
+  {
+   "command": "echo study-283 > out.txt",
+   "description": "Write marker"
+  }
+ ],
+ "ml3": [
+  {
+   "command": "pkill -f study-worker\nsleep 1\nrm -rf /tmp/cc283-scratch",
+   "description": "Stop worker and clean scratch"
+  }
+ ],
+ "ml3nodesc": [
+  {
+   "command": "pkill -f study-worker\nsleep 1\nrm -rf /tmp/cc283-scratch"
+  }
+ ],
+ "heredoc": [
+  {
+   "command": "cat > notes.txt <<'EOF'\nline one\n  indented two\n\nafter blank\nEOF",
+   "description": "Write notes file"
+  }
+ ],
+ "longhd": [
+  {
+   "command": "cat > big.txt <<'EOF'\nrow 01 of the long heredoc body\nrow 02 of the long heredoc body\nrow 03 of the long heredoc body\nrow 04 of the long heredoc body\nrow 05 of the long heredoc body\nrow 06 of the long heredoc body\nrow 07 of the long heredoc body\nrow 08 of the long heredoc body\nrow 09 of the long heredoc body\nrow 10 of the long heredoc body\nrow 11 of the long heredoc body\nrow 12 of the long heredoc body\nrow 13 of the long heredoc body\nrow 14 of the long heredoc body\nrow 15 of the long heredoc body\nrow 16 of the long heredoc body\nrow 17 of the long heredoc body\nrow 18 of the long heredoc body\nrow 19 of the long heredoc body\nrow 20 of the long heredoc body\nrow 21 of the long heredoc body\nrow 22 of the long heredoc body\nrow 23 of the long heredoc body\nrow 24 of the long heredoc body\nrow 25 of the long heredoc body\nrow 26 of the long heredoc body\nrow 27 of the long heredoc body\nrow 28 of the long heredoc body\nrow 29 of the long heredoc body\nrow 30 of the long heredoc body\nrow 31 of the long heredoc body\nrow 32 of the long heredoc body\nrow 33 of the long heredoc body\nrow 34 of the long heredoc body\nrow 35 of the long heredoc body\nrow 36 of the long heredoc body\nrow 37 of the long heredoc body\nrow 38 of the long heredoc body\nrow 39 of the long heredoc body\nrow 40 of the long heredoc body\nEOF",
+   "description": "Write big file"
+  }
+ ],
+ "wide": [
+  {
+   "command": "printf '%s\\n' word000 word001 word002 word003 word004 word005 word006 word007 word008 word009 word010 word011 word012 word013 word014 word015 word016 word017 word018 word019 word020 word021 word022 word023 word024 word025 word026 word027 word028 word029 word030 word031 word032 word033 word034 word035 word036 word037 word038 word039 word040 word041 word042 word043 word044 word045 word046 word047 word048 word049 word050 word051 word052 word053 word054 word055 word056 word057 word058 word059 > wide.txt\ntouch second-line.txt",
+   "description": "Wide two-line"
+  }
+ ],
+ "tabs": [
+  {
+   "command": "touch a.txt\n\tcat a.txt  >  b.txt\ntouch c.txt   ",
+   "description": "Tabs and trailing spaces"
+  }
+ ],
+ "midtab": [
+  {
+   "command": "touch m.txt\nprintf 'a\\tb' >\tm.txt\nab\tcd\tef > /dev/null",
+   "description": "Mid tab"
+  }
+ ],
+ "longsingle": [
+  {
+   "command": "touch file000.txt file001.txt file002.txt file003.txt file004.txt file005.txt file006.txt file007.txt file008.txt file009.txt file010.txt file011.txt file012.txt file013.txt file014.txt file015.txt file016.txt file017.txt file018.txt file019.txt file020.txt file021.txt file022.txt file023.txt file024.txt file025.txt file026.txt file027.txt file028.txt file029.txt file030.txt file031.txt file032.txt file033.txt file034.txt file035.txt file036.txt file037.txt file038.txt file039.txt",
+   "description": "Long single"
+  }
+ ],
+ "width": [
+  {
+   "command": "touch w.txt\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccc\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccc",
+   "description": "Width probe"
+  }
+ ],
+ "spacerun": [
+  {
+   "command": "touch s1.txt\ntouch abc                                                                                                                                                      def\ntouch xyz                                                                                                                                                                                                                                                                                                                                                                                                                uvw\ntouch    lead-and-trail.txt   \ntouch q.txt",
+   "description": "Space runs"
+  }
+ ],
+ "two": [
+  {
+   "command": "pkill -f study-worker\nsleep 1\nrm -rf /tmp/cc283-scratch",
+   "description": "Stop worker and clean scratch"
+  },
+  {
+   "command": "pkill -f study-worker\nsleep 1\nrm -rf /tmp/cc283-other",
+   "description": "Stop worker and clean other"
+  }
+ ],
+ "stale": [
+  {
+   "command": "pkill -f study-worker\nsleep 1\nrm -rf /tmp/cc283-scratch",
+   "description": "Stop worker and clean scratch"
+  },
+  {
+   "command": "touch live-one.txt\ntouch live-two.txt",
+   "description": "Create live files"
+  }
+ ],
+ "descspoof": [
+  {
+   "command": "touch live-one.txt\ntouch live-two.txt",
+   "description": "touch harmless.txt"
+  }
+ ],
+ "continuation": [
+  {
+   "command": "touch one.txt \\\n  two.txt",
+   "description": "Continued line"
+  }
+ ]
+}

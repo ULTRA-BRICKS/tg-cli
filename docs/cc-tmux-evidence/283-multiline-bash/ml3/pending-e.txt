@@ -1,0 +1,50 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.296[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mOpus 5.5 · API Usage Billing[39m
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/tmp/cc283-lab-ml3/repo[39m
+
+
+[38;5;246m[48;5;237m❯ [38;5;231mSCENARIO:ml3[39m
+
+[38;5;246m[49m●[39m Stopping worker and clean scratch
+[38;5;246m  ⎿  $ pkill -f study-worker[39m
+     [38;5;246msleep 1[39m
+     [38;5;246mrm -rf /tmp/cc283-scratch[39m
+
+[38;5;153m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;5;153mBash command[0m
+ [1mTip: auto mode handles these prompts for you — choose "switch to auto mode" below[0m
+ [38;5;246mStop worker and clean scratch[39m
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m [2m│[0m pkill -f study-worker
+ [2m│[0m sleep 1
+ [2m│[0m rm -rf /tmp/cc283-scratch
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m This command requires approval
+
+ Do you want to proceed?
+ [38;5;153m❯[39m [38;5;246m1. [38;5;153mYes[39m
+   [38;5;246m2. [39mYes, and don't ask again for [1mpkill -f study-worker[0m and [1mrm -rf /tmp/cc283-scratch[0m commands in [1m/tmp/cc283-lab-ml3/repo[0m
+   [38;5;246m3. [39mYes, and switch to auto mode[38;5;246m · auto mode handles these prompts for you[39m
+   [38;5;246m4. [39mNo
+
+ [38;5;246mEsc to cancel · Tab to amend[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

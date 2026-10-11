@@ -1,0 +1,50 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.296[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mOpus 5.5 · API Usage Billing[39m
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/tmp/cc283-lab-spacerun/repo[39m
+
+
+[38;5;246m[48;5;237m❯ [38;5;231mSCENARIO:spacerun[39m
+
+[38;5;246m[49m●[39m Space runs
+[38;5;246m  ⎿  $ touch s1.txt[39m
+     [38;5;246mtouch abc def[39m
+     [38;5;246mtouch xyz uvw[39m
+     [38;5;246mtouch lead-and-trail.txt[39m
+     [38;5;246mtouch q.txt[39m
+
+[38;5;153m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;5;153mBash command[0m
+ [1mTip: auto mode handles these prompts for you — choose "switch to auto mode" below[0m
+ [38;5;246mSpace runs[39m
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m [2m│[0m touch s1.txt
+ [2m│[0m touch abc                                                                                                                                                      def
+ [2m│[0m touch xyz
+ [2m│[0m
+ [2m│[0m                 uvw
+ [2m│[0m touch    lead-and-trail.txt
+ [2m│[0m touch q.txt
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m Do you want to proceed?
+ [38;5;153m❯[39m [38;5;246m1. [38;5;153mYes[39m
+   [38;5;246m2. [39mYes, and don't ask again for [1mtouch s1.txt, touch abc, touch xyz, "touch    lead-and-trail.txt"[0m, and [1mtouch q.txt[0m commands in [1m/tmp/cc283-lab-spacerun/repo[0m
+   [38;5;246m3. [39mYes, and switch to auto mode[38;5;246m · auto mode handles these prompts for you[39m
+   [38;5;246m4. [39mNo
+
+ [38;5;246mEsc to cancel · Tab to amend[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

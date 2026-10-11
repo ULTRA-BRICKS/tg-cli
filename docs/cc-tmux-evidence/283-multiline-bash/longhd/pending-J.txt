@@ -1,0 +1,50 @@
+ │ cat > big.txt <<'EOF'
+ │ row 01 of the long heredoc body
+ │ row 02 of the long heredoc body     
+ │ row 03 of the long heredoc body   
+ │ row 04 of the long heredoc body
+ │ row 05 of the long heredoc body
+ │ row 06 of the long heredoc body                                                                                                                                                                      
+ │ row 07 of the long heredoc body
+ │ row 08 of the long heredoc body
+ │ row 09 of the long heredoc body
+ │ row 10 of the long heredoc body
+ │ row 11 of the long heredoc body
+ │ row 12 of the long heredoc body
+ │ row 13 of the long heredoc body
+ │ row 14 of the long heredoc body
+ │ row 15 of the long heredoc body
+ │ row 16 of the long heredoc body
+ │ row 17 of the long heredoc body
+ │ row 18 of the long heredoc body
+ │ row 19 of the long heredoc body
+ │ row 20 of the long heredoc body
+ │ row 21 of the long heredoc body
+ │ row 22 of the long heredoc body
+ │ row 23 of the long heredoc body
+ │ row 24 of the long heredoc body
+ │ row 25 of the long heredoc body
+ │ row 26 of the long heredoc body
+ │ row 27 of the long heredoc body
+ │ row 28 of the long heredoc body
+ │ row 29 of the long heredoc body
+ │ row 30 of the long heredoc body
+ │ row 31 of the long heredoc body
+ │ row 32 of the long heredoc body
+ │ row 33 of the long heredoc body
+ │ row 34 of the long heredoc body
+ │ row 35 of the long heredoc body
+ │ row 36 of the long heredoc body
+ │ row 37 of the long heredoc body
+ │ row 38 of the long heredoc body
+ │ row 39 of the long heredoc body
+ │ row 40 of the long heredoc body
+ │ EOF
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes     
+   2. Yes, and always allow access to /tmp/cc283-lab-longhd/repo from this project                                                                                                                    
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you                                                                                                                            
+   4. No
+
+ Esc to cancel · Tab to amend                       

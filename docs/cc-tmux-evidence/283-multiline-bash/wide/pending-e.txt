@@ -1,0 +1,50 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.296[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mOpus 5.5 · API Usage Billing[39m
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/tmp/cc283-lab-wide/repo[39m
+
+
+[38;5;246m[48;5;237m❯ [38;5;231mSCENARIO:wide[39m
+
+[38;5;246m[49m●[39m Wide two-line
+[38;5;246m  ⎿  $ printf '%s\n' word000 word001 word002 word003 word004 word005 word006 word007 word008 word009 word010 word011 word012 word013 word014 word015 word016 word017 word018 word019 word020 word021 [39m
+     [38;5;246mword022 word023 word024 word025 word026 word027 word028 word029 word030 word031 word032 word033 word034 wor…[39m
+
+[38;5;153m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;5;153mBash command[0m
+ [1mTip: auto mode handles these prompts for you — choose "switch to auto mode" below[0m
+ [38;5;246mWide two-line[39m
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m [2m│[0m printf '%s\n' word000 word001 word002 word003 word004 word005 word006 word007 word008 word009 word010 word011 word012 word013 word014 word015 word016 word017 word018 word019 word020 word021
+ [2m│[0m word022 word023 word024 word025 word026 word027 word028 word029 word030 word031 word032 word033 word034 word035 word036 word037 word038 word039 word040 word041 word042 word043 word044 word045
+ [2m│[0m word046 word047 word048 word049 word050 word051 word052 word053 word054 word055 word056 word057 word058 word059 > wide.txt
+ [2m│[0m touch second-line.txt
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m Do you want to proceed?
+ [38;5;153m❯[39m [38;5;246m1. [38;5;153mYes[39m
+   [38;5;246m2. [39mYes, and don’t ask again for: touch second-line.txt
+   [38;5;246m3. [39mYes, and switch to auto mode[38;5;246m · auto mode handles these prompts for you[39m
+   [38;5;246m4. [39mNo
+
+ [38;5;246mEsc to cancel · Tab to amend[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

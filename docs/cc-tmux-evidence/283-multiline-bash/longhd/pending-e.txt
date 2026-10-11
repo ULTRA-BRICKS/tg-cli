@@ -1,0 +1,50 @@
+ [2m│[0m cat > big.txt <<'EOF'
+ [2m│[0m row 01 of the long heredoc body
+ [2m│[0m row 02 of the long heredoc body
+ [2m│[0m row 03 of the long heredoc body
+ [2m│[0m row 04 of the long heredoc body
+ [2m│[0m row 05 of the long heredoc body
+ [2m│[0m row 06 of the long heredoc body
+ [2m│[0m row 07 of the long heredoc body
+ [2m│[0m row 08 of the long heredoc body
+ [2m│[0m row 09 of the long heredoc body
+ [2m│[0m row 10 of the long heredoc body
+ [2m│[0m row 11 of the long heredoc body
+ [2m│[0m row 12 of the long heredoc body
+ [2m│[0m row 13 of the long heredoc body
+ [2m│[0m row 14 of the long heredoc body
+ [2m│[0m row 15 of the long heredoc body
+ [2m│[0m row 16 of the long heredoc body
+ [2m│[0m row 17 of the long heredoc body
+ [2m│[0m row 18 of the long heredoc body
+ [2m│[0m row 19 of the long heredoc body
+ [2m│[0m row 20 of the long heredoc body
+ [2m│[0m row 21 of the long heredoc body
+ [2m│[0m row 22 of the long heredoc body
+ [2m│[0m row 23 of the long heredoc body
+ [2m│[0m row 24 of the long heredoc body
+ [2m│[0m row 25 of the long heredoc body
+ [2m│[0m row 26 of the long heredoc body
+ [2m│[0m row 27 of the long heredoc body
+ [2m│[0m row 28 of the long heredoc body
+ [2m│[0m row 29 of the long heredoc body
+ [2m│[0m row 30 of the long heredoc body
+ [2m│[0m row 31 of the long heredoc body
+ [2m│[0m row 32 of the long heredoc body
+ [2m│[0m row 33 of the long heredoc body
+ [2m│[0m row 34 of the long heredoc body
+ [2m│[0m row 35 of the long heredoc body
+ [2m│[0m row 36 of the long heredoc body
+ [2m│[0m row 37 of the long heredoc body
+ [2m│[0m row 38 of the long heredoc body
+ [2m│[0m row 39 of the long heredoc body
+ [2m│[0m row 40 of the long heredoc body
+ [2m│[0m EOF
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m Do you want to proceed?
+ [38;5;153m❯[39m [38;5;246m1. [38;5;153mYes[39m
+   [38;5;246m2. [39mYes, and always allow access to [1m/tmp/cc283-lab-longhd/repo[0m from this project
+   [38;5;246m3. [39mYes, and switch to auto mode[38;5;246m · auto mode handles these prompts for you[39m
+   [38;5;246m4. [39mNo
+
+ [38;5;246mEsc to cancel · Tab to amend[39m

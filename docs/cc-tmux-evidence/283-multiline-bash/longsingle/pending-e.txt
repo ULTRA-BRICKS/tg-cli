@@ -1,0 +1,50 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.296[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mOpus 5.5 · API Usage Billing[39m
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/tmp/cc283-lab-longsingle/repo[39m
+
+
+[38;5;246m[48;5;237m❯ [38;5;231mSCENARIO:longsingle[39m
+
+[38;5;246m[49m●[39m Long single
+[38;5;246m  ⎿  $ touch file000.txt file001.txt file002.txt file003.txt file004.txt file005.txt file006.txt file007.txt file008.txt file009.txt file010.txt file011.txt file012.txt file013.txt file014.txt [39m
+     [38;5;246mfile015.txt file016.txt file017.txt file018.txt file019.txt file020.txt file021.txt file022.txt file023.txt fil…[39m
+
+[38;5;153m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;5;153mBash command[0m
+ [1mTip: auto mode handles these prompts for you — choose "switch to auto mode" below[0m
+ [38;5;246mLong single[39m
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m [2m│[0m touch file000.txt file001.txt file002.txt file003.txt file004.txt file005.txt file006.txt file007.txt file008.txt file009.txt file010.txt file011.txt file012.txt file013.txt file014.txt
+ [2m│[0m file015.txt file016.txt file017.txt file018.txt file019.txt file020.txt file021.txt file022.txt file023.txt file024.txt file025.txt file026.txt file027.txt file028.txt file029.txt file030.txt
+ [2m│[0m file031.txt file032.txt file033.txt file034.txt file035.txt file036.txt file037.txt file038.txt file039.txt
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m Do you want to proceed?
+ [38;5;153m❯[39m [38;5;246m1. [38;5;153mYes[39m
+   [38;5;246m2. [39mYes, and always allow access to [1m/tmp/cc283-lab-longsingle/repo[0m from this project
+   [38;5;246m3. [39mYes, and switch to auto mode[38;5;246m · auto mode handles these prompts for you[39m
+   [38;5;246m4. [39mNo
+
+ [38;5;246mEsc to cancel · Tab to amend[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
