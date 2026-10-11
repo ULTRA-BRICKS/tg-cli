@@ -3,6 +3,12 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.60.1
+
+- **Main is green again (#636).** The `tg-ctl alert` lifecycle test made its temp home with a
+  direct `mkdtempSync`, which the temp-hygiene guard (#638) rejects; it now uses `tempDir()` and
+  tracks its spawned processes with `trackChild()`, so the run-scoped cleanup owns both.
+
 ## 1.60.0
 
 - **Monitoring alerts reach the agent responsible (`tg-ctl alert`, #636).** A live omp

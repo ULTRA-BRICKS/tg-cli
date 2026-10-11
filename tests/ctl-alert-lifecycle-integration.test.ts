@@ -3,10 +3,10 @@
 // `[alert tg#<id> …]` copy into the session, the throttle, unbind when the session's
 // endpoint is gone, rebind when a NEW process publishes the SAME session id (a resume).
 import { afterAll, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Subprocess } from 'bun';
+import { tempDir, trackChild } from './helpers/test-temp';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const SESSION = '01a0d2d7-6202-702d-b9e8-006b656b0799';
@@ -25,7 +25,7 @@ const server = Bun.serve({
   },
 });
 
-const home = mkdtempSync(join(tmpdir(), 'tgctl-alert-'));
+const home = tempDir('tgctl-alert-');
 const cfg = join(home, '.config', 'tg-cli');
 mkdirSync(cfg, { recursive: true });
 writeFileSync(join(cfg, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
@@ -36,7 +36,6 @@ afterAll(async () => {
   server.stop(true);
   for (const p of procs) p.kill();
   await Promise.all(procs.map((p) => p.exited));
-  rmSync(home, { recursive: true, force: true });
 });
 
 const env = { ...process.env, HOME: home, TG_CTL_CONFIG_DIR: cfg, TG_API_BASE: `http://127.0.0.1:${server.port}` };
@@ -53,7 +52,7 @@ async function startHost(title: string): Promise<Subprocess> {
     process.on('SIGTERM', async () => { await ep.close(); process.exit(0); });
     console.log('ready');
   `;
-  const proc = Bun.spawn(['bun', '-e', script], { env, stdout: 'pipe', stderr: 'pipe' });
+  const proc = trackChild(Bun.spawn(['bun', '-e', script], { env, stdout: 'pipe', stderr: 'pipe' }));
   procs.push(proc);
   const reader = proc.stdout.getReader();
   const { value } = await reader.read();
@@ -63,7 +62,7 @@ async function startHost(title: string): Promise<Subprocess> {
 }
 
 async function ctl(...args: string[]): Promise<{ code: number; out: string; err: string }> {
-  const proc = Bun.spawn(['bun', TG_CTL, 'alert', ...args], { env, stdout: 'pipe', stderr: 'pipe' });
+  const proc = trackChild(Bun.spawn(['bun', TG_CTL, 'alert', ...args], { env, stdout: 'pipe', stderr: 'pipe' }));
   const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
   return { code: await proc.exited, out, err };
 }
