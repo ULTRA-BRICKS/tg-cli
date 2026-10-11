@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, expect, test } from 'bun:test';
 import { mkdirSync } from 'fs';
 import { join } from 'path';
-import { apiError, BOT_TOKEN, makeTgHome, readHistory, removeTgHomes, runTg, startFakeBotApi, type TgHome } from './helpers/fake-bot-api';
+import { apiError, BOT_TOKEN, makeTgHome, readHistory, runTg, startFakeBotApi, type TgHome } from './helpers/fake-bot-api';
 
 // The REAL `tg` against a Bot API that refuses or rate-limits: the exit code an agent scripts
 // against, what reaches the terminal (and so the agent's transcript), and what history keeps.
@@ -17,7 +17,6 @@ const api = startFakeBotApi();
 beforeEach(() => api.reset());
 afterAll(() => {
   api.stop();
-  removeTgHomes();
 });
 
 function session(): { h: TgHome; cwd: string } {

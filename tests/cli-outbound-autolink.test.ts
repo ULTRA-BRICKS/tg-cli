@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, expect, test } from 'bun:test';
 import { mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { makeTgHome, removeTgHomes, runTg, startFakeBotApi, writeShim, type HomeOptions, type TgHome } from './helpers/fake-bot-api';
+import { makeTgHome, runTg, startFakeBotApi, writeShim, type HomeOptions, type TgHome } from './helpers/fake-bot-api';
 
 // The REAL `tg` with a scripted `gh` on PATH, against a recording Bot API: what autolinking
 // does to the wire body (docs/specs/autolink-prs.md, autolink-msgrefs.md), and the attachment
@@ -12,7 +12,6 @@ const api = startFakeBotApi();
 beforeEach(() => api.reset());
 afterAll(() => {
   api.stop();
-  removeTgHomes();
 });
 
 const PR_12 = { __typename: 'PullRequest', number: 12, title: 'Fix the splitter', url: 'https://github.com/o/a/pull/12', state: 'MERGED', isDraft: false };

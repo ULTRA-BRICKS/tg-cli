@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, expect, test } from 'bun:test';
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { makeTgHome, readHistory, removeTgHomes, runTg, sentRefs, startFakeBotApi, type TgHome } from './helpers/fake-bot-api';
+import { makeTgHome, readHistory, runTg, sentRefs, startFakeBotApi, type TgHome } from './helpers/fake-bot-api';
 
 // The REAL `tg` against a recording Bot API: what a long or attachment-carrying message turns
 // into on the wire (docs/specs/auto-attach.md "Caption overflow", "Message splitting",
@@ -12,7 +12,6 @@ const api = startFakeBotApi();
 beforeEach(() => api.reset());
 afterAll(() => {
   api.stop();
-  removeTgHomes();
 });
 
 // A session whose [window] is the cwd basename — ASCII, so the header is Unicode-styled plain

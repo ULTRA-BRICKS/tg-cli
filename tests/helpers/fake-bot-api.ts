@@ -10,10 +10,11 @@
 // (ps/launchctl shims), a per-home bin dir that shadows tmux/gh/linear/pandoc, and a
 // TG_CHROME_PATH that does not exist, so no test ever reaches a live tmux server, a real repo's
 // GitHub, or a real headless Chrome.
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { parseHistory, type HistoryRecord } from '../../features/replies/history';
 import { TMUX_NO_SERVER_SHIM } from './hermetic-host';
+import { tempDir } from './test-temp';
 
 export const TG_SCRIPT = join(import.meta.dir, '..', '..', 'tg');
 export const BOT_ID = '123';
@@ -113,12 +114,9 @@ export interface HomeOptions {
   history?: HistoryRecord[];
 }
 
-const homes: string[] = [];
-
-// /tmp, not tmpdir(): a daemon socket under it must stay inside the 104-byte unix-socket limit.
+// short: a daemon socket under it must stay inside the 104-byte unix-socket limit.
 export function makeTgHome(opts: HomeOptions = {}): TgHome {
-  const home = mkdtempSync('/tmp/tg-out-');
-  homes.push(home);
+  const home = tempDir('tg-out-', { short: true });
   const cfg = join(home, '.config', 'tg-cli');
   mkdirSync(cfg, { recursive: true });
   writeFileSync(join(cfg, '.env'), `TG_BOT_TOKEN=${BOT_TOKEN}\nTG_CHAT_ID=${opts.chatId ?? 5153477378}\n${opts.envFile ?? ''}`);
@@ -135,11 +133,6 @@ export function makeTgHome(opts: HomeOptions = {}): TgHome {
 export function writeShim(bin: string, name: string, body: string): void {
   writeFileSync(join(bin, name), body);
   chmodSync(join(bin, name), 0o755);
-}
-
-/** Remove every home this module created; call from afterAll. */
-export function removeTgHomes(): void {
-  for (const h of homes.splice(0)) rmSync(h, { recursive: true, force: true });
 }
 
 export const historyPath = (h: TgHome): string => join(h.cfg, `tg-ctl.${BOT_ID}.history.jsonl`);

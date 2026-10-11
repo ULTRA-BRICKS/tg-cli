@@ -2,7 +2,7 @@ import { afterAll, beforeEach, expect, test } from 'bun:test';
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { HistoryRecord } from '../features/replies/history';
-import { apiError, makeTgHome, readHistory, removeTgHomes, runTg, sentRefs, startFakeBotApi, type HomeOptions, type TgHome } from './helpers/fake-bot-api';
+import { apiError, makeTgHome, readHistory, runTg, sentRefs, startFakeBotApi, type HomeOptions, type TgHome } from './helpers/fake-bot-api';
 
 // The REAL `tg` against a recording Bot API: where a send lands and how it is threaded.
 //   * Rich Messages — a body with rich-only tags goes out WHOLE as sendRichMessage, threaded with
@@ -17,7 +17,6 @@ const api = startFakeBotApi();
 beforeEach(() => api.reset());
 afterAll(() => {
   api.stop();
-  removeTgHomes();
 });
 
 const HEADER = '📁 [𝗮𝗽𝗶-𝗯𝗼𝘁]\n';
