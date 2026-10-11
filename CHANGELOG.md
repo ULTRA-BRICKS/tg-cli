@@ -3,6 +3,15 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.60.3
+
+- **An argument error is the last line of stderr (#660).** A refused send — `--tag answer`
+  without `--reply-to`, an unknown flag, a `--feature` with no name — printed `Error: …` and
+  then the ~200-line help, which ends with a blank line. `tg … 2>&1 | tail -1` showed only that
+  blank line (and `$?` was tail's 0), so the refused send looked like a silent success. The
+  help now comes first and the `Error: …` line last; tg still exits 1. Control characters and
+  line separators from argv are shown escaped, so an argument cannot forge a line after it.
+
 ## 1.60.2
 
 - **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on

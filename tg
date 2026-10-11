@@ -393,7 +393,10 @@ Screenshot-attach gate (feature screenshot-guard, ON by default — toggle with
 
 Unknown flags:
   Unknown dashed tokens (e.g. --foo) are an ERROR: this help is printed to
-  stderr and the process exits non-zero. They are NOT sent as message text.
+  stderr, then the error as the LAST line, and the process exits non-zero.
+  They are NOT sent as message text. The same holds for every argument error
+  of a send (an unknown flag, --tag answer without --reply-to, a --feature
+  with no name): the Error line comes last, so "tg … 2>&1 | tail -1" shows it.
 
 Text escape handling:
   Message text and captions convert \\n, \\r, \\t, and \\\\ into real newlines,
@@ -556,6 +559,23 @@ function authDeps(configDir: string): AuthDeps {
     out: (line) => console.log(line),
     err: (line) => console.error(line),
   }
+}
+
+// An argument error: the usage to stderr, then the `Error: …` line LAST — callers
+// (agents above all) trim output with `tail`, and an error printed above ~200 lines
+// of help is lost, making a refused send look like a silent success (tg-cli#660).
+// The message echoes argv (an unknown flag verbatim), so its control characters are
+// shown escaped: a newline in an argument must not push a forged line after the error.
+// Colorized only when stderr is the terminal.
+function exitWithUsageError(message: string): never {
+  const named: Record<string, string> = { "\n": "\\n", "\r": "\\r", "\t": "\\t" }
+  const oneLine = message.replace(
+    /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu,
+    (c) => named[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  )
+  console.error(colorizeHelp(USAGE, shouldColorize({ isTTY: Boolean(process.stderr.isTTY) })))
+  console.error(`Error: ${oneLine}`)
+  process.exit(1)
 }
 
 // --- CLI entrypoint (only runs when executed directly, not when imported) ---
@@ -784,9 +804,7 @@ if (import.meta.main) {
   // and always run.
   const flagResult = applyFeatureFlags(rawArgs)
   if (flagResult.error) {
-    console.error(`Error: ${flagResult.error}`)
-    console.error(colorizeHelp(USAGE, shouldColorize({ isTTY: Boolean(process.stderr.isTTY) })))
-    process.exit(1)
+    exitWithUsageError(flagResult.error)
   }
   // config.yaml is read ONCE; the raw text feeds both the features: block
   // parser here and the control: block parser for tg-ctl auto-start below.
@@ -838,10 +856,7 @@ if (import.meta.main) {
     process.exit(0)
   }
   if (parsed.action === "error") {
-    console.error(`Error: ${parsed.message}`)
-    // Errors go to stderr; colorize only when stderr is the terminal.
-    console.error(colorizeHelp(USAGE, shouldColorize({ isTTY: Boolean(process.stderr.isTTY) })))
-    process.exit(1)
+    exitWithUsageError(parsed.message)
   }
 
   const configEnv = loadEnv(join(configDir, ".env"))
