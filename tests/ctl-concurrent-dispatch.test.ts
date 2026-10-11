@@ -202,6 +202,41 @@ test('TargetDispatchQueues: a key whose work all finished is forgotten; one stil
   expect(queues.size).toBe(0);
 });
 
+// A batch's groups start in the order they are enqueued: a keyed group whose keys are free must
+// not lose its turn to a keyless one queued after it (the no-agent guard reply of a message, then
+// the /status reply, tg-cli#280).
+test('TargetDispatchQueues: work none of whose keys is busy starts in the caller turn, like keyless work', async () => {
+  const queues = new TargetDispatchQueues();
+  const started: string[] = [];
+  const keyed = queues.run('dest:%1', async () => void started.push('message'));
+  const keyless = queues.run(null, async () => void started.push('/status'));
+  expect(started).toEqual(['message', '/status']);
+  await Promise.all([keyed, keyless]);
+  // An fn that throws before its first await rejects with its own error and holds no key back.
+  const thrown = queues.run('dest:%1', () => {
+    throw new Error('boom');
+  });
+  await expect(thrown).rejects.toThrow('boom');
+  expect(queues.size).toBe(0);
+  expect(await queues.run('dest:%1', async () => 7)).toBe(7);
+});
+
+// Starting at once must not open a gap: work that queues more work on its own key while it runs
+// still finishes first.
+test('TargetDispatchQueues: work queued on a key by the work holding it waits for it', async () => {
+  const queues = new TargetDispatchQueues();
+  const order: string[] = [];
+  let inner: Promise<void> = Promise.resolve();
+  await queues.run('pane:x', async () => {
+    order.push('outer start');
+    inner = queues.run('pane:x', async () => void order.push('inner'));
+    await Promise.resolve();
+    order.push('outer end');
+  });
+  await inner;
+  expect(order).toEqual(['outer start', 'outer end', 'inner']);
+});
+
 // --- deliveryDispatchKey: deliveries to one destination share a key (tg-cli#280) ---
 
 // Pane %1 is the default, the origin of replied-to messages 100 and 101, and agent `alpha`;

@@ -27,29 +27,33 @@ export type DispatchKey = string | null;
 /** Per-key async queue: `run(key, fn)` chains onto whatever is already queued for that key (so
  *  same-key work stays strictly ordered) while different keys never block each other. Work
  *  under several keys (one message's group can touch a tap's guard and a delivery's pane) waits
- *  for every one of them and holds each back until it finishes; no keys = runs at once. A key
- *  whose last queued work finished is forgotten — keys name one-off request ids and tokens too,
- *  and the daemon runs for weeks. */
+ *  for every one of them and holds each back until it finishes; work none of whose keys is busy
+ *  — and work with no keys — starts at once, in the caller's turn, so a batch's groups start in
+ *  the order they were enqueued whether or not they carry a key. A key whose last queued work
+ *  finished is forgotten — keys name one-off request ids and tokens too, and the daemon runs for
+ *  weeks. */
 export class TargetDispatchQueues {
   private readonly tails = new Map<string, Promise<unknown>>();
 
   run<T>(key: DispatchKey | readonly string[], fn: () => Promise<T>): Promise<T> {
     const keys = key === null ? [] : typeof key === "string" ? [key] : key;
     if (keys.length === 0) return fn();
-    const prior = Promise.all(keys.map((k) => this.tails.get(k)));
+    const busy = keys.flatMap((k) => this.tails.get(k) ?? []);
+    // The keys are held before fn can start, so work it queues on them itself still waits for it.
+    // The tail only ever resolves, so a rejection never poisons the chain for the NEXT item queued
+    // on these keys -- the real result/rejection reaches the caller through the returned promise.
+    let release: () => void = () => {};
+    const tail = new Promise<void>((resolve) => (release = resolve));
+    for (const k of keys) this.tails.set(k, tail);
     const settle = async (): Promise<T> => {
       try {
         return await fn();
       } finally {
         for (const k of keys) if (this.tails.get(k) === tail) this.tails.delete(k);
+        release();
       }
     };
-    const started = prior.then(settle, settle);
-    // Swallow so a rejection never poisons the chain for the NEXT item queued on this key --
-    // the real result/rejection still reaches the caller through `started`.
-    const tail = started.catch(() => undefined);
-    for (const k of keys) this.tails.set(k, tail);
-    return started;
+    return busy.length === 0 ? settle() : Promise.all(busy).then(settle);
   }
 
   /** Number of keys with in-flight or queued work -- for tests/diagnostics only. */

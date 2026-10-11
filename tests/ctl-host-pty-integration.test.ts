@@ -228,6 +228,9 @@ test('a hosted Claude Code receives /agent, a plain message and a reply through 
   // the armed one-shot route: typed once, and the selection card was edited to "→ <label>"
   expect(lines.filter((l) => l.includes('follow-up through the armed route') && l.includes('tg#15'))).toHaveLength(1);
   expect(editedMessages.some((m) => String(m.text).startsWith('→ landing'))).toBe(true);
+  // the redelivered `/agent landing deploy now` (update 990) is a duplicate: it must not cancel the
+  // selection the later `/agent landing` armed, even when it runs after it
+  expect(editedMessages.filter((m) => String(m.text).startsWith('cancelled'))).toEqual([]);
 
   // The ledger: delivered once per message to host:<name>, and the redelivery suppressed.
   const ledger = readFileSync(join(cfgDir, 'tg-ctl.123.delivery.jsonl'), 'utf8')

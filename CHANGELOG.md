@@ -24,7 +24,10 @@ semantic versioning.
   flat-chat deliveries that land in one pane (plain, a reply to any of its messages, `/agent`, a
   caption) now run in the order they were sent. An item that joins a restored album whose other
   items the previous run already delivered is delivered on its own — as an item arriving after its
-  album went out is — instead of being suppressed with them.
+  album went out is — instead of being suppressed with them. A Telegram redelivery of an
+  `/agent <name> <message>` that queues behind the same pane no longer cancels the selection a
+  later `/agent <name>` armed, and a batch's deliveries start in the order they were sent, so a
+  message's no-agent reply still goes out ahead of a `/status` sent after it.
 
 ## 1.60.2
 

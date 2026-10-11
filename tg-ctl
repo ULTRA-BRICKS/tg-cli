@@ -8064,7 +8064,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     clearTimeout(selected.timer)
     return selected
   }
-  const cancelSelectedAgentRouteForAgentCommand = (): void => {
+  // `messageId`: the `/agent` command's own message. One the ledger has any record of (delivered,
+  // in flight, held for a question or a picker, failed) is Telegram redelivering it — its cancel ran
+  // with the first copy, and a selection armed since (by a later `/agent`) is the CTO's, not this
+  // copy's to cancel.
+  const cancelSelectedAgentRouteForAgentCommand = (messageId: number): void => {
+    const ledger = deliveryLedger
+    if (ledger?.state.messages.has(ledgerKey(ledger.chat, messageId))) return
     const previous = cancelSelectedAgentRoute()
     if (previous && previous.messageId !== null) {
       void editMessageText(ctx, previous.messageId, `cancelled ${previous.label} — another /agent command was used`)
@@ -9128,7 +9134,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     prewrappedText: string,
     sourceMessageId: number,
   ): Promise<boolean> => {
-    cancelSelectedAgentRouteForAgentCommand()
+    cancelSelectedAgentRouteForAgentCommand(sourceMessageId)
     const candidates = listAgentCandidates()
     const msgPreview = prewrappedText.slice(0, 60).replace(/\n/g, " ")
     if (candidates.length === 0) {
@@ -9218,7 +9224,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // message; named selector with NO match → error reply, never silent fallback.
   const handleAgentRoute = async (action: Extract<Action, { kind: "agent-route" }>): Promise<boolean> => {
     const out = replyContext(action.threadId)
-    cancelSelectedAgentRouteForAgentCommand()
+    cancelSelectedAgentRouteForAgentCommand(action.messageId)
     const candidates = listAgentCandidates()
     const msgPreview = action.all.slice(0, 60).replace(/\n/g, " ")
     if (candidates.length === 0) {
