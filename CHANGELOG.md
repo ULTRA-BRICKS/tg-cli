@@ -10,8 +10,10 @@ semantic versioning.
   and exits with bun's code (AGENTS.md, "Full suite on Runpod"). By default each run rents its
   own pod and deletes it on every exit path (about $0.04 a full run, ~10 min end to end); a pod
   whose ssh never answers is replaced once, a pod that cannot be deleted stops the run instead
-  of renting another, and if the client is killed outright the pod deletes itself an hour after
-  the run's timeout. A long-lived shared pod (`TG_REMOTE_TEST_POD_ID`) is opt-in: it bills
+  of renting another, and a client killed outright leaves no pod for long: the next run (or
+  `--reap-orphans`) deletes this host's pods whose client pid is gone, the pod deletes itself an
+  hour after the run's timeout, and its start command removes it 2 h after it. A long-lived
+  shared pod (`TG_REMOTE_TEST_POD_ID`) is opt-in: it bills
   $0.24/h while it exists, so its owner must stop it.
 - The bun version it installs on the pod must be exactly `x.y.z` (a value with a path after it
   could make the root setup install into and chmod another directory); the pod's ssh address is

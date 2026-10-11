@@ -678,10 +678,13 @@ replaced, once, in another data center: pods in some data centers (EU-SE-1, as o
 never answer ssh from this workstation, so list those in `TG_REMOTE_TEST_AVOID_DATA_CENTERS`
 (comma-separated) in the config file to skip the wait. If that dead pod cannot be deleted
 (three tries) the run stops with exit 3 and prints the `runpodctl pod delete` line rather than
-renting another. A client killed outright (SIGKILL) cannot run its trap, so as soon as ssh
-answers the pod is set to delete itself (with its own pod-scoped `RUNPOD_API_KEY`): an hour
-later while it provisions, then `--timeout` + 1 h after provisioning ends. A kill in the minute
-or two before that leaves a pod named `tg-remote-test-<run-id>` in `runpodctl pod list`.
+renting another. One run = one pod. A client killed outright (SIGKILL) cannot run its trap, so
+there are three backstops: every ephemeral run — and `scripts/remote-test.sh --reap-orphans`
+alone — first deletes this machine's pods named `tg-remote-test-<date>-<time>-<host>-<machine>-<pid>-<n>`
+whose client pid is gone; as soon as ssh answers the pod is set to delete itself (with its own
+pod-scoped `RUNPOD_API_KEY`) an hour later while it provisions, then `--timeout` + 1 h after
+provisioning ends; and the pod's own start command removes it `--timeout` + 2 h after boot,
+whatever happens to the client.
 
 Configure in the environment or in `~/.config/tg-cli/remote-test.env` (sourced `KEY=VALUE`
 lines; the environment wins, and a pod id or host given there replaces the file's address as a

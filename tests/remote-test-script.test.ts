@@ -62,8 +62,8 @@ done
 case "$method $url" in
   "GET "*/catalog/*) printf '%s\\n' "$CATALOG_RESPONSE" ;;
   "GET "*/pods/*) printf '%s\\n' "$POD_RESPONSE" ;;
-  "GET "*/pods)
-    echo >>"$FAKE_LOGS/pod.lists"; name=$(sed -n 1p "$FAKE_LOGS/curl.bodies" | jq -r .name)
+  "GET "*/pods\\?*)
+    echo >>"$FAKE_LOGS/pod.lists"; name=$(sed -n 1p "$FAKE_LOGS/curl.bodies" 2>/dev/null | jq -r .name)
     sed -n "$(wc -l <"$FAKE_LOGS/pod.lists")p" <<<"\${LIST_RESPONSE//NAME/$name}" ;;
   "POST "*/pods)
     printf '%s\\n' "$body" >>"$FAKE_LOGS/curl.bodies"
@@ -223,8 +223,8 @@ test('a rental whose answer is lost still deletes the pod it created, found by i
     {
       RUNPOD_API_KEY: FAKE_KEY,
       CREATE_RESPONSES: 'curl: (52) Empty reply from server',
-      // Not listed on the first look; listed on the second.
-      LIST_RESPONSE: '{"pods":[{"id":"podother","name":"other"}]}\n{"pods":[{"id":"podother","name":"other"},{"id":"podlost1","name":"NAME"}]}',
+      // The reaper's list first; then not listed on the first look, listed on the second.
+      LIST_RESPONSE: '{"pods":[]}\n{"pods":[{"id":"podother","name":"other"}]}\n{"pods":[{"id":"podother","name":"other"},{"id":"podlost1","name":"NAME"}]}',
     },
     '--ephemeral',
   );
@@ -361,8 +361,13 @@ test('--ephemeral deletes the pod it rented when stopped with TERM, and keeps th
   const [body] = fakeLog('curl.bodies').trim().split('\n').map((line) => JSON.parse(line));
   expect(body).toMatchObject({ name: expect.stringMatching(/^tg-remote-test-/), cpu: { id: 'cpu3c', vcpuCount: 8 } });
   expect(body.dataCenterIds).toBeUndefined();
+  // The pod's own start command removes it --timeout (1800) + 2 h after boot, then runs sshd.
+  expect(body.entrypoint).toEqual(['/bin/bash', '-c']);
+  expect(body.cmd[0]).toContain('sleep 9000; runpodctl remove pod "$RUNPOD_POD_ID"');
+  expect(body.cmd[0]).toEndWith('& exec /start.sh');
   expect(fakeLog('curl.args')).not.toContain(FAKE_KEY);
-  expect(fakeLog('curl.config')).toBe(`header = "Authorization: Bearer ${FAKE_KEY}"\n`);
+  // One config per API call (the orphan sweep's list, then the create), each just the header.
+  expect(fakeLog('curl.config')).toBe(`header = "Authorization: Bearer ${FAKE_KEY}"\n`.repeat(2));
 }, 30_000);
 
 test('a TERM during the create request still deletes the pod, found by its name', async () => {
@@ -372,7 +377,7 @@ test('a TERM during the create request still deletes the pod, found by its name'
         RUNPOD_API_KEY: FAKE_KEY,
         CREATE_DELAY: '2',
         CREATE_RESPONSES: '{"id":"podlost1"}',
-        LIST_RESPONSE: '{"pods":[{"id":"podlost1","name":"NAME"}]}',
+        LIST_RESPONSE: '{"pods":[]}\n{"pods":[{"id":"podlost1","name":"NAME"}]}',
       }),
       stdin: 'ignore',
       stdout: 'ignore',
@@ -400,3 +405,55 @@ test('a TERM during the create request still deletes the pod, found by its name'
   expect(stderr).not.toContain('pod podlost1 created');
   expect(fakeLog('runpodctl')).toContain('pod delete podlost1');
 }, 30_000);
+
+// The tags remote-test.sh puts in a pod's name: `hostname -s` normalised, and the cksum of the
+// machine id (two machines may share a host name).
+function machineTags() {
+  const host =
+    spawnSyncBounded(['hostname', '-s']).stdout.toString().toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 16) || 'host';
+  const id = existsSync('/etc/machine-id') ? readFileSync('/etc/machine-id', 'utf8').trim() : host;
+  const machine = spawnSyncBounded(['cksum'], { stdin: Buffer.from(id) }).stdout.toString().split(' ')[0];
+  return `${host}-${machine}`;
+}
+
+test("--reap-orphans deletes only this machine's pods whose client pid is gone, on every page", () => {
+  const tags = machineTags();
+  const deadPid = spawnSyncBounded(['true']).pid;
+  const page1 = {
+    pods: [
+      { id: 'podlive', name: `tg-remote-test-1011-010203-${tags}-${process.pid}-2` },
+      { id: 'podelsewhere', name: `tg-remote-test-1011-010203-${tags}1-${deadPid}-3` },
+      { id: 'podoldname', name: `tg-remote-test-1011-010203-${deadPid}-4` },
+      { id: 'podshared', name: 'tg-cli-remote-test' },
+    ],
+    pagination: { hasNextPage: true, nextCursor: 'c 1' },
+  };
+  const page2 = {
+    pods: [{ id: 'podorphan', name: `tg-remote-test-1011-010203-${tags}-${deadPid}-1` }],
+    pagination: { hasNextPage: false, nextCursor: null },
+  };
+  // No bun needed: the sweep alone never checks the bun version.
+  const r = run(
+    {
+      RUNPOD_API_KEY: FAKE_KEY,
+      TG_REMOTE_TEST_BUN_VERSION: 'none',
+      LIST_RESPONSE: `${JSON.stringify(page1)}\n${JSON.stringify(page2)}`,
+    },
+    '--reap-orphans',
+  );
+  expect(r.code).toBe(0);
+  expect(r.stderr).toContain('deleted orphaned pod podorphan');
+  const deletes = fakeLog('runpodctl')
+    .split('\n')
+    .filter((line) => line.startsWith('pod delete'));
+  expect(deletes).toEqual(['pod delete podorphan']);
+  expect(fakeLog('curl.args')).toContain('/pods?limit=100&cursor=c%201');
+  expect(fakeLog('curl.bodies')).toBe('');
+});
+
+test('--reap-orphans fails (exit 3) when the pods cannot be listed', () => {
+  const r = run({ RUNPOD_API_KEY: FAKE_KEY, LIST_RESPONSE: '{"error":"unauthorized"}' }, '--reap-orphans');
+  expect(r.code).toBe(3);
+  expect(r.stderr).toContain('cannot list pods: {"error":"unauthorized"}');
+  expect(fakeLog('runpodctl')).not.toContain('pod delete');
+});

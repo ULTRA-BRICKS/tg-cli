@@ -12,6 +12,7 @@
 #   scripts/remote-test.sh -C ../other-worktree     # test another checkout
 #   scripts/remote-test.sh --ephemeral              # own pod even when a shared one is configured
 #   scripts/remote-test.sh --setup                  # shared pod only: provision it (idempotent)
+#   scripts/remote-test.sh --reap-orphans           # only delete this host's orphaned pods
 #
 # Options (before the bun arguments; `--` ends them):
 #   -C DIR          checkout to test (default: the git toplevel of the current directory)
@@ -20,6 +21,7 @@
 #   --keep          leave the remote run directory in place (shared pod only; swept after 3 h)
 #   --setup         only provision the shared pod
 #   --ephemeral     rent a pod for this run alone even when a shared pod is configured
+#   --reap-orphans  only delete orphaned pods (see below) and exit
 #
 # Configuration — environment, else ~/.config/tg-cli/remote-test.env (KEY=VALUE lines,
 # sourced; TG_REMOTE_TEST_CONFIG names another file). Never commit that file.
@@ -46,10 +48,11 @@
 # minutes (~$0.04 a full run, ~10 min end to end). A pod whose ssh does not answer in
 # TG_REMOTE_TEST_SSH_WAIT (pods in some data centers never do from here) is deleted and
 # replaced, once, in another data center; a pod that cannot be deleted stops the run (exit 3)
-# rather than renting another. A client killed with SIGKILL cannot delete it, so once ssh
-# answers the pod is set to delete itself: an hour later while it provisions, then --timeout +
-# 1 h after provisioning ends. Before that (its first minute or two) a leak shows in
-# `runpodctl pod list` as tg-remote-test-<run-id>.
+# rather than renting another. A client killed with SIGKILL cannot delete it, so three
+# backstops: every ephemeral run (and --reap-orphans) first deletes this host's pods named
+# tg-remote-test-<date>-<time>-<host>-<machine>-<pid>-<n> whose client pid is gone; once ssh answers the
+# pod is set to delete itself an hour later while it provisions, then --timeout + 1 h after
+# provisioning ends; and the pod's own start command removes it --timeout + 2 h after boot.
 #
 # Opt-in: a long-lived shared pod (TG_REMOTE_TEST_POD_ID or TG_REMOTE_TEST_HOST) is provisioned
 # once and serves every run of every checkout, up to TG_REMOTE_TEST_SLOTS at a time, without
@@ -83,6 +86,7 @@ log=""
 keep=0
 setup_only=0
 ephemeral=0
+reap_only=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -C) [ "$#" -ge 2 ] || die "-C needs a directory"; checkout=$2; shift 2 ;;
@@ -91,6 +95,7 @@ while [ "$#" -gt 0 ]; do
     --keep) keep=1; shift ;;
     --setup) setup_only=1; shift ;;
     --ephemeral) ephemeral=1; shift ;;
+    --reap-orphans) reap_only=1; ephemeral=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     *) break ;;
@@ -126,17 +131,27 @@ key=${TG_REMOTE_TEST_KEY:-}
 [ -z "$key" ] && [ -f "$HOME/.runpod/ssh/runpodctl-ssh-key" ] && key=$HOME/.runpod/ssh/runpodctl-ssh-key
 slots=${TG_REMOTE_TEST_SLOTS:-3}
 [[ "$slots" =~ ^[1-9][0-9]*$ ]] || die "TG_REMOTE_TEST_SLOTS must be a positive integer, got '$slots'"
-bun_version=${TG_REMOTE_TEST_BUN_VERSION:-$(bun --version 2>/dev/null)}
-[[ "$bun_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "cannot tell the bun version (no local bun?); set TG_REMOTE_TEST_BUN_VERSION to x.y.z, got '$bun_version'"
+if [ "$reap_only" -eq 0 ]; then
+  bun_version=${TG_REMOTE_TEST_BUN_VERSION:-$(bun --version 2>/dev/null)}
+  [[ "$bun_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "cannot tell the bun version (no local bun?); set TG_REMOTE_TEST_BUN_VERSION to x.y.z, got '$bun_version'"
+fi
 
-if [ "$setup_only" -eq 0 ]; then
+if [ "$setup_only" -eq 0 ] && [ "$reap_only" -eq 0 ]; then
   if [ -z "$checkout" ]; then
     checkout=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git checkout; pass -C DIR"
   fi
   checkout=$(cd "$checkout" && pwd) || die "no such directory: $checkout"
   git -C "$checkout" rev-parse --git-dir >/dev/null 2>&1 || die "$checkout is not a git checkout"
 fi
-run_id="$(date +%m%d-%H%M%S)-$$-$RANDOM"
+# The pod is named after the run: the host name, a number from the machine id (two machines
+# may share a host name) and the client's pid let a later run on this machine tell a pod whose
+# client died (reap_orphans).
+host_tag=$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9' | cut -c1-16)
+host_tag=${host_tag:-host}
+machine_id=$(cat /etc/machine-id 2>/dev/null ||
+  ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | sed -n 's/.*"IOPlatformUUID" = "\(.*\)"/\1/p')
+machine_tag=$(printf '%s' "${machine_id:-$host_tag}" | cksum | cut -d' ' -f1)
+run_id="$(date +%m%d-%H%M%S)-$host_tag-$machine_tag-$$-$RANDOM"
 remote_dir="runs/$run_id"
 [ -n "$log" ] || log=$HOME/.cache/tg-cli/remote-test/$run_id.log
 
@@ -185,14 +200,27 @@ runpod_api() {
   printf 'header = "Authorization: Bearer %s"\n' "$api_key" |
     curl -sS --max-time 60 -K - -X "$1" "https://api.runpod.io/v2$2" -H 'Content-Type: application/json' ${data[@]+"${data[@]}"} 2>&1
 }
+# list_pods: every pod's "id name" line, across the API's pages; 1, with a warning, when a page
+# cannot be read.
+list_pods() {
+  local cursor="" page
+  while :; do
+    page=$(runpod_api GET "/pods?limit=100${cursor:+&cursor=$cursor}")
+    jq -e '.pods | type == "array"' <<<"$page" >/dev/null 2>&1 || { echo "remote-test: WARNING — cannot list pods: $page" >&2; return 1; }
+    jq -r '.pods[] | "\(.id) \(.name)"' <<<"$page"
+    cursor=$(jq -r 'if .pagination.hasNextPage then (.pagination.nextCursor // "" | @uri) else "" end' <<<"$page")
+    [ -n "$cursor" ] || return 0
+  done
+}
 # find_rented_pod: set ephemeral_pod to the pod named for this run, when a create's answer was
 # lost (a dropped connection, or a signal mid-request). A just-created pod can take a moment to
 # show in the list.
 find_rented_pod() {
-  local try
+  local try id name
   for try in 1 2 3; do
-    ephemeral_pod=$(runpod_api GET /pods |
-      jq -r --arg name "tg-remote-test-$run_id" 'first(.pods[]? | select(.name == $name) | .id) // empty' 2>/dev/null)
+    ephemeral_pod=$(list_pods | while read -r id name; do
+      [ "$name" = "tg-remote-test-$run_id" ] && { echo "$id"; break; }
+    done)
     [ -n "$ephemeral_pod" ] || [ "$try" -eq 3 ] && break
     sleep 2 </dev/null >/dev/null 2>&1 & wait "$!"
   done
@@ -214,9 +242,14 @@ create_pod() {
       exit 3
     fi
   fi
-  body=$(jq -nc --arg name "tg-remote-test-$run_id" --argjson dcs "$dcs" '{name: $name,
+  # The pod's own start command removes it after --timeout + 2 h whatever happens to this
+  # client (a SIGKILL before its ssh answers included), with the pod-scoped key Runpod puts in
+  # its environment; /start.sh is runpod/base's own command (sshd).
+  body=$(jq -nc --arg name "tg-remote-test-$run_id" --argjson dcs "$dcs" --arg ttl "$((timeout_s + 7200))" '{name: $name,
     image: "runpod/base:1.0.2-ubuntu2404", cpu: {id: "cpu3c", vcpuCount: 8}, disk: 40, ports: ["22/tcp"],
-    startSsh: true} + if $dcs == [] then {} else {dataCenterIds: $dcs} end')
+    startSsh: true, entrypoint: ["/bin/bash", "-c"],
+    cmd: ["(sleep \($ttl); runpodctl remove pod \"$RUNPOD_POD_ID\" || runpodctl pod delete \"$RUNPOD_POD_ID\") >/dev/null 2>&1 & exec /start.sh"]}
+    + if $dcs == [] then {} else {dataCenterIds: $dcs} end')
   echo "remote-test: renting pod tg-remote-test-$run_id (cpu3c 8 vCPU / 16 GB, \$0.24/h) — deleted when this run ends" >&2
   renting=1
   response=$(runpod_api POST /pods "$body")
@@ -229,6 +262,26 @@ create_pod() {
   fi
   renting=0
   echo "remote-test: pod $ephemeral_pod created — waiting for ssh" >&2
+}
+# reap_orphans: delete this machine's tg-remote-test pods whose client process is gone (killed
+# before its EXIT trap could delete them). A pid that is alive again (reused) keeps its pod;
+# the pod's own TTL removes it then. 1 when the pods cannot be listed or one cannot be deleted.
+reap_orphans() {
+  local pods id name pid failed=0
+  pods=$(list_pods) || return 1
+  while read -r id name; do
+    [[ "$name" =~ ^tg-remote-test-[0-9]{4}-[0-9]{6}-${host_tag}-${machine_tag}-([0-9]+)-[0-9]+$ ]] || continue
+    pid=${BASH_REMATCH[1]}
+    [ "$pid" = "$$" ] && continue
+    ps -p "$pid" >/dev/null 2>&1 && continue
+    if bounded 60 runpodctl pod delete "$id" </dev/null >/dev/null 2>&1; then
+      echo "remote-test: deleted orphaned pod $id ($name): its client, pid $pid, is gone" >&2
+    else
+      echo "remote-test: WARNING — could not delete orphaned pod $id ($name): runpodctl pod delete $id" >&2
+      failed=1
+    fi
+  done <<<"$pods"
+  return "$failed"
 }
 # bounded SECS CMD...: CMD, killed after SECS where timeout(1) exists (gtimeout on macOS with
 # coreutils); unbounded otherwise.
@@ -309,6 +362,9 @@ if [ "$ephemeral" -eq 1 ]; then
   for tool in runpodctl curl jq; do command -v "$tool" >/dev/null || die "an ephemeral run needs $tool"; done
   api_key=${RUNPOD_API_KEY:-$(sed -n '/^ *apikey *= *"/{s/^ *apikey *= *"\([^"]*\)".*/\1/p;q;}' "$HOME/.runpod/config.toml" 2>/dev/null)}
   [ -n "$api_key" ] || die "an ephemeral run needs a Runpod API key: RUNPOD_API_KEY, or apikey in ~/.runpod/config.toml"
+  # A failed sweep does not stop a run: that run's own pod is still deleted on every exit path.
+  if ! reap_orphans; then [ "$reap_only" -eq 1 ] && exit 3; fi
+  [ "$reap_only" -eq 1 ] && exit 0
   ssh_wait=${TG_REMOTE_TEST_SSH_WAIT:-300}
   [[ "$ssh_wait" =~ ^[0-9]+$ ]] || die "TG_REMOTE_TEST_SSH_WAIT must be a whole number of seconds, got '$ssh_wait'"
   avoid_dcs=${TG_REMOTE_TEST_AVOID_DATA_CENTERS:-}
