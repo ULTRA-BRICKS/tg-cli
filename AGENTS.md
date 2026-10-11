@@ -45,6 +45,37 @@ surface directly. Do not change cwd, hide repo context, or add caller-side envir
 to coerce a tool into the desired mode; those workarounds make hook behavior depend on the
 launch environment and leave help/docs stale.
 
+## Heavy work runs on Runpod
+
+This workstation is shared by many agent sessions, the review queue and the owner's own
+desktop; a full suite here starves all of them (it froze the machine twice on 2026-10-10).
+**Rule: locally, a single test file at most; the full suite goes to a Runpod pod** via the
+shared `runpod-offload` skill (`skill://runpod-offload`; script
+`~/.agents/skills/runpod-offload/runpod-run`, on PATH as `runpod-run`).
+
+Heavy here: `bun test ./tests` (the full suite — 10-14 min, hundreds of daemons, tmux and
+abduco sessions, Chrome for the pdf tests) and `bun test <prefix>-` across a whole area
+(the files are flat under `tests/`, bun's filter is a path substring; `ctl-` alone is 120+ files).
+
+```bash
+runpod-run --cpu cpu3c-8 --apt tmux,lsof,procps,psmisc,ffmpeg,pandoc,python3,python3-pil -- bun test ctl-
+                                        # an area, on an 8-vCPU CPU pod ($0.24/h), pod deleted when done
+runpod-run --ttl 30 --cpu cpu3c-8 --apt tmux,lsof,procps,psmisc,ffmpeg,pandoc,python3,python3-pil -- bun test auth-
+                                        # same, keeping the pod 30 idle minutes between runs
+bun test tests/<one>.test.ts            # local: one file, that's the limit
+```
+
+The apt list has no abduco (not packaged for Ubuntu 24.04), so the `abduco-*` tests skip
+their real-PTY cases on that pod; until tg-cli#616 lands they run for real on CI only.
+
+The full suite also needs abduco and Chrome, which apt does not ship, so until this repo's
+wrapper `scripts/remote-test.sh` (tg-cli#616, not merged yet — it provisions both on its pod
+and runs `bun test ./tests` there) lands, the whole suite has no single remote command:
+run it area by area with the first command above (the pdf tests, which need Chrome, stay
+on CI). `runpod-run --dry-run -- …` prints the plan and price. `runpod-run --status` lists
+every pod on the account; bare `runpod-run --stop` terminates only this repo's pods,
+`runpod-run --stop all` every pod created under this hostname — leave none behind.
+
 ---
 
 ## Architecture
@@ -628,8 +659,9 @@ Roadmap and priorities: docs/ROADMAP.md (source of truth since 2026-09-29).
 
 ## Conventions
 
-- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test ./tests` (scope to `./tests` —
-  a bare `bun test` from a parent dir falsely grabs sibling-repo tests). All 1460 tests must pass.
+- **TDD**: write tests in `tests/*.test.ts` first; run the file locally with `bun test tests/<one>.test.ts`
+  (always scope to `tests/` — a bare `bun test` from a parent dir falsely grabs sibling-repo tests);
+  areas and the full suite run on Runpod (§ Heavy work runs on Runpod) or CI. All 1460 tests must pass.
 - **Hermetic host**: `bunfig.toml` preloads `tests/hermetic-env.ts`, which puts a `ps` that lists only
   launchd, a `launchctl` with no jobs and a tmux with no server (`TMUX_TMPDIR` is a private empty dir)
   in front of every test's PATH, so a test never sees the developer's own omp/claude sessions or
