@@ -85,11 +85,13 @@ import {
   parseProcList,
   pickTargetPaneFromSet,
 } from "./features/tg-ctl/discover"
+import { isOpencodeBridgeRequest, opencodeRefOf } from "./features/tg-ctl/opencode"
 import {
   DEFAULT_BRIDGE_OPTIONS,
   discoverOpencodeServers,
   parseLsofListenUrls,
   startOpencodeBridge,
+  type OpencodeBridge,
 } from "./features/tg-ctl/opencode-bridge"
 import { isBareWindowName, resolveSessionName } from "./features/tg-ctl/session-name"
 import { buildDigitInjectPlan, buildKeyInjectPlan, buildTextInjectPlan, paneTypingKey, unsubmittedNotice, wrapInbound } from "./features/tg-ctl/inject"
@@ -4994,6 +4996,9 @@ export function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     // Daemon-stamped at arrival (handleHookSocketLine overwrites whatever a
     // client sent); read back here so it survives the disk restore.
     sessionKey: typeof rec.sessionKey === "string" && rec.sessionKey ? rec.sessionKey : undefined,
+    // The opencode bridge's reply route (tg-cli#687) — read back here so a card the store
+    // restores can still be answered in opencode.
+    opencode: opencodeRefOf(rec.opencode),
   }
 }
 
@@ -5328,7 +5333,13 @@ async function forwardAndPostQuestion(
   // arrives (the ordinary tap path, unaffected) or the socket itself closes
   // (the underlying process actually exits/gets killed — armPendingSocketClose's
   // 'close' handler still retires it exactly as for any other request).
-  if (!req.paneId && req.critical !== true) {
+  //
+  // tg-cli#687: an opencode bridge ask is the other exception — it defers no pane (see
+  // paneHasPendingQuestion), so there is nothing for this timer to release, and opencode
+  // holds the ask until it is answered. Its socket closes only when opencode settles the
+  // ask elsewhere or its server goes away; a daemon restart hands the card to the durable
+  // question store, whose late tap replies through the bridge.
+  if (!req.paneId && req.critical !== true && !isOpencodeBridgeRequest(req)) {
     const abandonMs = clampRequestTimeoutMs(req.timeoutMs, UNSCOPED_ABANDON_MS)
     log(`unscoped-abandon-armed: req=${req.requestId} ms=${abandonMs}`)
     entry.timer = setTimeout(() => {
@@ -6101,11 +6112,11 @@ async function spawnText(argv: string[]): Promise<string> {
   }
 }
 
-function startDaemonOpencodeBridge(ctx: Ctx): void {
+function startDaemonOpencodeBridge(ctx: Ctx): OpencodeBridge {
   // opencode 2.x announces its background service in its XDG state dir.
   const stateHome = process.env.XDG_STATE_HOME || join(process.env.HOME ?? "", ".local", "state")
   const servicePath = join(stateHome, "opencode", "service.json")
-  startOpencodeBridge({
+  return startOpencodeBridge({
     discover: () => discoverOpencodeServers({
       readServiceState: async () => readFileOrNull(servicePath),
       pidAlive: kill0,
@@ -7807,12 +7818,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           // can't be late-delivered (no pane) and must not resurrect to re-wedge —
           // except a hatch permission, whose card stays answerable through its grace
           // record: dropping it made every tap after a daemon restart "expired"
-          // (tg-cli#403).
+          // (tg-cli#403), and an opencode bridge ask, which a restored daemon answers
+          // over opencode's reply route (tg-cli#687).
           ...[...pendingButtons.values()]
             .filter((e) =>
-              e.req.kind === "permission"
+              isOpencodeBridgeRequest(e.req) ||
+              (e.req.kind === "permission"
                 ? Boolean(e.req.paneId) || isHatchRequest(e.req)
-                : Boolean(e.req.paneId && e.req.options?.length),
+                : Boolean(e.req.paneId && e.req.options?.length)),
             )
             .map((e) => ({
               req: e.req as unknown as Record<string, unknown>,
@@ -7947,7 +7960,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     for (const rec of raw.questions) {
       const req = normalizeButtonRequest(rec.req)
       if (!req) continue
-      if (!req.paneId && !(req.kind === "permission" && isHatchRequest(req))) continue
+      if (!req.paneId && !(req.kind === "permission" && isHatchRequest(req)) && !isOpencodeBridgeRequest(req)) continue
       if (req.kind === "question" && !req.options?.length) continue
       // A card a human already decided stays closed (grants.ts DecidedCard): the
       // best-effort questions write of that decision may have been lost, and restoring
@@ -8200,9 +8213,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // approval gate, not a prompt in any pane, and may wait up to 15 min — it
       // must never hold every agent's inbound behind it.
       if (isGenericAskRequest(pb.req)) continue
-      // tg-cli#533: a paneless opencode ask comes from the opencode bridge — its prompt is in
-      // opencode's own UI, answered over HTTP, never typed into a pane we inject into.
-      if (pb.req.agent === "opencode" && !pb.req.paneId) continue
+      // tg-cli#533: an opencode bridge ask's prompt is in opencode's own UI, answered over
+      // HTTP, never typed into a pane we inject into.
+      if (isOpencodeBridgeRequest(pb.req)) continue
       if (!pb.req.paneId && pb.req.critical !== true) return true
       if (pb.req.paneId === paneId) return true
     }
@@ -8542,8 +8555,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   }
 
   hookServer = startHookServer(ctx, questionRuntime)
-  // opencode asks reach Telegram through the socket just opened (tg-cli#533).
-  if (hookServer) startDaemonOpencodeBridge(ctx)
+  // opencode asks reach Telegram through the socket just opened (tg-cli#533); a tap on a
+  // card the store restored replies through it (tg-cli#687).
+  const opencodeBridge = hookServer ? startDaemonOpencodeBridge(ctx) : null
 
   if (ctx.cfg.transport === "channel") {
     log("transport 'channel' is reserved for v1.2+ — falling back to tmux")
@@ -11546,6 +11560,53 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return handleHatchLateTap(action, rec.req, action.messageId ?? rec.messageId, answer, rec.expiredAt)
   }
 
+  // tg-cli#687: a restored opencode bridge card. opencode still holds the ask, so the tap
+  // replies over its HTTP route through the bridge — no pane, no hook to reconnect. Like
+  // every other late delivery, the entry leaves the store (memory and disk) before the
+  // reply goes out, so neither a double tap nor a restart mid-reply posts it twice; a reply
+  // opencode did not get or could not handle yet (`unreachable`) puts it back for another
+  // tap — unless the retention window closed while the reply was in flight.
+  const lateDeliverToOpencode = async (
+    action: Extract<Action, { kind: "answer-question" }>,
+    retained: AbandonedButton,
+  ): Promise<boolean> => {
+    const answer = resolveButtonCallback(retained.req, { requestId: action.requestId, value: action.value })
+    if (answer.status !== "answered") return false
+    abandonedButtons.delete(action.requestId)
+    persistQuestions()
+    const result = opencodeBridge
+      ? await opencodeBridge.reply(retained.req, answer.value)
+      : { status: "unreachable" as const, why: "the opencode bridge is not running" }
+    const cardId = retained.messageId ?? action.messageId
+    const retire = (): void => {
+      if (cardId === null) return
+      void clearMessageKeyboard(ctx, cardId)
+      void editMessageText(ctx, cardId, EXPIRED_TERMINAL_TEXT)
+    }
+    if (result.status === "unreachable") {
+      log(`ask-late-deliver-opencode-unreachable: ${describeAskRequest(retained.req)} key=${action.requestId} err=${result.why}`)
+      if (isAbandonedExpired(retained.req.kind, retained.at, Date.now(), retained.req.critical)) {
+        retire()
+        await answerCallbackQueryOrNotify(ctx, action, "expired")
+        return true
+      }
+      abandonedButtons.set(action.requestId, retained)
+      persistQuestions()
+      await answerCallbackQueryOrNotify(ctx, action, "could not reach opencode — tap again shortly")
+      return true
+    }
+    if (result.status === "refused") {
+      log(`ask-late-deliver-opencode-refused: ${describeAskRequest(retained.req)} key=${action.requestId} err=${result.why}`)
+      retire()
+      await answerCallbackQueryOrNotify(ctx, action, "opencode no longer has this ask")
+      return true
+    }
+    log(`ask-late-delivered-opencode: ${describeAskRequest(retained.req)} key=${action.requestId} label=${answer.label}`)
+    await answerCallbackQuery(ctx, action.callbackQueryId, "✓ sent to opencode")
+    if (cardId !== null) void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label))
+    return true
+  }
+
   const lateDeliverAbandonedQuestion = async (
     action: Extract<Action, { kind: "answer-question" }>,
   ): Promise<boolean> => {
@@ -11555,8 +11616,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // retained with no paneId (retainAbandonedQuestion's paneless carve-out)
     // specifically so a late tap here CAN still be recorded as a queuedDecision
     // — this early "nothing to inject into" bail-out must not reject it before
-    // the permission branch below ever runs.
-    if (!retained.req.paneId && !(retained.req.kind === "permission" && isHatchRequest(retained.req))) return false
+    // the permission branch below ever runs. An opencode bridge ask is answered over
+    // HTTP, not into a pane (tg-cli#687).
+    const answerableWithoutPane = (retained.req.kind === "permission" && isHatchRequest(retained.req)) || isOpencodeBridgeRequest(retained.req)
+    if (!retained.req.paneId && !answerableWithoutPane) return false
     // A tap must come from THIS retained entry's OWN Telegram message — mirrors the
     // live-prompt path's same guard (case "answer-question" below). Without it, a
     // stale card reusing a deterministic callback key (callbackRequestId is a
@@ -11593,6 +11656,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       log(`ask-late-deliver-expired: ${describeAskRequest(retained.req)} key=${action.requestId} ageMs=${Date.now() - retained.at}`)
       return false
     }
+    if (isOpencodeBridgeRequest(retained.req)) return lateDeliverToOpencode(action, retained)
     // A permission's LIVE hook needs a structured JSON reply, not terminal text —
     // but once that hook has closed, the harness has ALREADY fallen back to its own
     // terminal prompt, and for claude that prompt is directly answerable by

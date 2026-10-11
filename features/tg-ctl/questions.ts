@@ -66,6 +66,9 @@ export interface OpencodeRequestRef {
   replyKind: 'question' | 'question-v2' | 'permission' | 'permission-v2' | 'permission-api' | 'form';
   // form only: the single field the card answers, and option label → value.
   form?: { fieldKey: string; values: Record<string, string> };
+  // The server the daemon's opencode bridge got the ask from (tg-cli#687): a tap that lands
+  // after the bridge's own wait ended (a daemon restart) replies through it.
+  serverUrl?: string;
 }
 
 export interface ButtonRequest {

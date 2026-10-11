@@ -755,8 +755,27 @@ string field maps to buttons, replied `POST /api/session/{sid}/form/{id}/reply {
 {key: optionValue}}`. Each ask enters the daemon through its own hook socket as a
 `ButtonRequest` (cwd = the session's directory, so the registration gate applies), with the
 subagent label from the fetched session record; `*.replied` / `form.cancelled` from another
-client retires the card. An unanswered card expires on the unscoped-ask bound; the ask stays
-open in opencode.
+client retires the card. A session record that cannot be read, or carries no directory (3
+tries, 1 s apart), leaves the ask without a directory for the gate, so it is not forwarded;
+Telegram gets a notice naming only the session id and the error, telling the user to answer
+in opencode.
+
+**Late answers (tg-cli#687).** opencode holds an ask until someone answers it, so while the
+daemon that posted the card runs, the card stays live too. A bridge ask (paneless, `agent:
+opencode`, `opencode.serverUrl` set) defers no pane, so the daemon arms no unscoped-ask timer
+for it (`TG_CTL_UNSCOPED_TIMEOUT_MS`, 110 s): its socket stays open until a tap, a settle
+event, or its server going away. The durable question store carries the card across a daemon
+restart: a live bridge ask is persisted like a scoped one and restores as abandoned, keeping
+its `opencode` ref (sessionId, requestId, replyKind, form map, serverUrl). A restored card is
+bounded by the usual abandoned-retention windows from its posting (question 30 min,
+permission 12 h), even though opencode may still hold the ask. A tap on a restored card
+replies through the bridge (`OpencodeBridge.reply`), only to a server the bridge currently
+discovers (a failed discovery forgets them all), with that server's current credentials. The
+entry leaves the store before the POST. Sent → the card reads answered; any other 4xx (the
+ask is gone) → the card expires; no live server, a failed request, 401 / 403 (credentials a
+rediscovery may rotate), or 408 / 429 / 5xx → the entry goes back for another tap. A restored
+card answered in the opencode TUI meanwhile is not retired by the settle event (the new bridge
+has no socket for it); a tap on it is refused by opencode and expires it.
 
 **The "not supported" rule:** when a harness lacks native question-forwarding (aider,
 gemini, pi-for-now, omp), the bot does NOT silently scrape-and-hope; it forwards what tmux can

@@ -1,7 +1,13 @@
 import { expect, test } from 'bun:test';
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import { opencodeEventToButtonRequest, opencodeReplyPlan, type OpencodeEvent } from '../features/tg-ctl/opencode';
+import {
+  isOpencodeBridgeRequest,
+  opencodeEventToButtonRequest,
+  opencodeRefOf,
+  opencodeReplyPlan,
+  type OpencodeEvent,
+} from '../features/tg-ctl/opencode';
 
 test('opencodeEventToButtonRequest maps question.asked into a button request', () => {
   const req = opencodeEventToButtonRequest({
@@ -332,4 +338,30 @@ test('opencode 2.x ask from a child session carries the session title as the sub
     title: 'Scan repo (@explore subagent)',
   });
   expect(req?.subagent).toBe('Scan repo (@explore subagent)');
+});
+
+// tg-cli#687: the reply route survives the daemon socket and the question store, so a card
+// restored after a daemon restart can still be answered in opencode.
+test('opencodeRefOf reads back a stored reply route and rejects a malformed one', () => {
+  const ref = {
+    sessionId: 'ses_1',
+    requestId: 'frm_1',
+    replyKind: 'form',
+    form: { fieldKey: 'choice', values: { Alpha: 'a' } },
+    serverUrl: 'http://127.0.0.1:4096',
+  };
+  expect(opencodeRefOf(JSON.parse(JSON.stringify(ref)))).toEqual(ref);
+  expect(opencodeRefOf({ ...ref, replyKind: 'shell' })).toBeUndefined();
+  expect(opencodeRefOf({ ...ref, sessionId: 7 })).toBeUndefined();
+  expect(opencodeRefOf({ ...ref, form: { fieldKey: 'choice', values: { Alpha: 1 } } })?.form).toBeUndefined();
+  expect(opencodeRefOf('ses_1')).toBeUndefined();
+});
+
+test('only a paneless opencode ask carrying its server is a bridge ask', () => {
+  const opencode = { sessionId: 's', requestId: 'r', replyKind: 'permission-api' as const, serverUrl: 'http://127.0.0.1:4096' };
+  const base = { requestId: 'oc_s_r', agent: 'opencode' as const, kind: 'permission' as const, question: 'edit' };
+  expect(isOpencodeBridgeRequest({ ...base, opencode })).toBe(true);
+  expect(isOpencodeBridgeRequest({ ...base, opencode, paneId: '%1' })).toBe(false);
+  expect(isOpencodeBridgeRequest({ ...base, opencode: { ...opencode, serverUrl: undefined } })).toBe(false);
+  expect(isOpencodeBridgeRequest({ ...base, agent: 'claude', opencode })).toBe(false);
 });

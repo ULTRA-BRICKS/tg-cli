@@ -2,7 +2,9 @@
 // event-stream subscription per server, and turns each question/permission ask into a card
 // through the daemon's own hook socket — the same ButtonRequest path every hook ask takes
 // (registration gate, dedupe, expiry, callbacks). The tapped answer goes back through
-// opencode's reply route (opencodeReplyPlan).
+// opencode's reply route (opencodeReplyPlan): from the bridge while its ask is still waiting
+// on the socket, or from the daemon (OpencodeBridge.reply) for a card the durable question
+// store carried across a daemon restart (tg-cli#687).
 //
 // Everything here is async and bounded: a subscription is a fetch stream that never blocks
 // the Telegram poll loop, reconnects with capped backoff, caps its event buffer, and caps the
@@ -52,6 +54,10 @@ export interface BridgeOptions {
   maxPendingAsks: number;
   maxEventBytes: number;
   requestTimeoutMs: number;
+  // Tries at reading the asking session, sessionRetryMs apart: without its directory the
+  // ask cannot pass the registration gate.
+  sessionFetchAttempts: number;
+  sessionRetryMs: number;
 }
 
 export const DEFAULT_BRIDGE_OPTIONS: BridgeOptions = {
@@ -61,7 +67,19 @@ export const DEFAULT_BRIDGE_OPTIONS: BridgeOptions = {
   maxPendingAsks: 32,
   maxEventBytes: 1_000_000,
   requestTimeoutMs: 5_000,
+  sessionFetchAttempts: 3,
+  sessionRetryMs: 1_000,
 };
+
+// `refused`: opencode answered and did not take the reply (any other 4xx: the ask is gone);
+// `unreachable`: no live server for the ask, the request failed, opencode could not handle
+// it right now (408 / 429 / 5xx), or it rejected credentials the next discovery may rotate
+// (401 / 403) — the ask may still be open, so it is worth a retry.
+export type OpencodeReplyResult = { status: 'sent' } | { status: 'refused' | 'unreachable'; why: string };
+
+export interface OpencodeBridge {
+  reply(req: ButtonRequest, answer: string): Promise<OpencodeReplyResult>;
+}
 
 const ASK_TYPES: Record<string, true> = {
   'question.asked': true, 'question.v2.asked': true, 'permission.asked': true, 'permission.v2.asked': true, 'form.created': true,
@@ -165,32 +183,59 @@ export function createSseDecoder(onData: (data: string) => void, maxBytes: numbe
 
 // Runs for the daemon's lifetime: rescans discovery every rescanMs and keeps one
 // subscription per live server.
-export function startOpencodeBridge(io: BridgeIo, options: BridgeOptions = DEFAULT_BRIDGE_OPTIONS): void {
+export function startOpencodeBridge(io: BridgeIo, options: BridgeOptions = DEFAULT_BRIDGE_OPTIONS): OpencodeBridge {
   const subscriptions = new Map<string, AbortController>();
   const pending = new Map<string, AbortController>();
+  // The latest discovery by URL: a reply carries the server's current credentials.
+  let serverByUrl = new Map<string, OpencodeServer>();
 
   const headers = (server: OpencodeServer, extra: Record<string, string> = {}): Record<string, string> =>
     server.authorization ? { ...extra, authorization: server.authorization } : extra;
 
-  const fetchSession = async (server: OpencodeServer, sessionId: string): Promise<{ record?: OpencodeSessionRecord; cwd?: string }> => {
+  type SessionRead = { ok: true; record: OpencodeSessionRecord; cwd: string } | { ok: false; why: string };
+  const fetchSession = async (server: OpencodeServer, sessionId: string): Promise<SessionRead> => {
     const path = server.protocol === 'api' ? `/api/session/${encodeURIComponent(sessionId)}` : `/session/${encodeURIComponent(sessionId)}`;
     try {
       const res = await io.fetch(`${server.url}${path}`, { headers: headers(server), signal: AbortSignal.timeout(options.requestTimeoutMs) });
-      if (!res.ok) return {};
+      if (!res.ok) return { ok: false, why: `HTTP ${res.status}` };
       const body = recordOf(await res.json());
       const rec = server.protocol === 'api' ? recordOf(body?.data) : body;
-      if (!rec) return {};
-      const directory = recordOf(rec.location)?.directory ?? rec.directory;
+      if (!rec) return { ok: false, why: 'no session record in the response' };
+      // No directory, no registration gate to pass: the ask would be dropped unseen.
+      const directory = [recordOf(rec.location)?.directory, rec.directory]
+        .find((d): d is string => typeof d === 'string' && d.trim() !== '');
+      if (directory === undefined) return { ok: false, why: 'the session record has no directory' };
       return {
+        ok: true,
         record: {
           id: typeof rec.id === 'string' ? rec.id : undefined,
           parentID: typeof rec.parentID === 'string' ? rec.parentID : null,
           title: typeof rec.title === 'string' ? rec.title : undefined,
         },
-        cwd: typeof directory === 'string' ? directory : undefined,
+        cwd: directory,
       };
-    } catch {
-      return {};
+    } catch (err) {
+      return { ok: false, why: String(err) };
+    }
+  };
+
+  const postReply = async (server: OpencodeServer, req: ButtonRequest, answer: string): Promise<OpencodeReplyResult> => {
+    const plan = opencodeReplyPlan(server.url, req, answer);
+    if (!plan) return { status: 'refused', why: 'no reply route for this ask' };
+    try {
+      const res = await io.fetch(plan.url, {
+        method: plan.method,
+        headers: headers(server, { 'content-type': 'application/json' }),
+        body: JSON.stringify(plan.body),
+        signal: AbortSignal.timeout(options.requestTimeoutMs),
+      });
+      io.log(`opencode: reply ${req.requestId} → ${plan.url} ${res.status}`);
+      if (res.ok) return { status: 'sent' };
+      const transient = res.status >= 500 || [401, 403, 408, 429].includes(res.status);
+      return { status: transient ? 'unreachable' : 'refused', why: `HTTP ${res.status}` };
+    } catch (err) {
+      io.log(`opencode: reply ${req.requestId} → ${plan.url} failed: ${String(err)}`);
+      return { status: 'unreachable', why: String(err) };
     }
   };
 
@@ -205,25 +250,24 @@ export function startOpencodeBridge(io: BridgeIo, options: BridgeOptions = DEFAU
       io.log(`opencode: ask ${req.requestId} closed without an answer — it stays open in opencode`);
       return;
     }
-    const plan = opencodeReplyPlan(server.url, req, answer);
-    if (!plan) return;
-    // The card already says the answer was sent; a refused reply must be said out loud.
-    const refused = (why: string): void => {
-      io.log(`opencode: reply ${req.requestId} → ${plan.url} ${why}`);
-      io.notify(`opencode did not take the answer to "${req.title ?? req.question}" (${why}) — answer it in opencode.`);
-    };
-    try {
-      const res = await io.fetch(plan.url, {
-        method: plan.method,
-        headers: headers(server, { 'content-type': 'application/json' }),
-        body: JSON.stringify(plan.body),
-        signal: AbortSignal.timeout(options.requestTimeoutMs),
-      });
-      if (res.ok) io.log(`opencode: reply ${req.requestId} → ${plan.url} ${res.status}`);
-      else refused(`HTTP ${res.status}`);
-    } catch (err) {
-      refused(String(err));
+    const result = await postReply(server, req, answer);
+    // The card already says the answer was sent; a reply that did not land must be said out loud.
+    if (result.status !== 'sent') {
+      io.notify(`opencode did not take the answer to "${req.title ?? req.question}" (${result.why}) — answer it in opencode.`);
     }
+  };
+
+  // The session record names the subagent and gives the directory the registration gate
+  // checks. A transient failure is retried; a lasting one is reported, never dropped
+  // silently (tg-cli#687). The notice carries only the session id: without the directory
+  // nothing says the ask belongs to a project registered for this chat.
+  const readSession = async (server: OpencodeServer, sessionId: string, signal: AbortSignal): Promise<SessionRead> => {
+    let read = await fetchSession(server, sessionId);
+    for (let attempt = 1; !read.ok && attempt < options.sessionFetchAttempts && !signal.aborted; attempt++) {
+      await abortableSleep(options.sessionRetryMs, signal);
+      if (!signal.aborted) read = await fetchSession(server, sessionId);
+    }
+    return read;
   };
 
   const onAsk = async (server: OpencodeServer, event: OpencodeEvent, signal: AbortSignal): Promise<void> => {
@@ -246,11 +290,18 @@ export function startOpencodeBridge(io: BridgeIo, options: BridgeOptions = DEFAU
     const onStop = (): void => controller.abort();
     signal.addEventListener('abort', onStop);
     try {
-      const session = await fetchSession(server, draft.opencode.sessionId);
+      const session = await readSession(server, draft.opencode.sessionId, controller.signal);
+      if (controller.signal.aborted) return;
+      if (!session.ok) {
+        io.log(`opencode: ask ${draft.requestId} not forwarded — session ${draft.opencode.sessionId} unreadable (${session.why})`);
+        io.notify(`opencode asked for an answer in session ${draft.opencode.sessionId}, but tg-ctl could not read that session (${session.why}) — answer it in opencode.`);
+        return;
+      }
       const req = opencodeEventToButtonRequest(event, session.record);
-      if (!req || controller.signal.aborted) return;
-      const raw = await io.ask(session.cwd ? { ...req, cwd: session.cwd } : req, controller.signal);
-      if (!controller.signal.aborted) await deliver(server, req, raw);
+      if (!req?.opencode) return;
+      const asked: ButtonRequest = { ...req, cwd: session.cwd, opencode: { ...req.opencode, serverUrl: server.url } };
+      const raw = await io.ask(asked, controller.signal);
+      if (!controller.signal.aborted) await deliver(server, asked, raw);
     } catch (err) {
       io.log(`opencode: ask ${draft.requestId} failed: ${String(err)}`);
     } finally {
@@ -310,9 +361,12 @@ export function startOpencodeBridge(io: BridgeIo, options: BridgeOptions = DEFAU
     try {
       servers = await io.discover();
     } catch (err) {
+      // A late tap must not reply to a server the bridge can no longer vouch for.
+      serverByUrl = new Map();
       io.log(`opencode: discovery failed: ${String(err)}`);
       return;
     }
+    serverByUrl = new Map(servers.map((s) => [s.url, s]));
     // Keyed by URL AND credentials: a restarted service that reuses its port but rotates its
     // password replaces the old subscription instead of retrying stale auth forever.
     const identity = (s: OpencodeServer): string => `${s.url} ${s.authorization ?? ''}`;
@@ -337,6 +391,15 @@ export function startOpencodeBridge(io: BridgeIo, options: BridgeOptions = DEFAU
       await abortableSleep(options.rescanMs);
     }
   })();
+
+  return {
+    reply: async (req, answer) => {
+      const url = req.opencode?.serverUrl;
+      const server = url === undefined ? undefined : serverByUrl.get(url);
+      if (!server) return { status: 'unreachable', why: `no live opencode server at ${url ?? '(none)'}` };
+      return postReply(server, req, answer);
+    },
+  };
 }
 
 // Unref'd so an idle bridge never keeps the process alive on its own.

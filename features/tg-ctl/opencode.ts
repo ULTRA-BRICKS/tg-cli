@@ -8,7 +8,7 @@
 // `/openapi.json` and live `/api/event` stream, tests/fixtures/opencode) carries `data`,
 // asks questions as `form.created` forms and replies on `/api/session/{id}/...`.
 
-import type { ButtonOption, ButtonRequest } from './questions';
+import type { ButtonOption, ButtonRequest, OpencodeRequestRef } from './questions';
 import { opencodeSessionRole, type OpencodeSessionRecord } from '../agent-role/role';
 
 export interface OpencodeEvent {
@@ -111,6 +111,35 @@ export function opencodeReplyPlan(baseUrl: string, req: ButtonRequest, answer: s
     default:
       return null; // an unknown kind (a newer peer's request): no route to guess
   }
+}
+
+// An ask the daemon's own opencode bridge raised: paneless, answered over opencode's HTTP
+// reply route through the server it came from. It defers no pane and holds its card for as
+// long as opencode holds the ask (tg-cli#687), and the durable question store carries it
+// across a daemon restart.
+export function isOpencodeBridgeRequest(req: ButtonRequest): boolean {
+  return req.agent === 'opencode' && !req.paneId && typeof req.opencode?.serverUrl === 'string';
+}
+
+const REPLY_KINDS: Record<OpencodeRequestRef['replyKind'], true> = {
+  question: true, 'question-v2': true, permission: true, 'permission-v2': true, 'permission-api': true, form: true,
+};
+
+// The ref as read back from the daemon socket or the question store: malformed → undefined.
+export function opencodeRefOf(value: unknown): OpencodeRequestRef | undefined {
+  const rec = recordOf(value);
+  if (!rec) return undefined;
+  const { sessionId, requestId, replyKind, serverUrl } = rec;
+  if (typeof sessionId !== 'string' || typeof requestId !== 'string') return undefined;
+  if (typeof replyKind !== 'string' || !Object.hasOwn(REPLY_KINDS, replyKind)) return undefined;
+  const ref: OpencodeRequestRef = { sessionId, requestId, replyKind: replyKind as OpencodeRequestRef['replyKind'] };
+  const form = recordOf(rec.form);
+  const values = recordOf(form?.values);
+  if (form && typeof form.fieldKey === 'string' && values && Object.values(values).every((v) => typeof v === 'string')) {
+    ref.form = { fieldKey: form.fieldKey, values: values as Record<string, string> };
+  }
+  if (typeof serverUrl === 'string') ref.serverUrl = serverUrl;
+  return ref;
 }
 
 // opencode 2.x `form.created`: `data.form` = { id, sessionID, title, fields[] }. Exactly one

@@ -461,6 +461,14 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
   critical ask, which waits without limit, `expiresAt: null` until its card is gone from the
   questions store (`dropSettledDecided` at restore); the restore skips any card with one, so
   a stale questions-store copy cannot re-open it after a restart.
+  The other persisted paneless kind is an opencode bridge ask (`isOpencodeBridgeRequest`:
+  `agent: opencode`, no pane, `opencode.serverUrl` set; tg-cli#687). It defers no pane, so no
+  unscoped-ask timer is armed for it: opencode holds the ask until it is answered, and the live
+  card waits as long. Its `opencode` reply ref survives `normalizeButtonRequest`
+  (`opencodeRefOf`), so a card restored after a daemon restart — bounded, like any restored
+  entry, by the abandoned-retention window of its kind — is answered by
+  `lateDeliverAbandonedQuestion` over opencode's HTTP reply route (`OpencodeBridge.reply`, only
+  to a server the bridge currently discovers) instead of a pane inject.
   `question-store.ts` owns the on-disk format (PURE); the entrypoint owns the I/O.
 - **Pane-inject late-delivery for permissions (`features/tg-ctl/permission-menu.ts`, tg-cli#267):**
   for `claude` specifically, a disconnected permission's hook has already fallen back to Claude

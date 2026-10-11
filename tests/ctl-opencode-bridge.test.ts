@@ -231,3 +231,64 @@ test('a reply opencode refuses is reported to Telegram, since the card already s
   servers = [];
   oc.stop();
 });
+
+// tg-cli#687: the daemon answers a card the question store restored through the bridge,
+// which replies only to a server it currently discovers, with that server's credentials —
+// none after a failed discovery.
+test('the bridge replies to a restored ask through its live server, not an unknown one, and none after a failed discovery', async () => {
+  const oc = fakeOpencode('/event', () => true);
+  let discovery: () => OpencodeServer[] = () => [{ url: oc.url, protocol: 'legacy' }];
+  const failedLogs: (() => void)[] = [];
+  const subscribed = oc.nextSubscription();
+  const bridge = startOpencodeBridge({
+    discover: async () => discovery(),
+    fetch: (url, init) => fetch(url, init),
+    ask: async () => null,
+    log: (line) => {
+      if (line.includes('discovery failed')) failedLogs.splice(0).forEach((w) => w());
+    },
+    notify: () => {},
+  }, FAST);
+  await subscribed;
+  const ref = { sessionId: 'ses_main', requestId: 'per_9', replyKind: 'permission' as const, serverUrl: oc.url };
+  const req: ButtonRequest = { requestId: 'oc_ses_main_per_9', agent: 'opencode', kind: 'permission', question: 'edit', opencode: ref };
+  expect(await bridge.reply(req, 'allow')).toEqual({ status: 'sent' });
+  expect(oc.replies).toEqual([{ path: '/permission/per_9/reply', body: { reply: 'once' } }]);
+  const elsewhere = { ...req, opencode: { ...ref, serverUrl: 'http://127.0.0.1:1' } };
+  expect((await bridge.reply(elsewhere, 'allow')).status).toBe('unreachable');
+
+  const failed = nextOf(failedLogs);
+  discovery = () => {
+    throw new Error('ps timed out');
+  };
+  await failed;
+  expect((await bridge.reply(req, 'allow')).status).toBe('unreachable');
+  expect(oc.replies).toHaveLength(1);
+  discovery = () => [];
+  oc.stop();
+});
+
+// Only an answer opencode itself turns away (a 4xx other than auth / timeout / rate limit)
+// retires a restored card; anything that may pass on a later tap leaves it for one.
+test('a reply opencode turns away is refused; a busy, rate-limited or unauthorized one is retryable', async () => {
+  const statuses = [404, 409, 401, 403, 408, 429, 503];
+  const fakes = statuses.map((status) => fakeOpencode('/event', () => true, status));
+  let servers: OpencodeServer[] = fakes.map((f) => ({ url: f.url, protocol: 'legacy' }));
+  const subscribed = Promise.all(fakes.map((f) => f.nextSubscription()));
+  const bridge = startOpencodeBridge({
+    discover: async () => servers,
+    fetch: (url, init) => fetch(url, init),
+    ask: async () => null,
+    log: () => {},
+    notify: () => {},
+  }, FAST);
+  await subscribed;
+  const outcomes: string[] = [];
+  for (const f of fakes) {
+    const opencode = { sessionId: 'ses_main', requestId: 'per_x', replyKind: 'permission' as const, serverUrl: f.url };
+    outcomes.push((await bridge.reply({ requestId: 'oc_x', agent: 'opencode', kind: 'permission', question: 'edit', opencode }, 'allow')).status);
+  }
+  expect(outcomes).toEqual(['refused', 'refused', 'unreachable', 'unreachable', 'unreachable', 'unreachable', 'unreachable']);
+  servers = [];
+  for (const f of fakes) f.stop();
+});

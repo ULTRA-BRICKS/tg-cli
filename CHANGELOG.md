@@ -14,6 +14,11 @@ semantic versioning.
   the Telegram poll loop. A card answered in the opencode TUI meanwhile is retired. If opencode
   refuses the reply (the ask is gone), Telegram gets a notice to answer in opencode. An open
   opencode card does not hold back inbound messages to other agents' panes.
+- **A late tap on an opencode card still answers it (#687).** opencode keeps an ask open until
+  it is answered, so its card no longer expires after 110 s, and a card posted before a
+  `tg-ctl` restart is restored from the question store and answered over opencode's reply
+  route. If tg-ctl cannot read the asking session (tried 3 times), Telegram gets a notice to
+  answer in opencode instead of the ask vanishing.
 
 ## 1.60.2
 

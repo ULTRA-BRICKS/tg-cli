@@ -1502,6 +1502,8 @@ test('an opencode bridge ask does not defer inbound to agent panes while its car
     title: 'external_directory',
     question: 'external_directory\nresources: /opt/zz/*',
     cwd: cfgDir,
+    // The bridge stamps the server it got the ask from (tg-cli#687).
+    opencode: { sessionId: 'ses_1', requestId: 'per_1', replyKind: 'permission-api', serverUrl: 'http://127.0.0.1:4096' },
   }) + '\n'));
   {
     const t0 = Date.now();
