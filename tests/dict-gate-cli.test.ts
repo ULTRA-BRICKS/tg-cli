@@ -73,8 +73,9 @@ function expectRefused(r: ReturnType<typeof run>, ruleId: string, matched: strin
 function expectPassedGateThenFailedOffline(r: ReturnType<typeof run>) {
   expect(r.stderr.toLowerCase()).not.toContain('dictionary');
   expect(r.exitCode).not.toBe(0);
-  // The transport was actually reached: the closed port refused the connection.
-  expect(r.stderr).toMatch(/ConnectionRefused|Unable to connect/);
+  // The transport was actually reached: the closed port refused the connection. The error code
+  // differs by Bun version (ConnectionRefused / ECONNREFUSED); tg's own wording does not.
+  expect(r.stderr).toContain('could not reach Telegram (sendMessage)');
 }
 
 test('refuses a plain body with a почт- verb form, naming rule, match and replacement', () => {

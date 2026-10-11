@@ -57,7 +57,7 @@ function expectPassedGuardThenFailedOffline(proc: ReturnType<typeof run>) {
   expect(proc.exitCode).not.toBe(0);
   // Positively confirm the send reached the (offline) transmitter rather than
   // failing early for an unrelated reason that would also clear the checks above.
-  expect(err).toContain('connect');
+  expect(err).toContain('could not reach telegram (sendmessage)');
 }
 
 test('does NOT block a message with separate Cyrillic and Latin words ("влил PR gh ship")', () => {
