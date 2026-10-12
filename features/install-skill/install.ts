@@ -53,7 +53,10 @@ Push reports and files to Telegram; the user can reply back (typed into your tmu
 
 ## Invocation
 \`\`\`
-tg "text message"
+tg send "text message"                             # explicit send
+tg "text message"                                  # default send still works
+tg --literal send hello                            # literal "send hello"
+tg send -- --help                                  # literal "--help", not CLI help
 tg --format html "<b>Title</b>\\nbody"
 tg --format html "<h2>Heading</h2><table><tr><td>a</td><td>b</td></tr></table>"  # native rich table
 tg --file report.pdf "caption"
@@ -62,6 +65,11 @@ tg --reply-to 1234 --tag answer "answer that threads under message 1234"
 printf 'task\\tstatus\\nship\\tdone' | tg --table   # plain monospace <pre> fallback
 tg help format                                      # what formatting is supported
 \`\`\`
+
+A leading \`send\` with following arguments selects sending; it is not included in
+message text. A sole \`send\` and \`tg "send hello"\` remain literal for compatibility.
+After \`--literal\` or \`tg send --\`, all tokens are message text, including flags.
+Bun consumes an initial \`--\`; use \`--literal\` as the portable leading terminator.
 
 ## When to use
 - Report a finished task / status / blocker / question to the user's phone.

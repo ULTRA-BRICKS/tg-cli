@@ -129,6 +129,10 @@ export function applyFeatureFlags(args: string[]): ApplyFlagsResult {
   let i = 0;
   while (i < args.length) {
     const arg = args[i];
+    if (arg === '--' || arg === '--literal') {
+      rest.push(...args.slice(i));
+      break;
+    }
     if (arg === '--feature' || arg === '--no-feature') {
       const value = args[i + 1];
       if (!value || value.startsWith('-')) {

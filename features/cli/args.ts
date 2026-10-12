@@ -292,6 +292,8 @@ const TAG_GATES: Record<string, TagGate> = {
 };
 
 export interface ParseOptions {
+  // Pin routing before feature flags are removed; prose after leading flags stays prose.
+  explicitSend?: boolean;
   // Never-attach denylist (feature `attach-denylist`, ON by default): an explicit
   // --photo/--file naming a secret-looking file (.env family, private keys,
   // credential rc-files, …) is a HARD ERROR.
@@ -317,7 +319,7 @@ export interface ParseOptions {
  * never calls process.exit: the caller decides what to do with the result.
  *
  * Precedence (the reconciliation point for "unknown dashed → error"):
- *   1. -h/--help and -v/--version win anywhere, before everything else.
+ *   1. -h/--help and -v/--version win before the literal terminator.
  *   2. Info-only flags --ls-emoji-helpers / --detect-model / --detect-agent / --session-topic win next.
  *   3. Real flags are matched: --format (with value validation), --photo,
  *      --file (each consuming a path value).
@@ -329,30 +331,33 @@ export function parseArgs(
   args: string[],
   cwd: string,
   home: string,
-  { attachDenylist = true, msgrefAutolink = true, ticketAutolink = true }: ParseOptions = {},
+  { attachDenylist = true, msgrefAutolink = true, ticketAutolink = true, explicitSend = args[0] === 'send' && args.length > 1 }: ParseOptions = {},
 ): ParseResult {
-  // 1. Help / version win anywhere, before the empty check.
-  for (const a of args) {
+  if (explicitSend && args[0] === 'send') args = args.slice(1);
+  const terminator = args.findIndex((arg) => arg === '--' || arg === '--literal');
+  const optionArgs = terminator < 0 ? args : args.slice(0, terminator);
+  // 1. Help / version win before the literal terminator.
+  for (const a of optionArgs) {
     if (a === '-h' || a === '--help') return { action: 'help' };
   }
-  for (const a of args) {
+  for (const a of optionArgs) {
     if (a === '-v' || a === '--version') return { action: 'version' };
   }
 
-  // 2. Info-only flags win next, anywhere on the line.
-  for (const a of args) {
+  // 2. Info-only flags win next, before the literal terminator.
+  for (const a of optionArgs) {
     if (a === '--ls-emoji-helpers') return { action: 'lsEmojiHelpers' };
   }
-  for (const a of args) {
+  for (const a of optionArgs) {
     if (a === '--detect-model') return { action: 'detectModel' };
   }
-  for (const a of args) {
+  for (const a of optionArgs) {
     if (a === '--detect-agent') return { action: 'detectAgent' };
   }
-  for (const a of args) {
+  for (const a of optionArgs) {
     if (a === '--session-topic') return { action: 'sessionTopic' };
   }
-  for (const a of args) {
+  for (const a of optionArgs) {
     if (a === '--format-help') return { action: 'formatHelp' };
   }
 
@@ -381,6 +386,10 @@ export function parseArgs(
   let i = 0;
   while (i < args.length) {
     const arg = args[i];
+    if (arg === '--' || arg === '--literal') {
+      textParts.push(...args.slice(i + 1));
+      break;
+    }
     if (arg === '--format') {
       const nextArg = args[i + 1];
       if (!nextArg || nextArg.startsWith('--')) {
@@ -565,6 +574,9 @@ export function parseArgs(
     }
     if (arg === '--photo' || arg === '--file') {
       const nextArg = args[i + 1];
+      if (nextArg === '--' || nextArg === '--literal') {
+        return { action: 'error', message: `${arg} requires a path before the literal terminator; use ./${nextArg} for that filename` };
+      }
       // A dashed next token is only consumed as a path when it actually
       // resolves to an existing file (e.g. `--file -receipt.png`). Otherwise
       // it is a missing/invalid path → error, matching main's behavior.

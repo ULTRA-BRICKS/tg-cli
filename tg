@@ -149,7 +149,9 @@ export { VERSION } from "./features/cli/version"
 
 // --- Usage ---
 export const USAGE = `Usage:
+  tg send "text message"          # explicit send; default syntax below still works
   tg "text message"
+  tg --literal send hello          # send the literal words "send hello"
   tg --photo screen.png "caption"
   tg --file doc.pdf "caption"
   tg --photo a.png --photo b.png "caption"   # repeatable; mix --photo/--file
@@ -170,6 +172,12 @@ As YOUR Telegram account (MTProto; see \`tg help auth\`, \`tg call --help\`):
   tg call @alice --say "text"   ring a user and speak (or --audio file.ogg)
   tg call me --say "text"       ring YOURSELF from the caller account
   tg user send @alice "text"    send as you (text or stdin)
+
+Sending: a leading \`send\` with further arguments selects the normal send pipeline.
+A sole \`send\` remains literal text (shell quoting cannot distinguish \`tg send\` from
+\`tg "send"\`). \`tg "send hello"\` also stays literal. Use \`--literal\` before literal
+text, or \`tg send -- <text>\`; flags after either terminator are text. Bun consumes
+an initial \`--\`, so prefer \`--literal\` when it is the first argument.
 
 The global options (--format, --tag, --title, --subagent, --reply-to, --topic, the feature
 toggles) apply to ANY of the bot send forms above — see Options below. The account
@@ -821,6 +829,7 @@ if (import.meta.main) {
     attachDenylist: attachDenylistOn,
     msgrefAutolink: msgrefAutolinkOn,
     ticketAutolink: ticketAutolinkOn,
+    explicitSend: rawArgs[0] === "send" && rawArgs.length > 1,
   })
 
   // No-send actions resolve BEFORE the credential gate so help/version/info

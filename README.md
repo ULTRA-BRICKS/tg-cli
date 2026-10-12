@@ -4,6 +4,29 @@ The best way to monitor several coding agents at once: they push only what matte
 
 Works with any agent in tmux: Claude Code, Codex, opencode, aider, and more. omp also works outside tmux (omp-live); every other agent started outside tmux is listed as unreachable, with how to restart it inside tmux.
 
+## Explicit and default sending
+
+```bash
+tg send "hello"                    # explicit send
+tg "hello"                         # existing default sending
+tg "send hello"                    # literal text, unchanged
+tg --literal send hello            # literal text as separate words
+tg send -- --help                  # sends "--help", does not show help
+tg send --format html "<b>hello</b>"
+```
+
+Only a leading standalone `send` with further arguments selects the command.
+A sole `tg send` stays the literal word `send`, preserving `tg "send"` because
+shell quoting produces identical arguments. `tg send ""` retains empty-message
+help behavior. Options before a body that begins with `send` keep their existing
+literal semantics; put the command first when using the explicit form.
+
+`--literal` and `--` stop option parsing, including help, version and feature
+flags. Bun consumes an initial `--` before the script sees it, so use
+`tg --literal ...` for a leading terminator, or `tg send -- ...` after the command.
+Command-looking body words such as `auth user logout` are sent as text; explicit
+sending does not dispatch them as subcommands. `tg get` is not a recall command.
+
 ## What it looks like
 
 **An agent finishes a task:**

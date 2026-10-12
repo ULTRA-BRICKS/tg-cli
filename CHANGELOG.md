@@ -3,6 +3,10 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.61.0
+
+- **Explicit `tg send` preserves default sending ([#698](https://git.hyperide.ai/ultrabricks/tg-cli/issues/698)).** A leading send with further arguments selects the existing send pipeline instead of leaking the verb into the message. Default `tg "text"`, quoted text starting with send, and the sole word send remain compatible. Body words never dispatch account, hook, report, recall or installation commands. `--literal` and `--` protect command-like text and flags; use `--literal` when the terminator is first because Bun consumes an initial `--`. No get command is introduced.
+
 ## 1.60.2
 
 - **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on
