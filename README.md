@@ -713,6 +713,7 @@ tg sits at outbound-first / any-agent / thin-inbound; the "remote terminal" tool
 | RichardAtCT/claude-code-telegram | Full-duplex | Remote terminal (SDK) | Claude |
 | JessyTsui/Claude-Code-Remote | Full-duplex | Remote terminal + trace delivery | Claude |
 | jsayubi/ccgram | Full-duplex | Approvals + remote terminal | Claude |
+| six-ddc/ccbot | Full-duplex | Remote terminal (tmux, 1 topic = 1 session) | Claude |
 
 ### Features
 
@@ -725,6 +726,23 @@ tg sits at outbound-first / any-agent / thin-inbound; the "remote terminal" tool
 | RichardAtCT | — | — | ✓ | ✓ | ~ | ✓ |
 | JessyTsui | — (full trace) | — | — | ✓ | — | ✓ |
 | ccgram | — | — | — | ✓ | ✓ | ✓ |
+| ccbot | — (full trace) | — | ~ (terminal screenshots) | ✓ | ✓ (arrow keys) | ✓ |
+
+### ccbot in detail
+
+[six-ddc/ccbot](https://github.com/six-ddc/ccbot) is the most complete of the tmux-based mirrors, and like the rest it forwards the agent's whole output as is. A monitor reads the Claude Code session JSONL every 2 s and sends every assistant text in full, the thinking (cut to 500 chars, in an expandable quote), every tool call with its result, local command output, and the user's own turns. The agent never chooses what goes out. `CCBOT_SHOW_TOOL_CALLS=false` and `CCBOT_SHOW_USER_MESSAGES=false` are the only filters; replies and thinking always go out. It keeps the volume down by packing the trace into fewer messages: consecutive texts are merged up to 3800 chars, a tool result is edited into its tool-call message, and a status message is edited in place every second. It only works with Claude Code and only in a forum group. Closing a topic kills its tmux window.
+
+What tg takes from it. Each item is pull-only or sends nothing, so the chat stays curated:
+
+| ccbot | tg ticket |
+|---|---|
+| `/screenshot`: the terminal as a PNG, with ↑↓←→ / Space / Tab / Esc / ^C / Enter buttons that also drive menus no hook forwards | [#700](https://git.hyperide.ai/ultrabricks/tg-cli/issues/700) `/screen` |
+| `/history`: the session transcript, paged with buttons | [#701](https://git.hyperide.ai/ultrabricks/tg-cli/issues/701) `/tail`, on demand rather than mirrored |
+| A live status line, edited once a second | [#702](https://git.hyperide.ai/ultrabricks/tg-cli/issues/702) a "typing…" chat action in the bound topic, which sends no messages |
+| A picker that resumes an existing session when a topic starts | [#703](https://git.hyperide.ai/ultrabricks/tg-cli/issues/703) a Resume button when a topic's session is gone |
+| Waits out a 429 (`retry_after`) instead of failing | already tracked in [#613](https://git.hyperide.ai/ultrabricks/tg-cli/issues/613) |
+
+tg already has its own versions of ccbot's other features: `/stop` (Esc), `/kill`, slash-command passthrough, voice (local Whisper instead of the OpenAI API), hook-forwarded questions and permissions, and `/new` with forum topics. tg deliberately does not copy two of them. It does not mirror the transcript, and closing a topic does not kill the session, because a topic is only an address for a session that already exists.
 
 ---
 
