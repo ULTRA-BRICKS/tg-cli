@@ -351,7 +351,7 @@ describe('tg → sidecar handoff (real binary, fake sidecar)', () => {
     const f = fixture();
     const repo = join(f.home, 'repo');
     mkdirSync(join(repo, 'features', 'telegram_client'), { recursive: true });
-    writeFileSync(join(repo, 'features', 'telegram_client', 'runtime.lock'), 'pkg==1 --hash=sha256:00\n');
+    writeFileSync(join(repo, 'requirements-call.txt'), 'pkg==1 --hash=sha256:00\n');
     const cache = join(f.home, 'cache');
     const sha = new Bun.CryptoHasher('sha256').update('pkg==1 --hash=sha256:00\n').digest('hex');
     const lockDir = `${runtimeDir(cache, sha)}.building`;

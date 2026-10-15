@@ -60,7 +60,7 @@ export interface RuntimeBuildOptions {
 }
 
 /**
- * `<venv>/bin/python -m telegram_client`, building the venv from runtime.lock on first use.
+ * `<venv>/bin/python -m telegram_client`, building the venv from requirements-call.txt on first use.
  * One builder at a time (an atomic `mkdir` lock beside the venv, like role_lock on the
  * Python side): two agents' first `tg call` must not delete each other's half-built venv.
  * The `.tg-ready` marker is written only after every install step succeeded, so a half
@@ -72,7 +72,7 @@ export async function ensureSidecarRuntime(
   cacheHome: string,
   opts: RuntimeBuildOptions = {},
 ): Promise<RuntimeCommand> {
-  const lockPath = join(repoDir, 'features', 'telegram_client', 'runtime.lock');
+  const lockPath = join(repoDir, 'requirements-call.txt');
   const sha = new Bun.CryptoHasher('sha256').update(readFileSync(lockPath)).digest('hex');
   const venv = runtimeDir(cacheHome, sha);
   const ready = join(venv, '.tg-ready');

@@ -50,6 +50,13 @@ jobs:
       - name: Set up bun (bun audit; resolves a lockfile-less package.json as data)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
+      # The Python auditor, pinned, installed from PyPI by the trusted base workflow (never from
+      # the PR). Without it the root requirements*.txt (the call sidecar locks) fail closed.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - name: Install pip-audit (pinned auditor for requirements*.txt)
+        run: uv tool install 'pip-audit==2.10.1'
+
       # codeql[actions/untrusted-checkout/medium]
       # Justified: the PR head is fetched as a git OBJECT and materialized in a side worktree
       # that is never executed; dep-audit.sh copies only manifests/lockfiles out of it and

@@ -14,7 +14,7 @@ private WAV lifecycle and independent auth owner; no calendar business logic.
 No root LICENSE file or package.json license declaration was found in the
 inspected source. No license grant is inferred. Retain this provenance; any
 external redistribution requires clarification of the source license.
-Dependencies retain their respective upstream licenses and runtime.lock pins.
+Dependencies retain their respective upstream licenses and requirements-call.txt pins.
 
 Provider adaptation additionally refers to nova-streaming-stt.ts,
 silero-tts-service.ts and scripts/silero-tts.py at the revision above.

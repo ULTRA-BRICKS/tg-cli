@@ -80,9 +80,9 @@ is instant and needs no Python), and spawns the sidecar:
 
 - argv: `<python> -m telegram_client <personal|caller> --store=<configDir>/mtproto <command> …`
   with `PYTHONPATH=<repo>/features` — the sidecar code runs from the same checkout as `tg`.
-- `<python>`: a managed venv `$XDG_CACHE_HOME/tg-cli/mtproto-runtime-<sha256(runtime.lock)[:12]>`
+- `<python>`: a managed venv `$XDG_CACHE_HOME/tg-cli/mtproto-runtime-<sha256(requirements-call.txt)[:12]>`
   (default `~/.cache/…`), built on first use with `uv venv --python 3.12` +
-  `uv pip install --require-hashes -r features/telegram_client/runtime.lock`, and marked ready
+  `uv pip install --require-hashes -r requirements-call.txt`, and marked ready
   only after that succeeds. A lock change gets a fresh venv. `uv run --with-requirements` is NOT
   used: it installed a requirement whose hash did not match (observed with uv 0.12.24).
 - One builder at a time: an atomic `mkdir` lock `<venv>.building` holding the builder's pid.
@@ -167,7 +167,7 @@ explicit path plus SHA-256; no torch.hub downloads and no default voice.
 
 Offline doctor reports configuration, environment-variable presence, executable
 presence, model hashes and import availability separately from live verification.
-`voice-runtime.lock` preserves the source macOS CPU dependency pins. No production
+`requirements-voice.txt` preserves the source macOS CPU dependency pins. No production
 credentials or weights have been installed. `attach_configured_session` is a
 library entry point for a separately authorized, already connected call.
 

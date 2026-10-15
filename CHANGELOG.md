@@ -3,6 +3,17 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.60.3
+
+- **`dependency-review` audits the call sidecar's Python pins and passes again (#714).** Since
+  tg-call-lib's `pyproject.toml` landed, every PR failed closed: nothing pinned to audit. The
+  sidecar's hash-locked pins moved to the root, where the audit reads them —
+  `features/telegram_client/runtime.lock` → `requirements-call.txt` (the venv `tg call` / `tg user`
+  builds; its sha changes, so the venv is rebuilt once) and `voice-runtime.lock` →
+  `requirements-voice.txt` — and the workflow installs a pinned `pip-audit`. The first audit found
+  two advisories in the locks: `multidict` 6.7.1 → 6.9.1
+  (CVE-2026-104874) and `fsspec` 2026.2.0 → 2026.6.0 (CVE-2026-104851).
+
 ## 1.60.2
 
 - **CI gates no longer pass having checked nothing (#326).** `dependency-review` was a skip on

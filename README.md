@@ -569,7 +569,7 @@ tg auth status                       # bot + user + caller in one view (offline 
   A session file IS your account — keep it private. `tg auth user logout` deletes it;
   terminate the login itself in Telegram → Settings → Devices.
 - **Runtime**: the first account command builds a Python 3.12 venv under
-  `~/.cache/tg-cli/` with `uv` from the hash-locked `features/telegram_client/runtime.lock`
+  `~/.cache/tg-cli/` with `uv` from the hash-locked `requirements-call.txt`
   (needs `uv`; calls also need `ffmpeg`; `--say` needs macOS `say` or `espeak-ng`).
   `TG_MTPROTO_SIDECAR=<executable>` uses a runtime you built yourself instead.
 - **Calls**: one dial, never retried; success = the audio played to the end. An account
@@ -776,7 +776,7 @@ one attempt. A failure or crash after claiming requires manual reconciliation, s
 an uncertain call never repeats automatically. The recipient is the verified personal
 account owner. This is not activated by installation and needs process supervision
 on an always-on host. Neither live auth nor a real call is established by the module
-tests. No trigger for Tony is currently configured. `runtime.lock` is the hash-pinned
+tests. No trigger for Tony is currently configured. `requirements-call.txt` is the hash-pinned
 PyPI runtime; a patched ntgcalls binary still needs its own media acceptance.
 
 ### Independent conversational transport checkpoint
@@ -828,7 +828,7 @@ TTS requires an explicit supported speaker, local Silero `v5_ru` package and its
 SHA-256; VAD requires a local Silero TorchScript model and its SHA-256. Do not map
 Bracho to a built-in Silero voice without the actual confirmed preset. If the
 existing Bracho profile uses another engine, configure that engine adapter rather
-than relabeling a Silero speaker. `voice-runtime.lock` records the existing
+than relabeling a Silero speaker. `requirements-voice.txt` records the existing
 calbot macOS CPU Torch/numpy dependency closure; it was not installed in this step.
 The model paths and hashes are deliberately unset; no weight or key was copied.
 

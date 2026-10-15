@@ -107,6 +107,10 @@ describe('dependency-review.yml', () => {
       expect(s.with?.ref ?? '').not.toMatch(/head|merge/);
     }
   });
+
+  test('provisions a pinned pip-audit, so the root requirements*.txt sidecar locks are audited (tg-cli#714)', () => {
+    expect(steps.some((s) => /uv tool install 'pip-audit==\d+\.\d+\.\d+'/.test(s.run ?? ''))).toBe(true);
+  });
 });
 
 describe('leftover-grep.yml', () => {

@@ -111,7 +111,7 @@ I/O, fetch, signals, `bun:ffi`):
   first (not logged in = instant exit 3, no Python), then spawns
   `<venv>/bin/python -m telegram_client <personal|caller> --store=<config>/mtproto …` with
   `PYTHONPATH=<repo>/features`; the venv is `~/.cache/tg-cli/mtproto-runtime-<lock sha>`, built
-  with `uv pip install --require-hashes -r features/telegram_client/runtime.lock` (NOT
+  with `uv pip install --require-hashes -r requirements-call.txt` (NOT
   `uv run --with-requirements`, which skipped hash checks). `TG_MTPROTO_SIDECAR` overrides the
   runtime (tests use a fake). Stdout is JSON lines with stable error codes — never library
   exception text; message text for `tg user send` goes on stdin, never argv. Sessions live in
