@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { accessSync, appendFileSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs"
+import { accessSync, appendFileSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { dirname, join, resolve } from "path"
 // Explicit import (not the global `crypto`) so the multi-part groupId token
@@ -19,6 +19,7 @@ import {
   resolveDictionaryPath,
   type DictionaryField,
 } from "./features/cli/dict-gate"
+import { formatUnattachedFileError, unattachedFileMentions } from "./features/cli/file-mention-gate"
 import { formatScreenshotAttachError, mentionsScreenshot } from "./features/cli/screenshot-guard"
 import {
   applyFeatureFlags,
@@ -303,7 +304,7 @@ Options:
                        text becomes a heading above the table. Keep cells
                        ASCII/Cyrillic (double-width emoji/CJK misalign columns).
   --dry-run             validate/render the message through every local guard
-                       (escalation-format gate, cjk-guard, screenshot-guard, dictionary gate, table conversion) and
+                       (escalation-format gate, cjk-guard, screenshot-guard, file-mention-guard, dictionary gate, table conversion) and
                        print the outcome — NO network call, NO credentials
                        required, NOTHING is sent. Use this to iterate against
                        the strict --tag decision format instead of
@@ -427,6 +428,19 @@ Screenshot-attach gate (feature screenshot-guard, ON by default — toggle with
   tg --photo <path> (or equivalent). Do not dodge by deleting the word —
   attach the screenshot. A send that already has --photo is allowed. Override
   with --no-feature screenshot-guard.
+
+Unattached-file gate (feature file-mention-guard, ON by default — toggle with
+--feature/--no-feature):
+  An agent message whose prose names an existing local document — an
+  absolute, ~/ or ./ path to a non-empty, non-executable, group/other-readable
+  regular file under home or the temp dir, within the 50 MB upload limit —
+  that the send does not attach is a HARD ERROR before send: the reader sees
+  only a path. The error prints the exact resend command with --file <path>.
+  The text never attaches a file by itself. Paths in code (backticks, <code>,
+  <pre>, fenced blocks), on a "$ " command line, in a URL; directories,
+  missing, system, executable, private (0600) and never-attach files do not
+  count; --automated sends are not gated.
+  Override with --no-feature file-mention-guard.
 
 Unknown flags:
   Unknown dashed tokens (e.g. --foo) are an ERROR: this help is printed to
@@ -916,6 +930,7 @@ if (import.meta.main) {
   // final decoded caption/title, right before send.
   const cjkGuardOn = features["cjk-guard"] !== false
   const screenshotGuardOn = features["screenshot-guard"] !== false
+  const fileMentionGuardOn = features["file-mention-guard"] !== false
   // Same flag the body-detection `detectTicketCodesExpanded` call below gates on — threaded so
   // the --title HYP-<id> guard honours a disabled feature identically to the body.
   const ticketAutolinkOn = features["autolink-tasks"] !== false
@@ -1656,6 +1671,40 @@ if (import.meta.main) {
     ["TG_AI_MODEL", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "OPENCODE", "CODEX", "RIG_AGENT_ID", "RIG_DETACHED_AGENT", "TG_AGENT", "RIG_SESSION"].some(
       (key) => Boolean(env[key]),
     )
+  // --- Unattached-file gate (feature `file-mention-guard`, features/cli/file-mention-gate.ts) ---
+  // Same senders as the intent gate below, minus --automated (a program cannot act on the
+  // refusal, and a dropped alert costs more than a path in it). A body whose prose names an
+  // existing local file the send does not attach is refused with the `--file` command:
+  // the reader cannot open a path on a phone (tg#22056), and the text never attaches a
+  // file by itself (tg-cli#648). It reads the agent-authored fields the dictionary gate
+  // reads: for --table the raw rows, which the rendered caption hides inside a <pre>.
+  if (fileMentionGuardOn && agentAuthored && parsed.automated !== true) {
+    const realOr = (path: string): string => {
+      try {
+        return realpathSync(path)
+      } catch {
+        return resolve(path)
+      }
+    }
+    const authored = dictFields.map((field) => field.text).join("\n")
+    const unattached = unattachedFileMentions(authored, items.map((it) => it.path), {
+      cwd: process.cwd(),
+      home,
+      documentRoots: [realOr(home), realOr(tmpdir())],
+      stat: (path) => {
+        try {
+          const st = statSync(path)
+          return { isFile: st.isFile(), size: st.size, mode: st.mode, id: `${st.dev}:${st.ino}`, realPath: realpathSync(path) }
+        } catch {
+          return null
+        }
+      },
+    })
+    if (unattached.length > 0) {
+      console.error(`Error: ${formatUnattachedFileError(unattached, process.argv.slice(2), table === true)}`)
+      process.exit(1)
+    }
+  }
   const intentInput = { body: caption, tag, automated: parsed.automated === true }
   const intent: IntentVerdict =
     agentAuthored || intentInput.automated

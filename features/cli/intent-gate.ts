@@ -102,11 +102,13 @@ function decodeEntities(text: string): string {
   });
 }
 
-// The sender's visible prose as lines of sentences: quoted/code text and URLs removed,
-// block tags turned into line breaks, inline tags stripped, entities decoded.
-function proseLines(body: string): string[][] {
-  // The stripped text is only pattern-matched for asks/blockers, never rendered as HTML.
-  const visible = decodeEntities(
+/**
+ * The sender's visible prose: quoted/code text and URLs removed, block tags turned into
+ * line breaks, inline tags stripped, entities decoded. Only pattern-matched, never rendered
+ * as HTML. Shared with the unattached-file gate (file-mention-gate.ts).
+ */
+export function senderProse(body: string): string {
+  return decodeEntities(
     // codeql[js/incomplete-multi-character-sanitization]
     body
       .replace(QUOTED_ELEMENT_RE, ' ')
@@ -116,7 +118,11 @@ function proseLines(body: string): string[][] {
       .replace(BLOCK_BREAK_RE, '\n')
       .replace(TAG_RE, ''),
   );
-  return visible
+}
+
+// The sender's prose as lines of sentences.
+function proseLines(body: string): string[][] {
+  return senderProse(body)
     .split(/\r?\n/u)
     .map((line) =>
       line

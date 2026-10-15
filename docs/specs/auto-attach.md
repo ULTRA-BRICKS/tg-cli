@@ -24,6 +24,11 @@ nothing is uploaded for it.
 
 Paths written in text stay in the text verbatim (they were never excised and still are not).
 
+A path in an agent's prose that names an existing local document it does not attach is
+refused, not attached: the unattached-file gate (`features/cli/file-mention-gate.ts`,
+feature `file-mention-guard`, tg#22056) prints the exact `tg --file <path> …` resend
+command. The sender decides; the text still never uploads anything by itself.
+
 ## Rules (per explicit attachment F, and per inline pasted content)
 
 - **R1** `--file`/`--photo` F → ATTACH F (`--photo` sends a photo, `--file` a document).

@@ -50,6 +50,10 @@ export const DEFAULT_FEATURES: FeatureMap = {
   // screenshot/скриншот with no photo attached (tg-cli#337). ON by default.
   // `--no-feature screenshot-guard` opts out. See features/cli/screenshot-guard.ts.
   'screenshot-guard': true,
+  // file-mention-guard refuses an agent send whose prose names an existing local file it
+  // does not attach, and prints the `tg --file …` resend command (tg#22056). ON by default.
+  // `--no-feature file-mention-guard` opts out. See features/cli/file-mention-gate.ts.
+  'file-mention-guard': true,
   // pre-send-photo hooks (agents-hooks/v1). ON by default, but it is a TRUE
   // no-op unless ~/.agents/hooks/tg/ exists (one `stat`), so default-ON costs
   // nothing on machines with no descriptors. `--no-feature hooks` or

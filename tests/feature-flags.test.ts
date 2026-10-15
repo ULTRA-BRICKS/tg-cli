@@ -53,6 +53,10 @@ test('DEFAULT_FEATURES has screenshot-guard true (guard is ON by default)', () =
   expect(DEFAULT_FEATURES['screenshot-guard']).toBe(true);
 });
 
+test('DEFAULT_FEATURES has file-mention-guard true (guard is ON by default)', () => {
+  expect(DEFAULT_FEATURES['file-mention-guard']).toBe(true);
+});
+
 // --- config overrides default ---
 test('config can disable md-as-pdf', () => {
   const r = resolveFeatures({ 'md-as-pdf': false }, { enable: [], disable: [] });

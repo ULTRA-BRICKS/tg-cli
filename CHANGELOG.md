@@ -3,6 +3,23 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.65.0
+
+- **An agent message that names a local document has to attach it (#743).** tg#22056 told
+  the CTO "Черновик … ~/work/weekly-report-mari.md, проверь перед отправкой" and attached
+  nothing, so the phone showed a path. A new gate (feature `file-mention-guard`, ON) refuses an
+  agent send whose own prose (`--table` rows included) names an existing local document that
+  no `--file`/`--photo` attaches, before any API call and under `--dry-run` too, and prints
+  the exact resend command (`tg --file /abs/path <same flags> '<the same message text>'`). A
+  document is an absolute, `~/` or `./` path to a non-empty, non-executable,
+  group/other-readable regular file whose symlink-resolved path is under home or the temp
+  dir, within the 50 MB upload limit; paths in code, `$ ` command lines, URLs, directories,
+  missing, system, executable, private (0600) and never-attach files do not
+  count. On the live history it would have stopped 8 of 1684 agent messages, all of them
+  pointing at a report or plan. The text still never attaches a file by itself (#648).
+  `--automated` sends and non-agent senders are not gated; `--no-feature file-mention-guard`
+  turns it off.
+
 ## 1.64.5
 
 - **`tg-ctl status` and `/status` show the bot's topic settings (#736).** With topics or

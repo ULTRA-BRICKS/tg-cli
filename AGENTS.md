@@ -314,6 +314,13 @@ after Telegram took it is sent again by the retry or the replay.
   sends do). `tests/hermetic-env.ts` scrubs the agent markers and sets `TG_LAYA=0`, so the
   suite sees the same (non-agent) sender locally and in CI; a test that wants the gate sets
   `TG_AI_MODEL` in the env it spawns `tg` with.
+- `features/cli/file-mention-gate.ts` (PURE, tg#22056) — the unattached-file gate (feature
+  `file-mention-guard`): an agent body whose prose (`senderProse` from `intent-gate.ts`) names an
+  existing local document — an absolute/`~/`/`./` path to a non-empty, non-executable,
+  group/other-readable file under home or the temp dir, ≤ 50 MB, not on the never-attach list — that
+  no `--file`/`--photo` attaches is refused with the exact `tg --file <path> …` resend command.
+  Same scope as the intent gate minus `--automated`; runs before `--dry-run`. It never attaches
+  from the text (tg-cli#648); the disk is an injected `stat`.
 - `features/tg-ctl/` — inbound control logic: `control:` config block parser, singleton/pidfile
   helpers, the update→action step function (allowlist, staleness, command split, `/agent`
   routing, reply-quote forwarding), tmux inject plans as data, agent pane discovery (process-tree
