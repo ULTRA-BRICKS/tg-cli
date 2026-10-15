@@ -887,14 +887,15 @@ const EDIT_UNCHANGED: Record<string, unknown> = { ok: true, result: true }
 
 // The one path every daemon Bot API call takes, so an edit that changed nothing
 // (isEditNotModified, tg-cli#728) is success here for every edit call site: no failure line,
-// and the caller sees ok.
-async function botPostResult(ctx: Ctx, method: string, body: unknown): Promise<BotPostResult> {
+// and the caller sees ok. `timeoutMs`: a diagnostic read (status' getMe) passes a short one, so
+// a stalled API cannot hold the reply for the full send timeout.
+async function botPostResult(ctx: Ctx, method: string, body: unknown, timeoutMs = 15_000): Promise<BotPostResult> {
   try {
     const resp = await fetch(`${api(ctx)}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(timeoutMs),
     })
     if (!resp.ok) {
       const text = await resp.text()
@@ -3444,7 +3445,30 @@ function singleRegisteredCwd(regs: Registration[]): string | null {
   return unique.length === 1 ? unique[0] : null
 }
 
-function composeStatus(ctx: Ctx, statusCwd: string | null): string {
+// The bot's topic settings from getMe (docs/specs/session-registry-and-topics.md §4.6, tg-cli#736),
+// or null when topics are off. With allows_users_to_create_topics, Telegram opens a new topic for
+// every message sent from its "New Chat" entry (an implicit topic, §4.4 row 4) — the usual cause
+// behind "a new topic appeared and my message went to a picker". Null synchronously, not a
+// promise of null: with topics off, /status takes no extra await and keeps its place among the
+// replies of the same batch.
+function topicSettingsLine(ctx: Ctx): Promise<string> | null {
+  if (!ctx.cfg.topics && !ctx.cfg.privateTopics) return null
+  return botPostResult(ctx, "getMe", {}, 3_000).then((me) => {
+    if (!me.ok) return `topics: getMe unavailable (${me.description})`
+    const result = me.json.result
+    const settings = new Map<string, unknown>(result && typeof result === "object" ? Object.entries(result) : [])
+    const userTopics = settings.get("allows_users_to_create_topics")
+    const line =
+      `topics: has_topics_enabled=${String(settings.get("has_topics_enabled") ?? "unknown")}, ` +
+      `allows_users_to_create_topics=${String(userTopics ?? "unknown")}`
+    return userTopics === true
+      ? `${line} — ⚠ every message sent from Telegram's "New Chat" opens a new topic and waits behind the session picker; @BotFather can stop users creating topics`
+      : line
+  })
+}
+
+// `topicSettings`: the resolved topicSettingsLine, awaited by the async caller.
+function composeStatus(ctx: Ctx, statusCwd: string | null, topicSettings: string | null): string {
   const env = autostartEnv(ctx)
   const runState = probeDaemonRunState(ctx, false)
   const lines: string[] = [daemonStatusLine(runState, ctx.botId)]
@@ -3453,6 +3477,7 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
     const freshness = assessRunningCode(ctx, runState.pid)
     lines.push(codeFreshnessLine(freshness) + (shouldRestartForFreshness(freshness) ? " — run `tg-ctl restart`" : ""))
   }
+  if (topicSettings) lines.push(topicSettings)
 
   // Show every LIVE registered session (the per-pane set), not just one — a
   // multi-session operator must SEE that all their panes are registered to
@@ -12535,9 +12560,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         } else onUnscopedRelease()
         return true
       }
-      case "status":
-        await sendMessage(ctx, composeStatus(ctx, null), replyContext(action.threadId))
+      case "status": {
+        const topicSettings = topicSettingsLine(ctx)
+        await sendMessage(ctx, composeStatus(ctx, null, topicSettings ? await topicSettings : null), replyContext(action.threadId))
         return true
+      }
       case "limit-status":
         await sendMessage(ctx, composeLimitStatus(ctx, action.agent), replyContext(action.threadId))
         return true
@@ -13230,7 +13257,7 @@ if (import.meta.main) {
   }
   if (cmd === "status") {
     await refreshOriginalHosts()
-    console.log(composeStatus(ctx, null))
+    console.log(composeStatus(ctx, null, await topicSettingsLine(ctx)))
     process.exit(0)
   }
   if (cmd === "inbox") {

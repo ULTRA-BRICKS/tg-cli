@@ -461,6 +461,11 @@ Caveats while this is experimental:
   survives. A resumed session keeps its topic and says "reattached" there. A topic that
   rejects a post is retried once, then the post (text or media) goes to General with a notice; a
   deleted topic is recreated on the next post.
+- **"New Chat" opens a new topic per message.** When users may create topics (getMe
+  `allows_users_to_create_topics`), Telegram's client opens a new topic, named after the
+  message's first words, for every message sent from its "New Chat" entry; that message then waits
+  behind the attach picker. `tg-ctl status` and `/status` show the setting on their `topics:` line;
+  @BotFather can stop users creating topics.
 
 See `docs/specs/tg-forum-topics.md` (§9 increment plan) for the design of this shipped behaviour. It
 is superseded by `docs/specs/session-registry-and-topics.md` (one bot-created topic per existing

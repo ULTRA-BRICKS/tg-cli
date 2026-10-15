@@ -3,6 +3,15 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.64.5
+
+- **`tg-ctl status` and `/status` show the bot's topic settings (#736).** With topics or
+  private topics on, a `topics:` line reports `has_topics_enabled` and
+  `allows_users_to_create_topics` from getMe, and warns when users may create topics: every
+  message sent from Telegram's "New Chat" entry then opens a new topic that waits behind the
+  session picker (spec §4.6). A getMe failure, or no answer within 3 s, prints
+  `topics: getMe unavailable (…)`; status never fails or stalls on it.
+
 ## 1.64.3
 
 - **A session with a browser relay gets its Telegram messages again (#731).** An omp session that ran `omp browser-relay` had that helper listed as a second live omp in its tmux pane. Pane delivery picked it (the lower pid) instead of the session, and every message failed with `Original OMP bridge: endpoint_unavailable … Save/stop the original before resuming it`, although the session's bridge was up. `omp browser-relay` as omp spawns it (the subcommand right after the program) is no longer an agent. A pane now belongs only to the agent it runs (its shallowest one), never to an omp nested under it, and a pane delivery that knows that agent's pid targets exactly it. A relay started by hand with global flags before the subcommand is still listed outside panes (#737).
