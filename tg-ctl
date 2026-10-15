@@ -844,12 +844,16 @@ function fileMtimeMs(path: string): number | null {
   }
 }
 
+// Alive unless kill(2) answers ESRCH. EPERM means the pid exists but this process may not signal it
+// (another uid, a Landlock signal domain) — reading that as dead made `status` call a running daemon
+// a stale pidfile (#748). An error with no `syscall` was thrown before kill(2) ran (a pid outside
+// pid_t): no process has that pid.
 function kill0(pid: number): boolean {
   try {
     process.kill(pid, 0)
     return true
-  } catch {
-    return false
+  } catch (err) {
+    return err instanceof Error && "syscall" in err && err.syscall === "kill" && "code" in err && err.code !== "ESRCH"
   }
 }
 

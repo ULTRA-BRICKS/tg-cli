@@ -3,6 +3,18 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.65.2
+
+- **A pid that answers EPERM is alive (#748).** `kill(pid, 0)` fails with EPERM when the
+  process exists but the caller may not signal it: another uid, or an agent session running in
+  its own Landlock signal domain (rig-cli#704). Two probes read every failure as death.
+  omp-live discovery (`omp-steer list`, `tg-ctl omp-live status`/`send`) then deleted the
+  other sessions' bridge records and sockets, so they could no longer be steered and alerts
+  stopped reaching them; `tg-ctl status` printed `not running (stale pidfile)` for a running
+  daemon. Both now read a pid as gone only when kill(2) answers ESRCH (or rejects the pid
+  before any syscall, e.g. one above pid_t); `tg`'s session probe and the routes lock already
+  counted EPERM as alive.
+
 ## 1.65.1
 
 - **An unknown topic's picker can start a new session (#735).** The attach picker (and the

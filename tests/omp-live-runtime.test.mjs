@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, readdir, rm, stat, symlink, chmod, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { fork } from 'node:child_process';
+import { fork, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { startLiveEndpoint, listLiveEndpoints, sendLiveMessage, requestEndpoint } from '../features/tg-ctl/omp-live-runtime.mjs';
 import { tempDir } from './helpers/test-temp.ts';
+import { stubKill0 } from './helpers/kill0-stub.ts';
 
 async function fixture(t, send) {
   const root = tempDir('omp-live-test-');
@@ -165,4 +166,49 @@ test('oversized metadata is rejected through real discovery without hiding other
   assert.equal((await listLiveEndpoints(f.root)).length, 1);
   await writeFile(f.endpoint.metadataPath, 'x'.repeat(32001));
   assert.deepEqual(await listLiveEndpoints(f.root), []);
+});
+
+// tg-cli#748: signal 0 answers EPERM for a live process the caller may not signal (another uid,
+// a Landlock signal domain — rig-cli#704). Discovery must not read that as death and prune the
+// session's bridge; only ESRCH (or a pid kill(2) cannot take) proves the pid is gone.
+async function registrationPaths(f) {
+  const metadata = f.endpoint.metadataPath;
+  return { metadata, socket: JSON.parse(await readFile(metadata, 'utf8')).socket };
+}
+
+// EINVAL cannot come back for signal 0; it stands for any other kill(2) errno, which must not
+// read as death either.
+for (const code of ['EPERM', 'EINVAL']) {
+  test(`#748: kill(pid, 0) failing with ${code} keeps the record and socket — the session stays listed and steerable`, async t => {
+    const f = await fixture(t);
+    const reg = await registrationPaths(f);
+    t.after(stubKill0({ code, syscall: 'kill' }));
+    assert.deepEqual((await listLiveEndpoints(f.root)).map(r => [r.pid, r.sessionId]), [[process.pid, 's-original']]);
+    assert((await stat(reg.metadata)).isFile(), 'record not pruned');
+    assert((await stat(reg.socket)).isSocket(), 'socket not pruned');
+    const receipt = await sendLiveMessage({ root: f.root, pid: process.pid, sessionId: 's-original', requestId: `eperm-${code}`, text: 'still here' });
+    assert.equal(receipt.accepted, true);
+  });
+}
+
+const gone = [
+  ['ESRCH from kill(2)', { code: 'ESRCH', syscall: 'kill' }],
+  ['an argument error thrown before kill(2) ran', { code: 'ERR_INVALID_ARG_TYPE' }],
+];
+for (const [label, error] of gone) {
+  test(`#748: ${label} still prunes the dead record and its socket`, async t => {
+    const f = await fixture(t);
+    const reg = await registrationPaths(f);
+    t.after(stubKill0(error));
+    assert.deepEqual(await listLiveEndpoints(f.root), []);
+    await assert.rejects(stat(reg.metadata), { code: 'ENOENT' });
+    await assert.rejects(stat(reg.socket), { code: 'ENOENT' });
+  });
+}
+
+test('#748: the runtime tags real kill(2) errors with syscall "kill" — the stubs above use that shape', async () => {
+  const child = spawn('true', { stdio: 'ignore' });
+  await once(child, 'exit');
+  assert.throws(() => process.kill(child.pid, 0), e => e.syscall === 'kill' && e.code === 'ESRCH');
+  assert.throws(() => process.kill(2 ** 31, 0), e => e.syscall === undefined);
 });

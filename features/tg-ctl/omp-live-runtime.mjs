@@ -27,7 +27,13 @@ const failure = code => Object.assign(new Error(code), { code });
 const safeString = (s, max) => typeof s === 'string' && s.length > 0 && s.length <= max;
 const owns = info => uid() === undefined || info.uid === uid();
 const privateMode = info => (info.mode & 0o077) === 0;
-const processExists = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+// Alive unless kill(2) answers ESRCH. EPERM means the pid exists but we may not signal it (another
+// uid, a Landlock signal domain); pruning on it would unregister a live session (#748). An error
+// with no `syscall` was thrown before kill(2) ran (a pid outside pid_t): no process has that pid.
+const processExists = pid => {
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return e?.syscall === 'kill' && e.code !== 'ESRCH'; }
+};
 
 export function defaultRegistryRoot() {
   return join(process.env.TG_CTL_CONFIG_DIR || join(homedir(), '.config', 'tg-cli'), 'omp-live');
