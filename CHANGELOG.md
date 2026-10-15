@@ -3,6 +3,20 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.61.2
+
+- **Concurrent history writers no longer lose rows (#519).** The shared lockfile protocol
+  (`fsRoutesLockIo`: history, routes, registration, the photo-hook audit log, inject locks) creates
+  the lockfile and writes the owner pid in two calls. A contender that read the file in between
+  saw no pid, took it for a SIGKILL orphan and broke a LIVE lock, so two writers ran the
+  read-modify-write at once. Under CPU load the history test lost a row whose append had reported
+  success (CI run 1816: 149/150). A pid-less lockfile is now broken only once it is older than
+  5 s (`ORPHAN_LOCK_AGE_MS`), so a real orphan still clears itself, and the break re-checks that
+  age right before it unlinks. A writer frozen for more than 5 s inside that window can still
+  lose its lock; a kernel lock (#680) removes that. The test now checks the contract: the file
+  holds exactly the rows whose append returned true. A skipped append returns false; it was
+  never zero-loss.
+
 ## 1.61.1
 
 - **A hatch approval card reaches the session that asked for it (#717).** A
@@ -39,6 +53,7 @@ semantic versioning.
 - **A session topic never looks like the system 📥 Inbox (#709).** A leading 📥 in a session topic
   title becomes ✉, and a title opening with the word "inbox" gets ✉ in front — a session titled
   "📥 INBOX: …" was taken for the Inbox topic.
+
 ## 1.60.3
 
 - **`dependency-review` audits the call sidecar's Python pins and passes again (#714).** Since

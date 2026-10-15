@@ -432,8 +432,12 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
   - **Concurrency (#136):** both writers go through `appendHistoryFile`
     (`features/replies/history-file.ts`), a read-modify-write under the same O_EXCL lockfile
     protocol as `routes` (`<history>.lock`, PID-liveness staleness). When live writers hold the
-    lock past its ~1 s budget the append is skipped, never run unlocked, so no writer loses
-    another's rows.
+    lock past its ~1 s budget the append is skipped (returns false), never run unlocked, so a
+    skip costs only this append's own rows. A lockfile with no pid yet is a live writer between
+    its create and its pid write, so it is broken only once older than `ORPHAN_LOCK_AGE_MS` (5 s,
+    a SIGKILL orphan); breaking it on sight let two live writers in at once under CPU load
+    (#519). Rare residual double-holder paths (a writer frozen >5 s mid-acquire, a clock jump,
+    two breakers of one stale lock) are tracked in #680.
 
 - **Durable forwarded-question state (`tg-ctl.<botid>.questions.json`, v1.20.0):** the daemon held
   all question state ONLY in memory (`pendingButtons`/`activeButtonKeys`/`answeredButtons`), so a

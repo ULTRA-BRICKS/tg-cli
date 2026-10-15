@@ -162,7 +162,8 @@ function sha256OfString(s: string): string {
 // between `openSync('wx')` and writing the pid) as "owner unknown, not dead"
 // forever, permanently wedging rotation. `fsRoutesLockIo` models that exact
 // case as `'unparseable'` (routes.ts's own comment explains why) and breaks
-// it like any other dead owner. So: reuse it directly rather than re-fix the
+// it once it is older than ORPHAN_LOCK_AGE_MS (a younger one may be a live
+// writer between those two calls). So: reuse it directly rather than re-fix the
 // same bug twice. `lockPath`/`fsRoutesLockIo` are generic despite the
 // "routes" name (the lock path is just a constructor argument) — nothing
 // here is routes-specific.

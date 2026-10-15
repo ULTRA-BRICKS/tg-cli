@@ -1949,11 +1949,12 @@ if (import.meta.main) {
       // Serialize the read-modify-write across concurrent agents: two `tg` sends
       // racing this RMW would last-writer-wins-clobber each other's route entries,
       // dropping the very origin→message_id mapping the daemon needs to recognize a
-      // reply. The O_EXCL lockfile (fsRoutesLockIo) is the cross-process mutex; a
-      // dead-owner lock is broken by PID-liveness, so a live writer is never
-      // clobbered. onContended:'skip' — if we can't get the lock within the budget,
-      // we SKIP rather than write unlocked (an unlocked write could clobber the
-      // concurrent holder's entry; skipping drops only THIS send's bookkeeping).
+      // reply. The O_EXCL lockfile (fsRoutesLockIo) is the cross-process mutex; only
+      // a dead-owner (or aged pid-less) lock is broken, so a live writer is normally
+      // not clobbered (the rare residual double-holder paths: tg-cli#680).
+      // onContended:'skip' — if we can't get the lock within the budget, we SKIP rather
+      // than write unlocked (an unlocked write could clobber the concurrent holder's
+      // entry; skipping drops only THIS send's bookkeeping).
       withRoutesLock(
         fsRoutesLockIo(`${ROUTES_PATH}.lock`),
         () => {

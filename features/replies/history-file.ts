@@ -2,8 +2,10 @@
 // tg-ctl daemon (inbound). Each append is a read-modify-write (the file is
 // trimmed to MAX_HISTORY), so two concurrent writers used to lose each other's
 // rows (tg-cli#136). The RMW now runs under the same O_EXCL lockfile protocol as
-// routes.json (`withRoutesLock` / `fsRoutesLockIo`: PID-liveness staleness, never
-// breaking a live owner's lock).
+// routes.json (`withRoutesLock` / `fsRoutesLockIo`: PID-liveness staleness; a
+// pid-less lock is treated as a live writer mid-acquire until it is older than
+// ORPHAN_LOCK_AGE_MS, tg-cli#519; the rare paths that can still break a live lock
+// are tracked in tg-cli#680).
 //
 // Best-effort, like the log itself: when live writers hold the lock past the
 // budget this append is SKIPPED (running unlocked could clobber the holder's

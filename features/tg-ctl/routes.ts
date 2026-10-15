@@ -8,7 +8,7 @@
 // are ordered by how recently + how often each pane was last messaged — both
 // derived from this same map (no separate usage state).
 
-import { closeSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
+import { closeSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
 import { isLiveOmpOriginId } from './omp';
 
@@ -168,8 +168,9 @@ export function withRoutesLock<T>(io: RoutesLockIo, body: () => T, opts: RoutesL
       held = true;
       break;
     }
-    // Held by someone else. Break it ONLY if its owner process is dead (a
-    // SIGKILLed `tg`); a live owner is left strictly alone — no clobber.
+    // Held by someone else. Break it ONLY if its owner looks gone (a dead pid, or a
+    // pid-less file past ORPHAN_LOCK_AGE_MS); one that looks live is left alone (the
+    // rare misjudged-owner paths: tg-cli#680).
     if (io.ownerDead() === true) {
       io.breakIfDead();
       if (io.acquire()) {
@@ -191,17 +192,29 @@ export function withRoutesLock<T>(io: RoutesLockIo, body: () => T, opts: RoutesL
   }
 }
 
+// How old a pid-less lockfile must be before it counts as a SIGKILL orphan. A live
+// writer's lockfile is pid-less only between two adjacent syscalls, so this is a
+// margin of orders of magnitude over any scheduler stall. The age is wall-clock
+// (now - mtime): an orphan costs callers about this long of skipped (or unlocked)
+// runs, longer if the clock steps back. A live writer still loses its lock when its
+// freeze in that window (SIGSTOP) plus any forward clock step adds up to this age:
+// a lockfile cannot tell, a kernel lock can (#680).
+export const ORPHAN_LOCK_AGE_MS = 5_000;
+
 // Real-fs RoutesLockIo backing withRoutesLock for `tg`. The lockfile content is
 // the owner pid; liveness is `process.kill(pid, 0)` (injectable for tests). All
-// removals are ownership-checked: release/breakIfDead unlink ONLY when the file
-// still holds the pid they expect, so no removal can ever nuke a fresh lock a
-// racing live writer just created. `isAlive` defaults to a real kill(0) probe;
-// `now` is unused here (kept out — staleness is liveness, not age).
+// removals are ownership-checked: release/breakIfDead unlink ONLY when a re-read
+// still shows the pid they expect (a pid-less file: still pid-less and still aged),
+// so a removal does not nuke a fresh lock a racing live writer just created (bar the
+// read-to-unlink gap, tg-cli#680). `isAlive` defaults to a real kill(0) probe and
+// `now` to Date.now (both injectable for tests).
+// Staleness is liveness; only a lockfile with no pid to probe falls back to its age.
 export function fsRoutesLockIo(
   lockPath: string,
-  deps: { ownPid?: number; isAlive?: (pid: number) => boolean } = {},
+  deps: { ownPid?: number; isAlive?: (pid: number) => boolean; now?: () => number } = {},
 ): RoutesLockIo {
   const ownPid = deps.ownPid ?? process.pid;
+  const now = deps.now ?? Date.now;
   const isAlive =
     deps.isAlive ??
     ((pid: number): boolean => {
@@ -220,7 +233,8 @@ export function fsRoutesLockIo(
   // pid" the same as "no file" meant such a lock was NEVER breakable (no owner to
   // probe) — every later send then spun the full budget and ran unlocked forever.
   //   'absent'      → no lockfile at all
-  //   'unparseable' → file exists but holds no valid pid (the SIGKILL-window orphan)
+  //   'unparseable' → file exists but holds no valid pid: a LIVE writer inside that
+  //                   window, or the orphan a SIGKILL there left behind
   //   <number>      → the owner pid
   type LockOwner = 'absent' | 'unparseable' | number;
   const readOwner = (): LockOwner => {
@@ -234,16 +248,34 @@ export function fsRoutesLockIo(
     return Number.isInteger(pid) && pid > 0 ? pid : 'unparseable';
   };
 
-  // A lock is breakable (its owner effectively gone) when the file holds an
-  // unparseable owner OR a dead pid. 'absent' is never "dead" — there is nothing.
-  const ownerGone = (o: LockOwner): boolean => o === 'unparseable' || (typeof o === 'number' && !isAlive(o));
+  // A pid-less lockfile is a live writer between its two acquire calls until it is
+  // older than ORPHAN_LOCK_AGE_MS; only then is it an orphan. Breaking it on sight let
+  // a contender steal a live lock under CPU load, so two writers ran the history RMW at
+  // once and lost rows (tg-cli#519). A missing file (raced away) is not an orphan.
+  const agedOut = (): boolean => {
+    try {
+      const mtimeMs = statSync(lockPath).mtimeMs;
+      return now() - mtimeMs >= ORPHAN_LOCK_AGE_MS;
+    } catch {
+      return false;
+    }
+  };
+
+  // A lock is breakable (its owner effectively gone) when the file holds a dead pid,
+  // or no pid and is old enough to be an orphan. 'absent' is never "dead" — there is nothing.
+  const ownerGone = (o: LockOwner): boolean => {
+    if (o === 'unparseable') return agedOut();
+    return typeof o === 'number' && !isAlive(o);
+  };
 
   // Unlink ONLY if the file still holds `expected` (our pid, or the exact orphan
   // we just observed). The re-read makes the remove atomic w.r.t. ownership: a
   // writer that re-took the lock meanwhile has a different owner, so we leave it.
+  // A pid-less one is re-aged too: a writer that re-took it may still be pid-less.
   const unlinkIfOwner = (expected: LockOwner): void => {
     try {
-      if (readOwner() === expected) unlinkSync(lockPath);
+      const o = readOwner();
+      if (o === expected && (o !== 'unparseable' || agedOut())) unlinkSync(lockPath);
     } catch {
       // already gone / unreadable — fine
     }
@@ -263,7 +295,7 @@ export function fsRoutesLockIo(
         throw e;
       }
       // fd is open: ALWAYS close it, and on a write failure remove the empty lock
-      // we just created (else it would wedge until a liveness break).
+      // we just created (else it would wedge until it ages into an orphan).
       try {
         writeFileSync(fd, String(ownPid));
       } catch {

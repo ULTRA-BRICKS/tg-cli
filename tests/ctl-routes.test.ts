@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { writeOrphanLock } from './helpers/orphan-lock';
 import { tempDir } from './helpers/test-temp';
 import {
   parseRoutes,
@@ -388,14 +389,14 @@ test('fsRoutesLockIo: an EMPTY/unparseable lockfile (SIGKILL-window orphan) is b
   // Regression for review #53 finding 1: a `tg` SIGKILLed between openSync('wx')
   // and writeFileSync(pid) leaves a present-but-EMPTY lockfile with no owner. The
   // old two-state read treated "unreadable" like "absent" → never broken → every
-  // later send wedged. It must now be classified breakable.
+  // later send wedged. Once it is older than ORPHAN_LOCK_AGE_MS it is breakable.
   const dir = tempDir('tg-routeslock-orphan-');
   const lockPath = join(dir, 'routes.json.lock');
 
   for (const garbage of ['', '   ', 'not-a-pid', '0', '-5']) {
-    writeFileSync(lockPath, garbage);
+    writeOrphanLock(lockPath, garbage);
     // isAlive must be irrelevant here — there is no pid to probe; the orphan is
-    // breakable purely because its owner is unreadable.
+    // breakable purely because its owner is unreadable and it has aged out.
     const io = fsRoutesLockIo(lockPath, { ownPid: 111, isAlive: () => true });
     expect(io.ownerDead()).toBe(true); // unparseable owner ⇒ breakable
     io.breakIfDead();
@@ -404,13 +405,50 @@ test('fsRoutesLockIo: an EMPTY/unparseable lockfile (SIGKILL-window orphan) is b
 
   // And withRoutesLock recovers end-to-end: an orphan lockfile present, the body
   // still runs AND acquires (the orphan was broken), leaving a clean released lock.
-  writeFileSync(lockPath, '');
+  writeOrphanLock(lockPath);
   let ran = false;
   withRoutesLock(fsRoutesLockIo(lockPath, { ownPid: 111, isAlive: () => true }), () => {
     ran = true;
-  }, { attempts: 3, delayMs: 0 });
+  }, { attempts: 3, delayMs: 0, onContended: 'skip' });
   expect(ran).toBe(true);
   expect(existsSync(lockPath)).toBe(false); // recovered + released, not wedged
+});
+
+test('fsRoutesLockIo: a FRESH pid-less lockfile is a live writer mid-acquire — never broken (tg-cli#519)', () => {
+  // acquire creates the file (openSync 'wx') and writes its pid in a SECOND call. A
+  // contender reading in between sees exactly what a SIGKILL orphan looks like; breaking
+  // it on sight let two live writers into the history RMW under CPU load (lost rows).
+  const dir = tempDir('tg-routeslock-midacquire-');
+  const lockPath = join(dir, 'routes.json.lock');
+  writeFileSync(lockPath, '');
+  const io = fsRoutesLockIo(lockPath, { ownPid: 111, isAlive: () => true });
+  expect(io.ownerDead()).toBe(false);
+  io.breakIfDead();
+  expect(existsSync(lockPath)).toBe(true);
+  expect(withRoutesLock(io, () => true, { attempts: 3, delayMs: 0, onContended: 'skip' })).toBeUndefined();
+  expect(existsSync(lockPath)).toBe(true); // still the mid-acquire writer's
+});
+
+test('fsRoutesLockIo: breakIfDead re-ages before unlinking — a writer that re-took the orphan keeps its lock', () => {
+  // Two contenders see the same aged orphan; one breaks it and re-creates the lock, still
+  // pid-less, before the other reaches its unlink. Matching "pid-less" alone would delete
+  // that live writer's lock. The `now` stub plays the racing writer: it runs right after
+  // the first age check stats the orphan.
+  const dir = tempDir('tg-routeslock-rebreak-');
+  const lockPath = join(dir, 'routes.json.lock');
+  writeOrphanLock(lockPath);
+  let raced = false;
+  const now = (): number => {
+    if (!raced) {
+      raced = true;
+      unlinkSync(lockPath);
+      writeFileSync(lockPath, ''); // re-taken: fresh, pid not written yet
+    }
+    return Date.now();
+  };
+  fsRoutesLockIo(lockPath, { ownPid: 111, isAlive: () => true, now }).breakIfDead();
+  expect(raced).toBe(true);
+  expect(existsSync(lockPath)).toBe(true);
 });
 
 test('fsRoutesLockIo: a missing PARENT dir makes acquire THROW (not spin) → fast unlocked fallback', () => {

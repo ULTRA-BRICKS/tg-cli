@@ -11,10 +11,11 @@
 // back to a bare atomic append only when the lock is genuinely unavailable
 // for the whole spin budget.
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'fs';
 import { join } from 'path';
 import { appendAudit, auditFile } from '../features/hooks/run-photo-hooks';
 import { MAX_AUDIT_LINES, type AuditLine } from '../features/hooks/runner';
+import { writeOrphanLock } from './helpers/orphan-lock';
 import { tempDir } from './helpers/test-temp';
 
 let home: string;
@@ -105,16 +106,19 @@ test('a STALE lock (dead pid) is broken and rotation resumes', () => {
 // The bug this reuse fixed: an EMPTY lockfile (the SIGKILL window between
 // openSync('wx') creating it and the pid write landing) must ALSO be treated
 // as a dead/breakable owner — not "not dead" forever. fsRoutesLockIo models
-// this as its 'unparseable' owner state.
+// this as its 'unparseable' owner state, breakable once it is older than
+// ORPHAN_LOCK_AGE_MS (younger, it may be a live writer mid-acquire).
 test('an EMPTY lockfile (SIGKILL-window orphan) is broken, not a permanent wedge', () => {
   const lockPath = `${auditFile(home)}.lock`;
   mkdirSync(join(home, '.agents', 'hooks'), { recursive: true });
-  closeSync(openSync(lockPath, 'wx')); // created, empty — never got a pid written
+  writeOrphanLock(lockPath); // empty — never got a pid written
 
   appendAudit(home, line('after-empty-lock'), FAST);
 
   const ids = readLines().map((l) => (JSON.parse(l) as AuditLine).hook_id);
   expect(ids).toContain('after-empty-lock');
+  // Broken and taken, not bypassed by the contended-path fallback append.
+  expect(existsSync(lockPath)).toBe(false);
 });
 
 // Review finding (Opus): appendAudit's write is NOT allowed to throw out and
