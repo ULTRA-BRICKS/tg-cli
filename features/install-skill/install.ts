@@ -250,13 +250,18 @@ local Whisper (whisper.cpp or faster-whisper), and injects the transcript into
 the agent's pane — routed exactly like a typed reply (a voice note sent as a
 reply keeps the quote anchor and reaches the replied-to origin pane).
 
-- \`tg voice setup\` — discover a local Whisper (\`~/xp\` first) + a model, check
-  for \`ffmpeg\`, and persist the config. Run once.
+- \`tg voice setup\` — run once. Keeps a working \`voice:\` config as-is; else uses a
+  local Whisper (\`~/xp\` first, then PATH); else INSTALLS a prebuilt one, nothing
+  compiled: macOS → Homebrew \`whisper.cpp\` bottle (Metal) + ggml large-v3-turbo
+  q8_0; Linux → faster-whisper wheels in a uv venv (+ CUDA cuBLAS/cuDNN wheels on
+  an NVIDIA GPU) + the large-v3-turbo CT2 model, under
+  \`~/.local/share/tg-cli-voice\`. A missing brew/uv/ffmpeg prints the exact
+  install command. \`tg voice setup --dry-run\` shows the plan and changes nothing.
 - If a voice note arrives before voice is configured, the bot replies with a
   guided setup flow instead of dropping it.
 - Config lives in the \`voice:\` block of \`~/.config/tg-cli/config.yaml\`
   (\`enabled\`, \`runner\`, \`bin_path\`, \`model_path\`, \`language\` — default
-  \`auto\`, covering ru + en).
+  \`auto\`, covering ru + en — and optional \`threads\`, default = physical cores).
 - Inbound media downloads (voice / photo / doc) retry with backoff on a
   transient network blip (3 attempts, jittered ~300ms→2.7s) before giving up,
   so a momentary hiccup no longer silently drops the message.

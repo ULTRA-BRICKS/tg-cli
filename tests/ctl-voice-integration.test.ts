@@ -871,3 +871,147 @@ test('tg-ctl voice-setup exits NON-ZERO when a ready install cannot be persisted
     chmodSync(configDir, 0o755); // restore so afterAll/tmp cleanup works
   }
 }, 15_000);
+
+// --- `tg-ctl voice-setup`: keep, plan, install (tg-cli#711) ---
+
+// Only the test's shims plus the system dirs (`which`, `sh`, `cp`, `mkdir`): no Homebrew, uv or
+// whisper-cli from the developer's machine reaches the probe.
+const systemPath = (binDir: string): string => `${binDir}:/usr/bin:/bin`;
+
+async function runSetup(
+  home: string,
+  path: string,
+  configDir: string,
+  args: string[] = [],
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const proc = Bun.spawn([process.execPath, TG_CTL, 'voice-setup', ...args], {
+    env: { PATH: path, HOME: home, TG_CTL_CONFIG_DIR: configDir },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+  await proc.exited;
+  return { code: proc.exitCode ?? 1, stdout, stderr };
+}
+
+// A HOME with no Whisper and a PATH dir holding a fake ffmpeg and a fake `uv`. The fake uv
+// logs its argv; `uv venv <dir>` creates <dir>/bin/python, a shim that imports anything and,
+// asked to download a model, writes the CT2 files into <output_dir>. `uvExit` ≠ 0 makes uv fail.
+function bareHome(uvExit = 0): { home: string; binDir: string; uvLog: string } {
+  const home = tempDir('tgctl-vinstall-');
+  const binDir = join(home, 'bin');
+  mkdirSync(binDir);
+  writeFileSync(join(binDir, 'ffmpeg'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const fakePython = join(binDir, 'fake-python');
+  writeFileSync(
+    fakePython,
+    '#!/bin/sh\ncase "$*" in *download_model*) for a; do last=$a; done; mkdir -p "$last"; for f in model.bin config.json tokenizer.json vocabulary.json; do : > "$last/$f"; done;; esac\nexit 0\n',
+    { mode: 0o755 },
+  );
+  const uvLog = join(home, 'uv.log');
+  writeFileSync(
+    join(binDir, 'uv'),
+    [
+      '#!/bin/sh',
+      `echo "$*" >> '${uvLog}'`,
+      `[ ${uvExit} -ne 0 ] && exit ${uvExit}`,
+      `if [ "$1" = venv ]; then for a; do last=$a; done; mkdir -p "$last/bin"; cp '${fakePython}' "$last/bin/python"; fi`,
+      'exit 0',
+      '',
+    ].join('\n'),
+    { mode: 0o755 },
+  );
+  return { home, binDir, uvLog };
+}
+
+test('tg-ctl voice-setup keeps a configured runner whose files exist, even with another Whisper discoverable', async () => {
+  const { home, binDir } = fakeWhisperHome(); // a whisper.cpp in ~/xp the probe would pick
+  const python = join(home, 'custom', '.venv', 'bin', 'python');
+  const model = join(home, 'custom', 'models', 'my-turbo');
+  mkdirSync(join(home, 'custom', '.venv', 'bin'), { recursive: true });
+  mkdirSync(model, { recursive: true });
+  for (const f of ['model.bin', 'config.json', 'tokenizer.json', 'vocabulary.json']) writeFileSync(join(model, f), 'FAKE');
+  writeFileSync(python, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const configDir = join(home, '.config', 'tg-cli');
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(
+    join(configDir, 'config.yaml'),
+    `voice:\n  enabled: false\n  runner: faster-whisper\n  bin_path: "${python}"\n  model_path: "${model}"\n  language: auto\n  threads: 6\n`,
+  );
+  const { code } = await runSetup(home, systemPath(binDir), configDir);
+  expect(code).toBe(0);
+  const yaml = readFileSync(join(configDir, 'config.yaml'), 'utf8');
+  expect(yaml).toContain('enabled: true');
+  expect(yaml).toContain('runner: faster-whisper');
+  expect(yaml).toContain(`bin_path: "${python}"`);
+  expect(yaml).toContain(`model_path: "${model}"`);
+  expect(yaml).toContain('threads: 6');
+}, 15_000);
+
+test('tg-ctl voice-setup --dry-run prints the prebuilt install plan and writes nothing', async () => {
+  const { home, binDir, uvLog } = bareHome();
+  const configDir = join(home, '.config', 'tg-cli');
+  const { code, stdout } = await runSetup(home, systemPath(binDir), configDir, ['--dry-run']);
+  expect(code).toBe(0);
+  expect(stdout).toContain(`${binDir}/uv venv --python 3.12`);
+  expect(stdout).toContain('--only-binary :all: faster-whisper==1.2.1');
+  expect(stdout).toContain('large-v3-turbo');
+  expect(existsSync(join(configDir, 'config.yaml'))).toBe(false);
+  expect(existsSync(uvLog)).toBe(false); // nothing ran
+}, 15_000);
+
+test('tg-ctl voice-setup installs with uv, re-probes, and configures what it installed', async () => {
+  const { home, binDir, uvLog } = bareHome();
+  const configDir = join(home, '.config', 'tg-cli');
+  const { code, stdout, stderr } = await runSetup(home, systemPath(binDir), configDir);
+  expect({ code, stderr }).toEqual({ code: 0, stderr: '' });
+  const uvCalls = readFileSync(uvLog, 'utf8').trim().split('\n');
+  expect(uvCalls[0]).toStartWith('venv --python 3.12');
+  expect(uvCalls[1]).toContain('pip install --python');
+  expect(uvCalls[1]).toContain('--only-binary :all:');
+  const root = join(home, '.local', 'share', 'tg-cli-voice', 'faster-whisper');
+  const yaml = readFileSync(join(configDir, 'config.yaml'), 'utf8');
+  expect(yaml).toContain('runner: faster-whisper');
+  expect(yaml).toContain(`bin_path: "${join(root, '.venv', 'bin', 'python')}"`);
+  expect(yaml).toContain(`model_path: "${join(root, 'models', 'large-v3-turbo')}"`);
+  expect(stdout).toContain('configured');
+}, 30_000);
+
+test('tg-ctl voice-setup exits non-zero and writes no config when an install step fails', async () => {
+  const { home, binDir } = bareHome(1);
+  const configDir = join(home, '.config', 'tg-cli');
+  const { code, stderr } = await runSetup(home, systemPath(binDir), configDir);
+  expect(code).not.toBe(0);
+  expect(stderr).toContain('failed (exit 1)');
+  expect(existsSync(join(configDir, 'config.yaml'))).toBe(false);
+}, 15_000);
+
+test('tg-ctl voice-setup rejects an unknown argument', async () => {
+  const { home, binDir } = bareHome();
+  const { code } = await runSetup(home, systemPath(binDir), join(home, '.config', 'tg-cli'), ['--install-everything']);
+  expect(code).toBe(2);
+}, 15_000);
+
+test('tg-ctl voice-setup finishes a setup install whose model download was cut off (model.bin without its config)', async () => {
+  const { home, binDir } = bareHome();
+  const root = join(home, '.local', 'share', 'tg-cli-voice', 'faster-whisper');
+  mkdirSync(join(root, '.venv', 'bin'), { recursive: true });
+  writeFileSync(join(root, '.venv', 'bin', 'python'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  mkdirSync(join(root, 'models', 'large-v3-turbo'), { recursive: true });
+  writeFileSync(join(root, 'models', 'large-v3-turbo', 'model.bin'), 'PARTIAL');
+  const configDir = join(home, '.config', 'tg-cli');
+  const unconfigured = await runSetup(home, systemPath(binDir), configDir, ['--dry-run']);
+  expect(unconfigured.code).toBe(0);
+  expect(unconfigured.stdout).toContain('download_model');
+  expect(unconfigured.stdout).not.toContain('would write');
+  // Configured to it already (the cut-off dir got into config.yaml): not kept either.
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(
+    join(configDir, 'config.yaml'),
+    `voice:\n  enabled: true\n  runner: faster-whisper\n  bin_path: "${join(root, '.venv', 'bin', 'python')}"\n` +
+      `  model_path: "${join(root, 'models', 'large-v3-turbo')}"\n  language: auto\n`,
+  );
+  const configured = await runSetup(home, systemPath(binDir), configDir, ['--dry-run']);
+  expect(configured.code).toBe(0);
+  expect(configured.stdout).toContain('download_model');
+}, 15_000);

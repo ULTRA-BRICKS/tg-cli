@@ -161,7 +161,8 @@ export const USAGE = `Usage:
   printf 'task\\tstatus\\nship\\tdone' | tg --table   # aligned <pre> table
   tg auth                       # connect to Telegram in one step (token + one Start tap)
   tg auth status                # bot, chat, and your user/caller accounts (tg help auth)
-  tg voice setup                # configure inbound voice→text (local Whisper STT)
+  tg voice setup [--dry-run]    # configure inbound voice→text (local Whisper STT; installs a
+                                 # prebuilt one when none is found; --dry-run shows the plan)
   tg report --title <t> --ticket <id> --impact <t> --verify-cmd <c> --verify-result <r>
                                  # structured result report → Telegram (tg help report)
   tg --ls-emoji-helpers
@@ -630,21 +631,26 @@ if (import.meta.main) {
     if (code !== null) process.exit(code)
   }
 
-  // `tg voice setup` — (re)configure inbound voice transcription (STT). Probes
-  // the host for an existing local Whisper (~/xp first), persists the discovered
-  // runner/model/language into config.yaml, and prints the guidance. Delegated
-  // to `tg-ctl voice-setup` so the probe + persist logic lives in ONE place.
-  // EXACT match only: bare `tg voice` (1 token) or `tg voice setup` (2 tokens).
-  // A longer first arg like `tg voice setup is done` is an ordinary message and
-  // must still send — hence the length guard, not just `rawArgs[1] === "setup"`.
+  // `tg voice setup` — (re)configure inbound voice transcription (STT). Keeps a
+  // working voice: config, else uses a local Whisper (~/xp first), else installs
+  // a prebuilt one (Homebrew whisper.cpp on macOS, faster-whisper wheels on
+  // Linux), persists runner/model/language into config.yaml, and prints the
+  // guidance. Delegated to `tg-ctl voice-setup` so the logic lives in ONE place.
+  // EXACT match only: bare `tg voice` (1 token), `tg voice setup` (2 tokens) or
+  // `tg voice setup --dry-run` (3). A longer first arg like `tg voice setup is
+  // done` is an ordinary message and must still send — hence the length guard,
+  // not just `rawArgs[1] === "setup"`.
   if (
     rawArgs[0] === "voice" &&
-    (rawArgs.length === 1 || (rawArgs.length === 2 && rawArgs[1] === "setup"))
+    (rawArgs.length === 1 ||
+      (rawArgs[1] === "setup" && (rawArgs.length === 2 || (rawArgs.length === 3 && rawArgs[2] === "--dry-run"))))
   ) {
-    const result = Bun.spawnSync([join(import.meta.dir, "tg-ctl"), "voice-setup"], {
+    const result = Bun.spawnSync([join(import.meta.dir, "tg-ctl"), "voice-setup", ...rawArgs.slice(2)], {
+      stdin: "inherit",
       stdout: "inherit",
       stderr: "inherit",
-      timeout: 60_000,
+      // An install downloads ~1-3 GB (wheels + model); bounded, but not by a probe's budget.
+      timeout: 60 * 60_000,
     })
     process.exit(result.exitCode ?? 1)
   }

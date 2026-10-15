@@ -337,10 +337,12 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
   QUEUED per-pane while that pane has an open question and flushed on answer or release, so it is
   never pasted into the prompt — `driveFlush` re-checks the pane before EACH paste so a follow-up
   question re-defers the untouched tail), and `voice.ts` (inbound VOICE→text: `voice:` config block
-  parse/resolve/upsert, ffmpeg + whisper argv builders, transcript cleaning, and the onboarding
-  decision). `voice-probe.ts` is the ONE impure module here — it scans `~/xp` for an existing
-  Whisper install (whisper.cpp binary + ggml model, or a faster-whisper venv) and checks for
-  `ffmpeg`, handing a pure `WhisperProbe` to `decideOnboarding`. `git-state.ts` (git-state-check
+  parse/resolve/upsert, ffmpeg + whisper argv builders, the built-in faster-whisper script,
+  transcript cleaning, and the onboarding decision incl. the per-platform prebuilt install plan).
+  `voice-probe.ts` is the ONE impure module here — it scans `~/xp`, PATH and the setup install
+  root for an existing Whisper install (whisper.cpp binary + ggml model, or a faster-whisper venv
+  + CT2 model), reads the host facts (OS, NVIDIA GPU via sysfs, brew, uv, physical cores) and
+  checks for `ffmpeg`, handing a pure `WhisperProbe` to `decideOnboarding`. `git-state.ts` (git-state-check
   banner, root-cause fix for a fresh unrelated message silently reading as "more of the same task"
   in an occupied pane): PURE parse of raw `git rev-parse --abbrev-ref HEAD` / `git status
   --porcelain` stdout into a `PaneGitState` + `buildGitStateBanner`'s warning text, mirroring
@@ -607,9 +609,22 @@ Every plan that types into a pane (text, digit, key) takes the pane's turn (`pan
   The daemon downloads the OGG, transcodes to WAV 16 kHz mono via `ffmpeg`, runs the configured
   local Whisper, cleans the transcript, then routes it through the SAME path a typed message uses
   (reply-route with the quote anchor when the note is a reply, else inject into the discovered
-  pane). An unconfigured note triggers a guided onboarding reply — never a silent drop. Configure
-  with `tg voice setup` (→ `tg-ctl voice-setup`), which probes `~/xp` and persists the `voice:`
-  block. Whisper/ffmpeg/network spawns are all timeout-guarded.
+  pane). An unconfigured note triggers a guided onboarding reply — never a silent drop (the daemon
+  never installs anything). Configure with `tg voice setup [--dry-run]` (→ `tg-ctl voice-setup`):
+  it keeps a `voice:` block whose binary/model still exist (a re-run never replaces a hand-picked
+  model), else uses a found install (Linux prefers faster-whisper, macOS whisper.cpp/Metal), else
+  runs a PREBUILT-only install plan into `$XDG_DATA_HOME/tg-cli-voice` — macOS: `brew install
+  whisper.cpp` + `ggml-large-v3-turbo-q8_0.bin`; Linux: `uv venv` + `uv pip install
+  --only-binary :all: faster-whisper==1.2.1 'av<16'` (+ `nvidia-cublas-cu12`
+  `nvidia-cudnn-cu12==9.*` when sysfs shows an NVIDIA GPU) + the `large-v3-turbo` CT2 model —
+  then re-probes and persists. No brew/uv/ffmpeg → the exact install command, never a source
+  build. Default model: large-v3-turbo. Threads: physical cores (`voice.threads` overrides) —
+  `-t` for whisper.cpp, `--threads` to the built-in script only when set. The built-in script
+  (`tg-faster-whisper.py`, rewritten in the config dir whenever it changes; a project
+  `transcribe.py` next to the venv wins) does auto language in ONE encoder pass
+  (`multilingual=True` with a seed language, not `language=None`), VAD, beam 5, CUDA float16 with
+  CPU int8 fallback when CUDA fails to load or decode. Whisper/ffmpeg/network spawns are all
+  timeout-guarded.
 
 - **Threaded replies:** the injected wrap (`injectWrap` in `DEFAULT_CONTROL`,
   `[TG from {name} {id}] {msg} — reply via tg`) now carries the inbound Telegram `message_id`

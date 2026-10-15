@@ -156,9 +156,16 @@ test('buildWhisperCppArgv uses -nt -np and the configured model + language', () 
     modelPath: '/ggml.bin',
     language: 'auto',
   };
-  const argv = buildWhisperCppArgv(cfg, '/a.wav');
+  const argv = buildWhisperCppArgv(cfg, '/a.wav', 8);
   expect(argv[0]).toBe('/wc');
   expect(argv).toEqual(expect.arrayContaining(['-m', '/ggml.bin', '-f', '/a.wav', '-l', 'auto', '-nt', '-np']));
+});
+
+test('buildWhisperCppArgv runs on the given core count, or voice.threads when set', () => {
+  const cfg: VoiceConfig = { enabled: true, runner: 'whisper.cpp', binPath: '/wc', modelPath: '/m.bin', language: 'auto' };
+  const threadsOf = (argv: string[]): string | undefined => argv[argv.indexOf('-t') + 1];
+  expect(threadsOf(buildWhisperCppArgv(cfg, '/a.wav', 8))).toBe('8');
+  expect(threadsOf(buildWhisperCppArgv({ ...cfg, threads: 3 }, '/a.wav', 8))).toBe('3');
 });
 
 test('buildFasterWhisperArgv passes input + model; omits --language for auto', () => {
@@ -173,6 +180,13 @@ test('buildFasterWhisperArgv passes input + model; omits --language for auto', (
   expect(auto).toEqual(['/py', '/s.py', '--input_audio', '/a.wav', '--model', 'large-v3']);
   const ru = buildFasterWhisperArgv('/py', '/s.py', { ...cfg, language: 'ru' }, '/a.wav');
   expect(ru).toEqual(expect.arrayContaining(['--language', 'ru']));
+});
+
+test('buildFasterWhisperArgv passes --threads only when voice.threads is set (a project script may not take it)', () => {
+  const cfg: VoiceConfig = { enabled: true, runner: 'faster-whisper', binPath: '/py', modelPath: 'm', language: 'auto' };
+  expect(buildFasterWhisperArgv('/py', '/s.py', cfg, '/a.wav')).not.toContain('--threads');
+  const argv = buildFasterWhisperArgv('/py', '/s.py', { ...cfg, threads: 6 }, '/a.wav');
+  expect(argv.slice(argv.indexOf('--threads'))).toEqual(['--threads', '6']);
 });
 
 // --- transcript cleaning ---
@@ -292,7 +306,7 @@ test('decideOnboarding accepts a venv-only faster-whisper probe (no project scri
 
 test('onboardingMessage covers each verdict', () => {
   expect(onboardingMessage(decideOnboarding(PROBE_READY))).toContain('configured');
-  expect(onboardingMessage({ kind: 'need-ffmpeg' })).toContain('ffmpeg');
+  expect(onboardingMessage({ kind: 'need-ffmpeg', hint: 'brew install ffmpeg' })).toContain('ffmpeg');
   expect(onboardingMessage({ kind: 'need-install', hint: 'do X' })).toContain('do X');
 });
 
@@ -308,7 +322,7 @@ test('onboardingMessage leads with a ✓ status glyph when configured', () => {
 
 test('onboardingMessage leads with a ○ pending glyph when not yet set up', () => {
   for (const verdict of [
-    { kind: 'need-ffmpeg' } as const,
+    { kind: 'need-ffmpeg', hint: 'brew install ffmpeg' } as const,
     { kind: 'need-install', hint: 'do X' } as const,
   ]) {
     const msg = onboardingMessage(verdict);
@@ -323,7 +337,7 @@ test('onboardingMessage carries NO ANSI — it is sent verbatim to Telegram (no 
   // Telegram, which cannot render escape codes. Color is added later, CLI-only.
   for (const verdict of [
     decideOnboarding(PROBE_READY),
-    { kind: 'need-ffmpeg' } as const,
+    { kind: 'need-ffmpeg', hint: 'brew install ffmpeg' } as const,
     { kind: 'need-install', hint: 'do X' } as const,
   ]) {
     expect(onboardingMessage(verdict)).not.toContain('\x1b[');

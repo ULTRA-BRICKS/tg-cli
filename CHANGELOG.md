@@ -3,6 +3,39 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.62.0
+
+- **`tg voice setup` installs a fast, prebuilt Whisper on macOS and Linux (#711).** With no
+  usable Whisper on the machine, setup used to say "build whisper.cpp". It now installs one —
+  prebuilt only, nothing is compiled — into `~/.local/share/tg-cli-voice` (`$XDG_DATA_HOME`):
+  - **macOS:** `brew install whisper.cpp` (the Homebrew bottle, Metal) and
+    `ggml-large-v3-turbo-q8_0.bin` from Hugging Face.
+  - **Linux:** a uv venv with `faster-whisper==1.2.1` and `av<16` from wheels
+    (`--only-binary :all:`), plus the `nvidia-cublas-cu12` / `nvidia-cudnn-cu12==9.*` wheels
+    when the PCI bus shows an NVIDIA GPU (even before its driver loads), and the
+    `large-v3-turbo` CT2 model.
+
+  The host is probed again afterwards, and the config is written only for an install that
+  works; a model download cut off midway is resumed by the next `tg voice setup`. A missing
+  Homebrew, uv or ffmpeg prints the exact command that installs it. `tg voice setup --dry-run`
+  prints the plan, or the `voice:` block it would write, and changes nothing. The daemon never
+  installs: an unconfigured voice note gets a reply that lists the commands `tg voice setup`
+  will run.
+- **A re-run keeps your voice config.** If the binary and model in `voice:` still exist,
+  `tg voice setup` keeps them; it used to replace them with what it discovered. When nothing is
+  configured, Linux now prefers faster-whisper over whisper.cpp (about 6x faster on a CPU) and
+  macOS prefers whisper.cpp (Metal). The default faster-whisper model is `large-v3-turbo`
+  (was `large-v3`), and a `large-v3-turbo` CT2 dir next to the venv is used directly.
+- **Faster transcription.** The built-in faster-whisper script (`tg-faster-whisper.py`) is
+  rewritten whenever it changes. It detects the language in the same encoder pass that decodes
+  (`multilingual=True`, not `language=None`, which ran the encoder twice); a venv with
+  faster-whisper older than 1.1, which has no `multilingual`, keeps the separate detection pass.
+  It runs int8 on the physical cores with VAD, uses CUDA float16 on an NVIDIA GPU, and falls
+  back to CPU when CUDA fails to load or to decode. On an i7-11800H a 15 s note takes about
+  5 s to transcribe (stock: 10–11 s; whisper.cpp q5_0 on the CPU: 30–35 s). whisper.cpp now
+  gets `-t <physical cores>` (it defaulted to 4). The new optional `voice.threads` overrides
+  the thread count for both runners.
+
 ## 1.61.2
 
 - **Concurrent history writers no longer lose rows (#519).** The shared lockfile protocol
@@ -64,6 +97,7 @@ semantic versioning.
   `requirements-voice.txt` — and the workflow installs a pinned `pip-audit`. The first audit found
   two advisories in the locks: `multidict` 6.7.1 → 6.9.1
   (CVE-2026-104874) and `fsspec` 2026.2.0 → 2026.6.0 (CVE-2026-104851).
+
 
 ## 1.60.2
 

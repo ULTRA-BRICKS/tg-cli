@@ -494,14 +494,18 @@ import {
   formatVoiceTranscript,
   FASTER_WHISPER_FALLBACK_SCRIPT,
   decideOnboarding,
+  formatCommand,
   isVoiceConfigured,
+  managedVoicePaths,
   onboardingMessage,
   parseVoiceConfig,
+  renderVoiceConfigBlock,
   resolveVoiceConfig,
   upsertVoiceBlock,
+  voiceArtifactsPresent,
   type VoiceConfig,
 } from "./features/tg-ctl/voice"
-import { probeWhisper } from "./features/tg-ctl/voice-probe"
+import { physicalCores, probeWhisper, voiceInstallRoot } from "./features/tg-ctl/voice-probe"
 import { shouldColorize } from "./features/render/help-color"
 import type {
   Action,
@@ -590,7 +594,12 @@ export const USAGE = `Usage:
                          # a repeat of (source,key,severity) inside --window is throttled
   tg-ctl install-hooks   # wire q→buttons + StopFailure + Claude/Codex usage telemetry
                          #   (codex: delegates to rig when present — rig owns ~/.codex hooks)
-  tg-ctl voice-setup     # discover a local Whisper (~/xp) → configure inbound voice→text
+  tg-ctl voice-setup [--dry-run]
+                         # configure inbound voice→text: keep a working voice: config, else
+                         # use a local Whisper (~/xp, PATH), else install a prebuilt one
+                         # (macOS: Homebrew whisper.cpp + Metal; Linux: faster-whisper wheels
+                         # in a uv venv, CUDA wheels with an NVIDIA GPU) + large-v3-turbo;
+                         # --dry-run prints the plan / the voice: block, changes nothing
   tg-ctl harness-event [--dry-run] [--pane %N] [--window-name NAME] [--agent NAME] [--language LANG]
                         [--reason MATCHER]
                         [--reset-at ISO] [--source-message-id ID] [--transcript PATH]
@@ -3085,19 +3094,12 @@ function capturePane(paneId: string): string | null {
 // can't do (it is pure). A deleted model/binary falls back to onboarding instead
 // of downloading the note and failing deep inside the runner.
 function voiceReady(ctx: Ctx): boolean {
-  if (!isVoiceConfigured(ctx.voice)) return false
-  if (!existsSync(ctx.voice.binPath)) return false
-  // whisper.cpp model is always a path → must exist. faster-whisper model is
-  // EITHER a bare size token ('large-v3' — downloaded on demand, no path check)
-  // OR a local CT2 directory path; a path-shaped value (contains a slash) must
-  // exist on disk, else a stale/moved model would pass the gate and fail in
-  // Python after the note was already downloaded.
-  if (ctx.voice.runner === "whisper.cpp") {
-    if (!existsSync(ctx.voice.modelPath)) return false
-  } else if (ctx.voice.modelPath.includes("/")) {
-    if (!existsSync(ctx.voice.modelPath)) return false
-  }
-  return true
+  return isVoiceConfigured(ctx.voice) && voiceArtifactsPresent(ctx.voice, existsSync, managedModelDir(ctx.home))
+}
+
+// The CT2 dir `tg voice setup` downloads into — it must also hold its tokenizer.
+function managedModelDir(home: string): string {
+  return managedVoicePaths(voiceInstallRoot(home)).fasterWhisperModelDir
 }
 
 // Spawn a binary ASYNCHRONOUSLY (Bun.spawn, not spawnSync) with a timeout +
@@ -3154,7 +3156,7 @@ async function runTranscription(ctx: Ctx, oggPath: string): Promise<string | nul
 
   const argv =
     ctx.voice.runner === "whisper.cpp"
-      ? buildWhisperCppArgv(ctx.voice, wavPath)
+      ? buildWhisperCppArgv(ctx.voice, wavPath, physicalCores())
       : buildFasterWhisperArgv(ctx.voice.binPath, fasterWhisperScriptPath(ctx), ctx.voice, wavPath)
 
   const proc = await spawnGuarded(argv, 300_000)
@@ -3195,7 +3197,8 @@ function formatVoiceConfirmation(text: string): string {
 // fallback written into the config dir. `main.py` is intentionally NOT trusted
 // as a transcriber — uv-init projects ship a "Hello world" main.py that would
 // silently produce no text. Resolved at transcription time (not stored) so a
-// moved project is tolerated. The fallback is written once and reused.
+// moved project is tolerated. The fallback is (re)written whenever it differs
+// from the built-in copy, so an upgrade reaches hosts that already have one.
 function fasterWhisperScriptPath(ctx: Ctx): string {
   // binPath is <project>/.venv/bin/python → project root is three dirs up.
   const projectRoot = resolve(ctx.voice.binPath, "..", "..", "..")
@@ -3203,9 +3206,9 @@ function fasterWhisperScriptPath(ctx: Ctx): string {
     const candidate = join(projectRoot, name)
     if (existsSync(candidate)) return candidate
   }
-  // No project transcriber → write (once) the self-contained fallback.
+  // No project transcriber → the self-contained built-in one.
   const fallback = join(ctx.configDir, "tg-faster-whisper.py")
-  if (!existsSync(fallback)) {
+  if (readFileOrNull(fallback) !== FASTER_WHISPER_FALLBACK_SCRIPT) {
     try {
       mkdirSync(ctx.configDir, { recursive: true })
       writeFileSync(fallback, FASTER_WHISPER_FALLBACK_SCRIPT)
@@ -3236,20 +3239,71 @@ function persistVoiceConfigToDir(configDir: string, cfg: VoiceConfig): boolean {
 }
 
 // `tg-ctl voice-setup` (invoked by `tg voice setup`): probe the host, decide,
-// persist when ready, and print the human guidance to stdout so the CLI relays
-// it. Never sends to Telegram — this is the interactive local path. Takes only
-// what it needs (no bot token / chatId — the gate is bypassed for this command).
+// install when nothing usable is there, persist when ready, and print the human
+// guidance to stdout so the CLI relays it. Never sends to Telegram — this is the
+// interactive local path. Takes only what it needs (no bot token / chatId — the
+// gate is bypassed for this command). A configured runner whose files are still
+// on disk is kept (decideOnboarding). The install plan is prebuilt only
+// (Homebrew bottles, PyPI wheels, model downloads); each step runs with the
+// terminal attached so download progress shows, and the host is re-probed after
+// it, so "configured" is only claimed for an install that is really usable.
+// `dryRun` prints the plan / the voice block it would write and changes nothing.
 // Returns true on success (config written, or guidance shown for a not-ready
-// host), false ONLY when a ready install could not be persisted — the caller
-// exits non-zero in that case so scripts/agents don't mistake a failed write for
+// host), false when an install step fails or a ready install could not be
+// persisted — the caller exits non-zero so scripts/agents don't mistake it for
 // a successful setup.
-function runVoiceSetup(args: { configDir: string; home: string; language: string }): boolean {
-  const verdict = decideOnboarding(probeWhisper(args.home), args.language)
+function runVoiceSetup(args: { configDir: string; home: string; current: VoiceConfig; dryRun: boolean }): boolean {
+  const color = shouldColorize()
+  const current = {
+    cfg: args.current,
+    present: voiceArtifactsPresent(args.current, existsSync, managedModelDir(args.home)),
+  }
+  let verdict = decideOnboarding(probeWhisper(args.home), args.current.language, current)
+  if (verdict.kind === "install") {
+    console.log(colorizeVoiceStatus(onboardingMessage(verdict), color))
+    if (args.dryRun) {
+      console.log("--dry-run: nothing installed, config.yaml unchanged.")
+      return true
+    }
+    for (const step of verdict.steps) {
+      console.log(`\n→ ${step.label}: ${formatCommand(step.argv)}`)
+      let outcome: string | null
+      try {
+        // Each step is bounded on its own: `tg-ctl voice-setup` may be run directly,
+        // without the `tg` wrapper's overall cap. The network tools time out stalls
+        // themselves (curl --speed-time, uv/HF read timeouts); this catches the rest.
+        const r = Bun.spawnSync(step.argv, {
+          stdin: "inherit",
+          stdout: "inherit",
+          stderr: "inherit",
+          timeout: 30 * 60_000,
+        })
+        outcome = r.exitedDueToTimeout ? "timed out after 30 min" : r.exitCode === 0 ? null : `exit ${r.exitCode ?? 1}`
+      } catch (err) {
+        console.error(String(err))
+        outcome = "exit 127"
+      }
+      if (outcome !== null) {
+        console.error(`✗ ${step.label} failed (${outcome}). Fix the cause above and re-run \`tg voice setup\`.`)
+        return false
+      }
+    }
+    verdict = decideOnboarding(probeWhisper(args.home), args.current.language, current)
+    if (verdict.kind !== "ready") {
+      console.error(`The install finished but no usable Whisper was found:\n${onboardingMessage(verdict)}`)
+      return false
+    }
+  }
   if (verdict.kind === "ready") {
+    const path = join(args.configDir, "config.yaml")
+    if (args.dryRun) {
+      console.log(`--dry-run: ${path} unchanged; tg voice setup would write:\n${renderVoiceConfigBlock(verdict.cfg)}`)
+      return true
+    }
     if (!persistVoiceConfigToDir(args.configDir, verdict.cfg)) {
       console.error(
         `Found a local Whisper (${verdict.cfg.runner}, ${verdict.cfg.modelPath}) but could not write ` +
-          `${join(args.configDir, "config.yaml")}. Fix the permissions and re-run \`tg voice setup\`.`,
+          `${path}. Fix the permissions and re-run \`tg voice setup\`.`,
       )
       return false
     }
@@ -3258,7 +3312,7 @@ function runVoiceSetup(args: { configDir: string; home: string; language: string
   // terminal (green=configured, yellow=pending), and never when piped/NO_COLOR.
   // The DAEMON path (an unconfigured voice note) sends onboardingMessage to
   // Telegram uncolored — it builds the message directly and never calls this.
-  console.log(colorizeVoiceStatus(onboardingMessage(verdict), shouldColorize()))
+  console.log(colorizeVoiceStatus(onboardingMessage(verdict), color))
   return true
 }
 
@@ -12893,12 +12947,18 @@ if (import.meta.main) {
     const watermarkPath = ctlPaths(configDir, botIdFromToken(env.TG_BOT_TOKEN ?? "") || "unknown").usageSchedule
     process.exit(await runUsageScheduleCheck(new Date(), dryRun, watermarkPath))
   }
-  // voice-setup is a LOCAL probe + config write — no Telegram I/O, so it runs
-  // before the bot-token gate (a user may set up voice before configuring creds).
+  // voice-setup is a LOCAL probe + install + config write — no Telegram I/O, so it
+  // runs before the bot-token gate (a user may set up voice before configuring creds).
   if (cmd === "voice-setup") {
+    const setupArgs = process.argv.slice(3)
+    const unknown = setupArgs.filter((a) => a !== "--dry-run")
+    if (unknown.length > 0) {
+      console.error(`tg-ctl voice-setup: unknown argument ${unknown[0]} (usage: tg-ctl voice-setup [--dry-run])`)
+      process.exit(2)
+    }
     const configYaml = readFileOrNull(join(configDir, "config.yaml")) ?? ""
-    const voiceCfg = resolveVoiceConfig(parseVoiceConfig(configYaml))
-    const ok = runVoiceSetup({ configDir, home, language: voiceCfg.language })
+    const current = resolveVoiceConfig(parseVoiceConfig(configYaml))
+    const ok = runVoiceSetup({ configDir, home, current, dryRun: setupArgs.includes("--dry-run") })
     process.exit(ok ? 0 : 1)
   }
 
