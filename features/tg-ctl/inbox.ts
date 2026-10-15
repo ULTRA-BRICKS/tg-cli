@@ -214,14 +214,3 @@ export function strandedReportText(groups: StrandedGroup[], archiveRoot: string)
   // whole report; U+FFFD keeps it sendable and the length unchanged.
   return lines.join('\n').toWellFormed();
 }
-
-// Whether a failed stranded-report send is worth retrying next poll: no answer from Telegram
-// at all, or a 429 / 5xx — read from the HTTP status, or from the envelope's error_code when
-// Telegram answered `{ok:false}` on a 200 (status undefined, json present). Anything else is
-// Telegram's final verdict on this report.
-export function strandedReportSendIsTransient(sent: { ok: boolean; status?: number; json?: Record<string, unknown> }): boolean {
-  if (sent.ok) return false;
-  const code = sent.status ?? (typeof sent.json?.error_code === 'number' ? sent.json.error_code : undefined);
-  if (code === undefined) return sent.json === undefined;
-  return code === 429 || code >= 500;
-}

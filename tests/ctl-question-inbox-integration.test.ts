@@ -16,6 +16,7 @@ import { tempDir } from './helpers/test-temp';
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const PANE_ID = '%1';
 const PANE_PID = 4242;
+const TMUX_SERVER_PID = 4240;
 const INBOX_THREAD = 77;
 const SESSION_THREAD = 501;
 
@@ -36,7 +37,7 @@ case "$sub" in
     printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '${PANE_ID}' '${PANE_PID}' 'claude' 'main' '' '${cwd}'
     ;;
   # The server pid (session-registry locators, tg-cli#717); the session name otherwise.
-  display-message) case "$*" in *'#{pid}'*) printf '4240\\n' ;; *) printf 'main\\n' ;; esac ;;
+  display-message) case "$*" in *'#{pid}'*) printf '${TMUX_SERVER_PID}\\n' ;; *) printf 'main\\n' ;; esac ;;
   send-keys)
     while [ $# -gt 0 ]; do
       if [ "$1" = "-l" ]; then printf '%s\\n' "$2" >> '${injectLog}'; break; fi
@@ -88,12 +89,22 @@ async function startDaemon(cfgDir: string, apiPort: number): Promise<Subprocess>
 
 // A scoped ask from pane %1 of the claude session `inbox-sess` (its hook names the session, so
 // the card goes to that session's topic — tg-cli#717), or a paneless hatch ask no session owns
-// (its card goes INTO the 📥 Inbox).
-function startAsk(cfgDir: string, apiPort: number, request: Record<string, unknown>, scoped = true): Subprocess {
+// (its card goes INTO the 📥 Inbox). `asker` overrides the scoped asker's tmux server and hook
+// session id (`null`: the hook names none).
+function startAsk(
+  cfgDir: string,
+  apiPort: number,
+  request: Record<string, unknown>,
+  scoped = true,
+  asker: { tmuxServerPid?: number; sessionId?: string | null } = {},
+): Subprocess {
   const e = env(cfgDir, apiPort);
-  if (scoped) e.TMUX_PANE = PANE_ID;
+  // A real pane's process also carries its server in TMUX (socket,pid,session) — by default the
+  // fake server's pid, so the daemon sees the asker on its own server (tg-cli#722).
+  if (scoped) Object.assign(e, { TMUX_PANE: PANE_ID, TMUX: `/tmp/tmux-fake/default,${asker.tmuxServerPid ?? TMUX_SERVER_PID},0` });
   const ask = trackProc(reg, Bun.spawn([process.execPath, TG_CTL, 'ask'], { env: e, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' }));
-  const scope = scoped ? { paneId: PANE_ID, origin: { sessionId: 'inbox-sess' } } : {};
+  const sessionId = asker.sessionId === undefined ? 'inbox-sess' : asker.sessionId;
+  const scope = scoped ? { paneId: PANE_ID, ...(sessionId !== null ? { origin: { sessionId } } : {}) } : {};
   ask.stdin.write(JSON.stringify({ cwd: cfgDir, ...scope, ...request }) + '\n');
   ask.stdin.end();
   return ask;
@@ -112,9 +123,16 @@ function mockTelegram() {
   const sent: Sent[] = [];
   const edits: Array<{ id: number; text: string }> = [];
   const deletes: Array<{ chat: number; id: number }> = [];
+  const failedDeletes: Array<{ chat: number; id: number }> = [];
   const answered: string[] = [];
   const reactions: Array<{ id: number; emoji: string }> = [];
   const keyboardClears: number[] = [];
+  // `outage`: deleteMessage answers 502 (Telegram down); `gone`: 400 "message to delete not
+  // found" (someone deleted it by hand) — and editMessageText 400 "message to edit not found".
+  const knobs: { deleteFailure: 'outage' | 'gone' | null } = { deleteFailure: null };
+  // A card whose text names `held.text` is not answered until the test calls `releaseHeld` —
+  // so it posts AFTER a card sent later.
+  const held = { text: null as string | null, gate: Promise.withResolvers<void>() };
   let seq = 100;
   const server = Bun.serve({
     port: 0,
@@ -135,6 +153,7 @@ function mockTelegram() {
         return Response.json({ ok: true, result: { message_thread_id: threadId, name: body.name } });
       }
       if (method === 'sendMessage') {
+        if (held.text !== null && String(body.text ?? '').includes(held.text)) await held.gate.promise;
         seq += 1;
         const markup = body.reply_markup as { inline_keyboard?: Sent['keyboard'] } | undefined;
         sent.push({
@@ -145,6 +164,14 @@ function mockTelegram() {
           keyboard: markup?.inline_keyboard ?? [],
         });
         return Response.json({ ok: true, result: { message_id: seq } });
+      }
+      if (method === 'deleteMessage' && knobs.deleteFailure !== null) {
+        failedDeletes.push({ chat: Number(body.chat_id), id: Number(body.message_id) });
+        if (knobs.deleteFailure === 'outage') return Response.json({ ok: false, error_code: 502, description: 'Bad Gateway' }, { status: 502 });
+        return Response.json({ ok: false, error_code: 400, description: 'Bad Request: message to delete not found' }, { status: 400 });
+      }
+      if (method === 'editMessageText' && knobs.deleteFailure === 'gone') {
+        return Response.json({ ok: false, error_code: 400, description: 'Bad Request: message to edit not found' }, { status: 400 });
       }
       if (method === 'editMessageText') edits.push({ id: Number(body.message_id), text: String(body.text ?? '') });
       if (method === 'deleteMessage') deletes.push({ chat: Number(body.chat_id), id: Number(body.message_id) });
@@ -218,6 +245,12 @@ function mockTelegram() {
     plain,
     edits: () => edits,
     deletes: () => deletes,
+    failedDeletes: () => failedDeletes,
+    knobs,
+    hold: (text: string): void => {
+      held.text = text;
+    },
+    releaseHeld: (): void => held.gate.resolve(),
     answered: () => answered,
     reactions: () => reactions,
     keyboardClears: () => keyboardClears,
@@ -238,7 +271,7 @@ async function until(cond: () => boolean, ms = 15_000): Promise<boolean> {
 }
 
 // Not written yet → empty, so a wait can poll it.
-function inboxState(cfgDir: string): { threadId: number | null; mirrors: Record<string, { messageId: number }> } {
+function inboxState(cfgDir: string): { threadId: number | null; mirrors: Record<string, { messageId: number }>; removing?: number[] } {
   const path = join(cfgDir, 'tg-ctl.123.question-inbox.json');
   return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : { threadId: null, mirrors: {} };
 }
@@ -470,6 +503,103 @@ test('HATCH SUPERSEDE: a newer request for the same (hookId, cwd) closes the old
   expect(tg.deletes().some((d) => d.id === olderCard.id)).toBe(false);
 }, 60_000);
 
+test('HATCH RACE: an older request whose card posts AFTER the newer one is closed as superseded — one open card (#723)', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  await startDaemon(cfgDir, tg.port);
+
+  const olderAsk = { ...hatchAsk('a', 'ship-skip-ci', cfgDir), question: 'Allow rig hatch escalation: ship-skip-ci? (attempt 1)' };
+  tg.hold('(attempt 1)');
+  const older = startAsk(cfgDir, tg.port, olderAsk, false);
+  expect(await until(() => daemonLog(cfgDir).includes(`ask-forward arrived: agent=claude kind=permission req=${olderAsk.requestId}`))).toBe(true);
+  const newer = startAsk(cfgDir, tg.port, hatchAsk('b', 'ship-skip-ci', cfgDir), false);
+  expect(await until(() => tg.inboxCards().length === 1)).toBe(true);
+  const newerCard = tg.inboxCards()[0];
+  tg.releaseHeld();
+  expect(await until(() => tg.inboxCards().length === 2)).toBe(true);
+  const olderCard = tg.inboxCards().find((c) => c.text.includes('(attempt 1)'))!;
+  expect(await until(() => tg.edits().some((e) => e.id === olderCard.id && e.text.includes('↻ superseded by a newer request')))).toBe(true);
+  expect((await new Response(older.stdout).text()).trim()).toBe('');
+  // The newer card is the one left open: untouched, its asker still waiting, the only Inbox entry.
+  expect(tg.edits().some((e) => e.id === newerCard.id)).toBe(false);
+  expect(newer.exitCode).toBeNull();
+  expect(await until(() => Object.values(inboxState(cfgDir).mirrors).map((m) => m.messageId).join() === String(newerCard.id))).toBe(true);
+}, 60_000);
+
+test('INBOX REMOVAL RETRY: copies whose delete fails in an outage stay owed and are deleted on a later sync (#722)', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  await startDaemon(cfgDir, tg.port);
+
+  const askQ = startAsk(cfgDir, tg.port, QUESTION);
+  const askP = startAsk(cfgDir, tg.port, PERMISSION);
+  expect(await until(() => tg.mirrors().length === 2 && Object.keys(inboxState(cfgDir).mirrors).length === 2)).toBe(true);
+  const mirrorQ = inboxState(cfgDir).mirrors.q_inbox.messageId;
+  const mirrorP = inboxState(cfgDir).mirrors.p_inbox.messageId;
+  tg.knobs.deleteFailure = 'outage';
+  const cardQ = tg.cards().find((c) => c.text.includes('Where should I deploy?'))!;
+  tg.tap(cardQ.id, cardQ.keyboard[1][0].callback_data, 801);
+  expect(await new Response(askQ.stdout).text()).toContain('Production');
+  // Off the open set, but still owed: the state file keeps the copy until Telegram confirms.
+  expect(await until(() => inboxState(cfgDir).mirrors.q_inbox === undefined && (inboxState(cfgDir).removing ?? []).includes(mirrorQ))).toBe(true);
+  // The permission, the only open card left, is answered in chat: its copy is owed too.
+  tg.say('no', 950, 802);
+  await askP.exited;
+  expect(await until(() => (inboxState(cfgDir).removing ?? []).join() === `${mirrorQ},${mirrorP}`)).toBe(true);
+  // The next syncs meet the outage at the first owed copy and stop there: one doomed request
+  // per sync, never one per owed copy — and no copy is edited to a placeholder on an outage.
+  expect(await until(() => tg.failedDeletes().filter((d) => d.id === mirrorQ).length >= 3)).toBe(true);
+  expect(tg.failedDeletes().some((d) => d.id === mirrorP)).toBe(false);
+  expect(tg.edits().some((e) => e.id === mirrorQ || e.id === mirrorP)).toBe(false);
+
+  tg.knobs.deleteFailure = null;
+  expect(await until(() => tg.deletes().some((d) => d.id === mirrorQ) && tg.deletes().some((d) => d.id === mirrorP))).toBe(true);
+  expect(await until(() => (inboxState(cfgDir).removing ?? []).length === 0)).toBe(true);
+}, 60_000);
+
+test('ANSWERED IN CHAT: a card asked from the same pane id on ANOTHER tmux server is not answered (#722)', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  await startDaemon(cfgDir, tg.port);
+
+  // Pane %1 of a second tmux server (pid 9999), no hook session: the daemon's %1 is someone else.
+  const ask = startAsk(cfgDir, tg.port, PERMISSION, true, { tmuxServerPid: 9999, sessionId: null });
+  // Its card does not go into the topic of the daemon-server session in %1: no session of its
+  // own resolves, so it lands in the 📥 Inbox itself.
+  expect(await until(() => tg.inboxCards().length === 1)).toBe(true);
+  expect(tg.cards()).toHaveLength(0);
+  expect(daemonLog(cfgDir)).toContain('ask-forward arrived');
+  tg.say('no, use the staging db', 951, 803);
+  // The message took its normal path (deferred behind the pane's open prompt or typed into it).
+  expect(await until(() => tg.reactions().some((r) => r.id === 951) || injected(cfgDir).includes('staging db'))).toBe(true);
+  expect(daemonLog(cfgDir)).not.toContain('ask-answered-in-chat');
+  expect(ask.exitCode).toBeNull();
+}, 60_000);
+
+test('INBOX REMOVAL: a copy Telegram says is already gone counts as removed — no retry (#722)', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  await startDaemon(cfgDir, tg.port);
+
+  const ask = startAsk(cfgDir, tg.port, QUESTION);
+  expect(await until(() => tg.mirrors().length === 1 && inboxState(cfgDir).mirrors.q_inbox !== undefined)).toBe(true);
+  const card = tg.cards()[0];
+  const mirror = tg.mirrors()[0];
+  tg.knobs.deleteFailure = 'gone';
+  tg.tap(card.id, card.keyboard[1][0].callback_data, 802);
+  expect(await new Response(ask.stdout).text()).toContain('Production');
+  expect(await until(() => tg.failedDeletes().some((d) => d.id === mirror.id))).toBe(true);
+  expect(await until(() => inboxState(cfgDir).mirrors.q_inbox === undefined && (inboxState(cfgDir).removing ?? []).length === 0)).toBe(true);
+  // A later sync — the one that posts the next card's copy — does not ask again.
+  startAsk(cfgDir, tg.port, PERMISSION);
+  expect(await until(() => inboxState(cfgDir).mirrors.p_inbox !== undefined)).toBe(true);
+  expect(tg.failedDeletes().filter((d) => d.id === mirror.id)).toHaveLength(1);
+}, 60_000);
+
 test('NO TOPICS: without topics mode nothing is mirrored anywhere', async () => {
   const cfgDir = makeCfgDir(false);
   const tg = mockTelegram();
@@ -523,6 +653,48 @@ test('MIGRATION: reminders the old #403/#464 sweeps left are retired once, in th
   expect(await until(() => daemonLog(cfgDir).split('questions restored').length >= 3)).toBe(true);
   expect(tg.deletes().filter((d) => d.id === 501 || d.id === 555)).toHaveLength(deletesBefore);
   expect(daemonLog(cfgDir).match(/reminder migration: retiring/g)).toHaveLength(2);
+}, 60_000);
+
+test('MIGRATION RETRY: reminders Telegram could not retire at startup are kept and retired on the next start (#723)', async () => {
+  const cfgDir = makeCfgDir();
+  writeFileSync(
+    join(cfgDir, 'tg-ctl.123.questions.json'),
+    JSON.stringify({
+      v: 1,
+      questions: [
+        {
+          req: { ...hatchAsk('e', 'ship-skip-ci', cfgDir), critical: true },
+          messageId: 41,
+          at: Date.now() - 60_000,
+          criticalState: { lastReminderAt: Date.now() - 1000, lastReminderMessageId: 601, lastReminderChatId: -100777 },
+        },
+      ],
+      answered: [],
+    }),
+  );
+  const legacy = join(cfgDir, 'tg-ctl.123.unanswered-reminder.json');
+  writeFileSync(legacy, JSON.stringify({ version: 1, firstSeen: {}, remindedKeys: [], messageId: 655, chatId: 7 }));
+  const queuePath = join(cfgDir, 'tg-ctl.123.reminder-retire.json');
+  const tg = mockTelegram();
+  servers.push(tg);
+  tg.knobs.deleteFailure = 'outage';
+  const daemon = await startDaemon(cfgDir, tg.port);
+
+  // The first retire meets the outage; the pass ends there instead of a doomed request per ping.
+  expect(await until(() => tg.failedDeletes().some((d) => d.id === 601))).toBe(true);
+  // The old sources go, but the ids they held are kept until each retire succeeds.
+  expect(await until(() => !existsSync(legacy) && !readFileSync(join(cfgDir, 'tg-ctl.123.questions.json'), 'utf8').includes('criticalState'))).toBe(true);
+  expect(JSON.parse(readFileSync(queuePath, 'utf8')).messages).toEqual([
+    { chatId: -100777, messageId: 601 },
+    { chatId: 7, messageId: 655 },
+  ]);
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+
+  tg.knobs.deleteFailure = null;
+  await startDaemon(cfgDir, tg.port);
+  expect(await until(() => tg.deletes().some((d) => d.id === 601 && d.chat === -100777) && tg.deletes().some((d) => d.id === 655 && d.chat === 7))).toBe(true);
+  expect(await until(() => !existsSync(queuePath))).toBe(true);
 }, 60_000);
 
 test('INBOX ONLY HOLDS CARDS: a stray message, a /status and a non-answer reply in the Inbox get their replies in General', async () => {

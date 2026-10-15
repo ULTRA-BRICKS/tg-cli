@@ -135,6 +135,17 @@ export function isEditNotModified(method: string, description: string): boolean 
   return method.startsWith('editMessage') && description.toLowerCase().includes('message is not modified');
 }
 
+// Whether a failed Bot API call is worth retrying later: no answer from Telegram at all, or a
+// 429 / 5xx — read from the HTTP status, or from the envelope's error_code when Telegram
+// answered `{ok:false}` on a 200 (status undefined, json present). Anything else is Telegram's
+// final verdict on the call.
+export function telegramFailureIsTransient(sent: { ok: boolean; status?: number; json?: Record<string, unknown> }): boolean {
+  if (sent.ok) return false;
+  const code = sent.status ?? (typeof sent.json?.error_code === 'number' ? sent.json.error_code : undefined);
+  if (code === undefined) return sent.json === undefined;
+  return code === 429 || code >= 500;
+}
+
 // Exit-on-error response check, shared by every send. A non-2xx response or an
 // { ok:false } body prints to stderr and exits 1; otherwise the `result`
 // payload is returned (a Message or an array of Messages).

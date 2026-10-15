@@ -132,7 +132,6 @@ import {
   serializeInboxEntry,
   splitStrandedLines,
   strandedReportMarker,
-  strandedReportSendIsTransient,
   strandedReportText,
   type InboxEntry,
   type StrandedGroup,
@@ -264,7 +263,7 @@ import {
 } from "./features/tg-ctl/session-topics"
 import { tmuxServerPidFromEnv } from "./features/cli/session-topic"
 import { createTopicRenamer, type TopicRenamer } from "./features/tg-ctl/topic-rename"
-import { isEditNotModified, isThreadRejection, isTopicDeletedError } from "./features/transport/telegram"
+import { isEditNotModified, isThreadRejection, isTopicDeletedError, telegramFailureIsTransient } from "./features/transport/telegram"
 import { installOmpLiveExtension, runOmpLiveCommand } from "./tools/omp-live-cli.mjs"
 import {
   DEFAULT_TASK_VIEW,
@@ -352,6 +351,8 @@ import {
 } from "./features/tg-ctl/question-store"
 import {
   CLOSE_STATUS,
+  addRetireTargets,
+  arrivalClock,
   emptyInboxState,
   emptyMirrors,
   freeTextAnswer,
@@ -364,10 +365,12 @@ import {
   hasLegacyCriticalState,
   inboxEntryOf,
   parseInboxState,
+  parseRetireQueue,
   parseWithdrawLine,
   planInboxSync,
   parseWithdrawArgv,
   serializeInboxState,
+  serializeRetireQueue,
   sessionCardKeys,
   WITHDRAW_USAGE,
   type OpenCard,
@@ -1048,14 +1051,19 @@ async function clearMessageKeyboard(ctx: Ctx, messageId: number): Promise<void> 
   await botPost(ctx, "editMessageReplyMarkup", { chat_id: ctx.chatId, message_id: messageId })
 }
 
-// Retire a reminder ping the removed #403 / #464 reminders left in the chat (tg-cli#705's
-// one-shot startup migration): delete it outright; when Telegram refuses the delete (message
-// too old for a bot delete, already gone, …) edit it to `placeholder` instead. Never throws
-// (botPostResult swallows transport/HTTP failures like every botPost* helper). `chatId` is the
-// chat the reminder was POSTED in (tg-cli#518): after a TG_CHAT_ID change it is not ctx.chatId.
-async function retireReminderMessage(ctx: Ctx, chatId: number, messageId: number, placeholder: string): Promise<void> {
-  const result = await botPostResult(ctx, "deleteMessage", { chat_id: chatId, message_id: messageId })
-  if (!result.ok) void botPost(ctx, "editMessageText", { chat_id: chatId, message_id: messageId, text: placeholder })
+// Take a message the daemon posted out of the chat — an Inbox copy whose card closed, a reminder
+// ping the removed #403 / #464 reminders left: delete it; when Telegram refuses the delete for
+// good (too old for a bot delete, already gone, …) edit it to `placeholder` instead. True once
+// Telegram gave its verdict: done, or refused for good — a message already gone counts as
+// removed. False when a step failed for a reason that may pass (no answer, 429, 5xx): the caller
+// keeps the message on disk and retries (tg-cli#722, #723). Never throws. `chatId` is the chat
+// the message was POSTED in (tg-cli#518): after a TG_CHAT_ID change it is not ctx.chatId.
+async function retireMessage(ctx: Ctx, chatId: number, messageId: number, placeholder: string): Promise<boolean> {
+  const deleted = await botPostResult(ctx, "deleteMessage", { chat_id: chatId, message_id: messageId })
+  if (deleted.ok) return true
+  if (telegramFailureIsTransient(deleted)) return false
+  const edited = await botPostResult(ctx, "editMessageText", { chat_id: chatId, message_id: messageId, text: placeholder })
+  return !telegramFailureIsTransient(edited)
 }
 
 // Set a reaction on a message (tg-cli#114 lifecycle: 👀 working → 😴 stalled →
@@ -2578,7 +2586,7 @@ async function reportStrandedInbox(ctx: Ctx): Promise<void> {
   const { text, count, complete, files } = strandedReportUnsent
   if (text !== null) {
     const sent = await botPostResult(ctx, "sendMessage", { chat_id: ctx.chatId, text })
-    if (strandedReportSendIsTransient(sent)) {
+    if (telegramFailureIsTransient(sent)) {
       log("inbox: the stranded-message report did not send — retrying the send next poll")
       return
     }
@@ -5326,6 +5334,10 @@ function armPendingSocketClose(
   return { closed: () => socketClosed }
 }
 
+// Each ask's `at`: strictly increasing, so two hatch asks in one millisecond still supersede in
+// arrival order (tg-cli#723).
+const askArrivedAt = arrivalClock()
+
 // Fresh forward: register the pending entry, arm its socket-close handler, post the
 // inline-keyboard card, and reconcile against a socket that closed mid-send. Split
 // out of handleHookSocketLine so the dispatcher stays a readable parse→guard→route.
@@ -5337,7 +5349,7 @@ async function forwardAndPostQuestion(
   pendingKey: string,
 ): Promise<void> {
   rt.activeKeys.add(pendingKey)
-  const entry: PendingButton = { req, socket, messageId: null, at: Date.now() }
+  const entry: PendingButton = { req, socket, messageId: null, at: askArrivedAt() }
   // An UNSCOPED question defers EVERY pane (fail-closed), so it MUST self-clear on a
   // timer or it wedges all routing. A SCOPED question waits forever (no timer): only
   // its socket close releases it (see armPendingSocketClose).
@@ -5380,7 +5392,7 @@ async function forwardAndPostQuestion(
   const cardSessionNow = (): SessionEntry | null =>
     (req.sessionKey ? liveEntry(ctx, req.sessionKey) : null)
     ?? (req.asker ? findSessionForAsker(currentRegistry(ctx), req.asker) : null)
-    ?? findSessionForCard(currentRegistry(ctx), { agent: req.agent, sessionId: req.origin?.sessionId, paneId: req.paneId })
+    ?? findSessionForCard(currentRegistry(ctx), { agent: req.agent, sessionId: req.origin?.sessionId, paneId: req.paneId, tmuxServerPid: req.asker?.tmuxServerPid })
   let cardSession = cardSessionNow()
   // A session that asked before the registry's next scan saw it (its first hook, a fresh
   // process): scan now rather than send its card to the Inbox.
@@ -5437,8 +5449,13 @@ async function forwardAndPostQuestion(
   // irrelevant (tg-cli#705): the retry is what the human should decide on. Done only once the
   // new card is live, so a failed post never leaves the hook with no card at all — and only for
   // cards that arrived before this one: an older request whose post was slower must not close
-  // the newer card that beat it to Telegram.
-  const olderCards = rt.closableCards().filter((c) => c.at <= entry.at)
+  // the newer card that beat it to Telegram. An older card still being posted is closed too
+  // (tg-cli#723): its post applies the close text when it returns, so two racing posts leave
+  // one open card, not two.
+  const olderCards = [
+    ...rt.closableCards(),
+    ...[...rt.pending].filter(([, e]) => e.messageId === null).map(([key, e]) => ({ key, req: e.req, at: e.at })),
+  ].filter((c) => c.at <= entry.at)
   for (const key of hatchSiblingsOf(olderCards, req, pendingKey)) rt.closeCard(key, CLOSE_STATUS.superseded)
   // The socket (or unscoped timer) closed DURING the send: the close handler set
   // finalText but, with messageId still null, couldn't touch the card. Apply it now —
@@ -5573,7 +5590,12 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
   const askReg = currentSessionRegistry()
   const pinKey = req.sessionPin && askReg ? pinnedSession(askReg, req.sessionPin)?.key : undefined
   const askerSession = req.asker && askReg ? findSessionForAsker(askReg, req.asker)?.key : undefined
-  req = { ...req, sessionKey: hookSessionKey(req) ?? pinKey ?? askerSession ?? (req.paneId && askReg ? sessionAtPane(askReg, req.paneId)?.key : undefined) }
+  // The pane fallback only on the asker's own tmux server (or for an asker that did not say):
+  // `%1` on another server is another session's pane (tg-cli#722).
+  const askerServer = req.asker?.tmuxServerPid ?? null
+  const paneEntry = req.paneId && askReg ? sessionAtPane(askReg, req.paneId) : null
+  const paneKey = paneEntry && (askerServer === null || paneEntry.locators.tmux?.serverPid === askerServer) ? paneEntry.key : undefined
+  req = { ...req, sessionKey: hookSessionKey(req) ?? pinKey ?? askerSession ?? paneKey }
   log(`ask-forward arrived: ${describeAskRequest(req)}`)
   recordHookSession(req)
 
@@ -7827,7 +7849,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return null
       }
       log(`inbox: topic created ${threadId}`)
-      inboxState = { chatId: ctx.chatId, threadId, mirrors: emptyMirrors() }
+      inboxState = { chatId: ctx.chatId, threadId, mirrors: emptyMirrors(), removing: [] }
       persistInbox()
       return threadId
     })().finally(() => {
@@ -7848,12 +7870,6 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     inboxState = emptyInboxState(ctx.chatId)
     persistInbox()
     return true
-  }
-  // Delete a copy; a copy Telegram will not let the bot delete (too old) loses its buttons and
-  // says so instead.
-  const removeInboxMirror = async (messageId: number): Promise<void> => {
-    const deleted = await botPostResult(ctx, "deleteMessage", { chat_id: ctx.chatId, message_id: messageId })
-    if (!deleted.ok) await editMessageText(ctx, messageId, "✓ no longer open")
   }
   // tg-cli#717: a card whose session has no topic is posted INTO the Inbox, with a notification
   // (it is the card, not a silent copy), and recorded as the key's Inbox entry so the sync never
@@ -7899,11 +7915,23 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     for (const key of plan.remove) {
       const mirror = inboxState.mirrors[key]
       delete inboxState.mirrors[key]
-      persistInbox()
       // A card posted INTO the Inbox (tg-cli#717) stays: closing it already edited it in place.
       const isCard = "card" in mirror
-      if (!isCard) await removeInboxMirror(mirror.messageId)
-      log(`inbox: ${isCard ? "dropped the Inbox card" : "removed copy"} of ${key} (message ${mirror.messageId})`)
+      if (!isCard) inboxState.removing.push(mirror.messageId)
+      persistInbox()
+      log(`inbox: ${isCard ? "dropped the Inbox card" : "removing the copy"} of ${key} (message ${mirror.messageId})`)
+    }
+    // Every copy still owed — closed just now, or by an earlier sync or run Telegram did not
+    // answer (tg-cli#722). A transient failure ends the pass: the next sync tries again, and an
+    // outage costs one doomed request per sync, not one per owed copy.
+    for (const messageId of [...inboxState.removing]) {
+      if (!(await retireMessage(ctx, ctx.chatId, messageId, "✓ no longer open"))) {
+        log(`inbox: copy ${messageId} not removed yet — retried next sync`)
+        break
+      }
+      inboxState.removing = inboxState.removing.filter((id) => id !== messageId)
+      persistInbox()
+      log(`inbox: removed copy ${messageId}`)
     }
     if (plan.post.length === 0) return
     const threadId = await ensureInboxTopic()
@@ -8122,6 +8150,43 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (!ensureHatchGrace(entry.req, pendingKey, entry.messageId, Date.now())) return
     if (!persistGrants()) log(`grace persist failed for ${pendingKey} — late taps on this card will not be addressable`)
   }
+  // tg-cli#723: the old reminder pings the startup migration below queued to retire. Retired
+  // at startup, then — while any stays queued because Telegram did not answer — retried from
+  // the poll loop at most once per REMINDER_RETIRE_RETRY_MS. A transient failure ends the pass.
+  const reminderRetirePath = join(ctx.configDir, `tg-ctl.${ctx.botId}.reminder-retire.json`)
+  const REMINDER_RETIRE_RETRY_MS = 60_000
+  let reminderRetireDone = false
+  let reminderRetiring = false
+  let reminderRetireAt = 0
+  const retireQueuedReminders = async (): Promise<void> => {
+    if (reminderRetireDone || reminderRetiring || Date.now() - reminderRetireAt < REMINDER_RETIRE_RETRY_MS) return
+    reminderRetiring = true
+    reminderRetireAt = Date.now()
+    try {
+      let queue = parseRetireQueue(readFileOrNull(reminderRetirePath))
+      for (const r of [...queue]) {
+        log(`reminder migration: retiring old reminder message ${r.messageId} in chat ${r.chatId}`)
+        if (!(await retireMessage(ctx, r.chatId, r.messageId, "⏰ reminders were replaced by the 📥 Inbox topic"))) {
+          log(`reminder migration: message ${r.messageId} not retired yet — retried later`)
+          break
+        }
+        queue = queue.filter((q) => q.chatId !== r.chatId || q.messageId !== r.messageId)
+        if (queue.length > 0) atomicWrite(reminderRetirePath, serializeRetireQueue(queue))
+      }
+      if (queue.length === 0) {
+        reminderRetireDone = true
+        try {
+          unlinkSync(reminderRetirePath)
+        } catch {
+          // absent — nothing was queued
+        }
+      }
+    } catch (err) {
+      log(`reminder migration: retire pass failed: ${err}`)
+    } finally {
+      reminderRetiring = false
+    }
+  }
   // Restore durable state on bootstrap. A restored scoped question lands in
   // `abandonedButtons` (no live socket) — a late tap injects to its pane, a reconnect
   // re-attaches. Restored scoped permissions land there too so a reconnecting hook can
@@ -8203,25 +8268,36 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // anyway would lose the card with no grace record to carry it on the next restart.
     // One-shot migration (tg-cli#705): the removed #403 / #464 reminders recorded the "⏳ still
     // waiting" pings they left in the chat — in each critical card's `criticalState` and in
-    // `tg-ctl.<bot>.unanswered-reminder.json`. Retire those pings, delete the old state file,
-    // and rewrite the questions file without the old field, so a restart finds nothing to
-    // migrate (idempotent).
+    // `tg-ctl.<bot>.unanswered-reminder.json`. Their ids move to the retire queue FIRST, then the
+    // old state file goes and the questions file is rewritten without the old field, so a restart
+    // finds nothing to migrate (idempotent) — and a ping Telegram cannot retire right now (an
+    // outage at upgrade time) stays queued until it is (tg-cli#723). A failed queue write keeps
+    // the old sources for the next start.
     const legacyUnansweredPath = join(ctx.configDir, `tg-ctl.${ctx.botId}.unanswered-reminder.json`)
     const legacyReminders = legacyReminderMessages(questionsRaw, readFileOrNull(legacyUnansweredPath), ctx.chatId)
-    const hadLegacyCriticalState = hasLegacyCriticalState(questionsRaw)
-    for (const r of legacyReminders) {
-      log(`reminder migration: retiring old reminder message ${r.messageId} in chat ${r.chatId}`)
-      void retireReminderMessage(ctx, r.chatId, r.messageId, "⏰ reminders were replaced by the 📥 Inbox topic")
+    let legacyQueued = true
+    if (legacyReminders.length > 0) {
+      try {
+        atomicWrite(reminderRetirePath, serializeRetireQueue(addRetireTargets(parseRetireQueue(readFileOrNull(reminderRetirePath)), legacyReminders)))
+        log(`reminder migration: queued ${legacyReminders.length} old reminder message(s) to retire`)
+      } catch (err) {
+        legacyQueued = false
+        log(`reminder migration: queue write failed (${err}) — the old state stays for the next start`)
+      }
     }
-    try {
-      unlinkSync(legacyUnansweredPath)
-      log("reminder migration: removed the unanswered-reminder state file")
-    } catch {
-      // absent — nothing to migrate
+    if (legacyQueued) {
+      try {
+        unlinkSync(legacyUnansweredPath)
+        log("reminder migration: removed the unanswered-reminder state file")
+      } catch {
+        // absent — nothing to migrate
+      }
     }
+    const legacyFieldGoes = legacyQueued && hasLegacyCriticalState(questionsRaw)
     const grantsDurable = !(graceOnRestore || decidedSettled) || persistGrants()
-    if (grantsDurable && (decidedOnRestore || pendingOnRestore || hadLegacyCriticalState)) persistQuestions()
+    if (grantsDurable && (decidedOnRestore || pendingOnRestore || legacyFieldGoes)) persistQuestions()
   }
+  void retireQueuedReminders()
   // /agent (and unrecognized-reply) selection awaiting a button tap: token →
   // message + candidate list. `prewrapped` = inject the message verbatim (a reply
   // already carries its wrap/anchor) instead of wrapping it again.
@@ -8983,9 +9059,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     sessionKey?: string,
   ): Promise<boolean> => {
     if (plain === undefined || !plain.trim() || sourceMessageId === null) return false
+    // The pane is on the daemon's own tmux server (every inject goes there): a card from the
+    // same pane id on another server is another session's, and so is a registry entry for that
+    // pane id on another server (tg-cli#722).
+    const serverPid = readTmuxServerPid()
     const reg = sessionKey === undefined ? currentSessionRegistry() : null
-    const key = sessionKey ?? (reg ? sessionAtPane(reg, paneId)?.key : undefined)
-    const cards = sessionCardKeys(openCards(), { sessionKey: key, paneId })
+    const paneEntry = reg ? sessionAtPane(reg, paneId) : null
+    const paneKey = paneEntry && (serverPid === null || paneEntry.locators.tmux?.serverPid === serverPid) ? paneEntry.key : undefined
+    const cards = sessionCardKeys(openCards(), { sessionKey: sessionKey ?? paneKey, paneId, serverPid })
     if (cards.length === 0) return false
     const thread = threadId !== null ? { threadId } : {}
     if (cards.length > 1) {
@@ -12661,6 +12742,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // retried here (tg-cli#705).
       if (noticeStaleQueuedDecisions(Date.now())) persistQuestions()
       await syncInbox()
+      void retireQueuedReminders()
 
       // Remind only verified original processes. Never spawn an anonymous agent
       // because a TUI has not published its bridge or its session identity is unknown.

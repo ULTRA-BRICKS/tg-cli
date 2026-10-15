@@ -133,6 +133,11 @@ test('a card resolves by its hook session id first, else by its pane', () => {
   expect(keyOf(findSessionForCard(reg, { agent: 'omp', paneId: '%0' }))).toBe(`omp:${SID}`);
   expect(findSessionForCard(reg, { agent: 'claude' })).toBeNull();
   expect(findSessionForCard(reg, { agent: 'claude', paneId: '%9' })).toBeNull();
+  // A pane id names a pane only on its own tmux server (tg-cli#722): `%3` asked from server 99
+  // is not the cc session in `%3` of server 7. An asker that did not say keeps the pane match.
+  expect(findSessionForCard(reg, { agent: 'claude', paneId: '%3', tmuxServerPid: 99 })).toBeNull();
+  expect(keyOf(findSessionForCard(reg, { agent: 'claude', paneId: '%3', tmuxServerPid: 7 }))).toBe(`cc:${CC_SID}`);
+  expect(keyOf(findSessionForCard(reg, { agent: 'claude', paneId: '%3', tmuxServerPid: null }))).toBe(`cc:${CC_SID}`);
 });
 
 test('ensureTopic: two concurrent first sends create exactly one topic; later calls reuse it', async () => {

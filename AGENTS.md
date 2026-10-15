@@ -609,13 +609,22 @@ after Telegram took it is sent again by the retry or the replay.
   With topics on and no topic for it, `postCardToInbox` posts the card ITSELF into the Inbox with
   a notification, recorded as a `card: true` entry (no copy, never deleted on close); never
   silently to General. Sync runs after every `persistQuestions` and every
-  poll tick. There is NO timer that closes a question and NO "⏳ still waiting" reminder (the #403 /
+  poll tick. A copy whose card closed moves to the state file's `removing` list and leaves it only
+  when Telegram gives a verdict (`retireMessage`: deleted, edited, or refused for good — a copy
+  already gone counts as removed); a failure that may pass (no answer, 429, 5xx —
+  `telegramFailureIsTransient`) keeps it for the next sync (tg-cli#722). The startup reminder
+  migration queues the old ping ids in `tg-ctl.<bot>.reminder-retire.json` before dropping their
+  sources, and retries them at startup and from the poll loop until done (tg-cli#723). There is
+  NO timer that closes a question and NO "⏳ still waiting" reminder (the #403 /
   #464 reminders are deleted; do not bring them back). A card closes only through
   `closeOpenCard(key, status)` on: an answer (tap/reply, on card or copy); a plain message to a
   session with exactly ONE open non-hatch card (live: answered down the socket, prose to a permission = deny
   with the text as reason; retained question: typed into its pane; retained permission/hatch: never
-  decided from chat) — with several open cards the daemon sends one "reply to the card you mean"
-  notice; a newer hatch request with the same (hookId, cwd) ("↻ superseded"); a decision or consumed
+  decided from chat; a card counts as the session's by its session key, or by its pane only when
+  its asker's `TMUX` server is the daemon's — pane ids repeat across tmux servers, tg-cli#722) —
+  with several open cards the daemon sends one "reply to the card you mean"
+  notice; a newer hatch request with the same (hookId, cwd) ("↻ superseded" — an older card still
+  being posted included, so racing posts leave one card, tg-cli#723); a decision or consumed
   grant on a sibling hatch card ("✓ decided"); Dismiss; and **withdraw**. Withdraw protocol: a hook
   socket line `{"withdraw":"<requestId>","reason":"…"}` or `{"withdrawHookId":"<id>","cwd":"…",
   "reason":"…"}` → reply `{"tgctl":"withdrawn","closed":N}`; `tg-ctl withdraw <requestId> | --hook-id

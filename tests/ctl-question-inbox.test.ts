@@ -3,6 +3,8 @@
 // maps to an answer, the withdraw line/argv, the state file, and the reminder migration.
 import { expect, test } from 'bun:test';
 import {
+  addRetireTargets,
+  arrivalClock,
   emptyInboxState,
   freeTextAnswer,
   ANY_CWD,
@@ -13,10 +15,12 @@ import {
   inboxEntryOf,
   legacyReminderMessages,
   parseInboxState,
+  parseRetireQueue,
   parseWithdrawArgv,
   parseWithdrawLine,
   planInboxSync,
   serializeInboxState,
+  serializeRetireQueue,
   sessionCardKeys,
   type OpenCard,
 } from '../features/tg-ctl/question-inbox';
@@ -35,7 +39,7 @@ function hatch(key: string, hookId: string, cwd: string): OpenCard {
 const open = (...pairs: Array<[string, number]>) => pairs.map(([key, messageId]) => ({ key, messageId }));
 
 test('planInboxSync posts a copy for every open card without one and removes copies of closed cards', () => {
-  const state = { chatId: CHAT, threadId: 7, mirrors: { a: { messageId: 10, cardId: 1 }, gone: { messageId: 11, cardId: 2 } } };
+  const state = { chatId: CHAT, threadId: 7, mirrors: { a: { messageId: 10, cardId: 1 }, gone: { messageId: 11, cardId: 2 } }, removing: [] };
   expect(planInboxSync(open(['a', 1], ['b', 3], ['c', 4]), state)).toEqual({ post: ['b', 'c'], remove: ['gone'] });
   expect(planInboxSync([], state)).toEqual({ post: [], remove: ['a', 'gone'] });
   expect(planInboxSync(open(['a', 1], ['gone', 2]), state)).toEqual({ post: [], remove: [] });
@@ -43,12 +47,12 @@ test('planInboxSync posts a copy for every open card without one and removes cop
 
 test('a copy left from an earlier card with the same request id is replaced, and maps to no card', () => {
   // Card 1 closed; before its copy was removed a new card (message 5) reused request id `p`.
-  const state = { chatId: CHAT, threadId: 7, mirrors: { p: { messageId: 10, cardId: 1 } } };
+  const state = { chatId: CHAT, threadId: 7, mirrors: { p: { messageId: 10, cardId: 1 } }, removing: [] };
   expect(planInboxSync(open(['p', 5]), state)).toEqual({ post: ['p'], remove: ['p'] });
   // The stale copy still names the OLD card, so the daemon maps a tap on it to no current card.
   expect(inboxEntryOf(state, 10)).toEqual({ key: 'p', cardId: 1 });
   // A card posted INTO the Inbox stands for itself.
-  const inInbox = { chatId: CHAT, threadId: 7, mirrors: { q: { messageId: 20, card: true as const } } };
+  const inInbox = { chatId: CHAT, threadId: 7, mirrors: { q: { messageId: 20, card: true as const } }, removing: [] };
   expect(planInboxSync(open(['q', 20]), inInbox)).toEqual({ post: [], remove: [] });
   expect(inboxEntryOf(inInbox, 20)).toEqual({ key: 'q', cardId: 20 });
   expect(inboxEntryOf(inInbox, 99)).toBeNull();
@@ -65,7 +69,7 @@ test('a request id named like an Object.prototype member is an ordinary card key
 });
 
 test('the state file round-trips; a foreign chat, an unknown version or garbage starts fresh', () => {
-  const state = { chatId: CHAT, threadId: 7, mirrors: { a: { messageId: 10, cardId: 1 }, b: { messageId: 11, card: true as const } } };
+  const state = { chatId: CHAT, threadId: 7, mirrors: { a: { messageId: 10, cardId: 1 }, b: { messageId: 11, card: true as const } }, removing: [] };
   expect(parseInboxState(serializeInboxState(state), CHAT)).toEqual(state);
   expect(parseInboxState(serializeInboxState(state), 2)).toEqual(emptyInboxState(2));
   expect(parseInboxState(JSON.stringify({ ...state, version: 2 }), CHAT)).toEqual(emptyInboxState(CHAT));
@@ -117,16 +121,69 @@ test('hatch siblings: same hook id and cwd, excluding the deciding card; --cwd o
   expect(hatchSiblingKeys([plainA], 'ship', '/a', null)).toEqual([]);
 });
 
+// The tmux server a card was asked from: pane ids repeat across servers (tg-cli#722).
+const onServer = (paneId: string, tmuxServerPid: number | null): Partial<ButtonRequest> => ({
+  paneId,
+  asker: { tmuxPane: paneId, tmuxServerPid, ancestorPids: [], sessionFile: null, sessionKey: null },
+});
+
 test('sessionCardKeys: cards asked by the session or from the pane the message goes to — never a hatch card', () => {
-  const cards = [card('a', { sessionKey: 'cc:1' }), card('b', { paneId: '%3' }), card('c', { sessionKey: 'cc:2', paneId: '%9' })];
-  expect(sessionCardKeys(cards, { sessionKey: 'cc:1', paneId: '%3' })).toEqual(['a', 'b']);
-  expect(sessionCardKeys(cards, { paneId: '%9' })).toEqual(['c']);
-  expect(sessionCardKeys(cards, { paneId: '%5' })).toEqual([]);
+  const cards = [card('a', { sessionKey: 'cc:1' }), card('b', onServer('%3', 40)), card('c', { sessionKey: 'cc:2', ...onServer('%9', 40) })];
+  expect(sessionCardKeys(cards, { sessionKey: 'cc:1', paneId: '%3', serverPid: 40 })).toEqual(['a', 'b']);
+  expect(sessionCardKeys(cards, { paneId: '%9', serverPid: 40 })).toEqual(['c']);
+  expect(sessionCardKeys(cards, { paneId: '%5', serverPid: 40 })).toEqual([]);
   // A hatch card on the session's own pane is a shell gate: the message is for the agent.
-  const gate = { ...hatch('h', 'ship', '/w'), req: { ...hatch('h', 'ship', '/w').req, sessionKey: 'cc:1', paneId: '%3' } };
-  expect(sessionCardKeys([gate], { sessionKey: 'cc:1', paneId: '%3' })).toEqual([]);
+  const gate = { ...hatch('h', 'ship', '/w'), req: { ...hatch('h', 'ship', '/w').req, sessionKey: 'cc:1', ...onServer('%3', 40) } };
+  expect(sessionCardKeys([gate], { sessionKey: 'cc:1', paneId: '%3', serverPid: 40 })).toEqual([]);
   // One text cannot answer each question of a multi-question card.
-  expect(sessionCardKeys([card('m', { sessionKey: 'cc:1', multiQuestion: true } as Partial<ButtonRequest>)], { sessionKey: 'cc:1', paneId: '%3' })).toEqual([]);
+  expect(sessionCardKeys([card('m', { sessionKey: 'cc:1', multiQuestion: true } as Partial<ButtonRequest>)], { sessionKey: 'cc:1', paneId: '%3', serverPid: 40 })).toEqual([]);
+});
+
+test('sessionCardKeys: a pane matches only on the same tmux server — a session key matches anywhere (#722)', () => {
+  const other = card('other', onServer('%1', 41));
+  const mine = card('mine', onServer('%1', 40));
+  expect(sessionCardKeys([other, mine], { paneId: '%1', serverPid: 40 })).toEqual(['mine']);
+  expect(sessionCardKeys([other], { paneId: '%1', serverPid: 40 })).toEqual([]);
+  // A card or a target whose server is unknown cannot prove it is the same pane.
+  expect(sessionCardKeys([card('unknown', onServer('%1', null))], { paneId: '%1', serverPid: 40 })).toEqual([]);
+  expect(sessionCardKeys([card('bare', { paneId: '%1' })], { paneId: '%1', serverPid: 40 })).toEqual([]);
+  expect(sessionCardKeys([mine], { paneId: '%1', serverPid: null })).toEqual([]);
+  // The asking session's key is unambiguous on any server.
+  const keyed = card('keyed', { sessionKey: 'cc:7', ...onServer('%1', 41) });
+  expect(sessionCardKeys([keyed], { sessionKey: 'cc:7', paneId: '%1', serverPid: 40 })).toEqual(['keyed']);
+});
+
+test('copies whose removal is still owed survive in the state file until Telegram confirms (#722)', () => {
+  const state = { chatId: CHAT, threadId: 7, mirrors: emptyInboxState(CHAT).mirrors, removing: [10, 11] };
+  expect(parseInboxState(serializeInboxState(state), CHAT).removing).toEqual([10, 11]);
+  // An older state file has no list; garbage entries are dropped.
+  expect(parseInboxState(JSON.stringify({ version: 1, chatId: CHAT, threadId: 7, mirrors: {} }), CHAT).removing).toEqual([]);
+  expect(parseInboxState(JSON.stringify({ version: 1, chatId: CHAT, threadId: 7, mirrors: {}, removing: [12, 'x', 1.5, null] }), CHAT).removing).toEqual([12]);
+  // No topic, no copies to remove.
+  expect(parseInboxState(JSON.stringify({ version: 1, chatId: CHAT, threadId: null, mirrors: {}, removing: [12] }), CHAT).removing).toEqual([]);
+});
+
+test('the reminder retire queue round-trips, merges without duplicates and tolerates garbage (#723)', () => {
+  const queue = [{ chatId: CHAT, messageId: 501 }, { chatId: 7, messageId: 555 }];
+  expect(parseRetireQueue(serializeRetireQueue(queue))).toEqual(queue);
+  expect(parseRetireQueue(null)).toEqual([]);
+  expect(parseRetireQueue('{bad')).toEqual([]);
+  // A queue written by some other version is not read as this one: no message deleted on a guess.
+  expect(parseRetireQueue(JSON.stringify({ version: 2, messages: queue }))).toEqual([]);
+  expect(parseRetireQueue(JSON.stringify({ messages: queue }))).toEqual([]);
+  expect(parseRetireQueue(JSON.stringify({ version: 1, messages: [{ chatId: 1, messageId: 'x' }, { chatId: 2, messageId: 9 }, null] }))).toEqual([{ chatId: 2, messageId: 9 }]);
+  expect(addRetireTargets(queue, [{ chatId: 7, messageId: 555 }, { chatId: 7, messageId: 556 }])).toEqual([...queue, { chatId: 7, messageId: 556 }]);
+});
+
+test('arrivalClock: asks in the same millisecond still get distinct, ordered arrival times (#723)', () => {
+  let now = 5;
+  const at = arrivalClock(() => now);
+  expect([at(), at(), at()]).toEqual([5, 6, 7]);
+  now = 100;
+  expect(at()).toBe(100);
+  // A clock stepping back never reorders arrivals.
+  now = 50;
+  expect(at()).toBe(101);
 });
 
 test('freeTextAnswer: a question takes the text; a permission reads yes/no; other text denies with it as the reason', () => {

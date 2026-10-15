@@ -3,6 +3,23 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.64.2
+
+- **📥 Inbox copies and old reminders survive a Telegram outage (#722, #723).** A copy whose
+  card closed stays in `tg-ctl.<bot>.question-inbox.json` (`removing`) until Telegram deletes it
+  or refuses for good, retried on every sync; before, a delete that failed in an outage left a
+  dead copy with buttons in the Inbox for good. A copy already gone counts as removed. The
+  startup reminder migration now queues the old "⏳ still waiting" ids in
+  `tg-ctl.<bot>.reminder-retire.json` before dropping their sources, and retries them at startup
+  and once a minute until retired.
+- **A chat answer no longer lands on another tmux server's card (#722).** A plain message to a
+  session answers a card asked from the same pane only when the asker ran on the daemon's tmux
+  server (`%1` repeats across servers); the session key still matches anywhere. The asking
+  session (and so the card's topic) is no longer taken from a same-numbered pane on another
+  server either.
+- **Two racing posts of one hatch leave one open card (#723).** The newer card, once posted,
+  also closes an older one whose post had not returned yet ("↻ superseded").
+
 ## 1.64.1
 
 - **Open question cards are never dropped on restart (#707).** `tg-ctl.<bot>.questions.json`

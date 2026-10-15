@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import { hatchGrantNoticeText } from '../features/tg-ctl/grants';
-import { inboxDirFor, inboxRoot, isDeliveredBatchFile, parseInboxLines, parseStrandedMarker, serializeInboxEntry, splitStrandedLines, strandedReportSendIsTransient, strandedReportText, type InboxEntry } from '../features/tg-ctl/inbox';
+import { inboxDirFor, inboxRoot, isDeliveredBatchFile, parseInboxLines, parseStrandedMarker, serializeInboxEntry, splitStrandedLines, strandedReportText, type InboxEntry } from '../features/tg-ctl/inbox';
+import { telegramFailureIsTransient } from '../features/transport/telegram';
 
 test('inbox paths live under <configDir>/inbox/<key>', () => {
   expect(inboxRoot('/cfg')).toBe('/cfg/inbox');
@@ -67,16 +68,16 @@ test('strandedReportText: an archived record holding an unpaired surrogate still
   expect(text).toContain('broken \uFFFD here');
 });
 
-test('strandedReportSendIsTransient: only no answer, 429 and 5xx retry — including a 200-status ok:false envelope (#526)', () => {
-  expect(strandedReportSendIsTransient({ ok: true })).toBe(false);
-  expect(strandedReportSendIsTransient({ ok: false })).toBe(true); // no answer from Telegram at all
-  expect(strandedReportSendIsTransient({ ok: false, status: 429 })).toBe(true);
-  expect(strandedReportSendIsTransient({ ok: false, status: 502 })).toBe(true);
-  expect(strandedReportSendIsTransient({ ok: false, status: 400 })).toBe(false);
-  expect(strandedReportSendIsTransient({ ok: false, json: { ok: false, error_code: 429, description: 'Too Many Requests' } })).toBe(true);
-  expect(strandedReportSendIsTransient({ ok: false, json: { ok: false, error_code: 500 } })).toBe(true);
-  expect(strandedReportSendIsTransient({ ok: false, json: { ok: false, error_code: 400 } })).toBe(false);
-  expect(strandedReportSendIsTransient({ ok: false, json: { ok: false } })).toBe(false);
+test('telegramFailureIsTransient: only no answer, 429 and 5xx retry — including a 200-status ok:false envelope (#526)', () => {
+  expect(telegramFailureIsTransient({ ok: true })).toBe(false);
+  expect(telegramFailureIsTransient({ ok: false })).toBe(true); // no answer from Telegram at all
+  expect(telegramFailureIsTransient({ ok: false, status: 429 })).toBe(true);
+  expect(telegramFailureIsTransient({ ok: false, status: 502 })).toBe(true);
+  expect(telegramFailureIsTransient({ ok: false, status: 400 })).toBe(false);
+  expect(telegramFailureIsTransient({ ok: false, json: { ok: false, error_code: 429, description: 'Too Many Requests' } })).toBe(true);
+  expect(telegramFailureIsTransient({ ok: false, json: { ok: false, error_code: 500 } })).toBe(true);
+  expect(telegramFailureIsTransient({ ok: false, json: { ok: false, error_code: 400 } })).toBe(false);
+  expect(telegramFailureIsTransient({ ok: false, json: { ok: false } })).toBe(false);
 });
 
 test('strandedReportText: unreadable archived lines are counted in the report, never silently dropped', () => {

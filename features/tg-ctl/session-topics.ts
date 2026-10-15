@@ -116,17 +116,19 @@ export function findSessionForLookup(reg: Registry, q: SessionLookup): SessionEn
 export const HARNESS_AGENT: Record<Harness, AgentKind> = { omp: 'omp', cc: 'claude', codex: 'codex' };
 
 // The live entry a question/permission card belongs to: the hook's session id (cc/codex carry
-// it as `origin.sessionId`), else the asking pane.
+// it as `origin.sessionId`), else the asking pane — on the asker's tmux server when it said
+// which (`tmuxServerPid`): pane ids repeat across servers (tg-cli#722).
 export function findSessionForCard(
   reg: Registry,
-  card: { agent: string; sessionId?: string; paneId?: string },
+  card: { agent: string; sessionId?: string; paneId?: string; tmuxServerPid?: number | null },
 ): SessionEntry | null {
   const live = reg.sessions.filter((e) => e.state === 'live');
   if (card.sessionId) {
     const byId = live.find((e) => e.sessionId === card.sessionId && HARNESS_AGENT[e.harness] === card.agent);
     if (byId) return byId;
   }
-  if (card.paneId) return live.find((e) => e.locators.tmux?.paneId === card.paneId) ?? null;
+  const server = card.tmuxServerPid ?? null;
+  if (card.paneId) return live.find((e) => e.locators.tmux?.paneId === card.paneId && (server === null || e.locators.tmux?.serverPid === server)) ?? null;
   return null;
 }
 

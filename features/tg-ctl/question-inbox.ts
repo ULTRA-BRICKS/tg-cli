@@ -38,14 +38,18 @@ export const INBOX_TOPIC_NAME = '📥 Inbox';
 // copied again and never deleted on close (closing edits it in place).
 export type InboxMirror = { messageId: number; cardId: number } | { messageId: number; card: true };
 
+// `removing`: copies that left the open set but whose removal Telegram has not confirmed yet (an
+// outage, a 429), retried on every sync until it does (tg-cli#722) — dropping them at the first
+// failed attempt left dead copies with live buttons in the Inbox for good.
 export interface InboxState {
   chatId: number;
   threadId: number | null;
   mirrors: Record<string, InboxMirror>;
+  removing: number[];
 }
 
 export function emptyInboxState(chatId: number): InboxState {
-  return { chatId, threadId: null, mirrors: emptyMirrors() };
+  return { chatId, threadId: null, mirrors: emptyMirrors(), removing: [] };
 }
 
 // Keyed by request id, which may be any string (`__proto__`, `toString`): a null-prototype
@@ -69,6 +73,7 @@ export function parseInboxState(raw: string | null, chatId: number): InboxState 
     if (rec.version !== 1 || rec.chatId !== chatId) return emptyInboxState(chatId);
     const threadId = typeof rec.threadId === 'number' && Number.isInteger(rec.threadId) ? rec.threadId : null;
     const mirrors = emptyMirrors();
+    const removing: number[] = [];
     if (threadId !== null && rec.mirrors && typeof rec.mirrors === 'object' && !Array.isArray(rec.mirrors)) {
       for (const [key, m] of Object.entries(rec.mirrors as Record<string, unknown>)) {
         const entry = m && typeof m === 'object' ? (m as Record<string, unknown>) : {};
@@ -80,7 +85,11 @@ export function parseInboxState(raw: string | null, chatId: number): InboxState 
         else mirrors[key] = { messageId, cardId: typeof cardId === 'number' && Number.isInteger(cardId) ? cardId : -1 };
       }
     }
-    return { chatId, threadId, mirrors };
+    // Absent in a state file from before tg-cli#722: nothing owed.
+    if (threadId !== null && Array.isArray(rec.removing)) {
+      for (const id of rec.removing) if (typeof id === 'number' && Number.isInteger(id)) removing.push(id);
+    }
+    return { chatId, threadId, mirrors, removing };
   } catch {
     return emptyInboxState(chatId);
   }
@@ -147,6 +156,17 @@ function hatchIdentity(req: ButtonRequest): { hookId: string; cwd: string | unde
   return { hookId: req.hookId ?? parsed, cwd: req.cwd ?? req.operation?.cwd };
 }
 
+// The arrival time of each ask, strictly increasing within the daemon: which of two hatch
+// requests is the newer decides which card a supersede closes, and two asks arriving in the
+// same millisecond must still have an order — the one they arrived in (tg-cli#723).
+export function arrivalClock(now: () => number = Date.now): () => number {
+  let last = 0;
+  return () => {
+    last = Math.max(now(), last + 1);
+    return last;
+  };
+}
+
 // The open hatch cards a newer request or a decision makes irrelevant: same hook id in the same
 // directory, excluding `exceptKey` (the card that decided or superseded). The directory matches
 // exactly — a request with no cwd only matches cards with no cwd, so a cwd-less retry never
@@ -174,16 +194,21 @@ export function hatchSiblingsOf(cards: Iterable<OpenCard>, req: ButtonRequest, e
 }
 
 // The open cards a free-text message to a session can answer: asked by that registry session,
-// or asked from the pane the message goes to. Never a hatch card: it is a shell gate, not a
-// prompt the agent waits on (its pane is merely inherited — tg-cli#717), so a message to the
-// session is for the agent. Never a multi-question card either: one text cannot answer each of
-// its questions (a text reply to it is refused the same way).
-export function sessionCardKeys(cards: Iterable<OpenCard>, target: { sessionKey?: string; paneId: string }): string[] {
+// or asked from the pane the message goes to. A pane id (`%1`) is only unique within one tmux
+// server, so the pane counts only when the card's asker ran on `serverPid`, the server that pane
+// is on (tg-cli#722); a card or target whose server is unknown matches by session key alone.
+// Never a hatch card: it is a shell gate, not a prompt the agent waits on (its pane is merely
+// inherited — tg-cli#717), so a message to the session is for the agent. Never a multi-question
+// card either: one text cannot answer each of its questions (a text reply to it is refused the
+// same way).
+export function sessionCardKeys(cards: Iterable<OpenCard>, target: { sessionKey?: string; paneId: string; serverPid: number | null }): string[] {
   const out: string[] = [];
   for (const card of cards) {
     if (isHatchPermissionRequest(card.req) || card.req.multiQuestion) continue;
     const bySession = target.sessionKey !== undefined && card.req.sessionKey === target.sessionKey;
-    if (bySession || card.req.paneId === target.paneId) out.push(card.key);
+    const cardServer = card.req.asker?.tmuxServerPid ?? null;
+    const byPane = card.req.paneId === target.paneId && cardServer !== null && cardServer === target.serverPid;
+    if (bySession || byPane) out.push(card.key);
   }
   return out;
 }
@@ -257,16 +282,18 @@ export function parseWithdrawArgv(argv: readonly string[]): { line: Record<strin
   return { line };
 }
 
+// One reminder message still to take out of the chat it was posted in.
+export interface RetireTarget {
+  chatId: number;
+  messageId: number;
+}
+
 // Reminder messages the removed #403 / #464 reminders may have left live in the chat (one-shot
 // startup migration): every `criticalState.lastReminderMessageId` in the questions store and the
 // unanswered-reminder state's `messageId`. A reminder with no recorded chat was posted before
 // tg-cli#518 started recording one — in the current chat.
-export function legacyReminderMessages(
-  questionsRaw: string | null,
-  unansweredRaw: string | null,
-  currentChatId: number,
-): Array<{ chatId: number; messageId: number }> {
-  const out: Array<{ chatId: number; messageId: number }> = [];
+export function legacyReminderMessages(questionsRaw: string | null, unansweredRaw: string | null, currentChatId: number): RetireTarget[] {
+  const out: RetireTarget[] = [];
   const add = (rec: unknown, idField: string, chatField: string): void => {
     if (!rec || typeof rec !== 'object') return;
     const r = rec as Record<string, unknown>;
@@ -283,6 +310,37 @@ export function legacyReminderMessages(
     }
   }
   add(parseJsonOrNull(unansweredRaw), 'messageId', 'chatId');
+  return out;
+}
+
+// The reminders the migration found but Telegram has not retired yet (tg-cli#723):
+// `tg-ctl.<bot>.reminder-retire.json`, written BEFORE the old sources are dropped, so an outage
+// at upgrade time leaves the ids on disk and the next start (or poll) retries them. Never throws:
+// garbage or an unknown version is an empty queue — never a message deleted on a guess.
+export function parseRetireQueue(raw: string | null): RetireTarget[] {
+  const rec = parseJsonOrNull(raw);
+  const r = rec && typeof rec === 'object' ? (rec as Record<string, unknown>) : null;
+  const list = r?.version === 1 ? r.messages : null;
+  if (!Array.isArray(list)) return [];
+  const out: RetireTarget[] = [];
+  for (const m of list) {
+    if (!m || typeof m !== 'object') continue;
+    const { chatId, messageId } = m as Record<string, unknown>;
+    if (Number.isInteger(chatId) && Number.isInteger(messageId)) out.push({ chatId: chatId as number, messageId: messageId as number });
+  }
+  return out;
+}
+
+export function serializeRetireQueue(queue: readonly RetireTarget[]): string {
+  return JSON.stringify({ version: 1, messages: queue });
+}
+
+// `queue` plus every target of `additions` it does not hold yet: a migration that runs again before
+// the queue drained (it crashed between the queue write and the old sources' removal) adds
+// nothing twice.
+export function addRetireTargets(queue: readonly RetireTarget[], additions: readonly RetireTarget[]): RetireTarget[] {
+  const out = [...queue];
+  for (const t of additions) if (!out.some((q) => q.chatId === t.chatId && q.messageId === t.messageId)) out.push(t);
   return out;
 }
 
