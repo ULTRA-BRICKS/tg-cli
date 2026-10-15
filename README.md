@@ -183,6 +183,27 @@ Retries are at-least-once: when Telegram took a request but its answer was lost 
 
 Send exit codes: `0` sent, `1` failed, `75` queued for later delivery, `78` not connected (`tg auth`).
 
+### Intent gate — questions, problems and reports in their format, tagged or not (v1.64.0)
+
+Agents skipped `--tag decision`, so the decision-format gate never ran and bare prose questions ("Решай, оставлять его или закрыть") reached the CTO. `tg` now reads every **agent-written** body itself (`features/cli/intent-gate.ts`):
+
+- A **question** to the reader — a sentence ending in `?` or a decision imperative ("решай", "выбери", "жду твоего решения", "let me know") — is a decision request and needs the decision-request format (Context, Glossary, Options with pros/cons, Recommendation, Where to look, Rich Message structure). Quoted speech, code, URLs and a narrow set of self-answered questions ("Почему падало? Флейк в …") are not asks.
+- A **problem** (an explicit blocker: "блокер", "нет доступа", "blocked on") needs Context, evidence / where to look, the ask ("нужен доступ к …"), and ≥2 headings with `<hr>`.
+- A **report** of finished work ("готово", "смержил", "merged") needs a reference (`#123`, `ABC-123`, a URL) and verification (tests / CI / a live check); over 500 characters, headings or a list. `tg report` builds one.
+
+| The message is… | Outcome |
+| --- | --- |
+| a malformed decision / problem / report | **blocked** (exit 1, nothing sent), with the exact list of what is missing |
+| a decision, a problem **and** a report at once | **blocked** — send them separately |
+| a valid report / problem / answer that also asks a question outside the decision format, carries several decisions, or hides a blocker in a report | **sent**, and tg prints and **records** one follow-up per item: each goes out as its own `tg --reply-to <id> --tag decision …` reply |
+| everything in its format, or no ask / blocker / finished work at all | sent |
+
+`tg obligations` lists what is still owed (`--check` exits 1 while any is open, `--json`, `dismiss <id> --reason "…"`); a reply under the original that passes the gate settles the oldest open item of its kind, and the next send from the same sender reminds it of older ones. `--dry-run` shows the verdict without sending or recording.
+
+Scope: an agent process above `tg` or an agent's env marker (`TG_AI_MODEL`, `CLAUDECODE`, `RIG_AGENT_ID`, …). A cron job is not gated; a program spawned from an agent session passes `--automated` (tg-ctl's alerts and usage digests do), which skips the problem/report formats but still refuses a prose question. `ESCALATION_GATE_ENFORCE=0` downgrades a block to a warning, as for `--tag decision`.
+
+**laya** (task-cli's local classifier, the PyPI `laya` package) is asked only when the heuristic found no question, only through task-cli's **already-warm** classify server (a unix socket under `~/.local/state/task-cli/classify/`; `tg` never starts it and never loads a model), within `TG_LAYA_TIMEOUT_MS` (default 1200). A high P(asks the reader) adds a hint; it never blocks or passes a message on its own — measured on Russian agent messages, both laya checkpoints missed questions the regex detector catches. `TG_LAYA=0` turns the lookup off.
+
 ### Autolinks
 
 **Linear tickets** (`HYP-576` style) — verified via the `linear` CLI, title inlined or appended. Requires `brew install schpet/tap/linear` + `linear auth login`. Disable: `--no-feature autolink-tasks`.

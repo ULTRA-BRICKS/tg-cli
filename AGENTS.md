@@ -301,6 +301,19 @@ after Telegram took it is sent again by the retry or the replay.
   alignment is computed on raw cells so escaping never skews columns), and `format-help.ts`
   (the supported-HTML reference, basic + rich tiers — surfaced via `tg help format`, with
   `--format-help` kept as a back-compat alias).
+- `features/cli/intent-gate.ts` (PURE, tg-cli#706) — the pre-send intent gate on every
+  agent-written body, tagged or not: bilingual detection of decision asks / blockers / finished
+  work, the problem and report formats (the decision format stays in `escalation-format.ts`,
+  which also gained the Glossary requirement and `decisionLabels`), and the verdict — pass,
+  follow-up (sent; one reply per item owed) or block. `obligations.ts` (PURE) is the
+  append-only `<config>/intent-obligations.jsonl` store and `tg obligations`; `laya-socket.ts`
+  is the gate's one impure module: it asks task-cli's ALREADY-WARM laya classify server over
+  its unix socket (never spawns it, never loads a model in `tg`, bounded by
+  `TG_LAYA_TIMEOUT_MS`) and laya only ever adds a hint. Scope = agent ancestry or an agent env
+  marker; programs spawned from agent sessions pass `--automated` (tg-ctl's alert and usage
+  sends do). `tests/hermetic-env.ts` scrubs the agent markers and sets `TG_LAYA=0`, so the
+  suite sees the same (non-agent) sender locally and in CI; a test that wants the gate sets
+  `TG_AI_MODEL` in the env it spawns `tg` with.
 - `features/tg-ctl/` — inbound control logic: `control:` config block parser, singleton/pidfile
   helpers, the update→action step function (allowlist, staleness, command split, `/agent`
   routing, reply-quote forwarding), tmux inject plans as data, agent pane discovery (process-tree

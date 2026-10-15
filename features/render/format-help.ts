@@ -106,6 +106,8 @@ Header badge (--tag / --title), composes with BOTH basic and rich sends:
   send (exit 1) and lists what's missing. Required sections (skill:
   decision-request-discipline):
     • Context — one line: where the code is (file:line) and what it does.
+    • Glossary — every internal name (ticket, module, flag, acronym) in one
+      phrase, under a Glossary / Глоссарий heading (or "Глоссарий: …").
     • Options — ONE real <table> with ≥2 option rows and filled pros/cons
       cells, or ONE <ul>/<ol> of ≥2 options (not bullets from the
       Recommendation / Where-to-look sections).
@@ -120,7 +122,9 @@ Header badge (--tag / --title), composes with BOTH basic and rich sends:
   sections, short lines. Use --format html.
 
   GOOD (renders as a clean, scannable Rich Message):
-    tg --tag decision --format html '<h3>Context</h3><p>foo.ts:42 does X.</p><hr>
+    tg --tag decision --format html '<h3>Context</h3>
+    <p>features/foo.ts:42 picks the click target; it misses on cold maps.</p><hr>
+    <h3>Glossary</h3><ul><li>cold map — a map not yet rendered once</li></ul><hr>
     <h3>Options</h3><table><tr><th>Option</th><th>Pros</th><th>Cons</th></tr>
     <tr><td>A</td><td>fast</td><td>risky</td></tr>
     <tr><td>B</td><td>safe</td><td>slow</td></tr></table><hr>
@@ -133,6 +137,37 @@ Header badge (--tag / --title), composes with BOTH basic and rich sends:
 
   Escape hatch (genuine non-escalation / urgent edge case ONLY):
   ESCALATION_GATE_ENFORCE=0 downgrades the block to an advisory warning.
+
+INTENT GATE (every agent-written message, tagged or NOT — tg-cli#706):
+  tg reads the body itself, so a missing --tag no longer skips the format:
+    • a question to the reader ("…?", "решай", "выбери", "let me know") is a
+      decision request and needs the decision format above;
+    • a problem (a blocker you need the human to clear: "блокер", "нет
+      доступа", "blocked on") needs: Context prose; evidence / where to look
+      (file:line, link, log, or the failing output in <code>/<pre>); the ask
+      ("нужен доступ к …", "please grant …"); ≥2 <h3>/<h4> headings and <hr>;
+    • a report of finished work ("готово", "смержил", "merged", "deployed")
+      needs a reference (#123, ABC-123 or a URL) and verification (tests / CI /
+      a live check); over 500 characters, headings or a list (or use
+      tg report — tg help report).
+  Outcomes:
+    BLOCKED (exit 1, nothing sent, a list of what is missing): the message IS a
+      malformed decision / problem / report, or it mixes a decision, a problem
+      AND a report — send them separately.
+    FOLLOW-UP REQUIRED (sent, exit 0): the message is a valid report /
+      problem / answer that ALSO asks a question outside the decision format,
+      carries several decisions, or hides a blocker in a report. tg prints and
+      RECORDS one obligation per item: send each as its own reply,
+        tg --reply-to <id> --tag decision --format html '…'
+      A reply that passes the gate settles it; \`tg obligations\` lists what is
+      still owed (--check exits 1 while any is open; dismiss <id> --reason …).
+  Not gated: a sender with no agent identity (no agent process above it, no
+  agent env marker — a cron job). --automated (a program-generated alert or
+  digest) skips the problem/report formats; a prose question is still refused.
+  laya (task-cli's local classifier) is consulted only through its already
+  warm server (never loaded per message; TG_LAYA=0 off, TG_LAYA_TIMEOUT_MS,
+  default 1200) and only adds a hint. ESCALATION_GATE_ENFORCE=0 downgrades a
+  block to a warning. Iterate with --dry-run.
 
 DICTIONARY GATE (banned wording, ALWAYS on, NO bypass flag):
   Every outgoing message — the --title, the body, and the caption of a

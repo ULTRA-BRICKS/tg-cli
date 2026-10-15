@@ -115,7 +115,7 @@ test('real tg split text send prints every sent message ref', async () => {
 
 test('real tg rich send prints the returned message ref', async () => {
   resetServer();
-  const { exitCode, stdout } = await runSend(['--format', 'html', '<h1>Status</h1><p>done</p>']);
+  const { exitCode, stdout } = await runSend(['--format', 'html', '<h1>Status</h1><p>in progress</p>']);
   expect(exitCode).toBe(0);
   expect(stdout.trim()).toBe('OK tg#7501');
 });

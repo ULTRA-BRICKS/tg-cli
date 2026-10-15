@@ -2858,7 +2858,7 @@ async function runAlertSend(host: AlertHost, command: Extract<AlertCommand, { cm
   //    end-of-options, so a body starting with `-` would be read as an unknown flag;
   //    a leading space (trimmed by `tg`) keeps it text.
   const body = telegramAlertBody(message, boundNow())
-  const tgArgv = [tgBinary(), "--format", "html", "--tag", alertTag(message.severity), "--subagent", message.source, "--title", alertTitle(message), body.startsWith("-") ? ` ${body}` : body]
+  const tgArgv = [tgBinary(), "--format", "html", "--automated", "--tag", alertTag(message.severity), "--subagent", message.source, "--title", alertTitle(message), body.startsWith("-") ? ` ${body}` : body]
   const posted = await spawnGuarded(tgArgv, 60_000)
   const messageId = posted.exitCode === 0 ? parseTgSendOk(posted.stdout) : null
   if (messageId === null) {
@@ -4617,7 +4617,7 @@ function writeUsageScheduleWatermark(path: string, watermark: UsageScheduleWater
 // No splitting here: the `tg` CLI's own transmitter 4096-splits a non-rich HTML body
 // (features/auto-attach/transmitter.ts), unlike the daemon's direct Bot API sends.
 async function sendScheduledUsageReport(title: string, body: string): Promise<boolean> {
-  const r = await spawnGuarded(["tg", "--format", "html", "--tag", "report", "--title", title, escapeHtml(body)], 30_000)
+  const r = await spawnGuarded(["tg", "--format", "html", "--automated", "--tag", "report", "--title", title, escapeHtml(body)], 30_000)
   if (r.exitCode === 0) return true
   console.error(`tg-ctl: usage-schedule: sending "${title}" failed (exit ${r.exitCode}): ${r.stderr.trim() || "no error output"}`)
   return false

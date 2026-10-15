@@ -69,7 +69,7 @@ const FILE_REF_TOKEN_RE = new RegExp(
 const TOKEN_SPLIT_RE = /[\s<>"'`()[\]{},;]+/u;
 const URL_PREFIX_RE = /^[a-z][\w+.-]*:\/\/[^/]*\/?/iu;
 
-function hasFileRef(text: string): boolean {
+export function hasFileRef(text: string): boolean {
   return text.split(TOKEN_SPLIT_RE).some((token) => FILE_REF_TOKEN_RE.test(token.replace(URL_PREFIX_RE, '')));
 }
 
@@ -89,20 +89,24 @@ const FENCED_CODE_RE = /^ {0,3}(`{3,}|~{3,})[\s\S]*?(?:^ {0,3}\1|$(?![\s\S]))/gm
 // An Options section by name — it wins over the non-options names below, so
 // "Предлагаемые варианты" (proposed options) or "Options and context" is still
 // an options section.
-const OPTIONS_HEADING_RE = /\b(?:options?|alternatives?|choices?)\b|вариант|опци|альтернатив/iu;
+export const OPTIONS_HEADING_RE = /\b(?:options?|alternatives?|choices?)\b|вариант|опци|альтернатив/iu;
 // Sections whose bullets and tables are NOT the options: Context,
-// Recommendation, Where to look. Bullets from them never satisfy Options.
+// Recommendation, Where to look, Glossary. Bullets from them never satisfy Options.
 const NON_OPTIONS_HEADING_RE = new RegExp(
-  `${RECOMMENDATION_RE.source}|where to look|references?|links?|context|background|где смотреть|ссылк|контекст`,
+  `${RECOMMENDATION_RE.source}|where to look|references?|links?|context|background|glossary|terms|где смотреть|ссылк|контекст|глоссари|термин`,
   'iu',
 );
+// The Glossary section (skill point 2): a heading that names it, or an inline
+// "Глоссарий: …" / "Glossary — …" label followed by words.
+const GLOSSARY_HEADING_RE = /glossary|\bterms\b|глоссари|термин|словарик/iu;
+const GLOSSARY_LABEL_RE = /(?:glossary|глоссарий|термины)\s*[:：—–-]\s*[\p{L}\p{N}]/iu;
 // Words a Recommendation heading uses as a mere LABEL; anything else in the
 // heading ("I recommend A", "Рекомендую A") is the recommendation itself.
 const RECOMMENDATION_LABEL_WORD_RE = /^(?:recommendations?|рекомендаци[яи]|my|our|моя|мои|наша|наши)[:.]?$/iu;
 const TAG_RE = /<[^>]*>/gu;
 const HAS_CONTENT_RE = /[\p{L}\p{N}]/u;
 
-interface Section {
+export interface Section {
   heading: string; // tag-stripped heading text; '' for the preamble
   body: string;
 }
@@ -124,7 +128,7 @@ function maskAngles(code: string): string {
   return code.replace(/</gu, '‹').replace(/>/gu, '›');
 }
 
-function splitSections(text: string): Section[] {
+export function splitSections(text: string): Section[] {
   // Neutralize heading syntax inside code with SAME-LENGTH stand-ins, so the
   // heading scan cannot start (or end) inside code and the offsets still slice
   // the original text.
@@ -243,7 +247,7 @@ function withVisualLineBreaks(body: string): string {
     .replace(OPEN_BLOCK_RE, (tag) => `\n${tag}`)
     .replace(CLOSE_BLOCK_RE, (tag) => `${tag}\n`);
 }
-function hasWallOfText(body: string): boolean {
+export function hasWallOfText(body: string): boolean {
   for (const raw of withVisualLineBreaks(body).split('\n')) {
     const line = raw.trim();
     // INLINE_ENUM_RE runs on every visual line BEFORE the skips below (same
@@ -266,7 +270,7 @@ function hasWallOfText(body: string): boolean {
 
 // A body has explanatory PROSE (the Context requirement) when at least one line
 // is not part of a table/list markup and carries real words (>= 20 chars).
-function hasContextProse(body: string): boolean {
+export function hasContextProse(body: string): boolean {
   // Same tg-cli#261 normalization as hasWallOfText: without it, a one-line
   // structured body is a single "line" that starts with `<h3` (not in the
   // skip-list below) and the word count runs over the WHOLE glued body
@@ -346,6 +350,19 @@ export function validateEscalationFormat(body: string): EscalationFormatResult {
   if (!hasContextProse(text)) {
     missing.push('Context — a sentence of prose on where the code is and what it does');
   }
+  // Glossary (skill point 2, tg-cli#706): every internal name the request
+  // uses — a ticket, module, flag, acronym — explained in one phrase, so the
+  // CTO never has to recall the agent's jargon. A Glossary section with
+  // content, or an inline "Глоссарий: …" label, counts.
+  // Tag-stripped text here is only pattern-matched, never rendered as HTML.
+  const hasGlossary =
+    // codeql[js/incomplete-multi-character-sanitization]
+    sections.some((s) => GLOSSARY_HEADING_RE.test(s.heading) && HAS_CONTENT_RE.test(s.body.replace(TAG_RE, ''))) ||
+    // codeql[js/incomplete-multi-character-sanitization]
+    GLOSSARY_LABEL_RE.test(text.replace(TAG_RE, ' '));
+  if (!hasGlossary) {
+    missing.push('Glossary — every internal name (ticket, module, flag, acronym) explained in one phrase — "глоссарий"');
+  }
 
   // --- Readability / structure (CTO tg#8970): an 8-point message that follows
   // the content format is STILL unacceptable if it is a "wall of text". A
@@ -367,6 +384,36 @@ export function validateEscalationFormat(body: string): EscalationFormatResult {
   return { ok: missing.length === 0, missing };
 }
 
+/**
+ * The separate decisions a body that passes validateEscalationFormat carries, one
+ * label each: one per named Options section holding a real option structure, or —
+ * when no section is named Options — one per option table. Always at least one. The
+ * intent gate (features/cli/intent-gate.ts) asks for one reply per decision when a
+ * body carries more than one. A label is the options heading; for a bare "Options"
+ * heading, the heading just before it when that names a topic (not Context, Glossary…).
+ */
+export function decisionLabels(body: string): string[] {
+  const sections = splitSections(body ?? '');
+  const optionTables = (s: Section): string[][][] =>
+    [...tableOptionRows(s.body), ...boxedOptionRows(s.body)].filter((rows) => rows.length >= 2);
+  const topic = (i: number): string => {
+    const own = sections[i].heading;
+    if (!/^(?:options?|alternatives?|choices?|варианты?|опции|альтернативы)[:.]?$/iu.test(own)) return own;
+    const before = i > 0 ? sections[i - 1].heading : '';
+    return before && !NON_OPTIONS_HEADING_RE.test(before) ? before : '';
+  };
+  const named = sections.flatMap((s, i) =>
+    OPTIONS_HEADING_RE.test(s.heading) && (optionTables(s).length > 0 || topLevelListItemCounts(s.body).some((n) => n >= 2))
+      ? [topic(i)]
+      : [],
+  );
+  const labels =
+    named.length > 0
+      ? named
+      : sections.flatMap((s, i) => (NON_OPTIONS_HEADING_RE.test(s.heading) ? [] : optionTables(s).map(() => topic(i))));
+  return labels.length === 0 ? ['decision 1'] : labels.map((l, i) => `decision ${i + 1}${l ? `: ${l}` : ''}`);
+}
+
 // The copy-pasteable guidance appended when a decision send is
 // malformed. Shared by the parse-time gate and the pre-send-text hook so the two
 // never drift.
@@ -379,6 +426,7 @@ export function escalationFormatMessage(tag: string, missing: string[]): string 
     `Missing:\n${bullets}\n` +
     `Use --format html with this shape (markdown pipe grids are auto-converted to a <table>):\n` +
     `<h3>Context</h3><p>features/foo.ts:42 does X.</p><hr>\n` +
+    `<h3>Glossary</h3><ul><li>X — what the internal name means</li></ul><hr>\n` +
     `<h3>Options</h3><table><tr><th>Option</th><th>Pros</th><th>Cons</th></tr>` +
     `<tr><td>A</td><td>fast</td><td>risky</td></tr><tr><td>B</td><td>safe</td><td>slow</td></tr></table><hr>\n` +
     `<h3>Recommendation</h3><ul><li>A — because …</li></ul><hr>\n` +

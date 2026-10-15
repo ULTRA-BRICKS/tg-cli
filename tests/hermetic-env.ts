@@ -43,6 +43,15 @@ delete process.env.TMUX_PANE;
 // the real retry budget (tg-cli#710, 60 s of backoff) would outlast bun's 5 s test timeout.
 // A test that exercises the retry sets TG_SEND_RETRY_BUDGET_MS itself.
 process.env.TG_SEND_RETRY_BUDGET_MS ??= '0';
+// The suite never inherits the agent session it runs in (tg-cli#706): `tg` gates an
+// agent-written body by content (the intent gate) and brands it by the agent's env markers,
+// so a run from inside omp/claude and a run in CI must see the same sender — none. A test
+// that wants an agent sender sets the marker in the env it spawns `tg` with. laya is never
+// reached from the suite: a developer's warm task-cli classify server is off limits.
+for (const key of ['TG_AI_MODEL', 'CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'OPENCODE', 'CODEX', 'RIG_AGENT_ID', 'RIG_DETACHED_AGENT', 'TG_AGENT', 'RIG_SESSION']) {
+  delete process.env[key];
+}
+process.env.TG_LAYA = '0';
 
 // Bun gives a child spawned with NO `env` the environment bun STARTED with — the PATH,
 // TMUX_TMPDIR and TMUX changes above are invisible to it — and a child whose `env` names no PATH

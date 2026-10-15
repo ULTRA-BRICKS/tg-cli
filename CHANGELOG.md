@@ -3,6 +3,28 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.64.0
+
+- **Intent gate: questions, problems and reports must be in their format, tagged or not
+  (#706).** Agents skipped `--tag decision`, so bare prose questions ("Решай, оставлять его или
+  закрыть") went straight to the CTO. `tg` now reads every agent-written body: a question to the
+  reader (a `?` sentence or a decision imperative, RU/EN) needs the decision-request format; an
+  explicit blocker needs the problem format (context, evidence, the ask, headings + `<hr>`); a
+  report of finished work needs a reference and verification. A malformed one is **blocked**
+  (exit 1, the exact missing list); a decision + problem + report mix is blocked ("send
+  separately"). A valid report / problem / answer that also asks a question outside the format,
+  carries several decisions, or hides a blocker is **sent**, and each item is **recorded** as a
+  follow-up owed as its own `--reply-to` reply — `tg obligations` lists / checks (`--check`
+  exits 1) / dismisses them; a passing reply settles one. Scope: agent ancestry or an agent env
+  marker; `--automated` (now passed by tg-ctl's alert and usage sends) skips the problem/report
+  formats. laya is consulted only through task-cli's already-warm classify server, within
+  `TG_LAYA_TIMEOUT_MS`, as an advisory hint — tg never loads a model.
+- **The decision format requires a Glossary** (skill point 2): every internal name explained in
+  one phrase, under a Glossary / Глоссарий heading or an inline "Глоссарий: …". The `tg help
+  format` example now carries one and passes the gate itself.
+- The test suite no longer inherits the agent session it runs in (agent env markers scrubbed,
+  `TG_LAYA=0`), so a run inside omp and a CI run see the same sender.
+
 ## 1.63.0
 
 - **A Telegram outage no longer loses a send (#710).** On 2026-10-14 the Bot API answered
@@ -114,7 +136,6 @@ semantic versioning.
   `requirements-voice.txt` — and the workflow installs a pinned `pip-audit`. The first audit found
   two advisories in the locks: `multidict` 6.7.1 → 6.9.1
   (CVE-2026-104874) and `fsspec` 2026.2.0 → 2026.6.0 (CVE-2026-104851).
-
 
 ## 1.60.2
 

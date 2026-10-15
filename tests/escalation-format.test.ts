@@ -7,12 +7,16 @@ import { validateEscalationFormat } from '../features/cli/escalation-format';
 // A body that satisfies EVERY required section, laid out as a structured Rich
 // Message: table with pros/cons, a recommendation, a file:line "where to look",
 // context prose, >=2 headings, a <ul>, and <hr> dividers.
+// The Glossary section every compliant body carries (skill point 2, tg-cli#706).
+const GLOSSARY = '<hr><h4>Glossary</h4><ul><li>resolver — picks the element a click lands on</li></ul>';
+
 const COMPLIANT = [
   '<h3>Context</h3><p>The resolver in features/foo.ts:42 picks the wrong click target on cold maps.</p><hr>',
   '<h3>Options</h3><table><tr><th>Option</th><th>Pros</th><th>Cons</th></tr>',
   '<tr><td>A</td><td>fast</td><td>risky</td></tr><tr><td>B</td><td>safe</td><td>slow</td></tr></table><hr>',
   '<h3>Recommendation</h3><ul><li>I recommend A because it is faster</li></ul><hr>',
   '<h4>Where to look</h4><ul><li>features/foo.ts:42</li></ul>',
+  GLOSSARY,
 ].join('\n');
 
 test('a fully-compliant structured body passes with no missing sections', () => {
@@ -45,6 +49,7 @@ test('Russian recommendation / pros-cons / where-to-look keywords are recognized
     '<tr><td>A</td><td>быстро</td><td>риск</td></tr><tr><td>Б</td><td>надёжно</td><td>медленно</td></tr></table><hr>',
     '<h3>Рекомендация</h3><ul><li>Рекомендую A, потому что быстрее</li></ul><hr>',
     '<h4>Где смотреть</h4><ul><li>features/foo.ts:42</li></ul>',
+    '<hr><h4>Глоссарий</h4><ul><li>резолвер — выбирает элемент под кликом</li></ul>',
   ].join('\n');
   const r = validateEscalationFormat(body);
   expect(r.ok).toBe(true);
@@ -254,6 +259,7 @@ test('a real, non-template file path satisfies the where-to-look requirement', (
     '<tr><td>A</td><td>fast</td><td>risky</td></tr><tr><td>B</td><td>safe</td><td>slow</td></tr></table><hr>',
     '<h3>Recommendation</h3><ul><li>I recommend A because it is faster</li></ul><hr>',
     '<h4>Where to look</h4><ul><li>.github/workflows/self-hosted-runner-smoke.yml:1</li></ul>',
+    GLOSSARY,
   ].join('\n');
   const r = validateEscalationFormat(body);
   expect(r.ok).toBe(true);
@@ -269,6 +275,7 @@ test('a 3-row Options table with short 2-word cells still counts as a real table
     '<tr><td>C</td><td>middle ground</td><td>extra work</td></tr></table><hr>',
     '<h3>Recommendation</h3><ul><li>I recommend A because it is faster</li></ul><hr>',
     '<h4>Where to look</h4><ul><li>features/foo.ts:42</li></ul>',
+    GLOSSARY,
   ].join('\n');
   const r = validateEscalationFormat(body);
   expect(r.ok).toBe(true);
@@ -282,6 +289,7 @@ test('a 2-item Recommendation list is not penalized for having more than one bul
     '<tr><td>A</td><td>fast</td><td>risky</td></tr><tr><td>B</td><td>safe</td><td>slow</td></tr></table><hr>',
     '<h3>Recommendation</h3><ul><li>A wins on speed</li><li>B loses on latency</li></ul><hr>',
     '<h4>Where to look</h4><ul><li>features/foo.ts:42</li></ul>',
+    GLOSSARY,
   ].join('\n');
   const r = validateEscalationFormat(body);
   expect(r.ok).toBe(true);
@@ -439,6 +447,7 @@ test('#259: a single-line body with h3/table/ul(3 li)/hr sections well over 350 
     '<tr><td>A</td><td>fast</td><td>risky</td></tr><tr><td>B</td><td>safe</td><td>slow</td></tr></table><hr>',
     '<h3>Recommendation</h3><ul><li>I recommend A because it is faster</li><li>B — also fine</li><li>C — last resort</li></ul><hr>',
     '<h4>Where to look</h4><ul><li>features/foo.ts:42</li></ul>',
+    GLOSSARY,
   ].join('');
   expect(body.length).toBeGreaterThan(350);
   expect(validateEscalationFormat(body).missing).toEqual([]);

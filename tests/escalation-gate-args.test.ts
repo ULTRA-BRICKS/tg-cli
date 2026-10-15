@@ -21,6 +21,7 @@ const COMPLIANT = [
   '<tr><td>A</td><td>fast</td><td>risky</td></tr><tr><td>B</td><td>safe</td><td>slow</td></tr></table><hr>',
   '<h3>Recommendation</h3><ul><li>I recommend A because it is faster</li></ul><hr>',
   '<h4>Where to look</h4><ul><li>features/foo.ts:42</li></ul>',
+  '<hr><h4>Glossary</h4><ul><li>resolver — picks the element a click lands on</li></ul>',
 ].join('\n');
 
 test('the removed "question" tag is REFUSED at parse time — even with a compliant body (tg-cli#301)', () => {
