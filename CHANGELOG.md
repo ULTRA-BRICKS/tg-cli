@@ -3,6 +3,18 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.65.1
+
+- **An unknown topic's picker can start a new session (#735).** The attach picker (and the
+  "no session is running" notice) ends with **➕ New session**. A tap runs the `/new` directory →
+  harness → model buttons inside the topic (a typed absolute path answers the directory prompt
+  there too, a mistyped one gets "not a directory") and keeps the held messages for the 10 minutes
+  those prompts live. The agent spawns with THAT topic as its own — `TG_TOPIC=<thread>`, a bound
+  binding, no second topic — named after its directory, and the topic is renamed to it. The held
+  text messages, in order, are its initial prompt; held photos, files and voice notes are answered
+  "not passed — send them here again". A button from an earlier, finished hold starts nothing, and
+  a hold that an attach pick delivered or that expired meanwhile spawns nothing.
+
 ## 1.65.0
 
 - **An agent message that names a local document has to attach it (#743).** tg#22056 told

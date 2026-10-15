@@ -18,7 +18,7 @@
 import type { Action, ControlConfig, StepResult, TgMessage, TgPhotoSize, TgUpdate, TopicPayload, TopicStatus } from './types';
 import { parseButtonCallback, parseQuestionCloseCallback, parseDecisionReplyToken } from './questions';
 import { isAgentCommand, parseAgentCallback, parseAgentCancelCallback, parseAgentCommand } from './agent-match';
-import { parseTopicAttachCallback } from './topics';
+import { parseTopicAttachCallback, parseTopicNewSessionCallback } from './topics';
 import { parseNewCommand, parseNewDirCallback, parseNewHarnessCallback, parseNewModelCallback, parseNewRetryCallback, parseNewPrivateTopicFallbackCallback } from './new-command';
 import { parseTasksCallback, parseTasksCommand } from './tasks-command';
 import { parseContinueCallback } from './limits';
@@ -163,6 +163,18 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
           callbackQueryId: cb.id,
           threadId: attachCb.threadId,
           paneId: attachCb.paneId,
+          messageId: cb.message?.message_id ?? null,
+        });
+        continue;
+      }
+      // The picker's ➕ New session tap, ordered the same way: a same-batch message joins the hold
+      // before the tap reads it.
+      const newSessionCb = opts.topicsEnabled ? parseTopicNewSessionCallback(cb.data) : null;
+      if (newSessionCb) {
+        actions.push({
+          kind: 'topic-new-session',
+          callbackQueryId: cb.id,
+          threadId: newSessionCb.threadId,
           messageId: cb.message?.message_id ?? null,
         });
         continue;

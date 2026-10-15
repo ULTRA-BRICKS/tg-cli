@@ -329,6 +329,9 @@ export type Action =
   // A tap on an attach-picker button (tgt:<threadId>:<paneId>) → deliver the topic's queue to
   // that session and bind the topic to it when the session has no topic yet.
   | { kind: 'topic-attach'; callbackQueryId: string; threadId: number; paneId: string; messageId: number | null }
+  // A tap on the picker's ➕ New session row (tgn:<threadId>) → run the /new flow in that topic and
+  // spawn the agent with the topic as its own; the held text becomes its first task (tg-cli#735).
+  | { kind: 'topic-new-session'; callbackQueryId: string; threadId: number; messageId: number | null }
   // forum_topic_created / _edited / _closed / _reopened service messages: recorded (logged)
   // only. They never spawn and never touch tmux.
   | { kind: 'topic-event'; threadId: number; event: 'created' | 'edited' | 'closed' | 'reopened'; name?: string }

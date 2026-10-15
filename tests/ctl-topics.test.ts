@@ -20,6 +20,7 @@ import {
   findTopic,
   findTopicCreatedBy,
   goneTopicReply,
+  holdButtonMessages,
   holdExpiredReply,
   holdPayload,
   markBound,
@@ -31,7 +32,10 @@ import {
   type TopicHold,
   parseHolds,
   parseTopicAttachCallback,
+  parseTopicNewSessionCallback,
   parseTopics,
+  restartHoldClock,
+  returnHold,
   serializeHolds,
   serializeTopics,
   setHoldPicker,
@@ -318,10 +322,32 @@ test('hold cap: evicts by firstAt, not array position (a restored store may be o
 });
 
 test('a dead picker resets the no-session notice, so the next message is answered again', () => {
-  let holds = markNoSessionNotice(holdPayload([], 7, text('a', 1), NOW), 7);
+  let holds = markNoSessionNotice(holdPayload([], 7, text('a', 1), NOW), 7, 800);
+  expect(holdButtonMessages(findHold(holds, 7)!)).toEqual([800]);
   holds = setHoldPicker(holds, 7, 900); // a session started; a real picker was posted
+  expect(holdButtonMessages(findHold(holds, 7)!)).toEqual([900]);
   holds = setHoldPicker(holds, 7, null); // its session exited
-  expect(findHold(holds, 7)?.noSessionNoticeSent).toBeUndefined();
+  expect(findHold(holds, 7)?.noSessionNoticeId).toBeUndefined();
+  expect(holdButtonMessages(findHold(holds, 7)!)).toEqual([]);
+});
+
+test('the no-session notice id survives a restart, so its ➕ New session button stays checkable', () => {
+  const holds = markNoSessionNotice(holdPayload([], 7, text('a', 1), NOW), 7, 800);
+  expect(parseHolds(serializeHolds(holds))).toEqual(holds);
+});
+
+test('a message replayed after a crash is held once, not twice', () => {
+  const once = holdPayload([], 7, text('a', 1), NOW);
+  expect(holdPayload(once, 7, text('a', 1), NOW + 5)).toEqual(once);
+});
+
+test('a ➕ New session tap restarts the hold clock; a hold taken for a failed spawn goes back first in line', () => {
+  const taken = setHoldPicker(holdPayload([], 7, text('a', 1), NOW), 7, 900)[0];
+  expect(findHold(restartHoldClock([taken], 7, NOW + 300), 7)?.firstAt).toBe(NOW + 300);
+  expect(returnHold([], taken)).toEqual([taken]);
+  // A message held while the spawn ran opened a fresh hold with its own picker: it queues after.
+  const fresh = setHoldPicker(holdPayload([], 7, text('b', 2), NOW + 60), 7, 901);
+  expect(returnHold(fresh, taken)).toEqual([{ threadId: 7, firstAt: NOW, payloads: [text('a', 1), text('b', 2)], pickerMessageId: 901 }]);
 });
 
 test('holdExpiredReply counts the undelivered messages', () => {
@@ -331,17 +357,29 @@ test('holdExpiredReply counts the undelivered messages', () => {
 
 // --- attach picker ---
 
-test('attach picker: one button per session carrying tgt:<thread>:<pane>, parsed back exactly', () => {
+test('attach picker: one button per session carrying tgt:<thread>:<pane>, parsed back exactly; ➕ New session last', () => {
   const kb = buildAttachKeyboard(50, [
     { paneId: '%3', label: 'api · omp' },
     { paneId: 'omp:4242', label: 'web · omp' },
   ]);
-  expect(kb).toEqual([[{ text: 'api · omp', callback_data: 'tgt:50:%3' }], [{ text: 'web · omp', callback_data: 'tgt:50:omp:4242' }]]);
+  expect(kb).toEqual([
+    [{ text: 'api · omp', callback_data: 'tgt:50:%3' }],
+    [{ text: 'web · omp', callback_data: 'tgt:50:omp:4242' }],
+    [{ text: '➕ New session', callback_data: 'tgn:50' }],
+  ]);
   for (const row of kb) expect(Buffer.byteLength(row[0].callback_data)).toBeLessThanOrEqual(64);
   expect(parseTopicAttachCallback('tgt:50:%3')).toEqual({ threadId: 50, paneId: '%3' });
   expect(parseTopicAttachCallback('tgt:50:omp:4242')).toEqual({ threadId: 50, paneId: 'omp:4242' });
-  for (const bad of [undefined, 'tgt:0:%3', 'tgt:50:', 'tgt:50:%x', 'tgt:-1:%3', 'tga:50:%3', 'tgt:50:%3:extra']) {
+  for (const bad of [undefined, 'tgt:0:%3', 'tgt:50:', 'tgt:50:%x', 'tgt:-1:%3', 'tga:50:%3', 'tgt:50:%3:extra', 'tgn:50']) {
     expect(parseTopicAttachCallback(bad)).toBeNull();
+  }
+});
+
+test('attach picker with no session running still offers ➕ New session', () => {
+  expect(buildAttachKeyboard(77, [])).toEqual([[{ text: '➕ New session', callback_data: 'tgn:77' }]]);
+  expect(parseTopicNewSessionCallback('tgn:77')).toEqual({ threadId: 77 });
+  for (const bad of [undefined, 'tgn:', 'tgn:0', 'tgn:-1', 'tgn:77:x', 'tgt:77:%3', 'tgnx:77']) {
+    expect(parseTopicNewSessionCallback(bad)).toBeNull();
   }
 });
 
@@ -543,6 +581,18 @@ test('an attach tap → topic-attach in message order (after same-batch held mes
   const r = stepUpdates([inTopic(8, { text: 'queued' }, 77), tap], unknown);
   expect(r.actions.map((a) => a.kind)).toEqual(['topic-hold', 'ack', 'topic-attach']);
   expect(r.actions[2]).toEqual({ kind: 'topic-attach', callbackQueryId: 'cb1', threadId: 77, paneId: '%3', messageId: 500 });
+  const off = stepUpdates([tap], makeOpts({ topicsEnabled: false }));
+  expect(off.actions).toEqual([{ kind: 'answer-callback', callbackQueryId: 'cb1', text: 'expired' }]);
+});
+
+test('a ➕ New session tap → topic-new-session in message order; OFF → expired', () => {
+  const tap: TgUpdate = {
+    update_id: 9,
+    callback_query: { id: 'cb1', from: { id: CHAT_ID }, data: 'tgn:77', message: { message_id: 500, chat: { id: CHAT_ID }, date: NOW } },
+  };
+  const r = stepUpdates([inTopic(8, { text: 'queued' }, 77), tap], unknown);
+  expect(r.actions.map((a) => a.kind)).toEqual(['topic-hold', 'ack', 'topic-new-session']);
+  expect(r.actions[2]).toEqual({ kind: 'topic-new-session', callbackQueryId: 'cb1', threadId: 77, messageId: 500 });
   const off = stepUpdates([tap], makeOpts({ topicsEnabled: false }));
   expect(off.actions).toEqual([{ kind: 'answer-callback', callbackQueryId: 'cb1', text: 'expired' }]);
 });

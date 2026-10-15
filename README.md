@@ -435,12 +435,14 @@ topic and an inbound topic message routes to its bound pane.
 
 Caveats while this is experimental:
 
-- **A topic never spawns anything.** Creating, renaming, closing or reopening a topic is only
-  recorded. A message in a topic that is not linked to a session (a topic you created, or an
+- **A topic never spawns anything on its own.** Creating, renaming, closing or reopening a topic is
+  only recorded. A message in a topic that is not linked to a session (a topic you created, or an
   implicit one) is held and the bot posts an **attach picker** there: tap a live session and the
   held messages reach it in order. If that session has no topic yet, this topic becomes its topic
-  (renamed to the session's name); otherwise the reply links its own topic. Held messages expire
-  after 10 minutes with a "N messages not delivered" reply, and survive a daemon restart.
+  (renamed to the session's name); otherwise the reply links its own topic. The picker's last
+  button, **➕ New session**, runs the `/new` directory → harness → model buttons right there and
+  starts an agent whose topic is this one, with the held text as its first task. Held messages
+  expire after 10 minutes with a "N messages not delivered" reply, and survive a daemon restart.
 - **Daemon verbs work in any topic.** `/status`, `/agent`, `/new`, `/tasks`, `/limit`, `/daily`
   and `/spend` are answered inside the topic, linked or not. `/stop` and `/kill` reach the topic's
   session.

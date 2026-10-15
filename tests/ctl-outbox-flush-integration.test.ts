@@ -62,6 +62,8 @@ async function until(pred: () => boolean, ms: number): Promise<boolean> {
 }
 
 test('the daemon flushes the outbox after a successful getUpdates, marked, into the original thread and anchor', async () => {
+  const createdAt = Date.now() - 60 * 60 * 1000;
+  const hhmm = new Date(createdAt).toISOString().slice(11, 16);
   await writeOutboxEntry(outboxDir, {
     sends: [
       {
@@ -70,7 +72,8 @@ test('the daemon flushes the outbox after a successful getUpdates, marked, into 
         threadAdvisory: false,
       },
     ],
-    createdAt: Date.UTC(2026, 9, 14, 19, 7),
+    // Relative to now: a fixed date ages past OUTBOX_LIMITS.maxAgeMs (24 h) and the entry is dropped.
+    createdAt,
     route: { paneId: '%3', cwd: '/w/proj' },
   });
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'w');
@@ -87,7 +90,7 @@ test('the daemon flushes the outbox after a successful getUpdates, marked, into 
   expect(replays).toHaveLength(1);
   const text = String(replays[0].text);
   expect(text.startsWith('⏳ доставлено с задержкой')).toBe(true);
-  expect(text).toContain('19:07 UTC');
+  expect(text).toContain(`${hhmm} UTC`);
   expect(text).toContain('<b>late report</b>');
   expect(replays[0].parse_mode).toBe('HTML');
   expect(replays[0].message_thread_id).toBe(9);

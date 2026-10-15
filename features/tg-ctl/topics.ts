@@ -193,23 +193,27 @@ export function slugifyTopicName(name: string, threadId: number): string {
 // --- unknown-topic hold (§4.4 row 4) ---
 
 // A hold lives 10 minutes from its FIRST item; later messages (album parts included) join the
-// same queue without extending it. On expiry the bot answers in the topic.
+// same queue without extending it. A ➕ New session tap restarts the clock once per flow (a second
+// tap while that flow is open is refused), so the hold lasts as long as the /new prompts it starts.
+// On expiry the bot answers in the topic.
 export const TOPIC_HOLD_TTL_SEC = 600;
 
 export interface TopicHold {
   threadId: number;
-  firstAt: number; // unix seconds of the first queued item
+  firstAt: number; // unix seconds of the first queued item, or of the ➕ New session tap
   payloads: TopicPayload[]; // FIFO
   pickerMessageId: number | null; // the attach picker once posted; null until a send succeeds
-  // The "no session is running" notice was posted for this hold; it is not repeated per message
-  // until a session exists and a real picker can be posted.
-  noSessionNoticeSent?: true;
+  // The "no session is running" notice posted for this hold (it carries ➕ New session); it is not
+  // repeated per message until a session exists and a real picker can be posted.
+  noSessionNoticeId?: number;
 }
 
-// Append `payload` to the topic's hold, creating the hold when there is none.
+// Append `payload` to the topic's hold, creating the hold when there is none. A message already
+// held (a pending batch replayed after a crash) is not queued twice.
 export function holdPayload(holds: TopicHold[], threadId: number, payload: TopicPayload, now: number): TopicHold[] {
   const i = holds.findIndex((h) => h.threadId === threadId);
   if (i === -1) return [...holds, { threadId, firstAt: now, payloads: [payload], pickerMessageId: null }];
+  if (holds[i].payloads.some((p) => p.messageId === payload.messageId)) return holds;
   const next = holds.slice();
   next[i] = { ...holds[i], payloads: [...holds[i].payloads, payload] };
   return next;
@@ -225,17 +229,35 @@ export function setHoldPicker(holds: TopicHold[], threadId: number, pickerMessag
   return holds.map((h) => {
     if (h.threadId !== threadId) return h;
     const next: TopicHold = { ...h, pickerMessageId };
-    delete next.noSessionNoticeSent;
+    delete next.noSessionNoticeId;
     return next;
   });
 }
 
-export function markNoSessionNotice(holds: TopicHold[], threadId: number): TopicHold[] {
-  return holds.map((h) => (h.threadId === threadId ? { ...h, noSessionNoticeSent: true } : h));
+export function markNoSessionNotice(holds: TopicHold[], threadId: number, noticeMessageId: number): TopicHold[] {
+  return holds.map((h) => (h.threadId === threadId ? { ...h, noSessionNoticeId: noticeMessageId } : h));
+}
+
+// The messages that carry this hold's buttons (picker, no-session notice): a tap on any other is stale.
+export function holdButtonMessages(hold: TopicHold): number[] {
+  return [hold.pickerMessageId, hold.noSessionNoticeId].filter((id): id is number => typeof id === 'number');
+}
+
+export function restartHoldClock(holds: TopicHold[], threadId: number, now: number): TopicHold[] {
+  return holds.map((h) => (h.threadId === threadId ? { ...h, firstAt: now } : h));
 }
 
 export function dropHold(holds: TopicHold[], threadId: number): TopicHold[] {
   return holds.filter((h) => h.threadId !== threadId);
+}
+
+// Put back a hold that was taken for a delivery that did not happen. Messages held in the topic
+// meanwhile (a fresh hold) queue after the returned ones; the fresh hold's buttons are kept.
+export function returnHold(holds: TopicHold[], taken: TopicHold): TopicHold[] {
+  const fresh = findHold(holds, taken.threadId);
+  if (!fresh) return [...holds, taken];
+  const merged: TopicHold = { ...fresh, firstAt: Math.min(taken.firstAt, fresh.firstAt), payloads: [...taken.payloads, ...fresh.payloads] };
+  return holds.map((h) => (h.threadId === taken.threadId ? merged : h));
 }
 
 // Split holds into those past TOPIC_HOLD_TTL_SEC (to answer and discard) and those still open.
@@ -296,7 +318,7 @@ export function parseHolds(raw: string | null): TopicHold[] {
       firstAt: rec.firstAt,
       payloads,
       pickerMessageId: isFiniteNumber(rec.pickerMessageId) ? rec.pickerMessageId : null,
-      ...(rec.noSessionNoticeSent === true ? { noSessionNoticeSent: true as const } : {}),
+      ...(isFiniteNumber(rec.noSessionNoticeId) ? { noSessionNoticeId: rec.noSessionNoticeId } : {}),
     });
   }
   return out;
@@ -346,18 +368,30 @@ export function parseTopicAttachCallback(data: string | undefined): { threadId: 
   return { threadId: Number(m[1]), paneId: m[2] };
 }
 
-// One button per live session, in the given (most recent first) order.
+// Callback data of the picker's last row, `tgn:<threadId>`: start a new session for this topic
+// (the /new directory → harness → model flow, spawned with this topic as its own — tg-cli#735).
+export const TOPIC_NEW_SESSION_CALLBACK_PREFIX = 'tgn';
+
+export function parseTopicNewSessionCallback(data: string | undefined): { threadId: number } | null {
+  const m = data?.match(/^tgn:([1-9]\d*)$/);
+  return m ? { threadId: Number(m[1]) } : null;
+}
+
+// One button per live session, in the given (most recent first) order, then ➕ New session.
 export function buildAttachKeyboard(
   threadId: number,
   sessions: ReadonlyArray<{ paneId: string; label: string }>,
 ): Array<Array<{ text: string; callback_data: string }>> {
-  return sessions.map((s) => [{ text: s.label, callback_data: `${TOPIC_ATTACH_CALLBACK_PREFIX}:${threadId}:${s.paneId}` }]);
+  return [
+    ...sessions.map((s) => [{ text: s.label, callback_data: `${TOPIC_ATTACH_CALLBACK_PREFIX}:${threadId}:${s.paneId}` }]),
+    [{ text: '➕ New session', callback_data: `${TOPIC_NEW_SESSION_CALLBACK_PREFIX}:${threadId}` }],
+  ];
 }
 
 export function attachPickerText(sessionCount: number): string {
   return sessionCount > 0
-    ? 'This topic is not linked to a session. Pick one — the held messages go there, in order:'
-    : 'This topic is not linked to a session, and no session is running. Start one and send again; held messages expire in 10 min.';
+    ? 'This topic is not linked to a session. Pick one, or start a new one — the held messages go there, in order:'
+    : 'This topic is not linked to a session, and no session is running. Start a new one here, or start one elsewhere and send again; held messages expire in 10 min.';
 }
 
 // Telegram caps a topic name at 128 characters.

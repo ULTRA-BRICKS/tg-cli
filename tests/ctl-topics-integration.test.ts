@@ -461,7 +461,7 @@ test('topics ON: an UNKNOWN topic holds messages + posts the attach picker once;
   expect(pickers).toHaveLength(1); // posted once per hold, not per message
   expect(pickers[0].message_thread_id).toBe(77);
   const buttons = (pickers[0].reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> }).inline_keyboard.flat();
-  expect(buttons.map((b) => b.callback_data).sort()).toEqual(['tgt:77:%1', 'tgt:77:%2']);
+  expect(buttons.map((b) => b.callback_data).sort()).toEqual(['tgn:77', 'tgt:77:%1', 'tgt:77:%2']);
   expect(injected(cfgDir)).toEqual([]); // held, not delivered anywhere yet
   await waitFor(() => reactions.length >= 2);
   expect(reactions.map((r) => (r.reaction as Array<{ emoji: string }>)[0].emoji)).toEqual(['✍️', '✍️']);

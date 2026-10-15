@@ -473,6 +473,7 @@ import {
   findTopic,
   findTopicCreatedBy,
   goneTopicReply,
+  holdButtonMessages,
   holdExpiredReply,
   holdPayload,
   markBound,
@@ -482,6 +483,8 @@ import {
   parseHolds,
   parseTopics,
   removeTopic,
+  restartHoldClock,
+  returnHold,
   serializeHolds,
   serializeTopics,
   setHoldPicker,
@@ -8421,7 +8424,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   const newSessionAwaitingDir = (): boolean => {
     reapNewSessions()
     for (const s of pendingNew.values()) {
-      if (s.status === "awaiting-dir") return true
+      // A ➕ New session flow takes its directory in its own topic (newSessionDirAnswer), never
+      // from General: a flat `/compact` then still reaches the flat agent.
+      if (s.status === "awaiting-dir" && s.bindThreadId === undefined) return true
     }
     return false
   }
@@ -10402,7 +10407,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   const answerDroppedHolds = async (dropped: TopicHold[], why: string): Promise<void> => {
     for (const hold of dropped) {
       log(`topic ${hold.threadId}: hold ${why} with ${hold.payloads.length} undelivered message(s)`)
-      if (hold.pickerMessageId !== null) void clearMessageKeyboard(ctx, hold.pickerMessageId)
+      for (const id of holdButtonMessages(hold)) void clearMessageKeyboard(ctx, id)
       for (const p of hold.payloads) recordFailed(p.messageId, `thread:${hold.threadId}`, `topic hold ${why}`)
       await sendToTopic(hold.threadId, holdExpiredReply(hold.payloads.length))
     }
@@ -10432,7 +10437,23 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (findTopic(loadTopics(), action.threadId) || topicOwner(action.threadId)) {
       return handleTopicRoute({ kind: "topic-route", threadId: action.threadId, payload: action.payload })
     }
+    const dirAnswer = newSessionDirAnswer(action)
+    if (dirAnswer) return handleNewAnswer(dirAnswer, action.threadId)
     return holdUnknownTopicPayload(action)
+  }
+
+  // A path typed in a topic whose ➕ New session flow awaits a directory (tg-cli#735) answers that
+  // prompt — an existing directory advances it, anything else gets the "not a directory" reply —
+  // and is not held for the new agent. That includes a bare `/word` and a path with spaces: the
+  // topic has no agent a harness command could be meant for (daemon verbs were answered before the
+  // topic rows). A reply counts too: card replies were answered before the topic rows. Topic
+  // messages never reach the flat dir-answer gate in stepUpdates, so this is the topic's own.
+  const newSessionDirAnswer = (action: Extract<Action, { kind: "topic-hold" }>): Extract<Action, { kind: "new-answer" }> | null => {
+    const p = action.payload
+    if (p.type !== "text") return null
+    if (![...pendingNew.values()].some((s) => s.bindThreadId === action.threadId && s.status === "awaiting-dir")) return null
+    const path = (p.plain ?? p.text).trim()
+    return isAbsolute(path) ? { kind: "new-answer", text: path, from: p.from, messageId: p.messageId } : null
   }
 
   // The hold itself, without the "bound meanwhile?" re-check: handleTopicRoute's awaiting-model drop
@@ -10448,17 +10469,18 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const hold = findHold(topicHolds, action.threadId)
     if (!hold || hold.pickerMessageId !== null) return true
     const sessions = attachSessions()
-    // With no live session there is nothing to pick: that notice is posted once per hold. A later
-    // message re-checks, and posts the real picker once a session has started.
-    if (sessions.length === 0 && hold.noSessionNoticeSent) return true
+    // With no live session there is nothing to attach to: that notice (with only ➕ New session) is
+    // posted once per hold. A later message re-checks, and posts the full picker once a session
+    // has started.
+    if (sessions.length === 0 && hold.noSessionNoticeId !== undefined) return true
     const pickerId = await sendMessage(ctx, attachPickerText(sessions.length), {
       message_thread_id: action.threadId,
-      ...(sessions.length > 0 ? { reply_markup: { inline_keyboard: buildAttachKeyboard(action.threadId, sessions) } } : {}),
+      reply_markup: { inline_keyboard: buildAttachKeyboard(action.threadId, sessions) },
     })
     // A failed send stays unrecorded, so the next message retries it.
     if (pickerId === null) return true
     setTopicHolds(
-      sessions.length > 0 ? setHoldPicker(topicHolds, action.threadId, pickerId) : markNoSessionNotice(topicHolds, action.threadId),
+      sessions.length > 0 ? setHoldPicker(topicHolds, action.threadId, pickerId) : markNoSessionNotice(topicHolds, action.threadId, pickerId),
     )
     return true
   }
@@ -10555,11 +10577,144 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return failed === 0
   }
 
+  // The picker's ➕ New session tap (tg-cli#735): the /new directory → harness → model flow runs
+  // in this topic, and its spawn takes the topic as the new session's own (spawnIntoHeldTopic).
+  // The hold stays until that spawn, so the picker's other buttons keep working meanwhile; the tap
+  // restarts its clock so it lasts as long as the prompts do. Only a button of the topic's current
+  // hold works: a tap after that hold was delivered or expired starts nothing.
+  const handleTopicNewSession = async (action: Extract<Action, { kind: "topic-new-session" }>): Promise<boolean> => {
+    reapNewSessions()
+    // Run the expiry sweep now, not on its next tick: a hold past its TTL is answered and gone, so a
+    // late tap cannot revive it.
+    await expireTopicHolds()
+    const hold = findHold(topicHolds, action.threadId)
+    if (!hold || (action.messageId !== null && !holdButtonMessages(hold).includes(action.messageId))) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired — nothing is waiting here")
+      if (action.messageId !== null) void clearMessageKeyboard(ctx, action.messageId)
+      return true
+    }
+    // A flow already open for this topic is answered, not restarted: the hold clock is extended
+    // once per flow, so re-tapping cannot keep the hold alive forever.
+    if ([...pendingNew.values()].some((s) => s.bindThreadId === action.threadId)) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "already started — answer the prompt below")
+      return true
+    }
+    // An open private-topic fallback decision blocks replacing the pending /new, as in handleNewCommand.
+    if (privateTopicFallbackState === "pending") {
+      if ([...pendingNew.values()].some((s) => s.status === "awaiting-private-topic-fallback")) {
+        await answerCallbackQuery(ctx, action.callbackQueryId, "finish the open /new first")
+        return false
+      }
+      privateTopicFallbackState = "unknown"
+    }
+    const now = Math.floor(Date.now() / 1000)
+    setTopicHolds(restartHoldClock(topicHolds, action.threadId, now))
+    // One /new in flight at a time, the same rule a typed /new follows. A replaced flow's prompt
+    // loses its buttons, so a second topic's tap never leaves a dead prompt that looks alive.
+    for (const replaced of pendingNew.values()) if (replaced.promptMessageId != null) void clearMessageKeyboard(ctx, replaced.promptMessageId)
+    pendingNew.clear()
+    const session: NewSession = {
+      token: `n${++newTokenSeq}`,
+      name: "",
+      status: "awaiting-dir",
+      task: "",
+      ts: now,
+      threadId: action.threadId,
+      bindThreadId: action.threadId,
+      sourceChatId: ctx.chatId,
+      sourceMessageId: action.messageId ?? 0,
+    }
+    pendingNew.set(session.token, session)
+    log(`topic ${action.threadId}: ➕ new session — asking for a directory`)
+    await answerCallbackQuery(ctx, action.callbackQueryId, "new session — pick a directory")
+    await askNewDir(session)
+    return true
+  }
+
+  // Spawn a ➕ New session into the topic it was started from. The held text messages, in order,
+  // are the agent's initial prompt: argv, so nothing races the agent's startup. The hold is taken
+  // and the topic bound before the first await — the model tap runs under its own token lock, so
+  // an attach tap on this topic may run concurrently — and it is put back if the spawn fails. Claims
+  // reach the ledger before the spawn, so a restored hold can never send them a second time. Held
+  // media and voice notes cannot ride an argv prompt and are answered in the topic. A topic whose
+  // hold is gone (delivered by an attach tap, or expired) or that got linked spawns nothing.
+  const spawnIntoHeldTopic = async (
+    session: NewSession,
+    threadId: number,
+    modelId: string,
+    slug: string,
+    promptMessageId: number | null,
+  ): Promise<boolean> => {
+    const hold = findHold(topicHolds, threadId)
+    if (!hold || findTopic(loadTopics(), threadId) || topicOwner(threadId)) {
+      pendingNew.delete(session.token)
+      if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
+      const why = hold ? "this topic was linked to a session meanwhile" : "nothing is waiting in this topic any more"
+      await sendMessage(ctx, `${why} — no new agent was spawned; send /new to start one`, replyContext(threadId))
+      return false
+    }
+    setTopicHolds(dropHold(topicHolds, threadId))
+    // The task rides one argv element, which Linux caps at 128 KiB (MAX_ARG_STRLEN): held texts
+    // join it in order up to half that; the rest is answered like an attachment, never a spawn
+    // that fails the same way on every Retry.
+    const TASK_MAX_BYTES = 64 * 1024
+    const texts: Array<Extract<TopicPayload, { type: "text" }>> = []
+    let taskBytes = Buffer.byteLength(session.task)
+    for (const p of hold.payloads) {
+      if (p.type !== "text") continue
+      const bytes = Buffer.byteLength(p.text) + 2
+      if (taskBytes + bytes > TASK_MAX_BYTES) break
+      texts.push(p)
+      taskBytes += bytes
+    }
+    const task = [session.task, ...texts.map((p) => p.text)].filter((t) => t.trim().length > 0).join("\n\n")
+    const target = `thread:${threadId}`
+    const ledgerEvent = (event: "claimed" | "delivered", messageId: number): LedgerEvent[] =>
+      deliveryLedger ? [{ ts: Date.now(), event, chat: deliveryLedger.chat, msg: messageId, target }] : []
+    // The sink contract (deliverInboundOnce): a claim that cannot reach the disk sends nothing.
+    const claimed = texts.map((p) => recordDelivery(ledgerEvent("claimed", p.messageId)))
+    if (claimed.includes(false)) {
+      for (const p of texts) recordFailed(p.messageId, target, "the delivery ledger could not be written")
+      setTopicHolds(returnHold(topicHolds, hold))
+      pendingNew.delete(session.token)
+      if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
+      await sendMessage(ctx, "the delivery ledger could not be written, so no agent was started — the messages are still held; pick again", replyContext(threadId))
+      return false
+    }
+    if (!(await spawnNewSessionWithTopic(session, modelId, threadId, slug, promptMessageId, task))) {
+      // Unclaimed and held again: the Retry button, or a pick from the picker, still sends them.
+      for (const p of texts) recordFailed(p.messageId, target, "the new session did not start")
+      setTopicHolds(returnHold(topicHolds, hold))
+      return false
+    }
+    for (const p of texts) {
+      recordDelivery(ledgerEvent("delivered", p.messageId))
+      await settleAckReaction(p.messageId, true)
+    }
+    await editSessionTopic(ctx, threadId, sessionTopicTitle(session.name))
+    const summary = `→ new session ${session.name}: ${texts.length} held message(s) as its first task`
+    log(`topic ${threadId}: ${summary}`)
+    for (const id of holdButtonMessages(hold)) void editMessageText(ctx, id, summary)
+    const passed = new Set(texts.map((p) => p.messageId))
+    const left = hold.payloads.filter((p) => !passed.has(p.messageId))
+    if (left.length > 0) {
+      for (const p of left) recordFailed(p.messageId, target, "not part of a new session's first task (attachment, or past its size cap)")
+      await sendToTopic(threadId, `${left.length} held message(s) not passed to ${session.name} — send them here again`)
+    }
+    return true
+  }
+
   // A hold older than TOPIC_HOLD_TTL_SEC is answered in its topic and discarded. Run on a timer
   // and once at bootstrap, so a hold that expired while the daemon was down still gets its reply.
-  // The sweep also enforces MAX_TOPIC_HOLDS on a restored store, answering what it evicts.
+  // The sweep also enforces MAX_TOPIC_HOLDS on a restored store, answering what it evicts. A hold
+  // whose ➕ New session flow is still open is not expired: the flow's own TTL (reapNewSessions)
+  // bounds it, and its spawn takes the hold.
   const expireTopicHolds = async (): Promise<void> => {
-    const { expired, open } = splitExpiredHolds(topicHolds, Math.floor(Date.now() / 1000))
+    reapNewSessions()
+    const flowing = new Set([...pendingNew.values()].map((s) => s.bindThreadId))
+    const { expired: due, open } = splitExpiredHolds(topicHolds, Math.floor(Date.now() / 1000))
+    const expired = due.filter((h) => !flowing.has(h.threadId))
+    open.push(...due.filter((h) => flowing.has(h.threadId)))
     const { kept, evicted } = capHolds(open)
     if (expired.length === 0 && evicted.length === 0) return
     setTopicHolds(kept)
@@ -10927,10 +11082,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const out = replyContext(session.threadId)
     const extra: Record<string, unknown> =
       choices.length > 0 ? { ...out, reply_markup: { inline_keyboard: buildNewDirKeyboard(session.token, choices) } } : out
+    const subject = session.bindThreadId !== undefined ? "New session for this topic" : `New agent \`${session.name}\``
     const prompt =
       choices.length > 0
-        ? `New agent \`${session.name}\`. Pick a recent project below, or send an absolute path (e.g. /Users/you/project).`
-        : `New agent \`${session.name}\`. Which directory should it work in? Send an absolute path (e.g. /Users/you/project).`
+        ? `${subject}. Pick a recent project below, or send an absolute path (e.g. /Users/you/project).`
+        : `${subject}. Which directory should it work in? Send an absolute path (e.g. /Users/you/project).`
     session.promptMessageId = await sendMessage(ctx, prompt, extra)
   }
 
@@ -10957,6 +11113,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   }
 
   const advanceNewAfterDir = async (session: NewSession): Promise<boolean> => {
+    // A ➕ New session (tg-cli#735) is named after its directory: the topic it came from has no
+    // name of the CTO's choosing (Telegram names an implicit topic after the message's first words).
+    if (session.bindThreadId !== undefined && session.dir) session.name = basename(session.dir)
     if (session.model && findModel(session.model)) return spawnNewSession(session, session.model, null)
     if (session.harness) await askNewModel(session)
     else await askNewHarness(session)
@@ -11000,6 +11159,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
     const slug = slugifyTopicName(session.name, 0)
+    if (session.bindThreadId !== undefined) return spawnIntoHeldTopic(session, session.bindThreadId, modelId, slug, promptMessageId)
     const spawnToken = `new-${session.token}-${Math.floor(Date.now() / 1000)}`
     // Private-chat topic: try to create a per-session topic BEFORE spawning so the window is born
     // with TG_TOPIC already set. Failure (capability/API error) → graceful flat fallback.
@@ -11055,12 +11215,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   //     the attach picker (the Retry button re-runs this whole path).
   //   - On spawn SUCCESS: upgrade to a `bound` binding; call stampSpawnToken for log greppability.
   // Supergroup topic /new has no task tail, but private-chat flat /new can pass one through here.
+  // `task` is the agent's initial prompt: the /new tail, or a ➕ New session's held text.
   const spawnNewSessionWithTopic = async (
     session: NewSession,
     modelId: string,
     threadId: number,
     slug: string,
     promptMessageId: number | null,
+    task = session.task,
   ): Promise<boolean> => {
     const out = replyContext(session.threadId)
     const ts = Math.floor(Date.now() / 1000)
@@ -11068,7 +11230,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const preliminary = { threadId, name: session.name, status: "awaiting-model" as const, path: session.dir, model: modelId, harness: findModel(modelId)?.kind, sourceChatId: session.sourceChatId, sourceMessageId: session.sourceMessageId, ts }
     const spawnToken = `${threadId}-${ts}-${nextSpawnNonce()}`
     updateTopics((topics) => appendTopic(topics, markSpawnPending(preliminary, spawnToken, ts)))
-    const spawned = spawnTopicWindow(threadId, slug, session.dir, modelId, session.task)
+    const spawned = spawnTopicWindow(threadId, slug, session.dir, modelId, task)
     if (!spawned.ok) {
       updateTopics((topics) => removeTopic(topics, threadId))
       // Report the error once and offer a Retry button (answers preserved), never re-ask the model.
@@ -11181,13 +11343,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // A typed path answer to an awaiting-dir /new session. Matches the SINGLE awaiting-dir session
   // (a flat chat has at most one /new in flight). Validates the abs path, then advances: if a model
   // was already supplied on the command line, spawn now; else ask the model.
-  const handleNewAnswer = async (action: Extract<Action, { kind: "new-answer" }>): Promise<boolean> => {
+  // `bindThreadId`: the topic a ➕ New session answer was typed in — it answers that topic's flow
+  // only; a flat answer (undefined) answers only a flat /new. Neither picks the other's prompt, even
+  // when a tap elsewhere replaced the pending /new between triage and here.
+  const handleNewAnswer = async (action: Extract<Action, { kind: "new-answer" }>, bindThreadId?: number): Promise<boolean> => {
     reapNewSessions()
     // The NEWEST awaiting-dir session owns the typed path (review #2): even though handleNewCommand
     // clears prior sessions on a fresh /new, take the newest as a belt-and-suspenders so the path
     // always lands on the prompt the user is actually answering.
     const session = [...pendingNew.values()]
-      .filter((s) => s.status === "awaiting-dir")
+      .filter((s) => s.status === "awaiting-dir" && s.bindThreadId === bindThreadId)
       .sort((a, b) => b.ts - a.ts)[0]
     if (!session) return false // no /new awaiting a dir — defensive (stepUpdates only emits when one is)
     const out = replyContext(session.threadId)
@@ -11207,7 +11372,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // dir prompt). A `/path/with/slashes` that doesn't exist IS a genuine bad-path attempt → the
       // dir error. An empty / non-slash answer (the stepUpdates gate only emits slash text, but be
       // defensive) also re-asks.
-      if (path.startsWith("/") && isLikelySlashCommand(path)) {
+      // A ➕ New session's topic has no agent to pass a command to: the bare word is a bad path there.
+      if (path.startsWith("/") && isLikelySlashCommand(path) && session.bindThreadId === undefined) {
         // A harness control-command passthrough (/compact, /clear), not new content — no
         // git-state banner (see withGitStateBanner's scope note).
         return injectViaTarget((target) => buildTextInjectPlan(target.pane.paneId, path), path, true, action.messageId)
@@ -12375,12 +12541,18 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "topic-attach":
       case "topic-event":
         return `thread:${action.threadId}`
-      case "agent-callback":
-      case "agent-cancel":
-        return `token:${action.token}`
+      // Every /new step — a typed /new, a ➕ New session tap, a dir/harness/model/retry tap — reads
+      // or replaces the one global pending /new: they run one at a time, so a tap can never act on
+      // a flow another step is replacing.
+      case "topic-new-session":
+      case "new-command":
       case "new-dir":
+      case "new-harness":
       case "new-model":
       case "new-retry":
+        return "new-session"
+      case "agent-callback":
+      case "agent-cancel":
         return `token:${action.token}`
       case "answer-question":
       case "close-question-card":
@@ -12650,6 +12822,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return handleTopicHold(action)
       case "topic-attach":
         return handleTopicAttach(action)
+      case "topic-new-session":
+        return handleTopicNewSession(action)
       case "topic-event":
         return handleTopicEvent(action)
       case "new-command":
