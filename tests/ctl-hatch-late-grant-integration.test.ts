@@ -257,11 +257,10 @@ test('(a)+(j) GRACE-ONLY tap after a daemon restart: grant minted from the grace
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
-  const daemon = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '300' });
+  const daemon = await startDaemon(cfgDir, tg.port);
 
-  // The ask retires (grace written durably); the tiny retention window + a daemon
-  // restart removes the retained ENTRY, so the tap below can only be addressed
-  // through the grace store — the restart ALSO proves the grace store is durable.
+  // The ask retires (grace written durably); a daemon restart then proves the grace
+  // store is durable — the tap below mints from it.
   const ask = startAsk(cfgDir, tg.port, hatchAsk());
   expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
   ask.kill(9);
@@ -273,10 +272,9 @@ test('(a)+(j) GRACE-ONLY tap after a daemon restart: grant minted from the grace
 
   daemon.kill('SIGTERM');
   await daemon.exited;
-  await Bun.sleep(500); // the retention window (300ms) closes while the daemon is down
-  await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '300' });
+  await startDaemon(cfgDir, tg.port);
 
-  // The late tap: no pending, no retained entry → the grace store answers.
+  // The late tap on the restored card mints the grant from its grace record.
   tg.push([tap(tg.allowData()!, 911, 1)]);
   expect(await until(() => tg.answeredCbs().some((c) => c.text.includes('grant issued')), 8000)).toBe(true);
   expect(await until(() => (grantStoreOf(cfgDir).grants?.length ?? 0) === 1, 5000)).toBe(true);

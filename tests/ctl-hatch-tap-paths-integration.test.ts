@@ -327,15 +327,6 @@ async function expiredCard(cfgDir: string, tg: MockTg): Promise<number> {
   return 1;
 }
 
-// Past the (shrunk) 12h retention the running daemon's sweep prunes the retained entry;
-// only the grace record still answers for the card.
-async function graceOnlyCard(cfgDir: string, tg: MockTg): Promise<number> {
-  const cardId = await expiredCard(cfgDir, tg);
-  expect(await until(() => daemonLog(cfgDir).includes('ask-abandoned-long-outage'))).toBe(true);
-  expect(await until(() => tg.cards.get(cardId)!.text.includes('a long wait has passed'))).toBe(true);
-  return cardId;
-}
-
 async function expectMintedAndDelivered(cfgDir: string, tg: MockTg, cardId: number): Promise<Record<string, unknown>> {
   expect(await until(() => grantStore(cfgDir).grants.length === 1)).toBe(true);
   const grant = grantStore(cfgDir).grants[0]!;
@@ -388,12 +379,12 @@ test('1. a late Deny on a retained card is FINAL: grace retired, a raced Approve
   await stopDaemon(daemon);
 }, 90_000);
 
-test('2. past the 12h retention the long-outage edit keeps Approve/Reject on the card, and the tap mints the grant', async () => {
+test('2. a long-expired card keeps Approve/Reject (no retention give-up, tg-cli#705), and the tap mints the grant', async () => {
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
-  const daemon = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '300' });
-  const cardId = await graceOnlyCard(cfgDir, tg);
+  const daemon = await startDaemon(cfgDir, tg.port);
+  const cardId = await expiredCard(cfgDir, tg);
 
   tapIfShown(tg, cardId, 'approve', 711);
   expect(await toastFor(tg, 711)).toContain('grant issued');
@@ -406,8 +397,8 @@ test('3. a text reply "да" to a grace-only card approves it like a tap', async
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
-  const daemon = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '300' });
-  const cardId = await graceOnlyCard(cfgDir, tg);
+  const daemon = await startDaemon(cfgDir, tg.port);
+  const cardId = await expiredCard(cfgDir, tg);
 
   textReply(tg, cardId, 'да', 721);
   await expectMintedAndDelivered(cfgDir, tg, cardId);
@@ -419,8 +410,8 @@ test('4. a Deny on a grace-only card is final: the grace record is retired and a
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
-  const daemon = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '300' });
-  const cardId = await graceOnlyCard(cfgDir, tg);
+  const daemon = await startDaemon(cfgDir, tg.port);
+  const cardId = await expiredCard(cfgDir, tg);
 
   tapIfShown(tg, cardId, 'deny', 731);
   expect(await toastFor(tg, 731)).toContain('denied');
@@ -476,23 +467,21 @@ test('6. a daemon restart while a paneless hatch ask is LIVE keeps its card answ
   await stopDaemon(daemon2);
 }, 90_000);
 
-test('7. a restart past the retention window keeps the restored card tappable: the tap mints the grant', async () => {
+test('7. a restart long after the ask expired keeps the restored card tappable: the tap mints the grant', async () => {
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
-  const env = { TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '300' };
-  const daemon1 = await startDaemon(cfgDir, tg.port, env);
+  const daemon1 = await startDaemon(cfgDir, tg.port);
   const ask = startAsk(cfgDir, tg.port, hatchAsk({ timeoutMs: 600_000 }));
   expect(await until(() => tg.cards.size === 1)).toBe(true);
   expect(await until(() => daemonLog(cfgDir).includes('ask-forward posted'))).toBe(true);
 
   await stopDaemon(daemon1);
   await ask.exited;
-  // Down for longer than the (shrunk) retention: the restore itself retires the card.
-  await Bun.sleep(500); // real clock on purpose — the retention window elapses while no daemon runs
-  const daemon2 = await startDaemon(cfgDir, tg.port, env);
-  expect(await until(() => daemonLog(cfgDir).includes('ask-abandoned-long-outage'))).toBe(true);
-  expect(await until(() => tg.cards.get(1)!.text.includes('a long wait has passed'))).toBe(true);
+  // No retention timer (tg-cli#705): the restore keeps the card open, whatever the downtime.
+  const daemon2 = await startDaemon(cfgDir, tg.port);
+  expect(await until(() => daemonLog(cfgDir).includes('questions restored'))).toBe(true);
+  expect(daemonLog(cfgDir)).not.toContain('ask-abandoned-long-outage');
 
   tapIfShown(tg, 1, 'approve', 761);
   expect(await toastFor(tg, 761)).toContain('grant issued');
@@ -533,9 +522,9 @@ test('9. after the grace window closed, a tap mints nothing and retires the card
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
-  const env = { TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '300', TG_CTL_GRACE_MS: '15000' };
+  const env = { TG_CTL_GRACE_MS: '15000' };
   const daemon1 = await startDaemon(cfgDir, tg.port, env);
-  const cardId = await graceOnlyCard(cfgDir, tg);
+  const cardId = await expiredCard(cfgDir, tg);
   expect(buttonData(tg.cards.get(cardId)!.keyboard, 'approve')).not.toBeNull();
   const graceExpiresAt = Number(grantStore(cfgDir).grace[0]!.graceExpiresAt);
 
@@ -616,9 +605,9 @@ test('12. past the grace window, a Deny still revokes the unused grant the card 
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
-  const env = { TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '300', TG_CTL_GRACE_MS: '8000' };
+  const env = { TG_CTL_GRACE_MS: '8000' };
   const daemon1 = await startDaemon(cfgDir, tg.port, env);
-  const cardId = await graceOnlyCard(cfgDir, tg);
+  const cardId = await expiredCard(cfgDir, tg);
   tapIfShown(tg, cardId, 'approve', 821);
   expect(await toastFor(tg, 821)).toContain('grant issued');
   const grant = await expectMintedAndDelivered(cfgDir, tg, cardId);
@@ -801,7 +790,7 @@ test('18. a restart whose grace record cannot be written leaves the card in the 
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
-  const env = { TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '300' };
+  const env = {};
   const daemon1 = await startDaemon(cfgDir, tg.port, env);
   const ask = startAsk(cfgDir, tg.port, hatchAsk({ timeoutMs: 600_000 }));
   expect(await until(() => tg.cards.size === 1)).toBe(true);

@@ -120,7 +120,7 @@ test('plain message while a /new awaits its dir → new-answer', () => {
 test('plain message with NO /new in flight → injects as normal (1:1 unchanged)', () => {
   const r = stepUpdates([upd(15, { text: 'hello agent' })], makeOpts({ newSessionAwaitingDir: () => false }));
   const a = r.actions.find((x) => x.kind === 'inject-text');
-  expect(a).toEqual({ kind: 'inject-text', text: '[TG from Alex] hello agent', messageId: 15 });
+  expect(a).toEqual({ kind: 'inject-text', text: '[TG from Alex] hello agent', messageId: 15, plain: 'hello agent' });
   expect(r.actions.some((x) => x.kind === 'new-answer')).toBe(false);
 });
 
@@ -140,6 +140,7 @@ test('REGRESSION (review #1): ordinary prose mid-/new is NOT swallowed — it in
     kind: 'inject-text',
     text: '[TG from Alex] fix the bug',
     messageId: 19,
+    plain: 'fix the bug',
   });
 });
 

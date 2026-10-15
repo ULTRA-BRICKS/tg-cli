@@ -142,7 +142,7 @@ Goal: a tap always does something visible; a pending question stays open until i
 
 - **P0** #403 critical hatch approvals ("Approve в хетчах так и не нажимаются")
 - **P0** #304 pending-prompt detection per harness (evidence sits uncommitted, rescue via #470)
-- #464 remind about unanswered questions (new)
+- #705 📥 Inbox topic + close-on-relevance replaced the #403/#464 "⏳ still waiting" reminders (#569 #570 superseded)
 - late delivery / persistence: #57 #58 #99 #233 #283 #268 #309 #317
 - hatch: #356 `tg hatches`, #402 card design, #433 grant protocol, #327 photo hatch
 - design decisions pending: #127 defer queue vs "no queue", #149 / PR #368 block-and-wait, #373 #374

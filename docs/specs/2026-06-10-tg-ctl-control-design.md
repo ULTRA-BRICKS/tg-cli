@@ -313,7 +313,8 @@ Claude Code hook installation remains an automation layer over that handoff
   the WRONG prompt — a late tap on an abandoned member is refused with a "the
   terminal took over" toast WITHOUT mutating state, so the retained entry keeps
   doubling as the daemon-bounce reconnect anchor (re-attach, no duplicate card)
-  and stale members still expire via the retention window. The client also
+  and stays open until a relevance signal closes it (tg-cli#705: no retention
+  window — answer, withdraw, Dismiss). The client also
   REPAIRS a single-question reply from a stale RUNNING daemon that predates
   `hookEventName` (live-symlink deploys update the hook client before the
   daemon restarts).
@@ -455,13 +456,10 @@ into its pane, a permission's decision is QUEUED and delivered automatically on 
 matching reconnect within its retention window (safety WITHIN that window comes
 from requestId being scoped to the prompt turn, not a delivery timer —
 `TG_CTL_QUEUED_DECISION_NOTICE_MS` only triggers a one-time proactive notice past
-a shorter threshold, it never clears the queue by itself), and only past its
-retention window with no delivery does the card actually
-expire/give up (with a proactive "still no connection" notice, not a silent drop) —
-`ABANDONED_RETAIN_MS` (default 30 min) for a question, or the much longer
-`ABANDONED_PERMISSION_RETAIN_MS` (default 12h, tg-cli#182) for a permission,
-since its answer stays fully actionable for hours (the harness may still be sitting
-on its own terminal fallback prompt) unlike a question's fast-fading value.
+a shorter threshold, it never clears the queue by itself). Superseded by tg-cli#705
+(`docs/specs/2026-10-13-question-inbox-design.md`): there is no retention window any
+more — a retained card stays answerable until a relevance signal (answer, withdraw,
+newer hatch request, sibling decision, Dismiss) closes it.
 The plain "expire on timeout, reject a late tap" behavior described just above
 still applies UNSCOPED (no `paneId` — no pane to late-deliver to, no card worth
 retaining).

@@ -247,8 +247,12 @@ import {
 } from "./features/tg-ctl/session-target"
 import {
   createTopicEnsurer,
+  findSessionForAsker,
   findSessionForCard,
   findSessionForLookup,
+  parseAskerIdentity,
+  ancestorPidChain,
+  type AskerIdentity,
   HARNESS_AGENT,
   noteTopicMiss,
   paneLocatorOf,
@@ -258,6 +262,7 @@ import {
   topicTitleFor,
   type SessionLookup,
 } from "./features/tg-ctl/session-topics"
+import { tmuxServerPidFromEnv } from "./features/cli/session-topic"
 import { createTopicRenamer, type TopicRenamer } from "./features/tg-ctl/topic-rename"
 import { isThreadRejection, isTopicDeletedError } from "./features/transport/telegram"
 import { installOmpLiveExtension, runOmpLiveCommand } from "./tools/omp-live-cli.mjs"
@@ -310,7 +315,6 @@ import {
   type CodeFreshness,
 } from "./features/tg-ctl/code-freshness"
 import {
-  abandonedLongOutageText,
   abandonedMultiText,
   abandonedPermissionText,
   buildAnsweredQuestionText,
@@ -321,8 +325,8 @@ import {
   callbackRequestId,
   clampRequestTimeoutMs,
   collectQuestionAnswers,
+  closedQuestionText,
   formatAgentHookOutput,
-  hatchAbandonedLongOutageText,
   hatchAbandonedPermissionText,
   hatchGrantApprovedText,
   hatchParseMode,
@@ -347,19 +351,28 @@ import {
   type QuestionStoreData,
 } from "./features/tg-ctl/question-store"
 import {
-  markCriticalReminderSent,
-  planCriticalReminder,
-  type DaemonCriticalState,
-} from "./features/tg-ctl/hatch-critical-reminder"
-import {
-  markUnansweredReminderSent,
-  parseUnansweredReminderState,
-  planUnansweredReminder,
-  serializeUnansweredReminderState,
-  unansweredReminderText,
-  type OpenQuestion,
-  type UnansweredReminderState,
-} from "./features/tg-ctl/unanswered-reminder"
+  CLOSE_STATUS,
+  emptyInboxState,
+  emptyMirrors,
+  freeTextAnswer,
+  ANY_CWD,
+  hatchSiblingKeys,
+  hatchSiblingsOf,
+  INBOX_TOPIC_NAME,
+  inboxMirrorMessage,
+  legacyReminderMessages,
+  hasLegacyCriticalState,
+  inboxEntryOf,
+  parseInboxState,
+  parseWithdrawLine,
+  planInboxSync,
+  parseWithdrawArgv,
+  serializeInboxState,
+  sessionCardKeys,
+  WITHDRAW_USAGE,
+  type OpenCard,
+  type WithdrawRequest,
+} from "./features/tg-ctl/question-inbox"
 import {
   buildGraceRecord,
   buildGrantRecord,
@@ -571,6 +584,12 @@ export const USAGE = `Usage:
                          # Approve/Reject card, exit 0 ONLY on an Approve tap; reject,
                          # timeout (default 300s, max 900s), daemon down or no creds
                          # exit 1. Works without tmux and without a registration.
+                         # A SIGTERM/SIGINT/SIGHUP while either ask waits withdraws its card.
+  tg-ctl withdraw <requestId> | --hook-id <id> [--cwd <dir>] [--reason <text>]
+                         # close question cards that are no longer relevant: one request, or
+                         # every open hatch card of a hook id (in one directory with --cwd);
+                         # the card shows "⏹ withdrawn: <reason>" and leaves the 📥 Inbox.
+                         # exit 0 closed ≥1, 1 nothing matched, 2 usage, 69 daemon unreachable
   tg-ctl ask --verify-grant <approval_id> --hook <hook_id>
                          # internal: consume a late-approval grant by its id
                          # (single-use, bound to hook + operation + cwd); stdin
@@ -887,8 +906,21 @@ async function botPostResult(ctx: Ctx, method: string, body: unknown): Promise<B
   }
 }
 
+// The 📥 Inbox topic (tg-cli#705) carries ONLY question-card copies, which the daemon's inbox
+// sync posts straight through botPostResult. Every other daemon send — notices, replies, /status,
+// pickers, session posts — that would land there goes to General instead. Set by the daemon
+// whenever its Inbox state changes; null outside a daemon or before the topic exists.
+let inboxThreadId: number | null = null
+function outsideInbox<T extends { message_thread_id?: unknown }>(extra: T): T {
+  if (inboxThreadId === null || extra.message_thread_id !== inboxThreadId) return extra
+  log(`inbox guard: a non-card send aimed at the Inbox topic ${inboxThreadId} goes to General`)
+  const rest = { ...extra }
+  delete rest.message_thread_id
+  return rest
+}
+
 async function sendMessage(ctx: Ctx, text: string, extra: Record<string, unknown> = {}): Promise<number | null> {
-  const json = await botPost(ctx, "sendMessage", { chat_id: ctx.chatId, text, ...extra })
+  const json = await botPost(ctx, "sendMessage", { chat_id: ctx.chatId, text, ...outsideInbox(extra) })
   const result = json?.result
   if (!result || typeof result !== "object") return null
   const messageId = (result as { message_id?: unknown }).message_id
@@ -1008,20 +1040,15 @@ async function clearMessageKeyboard(ctx: Ctx, messageId: number): Promise<void> 
   await botPost(ctx, "editMessageReplyMarkup", { chat_id: ctx.chatId, message_id: messageId })
 }
 
-// Retire a previously-sent reminder ping (tg-cli#403 critical cadence, tg-cli#464
-// unanswered-question reminder): delete it outright, so reminders never pile up in the
-// chat; when Telegram refuses the delete (message too old for a bot delete, already
-// gone, …) edit it to `placeholder` instead. Never throws (botPostResult swallows
-// transport/HTTP failures like every botPost* helper). Only ever called on a reminder's
-// own message id — never on an original request card. `chatId` is the chat the reminder
-// was POSTED in (tg-cli#518): after a TG_CHAT_ID change it is not ctx.chatId.
+// Retire a reminder ping the removed #403 / #464 reminders left in the chat (tg-cli#705's
+// one-shot startup migration): delete it outright; when Telegram refuses the delete (message
+// too old for a bot delete, already gone, …) edit it to `placeholder` instead. Never throws
+// (botPostResult swallows transport/HTTP failures like every botPost* helper). `chatId` is the
+// chat the reminder was POSTED in (tg-cli#518): after a TG_CHAT_ID change it is not ctx.chatId.
 async function retireReminderMessage(ctx: Ctx, chatId: number, messageId: number, placeholder: string): Promise<void> {
   const result = await botPostResult(ctx, "deleteMessage", { chat_id: chatId, message_id: messageId })
   if (!result.ok) void botPost(ctx, "editMessageText", { chat_id: chatId, message_id: messageId, text: placeholder })
 }
-const REMINDER_SUPERSEDED_TEXT = "⏰ reminder superseded by a newer one"
-// Every card the reminder listed left the open set — answered, or expired by retention.
-const REMINDER_CLOSED_TEXT = "⏰ reminder closed — none of its questions is open any more"
 
 // Set a reaction on a message (tg-cli#114 lifecycle: 👀 working → 😴 stalled →
 // 👌 done). Skips an emoji Telegram would reject (⏳/✅ are REACTION_INVALID) so
@@ -1054,7 +1081,7 @@ async function sendRich(
     log(`sendRich invalid html: ${check.error}`)
     return null
   }
-  const json = await botPost(ctx, "sendRichMessage", { chat_id: ctx.chatId, rich_message: { html }, ...extra })
+  const json = await botPost(ctx, "sendRichMessage", { chat_id: ctx.chatId, rich_message: { html }, ...outsideInbox(extra) })
   const result = json?.result
   if (!result || typeof result !== "object") return null
   const messageId = (result as { message_id?: unknown }).message_id
@@ -2159,7 +2186,9 @@ function sessionTopic(ctx: Ctx, key: SessionKey): Promise<number | null> {
     threadIdOf: (k) => currentRegistry(ctx).sessions.find((e) => e.key === k)?.threadId ?? null,
     create: (k) => createSessionTopic(ctx, k),
   })
-  return Promise.race([topicEnsurer(key), Bun.sleep(TOPIC_WAIT_MS).then(() => null)])
+  // The 📥 Inbox topic is never a session's topic (tg-cli#705): not for a card, not for a `tg`
+  // send, not for `tg --session-topic`.
+  return Promise.race([topicEnsurer(key), Bun.sleep(TOPIC_WAIT_MS).then(() => null)]).then((t) => (t === inboxThreadId ? null : t))
 }
 
 // A threaded send fell back to General (§4.5): count the miss, recreate the topic once it is
@@ -2196,6 +2225,7 @@ function clearSessionTopicMisses(ctx: Ctx, key: SessionKey): void {
 // The CLI side of the same fallback is `send()` in features/transport/telegram.ts
 // (`threadRetryDelayMs`); a change to what counts as a rejection belongs in both.
 async function sendToSessionTopic(ctx: Ctx, key: SessionKey, threadId: number, text: string, extra: Record<string, unknown> = {}): Promise<number | null> {
+  if (threadId === inboxThreadId) return sendMessage(ctx, text, extra) // never into the 📥 Inbox (tg-cli#705)
   const body = { chat_id: ctx.chatId, text, ...extra, message_thread_id: threadId }
   let resp = await botPostResult(ctx, "sendMessage", body)
   if (!resp.ok && isThreadRejection(resp.description) && !isTopicDeletedError(resp.description)) {
@@ -4700,9 +4730,8 @@ interface PendingButton {
   req: ButtonRequest
   socket: Socket
   messageId: number | null
-  // ms epoch when this entry was created (or revived). Persisted so a restored
-  // entry carries its true age into the retention window, and so the durable file
-  // can be ordered/pruned by recency.
+  // ms epoch when this entry was created (or revived). Persisted so the durable file
+  // can be ordered by recency, and shown as the card's age in its 📥 Inbox copy.
   at: number
   // Only a SCOPED-less (unscoped) question arms an abandon timer; a scoped
   // question waits forever, so its timer is undefined. clearTimeout(undefined)
@@ -4711,14 +4740,6 @@ interface PendingButton {
   timer?: ReturnType<typeof setTimeout>
   finalText?: string
   finalReplyMarkup?: ButtonMessagePayload["reply_markup"]
-  // tg-cli#403: critical-mode reminder scheduling state (undefined unless
-  // req.critical === true). Lives here rather than a parallel store because a
-  // critical entry spends most of its life in EXACTLY this map — its
-  // underlying process/socket is still connected, simply awaiting a decision
-  // (see forwardAndPostQuestion's skip of the raw UNSCOPED_ABANDON_MS timer
-  // for a critical request). Carried over into AbandonedButton.criticalState
-  // if it later transitions there (retainAbandonedQuestion).
-  criticalState?: DaemonCriticalState
 }
 
 // A SCOPED question whose hook socket has CLOSED — the agent's 120s hook budget
@@ -4755,11 +4776,6 @@ interface AbandonedButton {
   // the notice for an entry that already got one (would read as spam / a false
   // "still no connection" repeat right after a bounce).
   queuedDecision?: { value: string; label: string; decision: PermissionDecision; at: number; notifiedAt?: number }
-  // tg-cli#403: see PendingButton.criticalState's doc comment — the same
-  // field, carried over by retainAbandonedQuestion when a critical entry's
-  // socket closes before a decision lands, and restored from disk (see
-  // question-store.ts's matching RetainedQuestionRecord.criticalState).
-  criticalState?: DaemonCriticalState
 }
 
 // Shared by permissionRequestIdForMessage's lookups (PendingButton, AbandonedButton
@@ -4818,40 +4834,12 @@ function pruneAnsweredButtons(answered: Map<string, AnsweredButton>, now: number
   }
 }
 
-// How long a socket-closed (abandoned) scoped question stays retained for
-// late-delivery + reconnect. Longer than the 5-min answered window: the human may
-// tap the card minutes after the hook budget elapsed and the agent fell back to the
-// terminal, and that answer is still worth delivering to the still-running agent.
-// Env-overridable so the integration tests exercise the past-window prune without a
-// real 30-min wait; production never sets it.
-const ABANDONED_RETAIN_MS = (() => {
-  const raw = Number(process.env.TG_CTL_ABANDONED_RETAIN_MS)
-  return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60_000
-})()
-
-// PERMISSIONS get a MUCH longer retention window than questions before the
-// daemon gives up and posts abandonedLongOutageText's "never delivered" notice
-// (tg-cli#182: Alex reported a permission going stale — and the card claiming
-// it was "never delivered" — well before he'd had a realistic chance to check
-// his phone, e.g. overnight or a few hours away). A question always has a live
-// human decision to make in the moment (its own value fades fast if stale), but
-// a permission's answer is still fully actionable hours later: the harness may
-// still be sitting on its own terminal fallback prompt (late-delivery via
-// pane-digit-injection, tg-cli#267) or a hook may still reconnect and consume a
-// queued decision (queuedDecision, above) — neither is time-bounded by anything
-// on the harness side, so tg-ctl's own give-up window was the only thing
-// artificially cutting this short. Env-overridable for tests; production never
-// sets it.
-const ABANDONED_PERMISSION_RETAIN_MS = (() => {
-  const raw = Number(process.env.TG_CTL_ABANDONED_PERMISSION_RETAIN_MS)
-  return Number.isFinite(raw) && raw > 0 ? raw : 12 * 60 * 60_000
-})()
-
 // Grant protocol v1.1 windows (tg-cli#398): how long an EXPIRED hatch ask stays
 // addressable for a late Approve tap (grace), and how long a minted grant stays
 // consumable (grant TTL). Both default 24h; env-overridable so integration
 // tests can expire a grant/grace without a real 24h wait — production never
-// sets them. (Same override style as TG_CTL_UNSCOPED_TIMEOUT_MS.)
+// sets them. These are security windows, not question retention: an open card
+// stays open until a relevance signal closes it (tg-cli#705).
 const GRACE_WINDOW_MS = (() => {
   const raw = Number(process.env.TG_CTL_GRACE_MS)
   return Number.isFinite(raw) && raw > 0 ? raw : 24 * 60 * 60_000
@@ -4873,60 +4861,23 @@ const ASK_LIVE_MAX_MS = Math.max(ASK_TIMEOUT_MAX_MS, UNSCOPED_ABANDON_MS)
 const DECIDED_RETAIN_MS = GRACE_WINDOW_MS + ASK_LIVE_MAX_MS
 const decidedRetainMs = (req: ButtonRequest): number | null => (req.critical ? null : DECIDED_RETAIN_MS)
 
-// PURE — the single source of truth for "which retention window applies to
-// this entry's kind" (review finding, round 5: this ternary was duplicated
-// verbatim at 5+ call sites, risking future drift) and "is it past that
-// window right now". EXPORTED for direct unit testing (review finding, round
-// 6: forcing the exact race between "expired" and "the periodic sweep
-// already caught it" isn't reliable from outside a real running daemon
-// process — see tests/ctl-question-durable-integration.test.ts's own comment
-// on 'PERM QUEUE EXPIRED AT RECONNECT' — so the boolean logic itself is
-// tested directly here instead, deterministically, with no timing race).
-// Scalar args, not an entry object (review finding: avoids a throwaway
-// wrapper allocation at every restore-loop call site).
-// `critical` (tg-cli#403, optional — every pre-existing call/test passes only
-// `kind`, unaffected): a critical request's decision must remain deliverable no
-// matter how long the human takes, the entire reason critical mode exists —
-// bypasses the kind-based window ENTIRELY (Infinity, never a real setTimeout
-// delay — this is only ever compared via subtraction, like every other use of
-// this function) rather than merely lengthening it. Without this, a critical
-// hatch request whose process disconnected would still silently expire (and
-// discard a genuinely late human tap) once ABANDONED_PERMISSION_RETAIN_MS
-// (12h) elapsed, directly contradicting "wait indefinitely" (review finding).
-export function retainMsFor(kind: ButtonRequest["kind"], critical?: boolean): number {
-  if (critical === true) return Infinity
-  return kind === "permission" ? ABANDONED_PERMISSION_RETAIN_MS : ABANDONED_RETAIN_MS
-}
-export function isAbandonedExpired(kind: ButtonRequest["kind"], at: number, now: number, critical?: boolean): boolean {
-  return now - at > retainMsFor(kind, critical)
-}
-
 // PURE decision for what a hook reconnect should do about a retained entry's
-// QUEUED permission decision — extracted from handleHookSocketLine (review
-// finding, tg-cli#182 round 8: five straight rounds asked for deterministic
-// coverage of this exact branch, since exercising it through a REAL daemon
-// racing a REAL sweep is not reliably forceable — see this module's unit
-// tests for `decideQueuedPermissionReconnect`, which call it directly with
-// no daemon, no timing race, no sweep to race against). Order matters and
-// mirrors the ORIGINAL single if/else-if chain exactly (round 7's fix): a
-// second, independent if-chain re-evaluating overlapping conditions is
-// EXACTLY what produced round 7's bug (an expired decision ALSO logging a
-// false "payload mismatch") — one function, one return value, one caller
-// switch, structurally impossible to double-fire.
+// QUEUED permission decision — extracted from handleHookSocketLine so the
+// branch is unit-testable with no daemon and no timing race. Order matters:
+// one function, one return value, one caller switch. There is no expiry
+// outcome (tg-cli#705): a queued decision stays deliverable until a relevance
+// signal closes its card.
 export type QueuedPermissionReconnectOutcome =
   | { kind: "no-queued-decision" }
-  | { kind: "expired" }
   | { kind: "no-turn-proof" }
   | { kind: "turn-mismatch" }
   | { kind: "payload-mismatch" }
   | { kind: "deliver"; queuedDecision: NonNullable<AbandonedButton["queuedDecision"]> }
 export function decideQueuedPermissionReconnect(
-  retained: Pick<AbandonedButton, "req" | "at" | "queuedDecision">,
+  retained: Pick<AbandonedButton, "req" | "queuedDecision">,
   req: ButtonRequest,
-  now: number,
 ): QueuedPermissionReconnectOutcome {
   if (!retained.queuedDecision) return { kind: "no-queued-decision" }
-  if (isAbandonedExpired(retained.req.kind, retained.at, now, retained.req.critical)) return { kind: "expired" }
   if (!queuedDecisionCanAutoDeliver(retained.req)) return { kind: "no-turn-proof" }
   if (retained.req.promptTurnId !== req.promptTurnId) return { kind: "turn-mismatch" }
   if (!permissionPayloadMatches(retained.req, req)) return { kind: "payload-mismatch" }
@@ -4944,15 +4895,8 @@ export function decideQueuedPermissionReconnect(
 // How long a QUEUED permission decision can wait with no reconnect before the
 // human gets a PROACTIVE "still waiting to reconnect" notice — a NOTICE
 // threshold, not an expiry (Alex tg#9982: a queued tap must never be silently
-// dropped/demoted on the SHORT question timer; while it's pending it stays
-// pending in Telegram until there's 100% confirmation it's resolved, or the
-// daemon genuinely gives up after the full ABANDONED_PERMISSION_RETAIN_MS
-// (tg-cli#182, default 12h — NOT the bare ABANDONED_RETAIN_MS question
-// window) with its own proactive notice). Past this NOTICE threshold the
-// queue is NOT cleared and stays fully eligible for automatic delivery — see
-// noticeStaleQueuedDecisions and decideQueuedPermissionReconnect, neither of
-// which is bounded by THIS threshold (they ARE bounded by the longer
-// retention window above — see isAbandonedExpired).
+// dropped/demoted on a timer). Past it the queue is NOT cleared and stays fully
+// eligible for automatic delivery (decideQueuedPermissionReconnect).
 //
 // The identity check that makes delivery safe WITHIN that window lives
 // upstream, in hook-normalize.ts's `invocationSeed`: requestId is now scoped to the prompt
@@ -4969,29 +4913,7 @@ const QUEUED_DECISION_NOTICE_MS = (() => {
   return Number.isFinite(raw) && raw > 0 ? raw : 10 * 60_000
 })()
 
-// Drop abandoned entries past the retention window. Called before every persist so
-// the durable file (and the in-memory map) stay bounded to the recent window. The
-// optional `onExpire` fires for each entry AT THE MOMENT it is dropped — this is
-// the daemon giving up on ever reconnecting it, so it is also the one honest place
-// to surface the "still no connection after a long wait" notice (Alex tg
-// requirement: a long-running uncertainty must eventually be reported, never left
-// silent). Called with the entry BEFORE it is deleted from the map. Permissions use
-// ABANDONED_PERMISSION_RETAIN_MS instead of ABANDONED_RETAIN_MS (see its own
-// comment, tg-cli#182) — everything else about giving up is unchanged.
-function pruneAbandonedButtons(
-  abandoned: Map<string, AbandonedButton>,
-  now: number,
-  onExpire?: (key: string, entry: AbandonedButton) => void,
-): void {
-  for (const [key, entry] of abandoned) {
-    if (isAbandonedExpired(entry.req.kind, entry.at, now, entry.req.critical)) {
-      onExpire?.(key, entry)
-      abandoned.delete(key)
-    }
-  }
-}
-
-// Exported for tests (same pattern as retainMsFor/isAbandonedExpired above):
+// Exported for tests (same pattern as decideQueuedPermissionReconnect above):
 // the AUTHORITATIVE socket/disk validator is the boundary the grant protocol's
 // additive fields (tg-cli#398) must survive, so tests/ctl-grants.test.ts pins
 // its tolerance contract directly instead of through a daemon round-trip.
@@ -5061,16 +4983,15 @@ export function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     // The per-turn identity proof (see ButtonRequest.promptTurnId) MUST survive
     // BOTH the socket boundary and the disk restore — it's what the reconnect
     // branch requires before auto-delivering a queued permission decision
-    // within its retention window (handleHookSocketLine, tg-cli#182). Dropping
+    // (handleHookSocketLine, tg-cli#182). Dropping
     // it here would silently
     // degrade every restored/reconnected request to the untrusted case.
     promptTurnId: typeof rec.promptTurnId === "string" ? rec.promptTurnId : undefined,
     // tg-cli#403 / agent-tools#754: MUST survive BOTH the socket boundary and
-    // the disk restore — it's what gates askDaemon's Infinity deadline,
-    // forwardAndPostQuestion's UNSCOPED_ABANDON_MS skip, and the daemon's
-    // reminder sweep. This is the SERVER-side (daemon socket) parse; the
-    // CLIENT-side counterpart lives in hook-normalize.ts's
-    // normalizeHookPayload "already normalized" branch.
+    // the disk restore — it's what gates askDaemon's Infinity deadline and
+    // forwardAndPostQuestion's UNSCOPED_ABANDON_MS skip. This is the
+    // SERVER-side (daemon socket) parse; the CLIENT-side counterpart lives in
+    // hook-normalize.ts's normalizeHookPayload "already normalized" branch.
     critical: rec.critical === true ? true : undefined,
     // Grant protocol v1.1 additive fields (tg-cli#398) — the AUTHORITATIVE
     // socket/disk validator carries them tolerantly: unknown or malformed
@@ -5086,6 +5007,7 @@ export function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     // Daemon-stamped at arrival (handleHookSocketLine overwrites whatever a
     // client sent); read back here so it survives the disk restore.
     sessionKey: typeof rec.sessionKey === "string" && rec.sessionKey ? rec.sessionKey : undefined,
+    asker: parseAskerIdentity(rec.asker),
   }
 }
 
@@ -5207,6 +5129,18 @@ interface QuestionRuntime {
   // the unscoped backstop timer and the hook socket close): upsert its grace
   // record so a late tap within GRACE_WINDOW_MS stays addressable.
   onHatchExpired: (entry: PendingButton, pendingKey: string) => void
+  // tg-cli#705: close an open card (pending or retained) on a relevance signal — a newer hatch
+  // request, a decision on a sibling, an explicit withdraw. Ends a live asker's socket with a
+  // `null` reply, edits the card to `status`, and the Inbox drops its copy. False when `key`
+  // names no open card.
+  closeCard: (key: string, status: string) => boolean
+  // Every card not yet delivered, a retained one with a queued decision included — what a
+  // newer hatch request or a sibling's decision closes.
+  closableCards: () => OpenCard[]
+  // tg-cli#717: post a card with no session topic INTO the 📥 Inbox (with a notification),
+  // recorded as its own Inbox entry so no second copy is posted. null when topics are off or
+  // the Inbox is unavailable — the caller then posts to General.
+  postCardToInbox: (req: ButtonRequest, key: string) => Promise<{ messageId: number; threadId: number } | null>
 }
 
 // A genuinely dead card: an UNSCOPED question (no pane to late-deliver to) that
@@ -5280,11 +5214,6 @@ function retainAbandonedQuestion(rt: QuestionRuntime, entry: PendingButton, pend
     req,
     messageId: entry.messageId,
     at: Date.now(),
-    // tg-cli#403: the reminder scheduler's clock must survive this transition —
-    // otherwise a socket-close mid-episode would silently reset it and either
-    // delay or (worse, if criticalState carried a quietHoursDeferredUntil)
-    // double-fire the deferred reminder.
-    ...(entry.criticalState ? { criticalState: entry.criticalState } : {}),
   })
   return true
 }
@@ -5315,8 +5244,8 @@ function expireDeadCard(ctx: Ctx, entry: PendingButton): void {
 function retireAbandonedEntry(ctx: Ctx, rt: QuestionRuntime, entry: PendingButton, pendingKey: string): void {
   // Grant protocol v1.1 (tg-cli#398): an expiring HATCH permission becomes
   // addressable for a late tap through its 24h grace record REGARDLESS of the
-  // retained/expired decision below (retention is 12h; grace outlives it, so a
-  // tap after the entry is pruned still mints a grant). Fail-soft with a loud
+  // retained/expired decision below (a retained card can be closed by a relevance signal
+  // — tg-cli#705 — and a daemon restart; grace still lets a late tap mint). Fail-soft with a loud
   // log: grace loss degrades the feature but never authorizes anything.
   if (entry.req.kind === "permission" && isHatchRequest(entry.req)) rt.onHatchExpired(entry, pendingKey)
   if (retainAbandonedQuestion(rt, entry, pendingKey)) {
@@ -5401,12 +5330,6 @@ async function forwardAndPostQuestion(
 ): Promise<void> {
   rt.activeKeys.add(pendingKey)
   const entry: PendingButton = { req, socket, messageId: null, at: Date.now() }
-  // tg-cli#403: a CRITICAL request's clock for the FIRST reminder starts at
-  // the card's post time, not at the first sweep tick that happens to
-  // observe it — otherwise a reminder could fire (near-)immediately after
-  // the card is posted, since planCriticalReminder treats an undefined
-  // lastReminderAt as "infinitely overdue".
-  if (req.critical === true) entry.criticalState = { lastReminderAt: entry.at }
   // An UNSCOPED question defers EVERY pane (fail-closed), so it MUST self-clear on a
   // timer or it wedges all routing. A SCOPED question waits forever (no timer): only
   // its socket close releases it (see armPendingSocketClose).
@@ -5441,13 +5364,27 @@ async function forwardAndPostQuestion(
   rt.pending.set(pendingKey, entry)
   const conn = armPendingSocketClose(ctx, rt, entry, pendingKey)
 
-  // The card goes into its session's topic (spec §4.3), created on this first card if need be.
-  // The asking session is req.sessionKey (resolved on arrival, §2.6), else looked up by origin/pane.
-  const cardSession = (req.sessionKey ? liveEntry(ctx, req.sessionKey) : null)
+  // The card goes into the ASKING session's topic (spec §4.3, tg-cli#717), created on this first
+  // card if need be, WITH a notification. The asking session is req.sessionKey (resolved on
+  // arrival from the hook's session id, the asker's explicit session / pid chain / pane, §2.6),
+  // else looked up by origin/pane. With topics on and no topic for it, the card itself goes to
+  // the 📥 Inbox — never silently to General, never to another session's topic.
+  const cardSessionNow = (): SessionEntry | null =>
+    (req.sessionKey ? liveEntry(ctx, req.sessionKey) : null)
+    ?? (req.asker ? findSessionForAsker(currentRegistry(ctx), req.asker) : null)
     ?? findSessionForCard(currentRegistry(ctx), { agent: req.agent, sessionId: req.origin?.sessionId, paneId: req.paneId })
+  let cardSession = cardSessionNow()
+  // A session that asked before the registry's next scan saw it (its first hook, a fresh
+  // process): scan now rather than send its card to the Inbox.
+  if (!cardSession && (ctx.cfg.topics || ctx.cfg.privateTopics)) {
+    refreshSessionRegistry(true)
+    cardSession = cardSessionNow()
+  }
   const threadId = cardSession ? await sessionTopic(ctx, cardSession.key) : null
-  const payload = buildButtonMessage(ctx.chatId, req, threadId)
-  const messageId = await sendButtonCard(ctx, payload, threadId !== null && cardSession ? cardSession.key : null)
+  const inboxCard = threadId === null ? await rt.postCardToInbox(req, pendingKey) : null
+  const messageId = inboxCard?.messageId
+    ?? (await sendButtonCard(ctx, buildButtonMessage(ctx.chatId, req, threadId), threadId !== null && cardSession ? cardSession.key : null))
+  const cardThread = inboxCard ? `inbox:${inboxCard.threadId}` : threadId === null ? "general" : String(threadId)
   if (messageId === null) {
     // botPost already logged the low-level send failure; tie it to THIS abandoned
     // forward so the drop is greppable. No card posted → nothing to late-deliver.
@@ -5473,7 +5410,7 @@ async function forwardAndPostQuestion(
     if (!conn.closed()) dropAsk(socket, "send-failed")
     return
   }
-  log(`ask-forward posted: ${describeAskRequest(req)} messageId=${messageId}`)
+  log(`ask-forward posted: ${describeAskRequest(req)} messageId=${messageId} thread=${cardThread} session=${cardSession?.key ?? "-"}`)
   if (!conn.closed()) writeAskStatus(socket, { tgctl: "ask-status", state: "posted", messageId })
   entry.messageId = messageId
   // If the socket closed DURING the send, the close handler may have retained an
@@ -5488,6 +5425,13 @@ async function forwardAndPostQuestion(
   // full closure would need a write-ahead marker BEFORE the send, not worth it for a
   // sub-ms window on a crash-relaunch.
   rt.persist() // the card id is now known — persist so a restart can late-deliver/reattach
+  // A newer hatch request for the same (hookId, cwd) makes every older open card for it
+  // irrelevant (tg-cli#705): the retry is what the human should decide on. Done only once the
+  // new card is live, so a failed post never leaves the hook with no card at all — and only for
+  // cards that arrived before this one: an older request whose post was slower must not close
+  // the newer card that beat it to Telegram.
+  const olderCards = rt.closableCards().filter((c) => c.at <= entry.at)
+  for (const key of hatchSiblingsOf(olderCards, req, pendingKey)) rt.closeCard(key, CLOSE_STATUS.superseded)
   // The socket (or unscoped timer) closed DURING the send: the close handler set
   // finalText but, with messageId still null, couldn't touch the card. Apply it now —
   // and for a genuinely-dead card (EXPIRED_TERMINAL_TEXT) clear the keyboard too, so
@@ -5539,6 +5483,20 @@ function startHookServer(ctx: Ctx, rt: QuestionRuntime): Server | null {
   }
 }
 
+// Close the cards a withdraw line names (tg-cli#705): one request by its requestId (or its
+// callback key), or every hatch card of a hook id, optionally narrowed to one directory.
+// Covers every card the daemon still holds — also a retained one whose tap is queued, which
+// the Inbox does not list. Returns how many closed.
+function withdrawCards(rt: QuestionRuntime, w: WithdrawRequest): number {
+  const open: OpenCard[] = [...rt.pending, ...rt.abandoned].map(([key, e]) => ({ key, req: e.req, at: e.at }))
+  const keys =
+    w.kind === "request"
+      ? open.filter((c) => c.req.requestId === w.requestId || c.key === w.requestId).map((c) => c.key)
+      : hatchSiblingKeys(open, w.hookId, w.cwd ?? ANY_CWD, null)
+  const status = CLOSE_STATUS.withdrawn(w.reason)
+  return keys.filter((key) => rt.closeCard(key, status)).length
+}
+
 async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socket, line: string): Promise<void> {
   // The verify-grant exchange (grant protocol v1.1, tg-cli#398) is NOT a
   // ButtonRequest — it is dispatched by its marker BEFORE normalization so an
@@ -5575,6 +5533,16 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
     }
     return
   }
+  // tg-cli#705: an asker (or a wrapper on its behalf — `tg-ctl withdraw`) says its question is
+  // no longer relevant. Dispatched before normalization like the lines above; an old daemon
+  // drops it as unparsable with a `null` reply, which the client reports as "not withdrawn".
+  const withdraw = parseWithdrawLine(parsedLine)
+  if (withdraw) {
+    const closed = withdrawCards(rt, withdraw)
+    log(`ask-withdraw: ${withdraw.kind === "request" ? `req=${withdraw.requestId}` : `hookId=${withdraw.hookId} cwd=${withdraw.cwd ?? "-"}`} closed=${closed}`)
+    socket.end(`${JSON.stringify({ tgctl: "withdrawn", closed })}\n`)
+    return
+  }
   let req: ButtonRequest | null = null
   try {
     req = parsedLine === undefined ? null : normalizeButtonRequest(parsedLine)
@@ -5591,11 +5559,13 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
   }
 
   // The asking session (spec §2.6): the hook's own session id, else the asker's TG_SESSION pin
-  // (a headless hatch ask has neither pane nor harness id — tg-cli#717), else the registry's
-  // occupant of the asking pane. Overwrites any client-sent sessionKey.
+  // (a headless hatch ask has neither pane nor harness id — tg-cli#717), else the session owning
+  // the asker's pid chain or pane, else the registry's occupant of the asking pane. Overwrites
+  // any client-sent sessionKey.
   const askReg = currentSessionRegistry()
   const pinKey = req.sessionPin && askReg ? pinnedSession(askReg, req.sessionPin)?.key : undefined
-  req = { ...req, sessionKey: hookSessionKey(req) ?? pinKey ?? (req.paneId && askReg ? sessionAtPane(askReg, req.paneId)?.key : undefined) }
+  const askerSession = req.asker && askReg ? findSessionForAsker(askReg, req.asker)?.key : undefined
+  req = { ...req, sessionKey: hookSessionKey(req) ?? pinKey ?? askerSession ?? (req.paneId && askReg ? sessionAtPane(askReg, req.paneId)?.key : undefined) }
   log(`ask-forward arrived: ${describeAskRequest(req)}`)
   recordHookSession(req)
 
@@ -5714,11 +5684,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       // "no queued decision": fall through to the ordinary re-attach so the human is
       // shown a fresh live prompt and taps it explicitly.
       //
-      // Bounded by the permission's own retention window (ABANDONED_PERMISSION_RETAIN_MS,
-      // default 12h — tg-cli#182 round 7; PREVIOUSLY documented here as "not
-      // time-bounded", which stopped being true once that window was added — see
-      // the synchronous check below), not the short question one (Alex tg#9982:
-      // never demoted onto the SHORT timer). Within that window, delivery is safe
+      // Not time-bounded (tg-cli#705 removed the retention window): delivery is safe
       // because the identity check itself is airtight for permissions — requestId folds in
       // `env.invocationNonce` (hook-normalize.ts), a random id generated ONCE PER
       // `tg-ctl ask` PROCESS. Claude's `prompt_id` / Codex's `turn_id` alone are
@@ -5731,8 +5697,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       // DIFFERENT requestId that never matches `retained.req.requestId ===
       // req.requestId` above. permissionPayloadMatches remains as defense-in-depth
       // against the narrower residual risk of a lossy `summarizeInput` digest
-      // collision (two DIFFERENT toolInputs summarizing to the same short string)
-      // — not a stand-in for a time bound.
+      // collision (two DIFFERENT toolInputs summarizing to the same short string).
       //
       // `retained.req.promptTurnId` is REQUIRED (not just permissionPayloadMatches):
       // it's the proof that THIS retained request was actually captured with
@@ -5750,20 +5715,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       // (PendingButton has no queuedDecision slot): once identity can't be proven,
       // presenting a genuinely fresh choice is the honest, safe behavior, not a
       // stale tap silently reapplied.
-      // Synchronous age check, not just the periodic pruneAbandonedButtons sweep
-      // (review finding, tg-cli#182 round 4): the sweep only runs on the poll
-      // loop's own cadence, so a reconnect landing in the gap between an entry
-      // crossing its retention window and the next sweep could otherwise still
-      // deliver a queued decision past its own kind's window — the entry's
-      // "genuinely still retained" status must be true AT THE MOMENT OF
-      // DELIVERY, not merely "not yet swept". This does not weaken the
-      // design above (safety WITHIN the window comes from identity, not a
-      // timer) — it only closes the race on the boundary that design already
-      // assumes pruneAbandonedButtons enforces synchronously. Gated on `queuedDecision`
-      // actually being present (review finding, round 5): an ordinary late
-      // reconnect with no tap ever made isn't a "decision" expiring — logging
-      // it as one would be misleading noise on the common overnight case.
-      const outcome = decideQueuedPermissionReconnect(retained, req, Date.now())
+      const outcome = decideQueuedPermissionReconnect(retained, req)
       switch (outcome.kind) {
         case "deliver": {
           const qd = outcome.queuedDecision
@@ -5792,9 +5744,6 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
           log(`ask-forward queued-decision-delivered: ${describeAskRequest(req)} key=${pendingKey} label=${qd.label}`)
           return
         }
-        case "expired":
-          log(`ask-forward queued-decision-expired-at-reconnect: key=${pendingKey} ageMs=${Date.now() - retained.at}`)
-          break
         case "no-turn-proof":
           log(`ask-forward queued-decision-discarded: retained request has no promptTurnId (no per-invocation identity proof) — refusing auto-delivery, showing a fresh live prompt instead. key=${pendingKey}`)
           break
@@ -5817,17 +5766,6 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
         socket,
         messageId: retained.messageId,
         at: Date.now(),
-        // tg-cli#403 review finding: a reconnecting SCOPED critical request (a hatch
-        // ask that happened to carry a real paneId — best-effort from TMUX_PANE —
-        // is the one case reconnectable at all) must carry its reminder-scheduling
-        // clock over from the abandoned entry it's reattaching to. Without this, the
-        // fresh PendingButton starts with `criticalState: undefined`, which
-        // planCriticalReminder treats as "infinitely overdue" — the very next sweep
-        // would fire a reminder immediately, and since `lastReminderMessageId` is also
-        // lost, the previous reminder (if any) would never get deleted/replaced,
-        // violating acceptance criterion (c) on every daemon bounce or transient
-        // socket drop for a scoped critical request.
-        ...(retained.criticalState ? { criticalState: retained.criticalState } : {}),
       }
       rt.pending.set(pendingKey, entry)
       armPendingSocketClose(ctx, rt, entry, pendingKey)
@@ -5966,6 +5904,10 @@ async function handleVerifyGrantRequest(ctx: Ctx, rt: QuestionRuntime, socket: S
   }
   log(`grant-consume: via=${pull ? "pull" : "token"} approvalId=${grant.approval_id} hookId=${hookId} req=${grant.request_id}`)
   reply(buildVerifyGrantAllow(payloadReq, grant))
+  // The agent got its decision through the grant: every other open card of this hatch is moot.
+  for (const key of hatchSiblingKeys(rt.closableCards(), grant.hook_id, grant.operation?.cwd ?? payloadReq?.cwd, null)) {
+    rt.closeCard(key, CLOSE_STATUS.decided)
+  }
 }
 
 // The agent kind the hook was installed for (`tg-ctl ask --agent codex`). Decides
@@ -6272,6 +6214,25 @@ function describeAskOutcome(req: ButtonRequest, attempt: AskAttempt): string {
   return `ask-forward not-posted: ${who} — daemon declined or unreachable (no status line: a daemon older than tg-cli#317 cannot say which)`
 }
 
+// Who this `tg-ctl ask` process is (tg-cli#717): its pid chain and its tmux pane — the daemon
+// matches them against the session registry so the card lands in the asking session's topic
+// (an explicit TG_SESSION pin rides as `sessionPin`). Best effort: a failed `ps` leaves the
+// pid chain empty.
+function askerIdentity(): AskerIdentity {
+  let ancestorPids: number[] = []
+  try {
+    const ps = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="], { stdout: "pipe", stderr: "pipe" })
+    if (ps.exitCode === 0) ancestorPids = ancestorPidChain(parseProcList(ps.stdout.toString()), process.ppid)
+  } catch {
+    // no process table — the session is found by its pin or pane alone
+  }
+  return {
+    ancestorPids,
+    tmuxPane: process.env.TMUX_PANE || null,
+    tmuxServerPid: tmuxServerPidFromEnv(process.env.TMUX),
+  }
+}
+
 async function askDaemon(ctx: Ctx): Promise<void> {
   const input = await readStdinText()
   if (!input.trim()) return
@@ -6312,25 +6273,24 @@ async function askDaemon(ctx: Ctx): Promise<void> {
     invocationNonce: crypto.randomUUID(),
     sessionPin: process.env.TG_SESSION?.trim() || undefined,
   }
-  // tg-cli#717: whoever asked waits on our stdout. If it dies (a `gh ship` killed by its
-  // timeout) we are reparented, nobody can use the answer, and a critical ask would otherwise
-  // wait forever and keep its card open. Exit, so the socket close retires the card.
-  const askerPid = process.ppid
-  setInterval(() => {
-    // ppid 1: the asker may already be gone before this process read its ppid.
-    if (process.ppid !== askerPid || process.ppid === 1) {
-      log(`ask-forward orphaned: asker pid ${askerPid} exited — giving up`)
-      process.exit(0)
-    }
-  }, ORPHAN_CHECK_MS).unref()
-  const reqs = normalizeHookRequests(payload, env)
-  if (!reqs) {
+  const normalized = normalizeHookRequests(payload, env)
+  if (!normalized) {
     // Unsupported payload shape (multi-select / free-form / an event we don't
     // forward). This never reaches the daemon, so the daemon log can't see it —
     // emit here (hook process stderr) so the drop isn't silent.
     log(`ask-forward dropped: reason=unsupported-payload agent=${env.agent} pane=${env.paneId ?? "-"} cwd=${env.cwd ?? "-"}`)
     return
   }
+  // tg-cli#717: who is asking, so the daemon posts the card in the asking session's topic.
+  const asker = askerIdentity()
+  const reqs = normalized.map((r) => ({ ...r, asker }))
+  // A stopped or orphaned asker withdraws its cards — except a hatch ask: its asker being
+  // killed (a `gh ship` timeout) is exactly when the #398 late approval matters, and a withdraw
+  // would retire the grace record that lets a later Approve mint a grant for the retry. Its card
+  // closes on the retry (superseded), a decision, or an explicit `tg-ctl withdraw`.
+  const withdrawable = reqs.filter((r) => !isHatchRequest(r)).map((r) => r.requestId)
+  withdrawOnSignal(ctx, withdrawable)
+  withdrawWhenOrphaned(ctx, withdrawable)
   // ONE deadline shared by the whole call (all cards of a multi-question), kept
   // under the harness's 120s hook budget so we always answer before it kills us.
   //
@@ -6403,8 +6363,10 @@ async function runGenericAsk(ctx: Ctx, question: string, timeout: GenericAskTime
     // client's timeout is the one that fires; clamped to the daemon's 15-min cap.
     timeoutMs: genericAskDaemonAbandonMs(timeout.seconds),
     origin: { agent: GENERIC_ASK_ORIGIN_AGENT },
+    asker: askerIdentity(),
   }
   log(`generic-ask requested: requestId=${req.requestId} timeoutS=${timeout.seconds} cwd=${req.cwd}`)
+  withdrawOnSignal(ctx, [req.requestId])
   const attempt = await oneAskAttempt(ctx, JSON.stringify(req), timeout.seconds * 1000)
   if (attempt.kind === "dropped") {
     console.error("denied: daemon unreachable — is it running? try `tg-ctl start`")
@@ -6425,6 +6387,97 @@ async function runGenericAsk(ctx: Ctx, question: string, timeout: GenericAskTime
   console.error(verdict.reason)
   log(`generic-ask denied: requestId=${req.requestId} reason=${verdict.reason}`)
   return 1
+}
+
+// One withdraw line to the daemon (tg-cli#705): resolves with how many cards it closed, or
+// null when the daemon could not be reached or did not answer within `timeoutMs` (an older
+// daemon replies `null` to a line it does not know).
+function sendWithdrawLine(ctx: Ctx, line: Record<string, string>, timeoutMs: number): Promise<number | null> {
+  const { promise, resolve } = Promise.withResolvers<number | null>()
+  let raw = ""
+  const socket = createConnection(ctx.paths.socket)
+  const timer = setTimeout(() => {
+    socket.destroy()
+    resolve(null)
+  }, timeoutMs)
+  socket.setEncoding("utf8")
+  socket.on("connect", () => socket.write(`${JSON.stringify(line)}\n`))
+  socket.on("data", (chunk) => {
+    raw += chunk
+  })
+  // 'close' follows 'error' too; the first resolve wins.
+  socket.on("close", () => {
+    clearTimeout(timer)
+    let closed: unknown
+    try {
+      const reply: unknown = JSON.parse(raw.trim())
+      closed = reply && typeof reply === "object" ? (reply as Record<string, unknown>).closed : undefined
+    } catch {
+      closed = undefined
+    }
+    resolve(typeof closed === "number" ? closed : null)
+  })
+  socket.on("error", () => {})
+  return promise
+}
+
+// How long a stopping asker waits for its withdraw to land before it exits anyway.
+const WITHDRAW_ON_SIGNAL_MS = 1500
+const SIGNAL_NUMBERS: Record<"SIGHUP" | "SIGINT" | "SIGTERM", number> = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 }
+
+// An asker stopped while it waits (its harness gave up on the hook, the terminal closed,
+// Ctrl-C) withdraws its cards so they leave the chat and the 📥 Inbox instead of waiting for a
+// Dismiss (tg-cli#705). Best effort: SIGKILL cannot be caught — the daemon then only sees the
+// socket close and the card stays open. Exits with the conventional 128+signal status; the
+// withdraw itself ends the ask with a `null` reply, so the ask entrypoint awaits
+// `signalExit` before its own exit and the signal status wins.
+let signalExit: Promise<unknown> | null = null
+function withdrawOnSignal(ctx: Ctx, requestIds: readonly string[]): void {
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+    process.on(signal, () => {
+      if (signalExit) return
+      const reason = `the asking process was stopped (${signal})`
+      signalExit = Promise.all(requestIds.map((id) => sendWithdrawLine(ctx, { withdraw: id, reason }, WITHDRAW_ON_SIGNAL_MS))).finally(() =>
+        process.exit(128 + SIGNAL_NUMBERS[signal]),
+      )
+    })
+  }
+}
+
+// tg-cli#717: whoever asked waits on our stdout. If it dies (a `gh ship` killed by its timeout)
+// we are reparented and nobody can use the answer: withdraw the cards that are no longer
+// relevant (tg-cli#705) and exit, instead of a critical ask waiting forever with its card open.
+// The exit closes the socket, which retires anything not withdrawn.
+function withdrawWhenOrphaned(ctx: Ctx, requestIds: readonly string[]): void {
+  const askerPid = process.ppid
+  setInterval(() => {
+    // ppid 1: the asker may already be gone before this process read its ppid.
+    if (signalExit || (process.ppid === askerPid && process.ppid !== 1)) return
+    log(`ask-forward orphaned: asker pid ${askerPid} exited — withdrawing`)
+    const reason = "the asking process exited"
+    signalExit = Promise.all(requestIds.map((id) => sendWithdrawLine(ctx, { withdraw: id, reason }, WITHDRAW_ON_SIGNAL_MS))).finally(() =>
+      process.exit(0),
+    )
+  }, ORPHAN_CHECK_MS).unref()
+}
+
+// `tg-ctl withdraw <requestId> | --hook-id <id> [--cwd <dir>] [--reason <text>]` — close cards
+// whose question is no longer relevant (tg-cli#705), for wrappers like the agent-tools hatch
+// helper. Exit 0: at least one card closed; 1: no open card matched; 2: usage; 69: the daemon
+// is not reachable.
+async function runWithdrawCommand(ctx: Ctx, argv: readonly string[]): Promise<number> {
+  const parsed = parseWithdrawArgv(argv)
+  if ("error" in parsed) {
+    console.error(`tg-ctl withdraw: ${parsed.error}\n${WITHDRAW_USAGE}`)
+    return 2
+  }
+  const closed = await sendWithdrawLine(ctx, parsed.line, 5000)
+  if (closed === null) {
+    console.error("tg-ctl withdraw: the daemon is not reachable (or predates withdraw) — is it running? try `tg-ctl start`")
+    return 69
+  }
+  console.log(closed === 0 ? "no open question matched" : `withdrawn: ${closed} card${closed === 1 ? "" : "s"}`)
+  return closed === 0 ? 1 : 0
 }
 
 function codexConfigDir(home: string): string {
@@ -7716,52 +7769,206 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // chosen answer can still reach the pane it asked from. NOT in `pendingButtons`, so
   // it never defers its pane's inbound. Keyed by callbackRequestId, like the others.
   const abandonedButtons = new Map<string, AbandonedButton>()
-  // The daemon is giving up on a retained entry (its retention window elapsed with
-  // no reconnect and no delivery) — surface that instead of leaving the card
-  // silently stuck on "hook disconnected"/"queued" forever (Alex tg requirement:
-  // long uncertainty must eventually be reported). Best-effort, like every other
-  // card edit in this file: a failed edit just means the card stays as it was.
-  const notifyAbandonedLongOutage = (key: string, entry: AbandonedButton): void => {
-    const label = resolveSessionName({ tmuxWindow: entry.req.windowName, cwd: entry.req.cwd }).primary
-    if (entry.messageId !== null) {
-      const hookId = parseHatchHookId(entry.req.requestId)
-      // A hatch card whose 24h grace window is still open stays TAPPABLE past the 12h
-      // retention (tg-cli#403): its long-outage text promises exactly that, and a tap
-      // then mints from the grace record (handleGraceStoreTap). editMessageText drops
-      // the keyboard unless it rides along, so it is re-sent; every other card retires.
-      const now = Date.now()
-      const graceOpen =
-        hookId !== null && !entry.queuedDecision && grantsData.grace.some((g) => g.key === key && now < g.graceExpiresAt)
-      if (!graceOpen) void clearMessageKeyboard(ctx, entry.messageId)
-      void editMessageText(
-        ctx,
-        entry.messageId,
-        hookId !== null
-          ? hatchAbandonedLongOutageText(entry.req, hookId, entry.queuedDecision?.label)
-          : abandonedLongOutageText(entry.req, label, entry.queuedDecision?.label),
-        graceOpen ? buildButtonMessage(ctx.chatId, entry.req).reply_markup : undefined,
-        hatchParseMode(entry.req),
-      )
+  // Every card not yet delivered — live, or retained, including a retained permission with a
+  // tap queued on it — oldest first: what a newer hatch request or a sibling's decision makes
+  // irrelevant (tg-cli#705). A card still being posted (no message id yet) is not listed.
+  const closableCards = (): Array<OpenCard & { messageId: number }> =>
+    [
+      ...[...pendingButtons].map(([key, e]) => ({ key, req: e.req, at: e.at, messageId: e.messageId })),
+      ...[...abandonedButtons].map(([key, e]) => ({ key, req: e.req, at: e.at, messageId: e.messageId })),
+    ]
+      .filter((c): c is OpenCard & { messageId: number } => c.messageId !== null)
+      .sort((a, b) => a.at - b.at)
+  // The cards still waiting for the human — closable ones with no tap queued: what the 📥 Inbox
+  // mirrors and what an answer typed in chat can answer.
+  const openCards = (): Array<OpenCard & { messageId: number }> => closableCards().filter((c) => !abandonedButtons.get(c.key)?.queuedDecision)
+  // --- 📥 Inbox (tg-cli#705): one forum topic holding a silent copy of every open card ---
+  // Only in topics mode, where a topic can exist; otherwise nothing is posted anywhere. The
+  // copies follow the open set: `syncInbox` runs after every questions write and once per poll
+  // tick, posts a copy for each open card without one and removes the copy of each card that
+  // closed. A failed send records nothing and is retried on the next run.
+  const inboxEnabled = ctx.cfg.topics || ctx.cfg.privateTopics
+  let inboxState = parseInboxState(readFileOrNull(ctx.paths.questionInbox), ctx.chatId)
+  inboxThreadId = inboxState.threadId
+  // A deleted Inbox topic is recreated at most this often, so a bot that lost the right to
+  // create topics does not create one per tick.
+  const INBOX_RECREATE_MIN_MS = 10 * 60_000
+  let inboxRecreatedAt = 0
+  // Every Inbox state change goes through here, so it also arms the send guard (outsideInbox).
+  const persistInbox = (): void => {
+    inboxThreadId = inboxState.threadId
+    try {
+      atomicWrite(ctx.paths.questionInbox, serializeInboxState(inboxState))
+    } catch (err) {
+      log(`inbox persist failed: ${err}`)
     }
-    log(`ask-abandoned-long-outage: ${describeAskRequest(entry.req)} key=${key}`)
+  }
+  // The topic, created on first need; null when topics are unavailable or the create failed.
+  // Single-flight: a sync and a card posted into the Inbox may both need it at once, and two
+  // creates would leave an orphan topic holding live cards.
+  let inboxCreating: Promise<number | null> | null = null
+  const ensureInboxTopic = (): Promise<number | null> => {
+    if (inboxState.threadId !== null) return Promise.resolve(inboxState.threadId)
+    inboxCreating ??= (async (): Promise<number | null> => {
+      if (!(await topicsCapable(ctx))) return null
+      const resp = await botPostResult(ctx, "createForumTopic", { chat_id: ctx.chatId, name: INBOX_TOPIC_NAME })
+      const result = resp.ok ? resp.json.result : undefined
+      const threadId = result && typeof result === "object" && "message_thread_id" in result ? result.message_thread_id : undefined
+      if (typeof threadId !== "number") {
+        log(`inbox: createForumTopic failed: ${resp.ok ? "no message_thread_id" : resp.description}`)
+        return null
+      }
+      log(`inbox: topic created ${threadId}`)
+      inboxState = { chatId: ctx.chatId, threadId, mirrors: emptyMirrors() }
+      persistInbox()
+      return threadId
+    })().finally(() => {
+      inboxCreating = null
+    })
+    return inboxCreating
+  }
+  // The Inbox topic is gone (deleted by hand), and every copy with it: forget it so the next
+  // ensureInboxTopic creates a new one. The background sync does this at most once per
+  // INBOX_RECREATE_MIN_MS (false when the rate limit refuses); a card with nowhere else to go
+  // (`force`) always may, or it would land in General.
+  const dropDeletedInbox = (threadId: number, why: string | undefined, force = false): boolean => {
+    // Another send already found it gone and a new topic replaced it: just use that one.
+    if (inboxState.threadId !== threadId) return true
+    if (!force && Date.now() - inboxRecreatedAt < INBOX_RECREATE_MIN_MS) return false
+    inboxRecreatedAt = Date.now()
+    log(`inbox: topic ${threadId} rejected a send (${why}) — recreating it`)
+    inboxState = emptyInboxState(ctx.chatId)
+    persistInbox()
+    return true
+  }
+  // Delete a copy; a copy Telegram will not let the bot delete (too old) loses its buttons and
+  // says so instead.
+  const removeInboxMirror = async (messageId: number): Promise<void> => {
+    const deleted = await botPostResult(ctx, "deleteMessage", { chat_id: ctx.chatId, message_id: messageId })
+    if (!deleted.ok) await editMessageText(ctx, messageId, "✓ no longer open")
+  }
+  // tg-cli#717: a card whose session has no topic is posted INTO the Inbox, with a notification
+  // (it is the card, not a silent copy), and recorded as the key's Inbox entry so the sync never
+  // copies it again. Posted directly: the send guard keeps everything else out of the Inbox.
+  const postCardToInbox = async (req: ButtonRequest, key: string): Promise<{ messageId: number; threadId: number } | null> => {
+    if (!inboxEnabled) return null
+    // A second attempt only after the topic was found deleted and recreated.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const threadId = await ensureInboxTopic()
+      if (threadId === null) return null
+      const card = buildButtonMessage(ctx.chatId, req, threadId)
+      const resp = await botPostResult(ctx, "sendMessage", {
+        chat_id: ctx.chatId,
+        message_thread_id: threadId,
+        text: card.text,
+        reply_markup: card.reply_markup,
+        ...(card.parse_mode ? { parse_mode: card.parse_mode } : {}),
+      })
+      const result = resp.ok ? resp.json.result : undefined
+      const messageId = result && typeof result === "object" && "message_id" in result ? result.message_id : undefined
+      if (typeof messageId === "number") {
+        inboxState.mirrors[key] = { messageId, card: true }
+        persistInbox()
+        return { messageId, threadId }
+      }
+      // Only a topic Telegram reports deleted is recreated: a private-topics "thread not found" is
+      // transient, and recreating on it would orphan the Inbox and its open cards.
+      const topicGone = !resp.ok && isTopicDeletedError(resp.description)
+      if (topicGone && attempt === 0 && dropDeletedInbox(threadId, resp.description, true)) continue
+      log(`inbox: card ${key} not posted in the Inbox (${resp.ok ? "no message_id" : resp.description}) — General instead`)
+      return null
+    }
+    return null
+  }
+  const syncInboxOnce = async (): Promise<void> => {
+    // `tg auth` rebound the chat: the old topic and its copies are out of reach.
+    if (inboxState.chatId !== ctx.chatId) {
+      inboxState = emptyInboxState(ctx.chatId)
+      persistInbox()
+    }
+    const open = new Map(openCards().map((c) => [c.key, c]))
+    const plan = planInboxSync(open.values(), inboxState)
+    for (const key of plan.remove) {
+      const mirror = inboxState.mirrors[key]
+      delete inboxState.mirrors[key]
+      persistInbox()
+      // A card posted INTO the Inbox (tg-cli#717) stays: closing it already edited it in place.
+      const isCard = "card" in mirror
+      if (!isCard) await removeInboxMirror(mirror.messageId)
+      log(`inbox: ${isCard ? "dropped the Inbox card" : "removed copy"} of ${key} (message ${mirror.messageId})`)
+    }
+    if (plan.post.length === 0) return
+    const threadId = await ensureInboxTopic()
+    if (threadId === null) return
+    const now = Date.now()
+    for (const key of plan.post) {
+      const card = open.get(key)
+      if (!card) continue
+      const label = resolveSessionName({ tmuxWindow: card.req.windowName, cwd: card.req.cwd }).primary
+      const message = inboxMirrorMessage(card, label, now)
+      const resp = await botPostResult(ctx, "sendMessage", {
+        chat_id: ctx.chatId,
+        message_thread_id: threadId,
+        text: message.text,
+        reply_markup: message.reply_markup,
+        disable_notification: true,
+        ...(message.parse_mode ? { parse_mode: message.parse_mode } : {}),
+      })
+      const result = resp.ok ? resp.json.result : undefined
+      const messageId = result && typeof result === "object" && "message_id" in result ? result.message_id : undefined
+      if (typeof messageId === "number") {
+        // The card may have closed while the copy was in flight: the next run removes it.
+        inboxState.mirrors[key] = { messageId, cardId: card.messageId }
+        persistInbox()
+        log(`inbox: posted copy of ${key} (message ${messageId})`)
+        continue
+      }
+      if (!resp.ok && (isThreadRejection(resp.description) || isTopicDeletedError(resp.description))) {
+        // The topic is gone, and every copy with it: start over in a new topic, once.
+        if (dropDeletedInbox(threadId, resp.description)) inboxDirty = true
+        return
+      }
+      log(`inbox: copy of ${key} not posted: ${resp.ok ? "no message_id" : resp.description} — retried next tick`)
+    }
+  }
+  // Serialized: a run requested while one is in flight runs once more after it.
+  let inboxSyncing = false
+  let inboxDirty = false
+  const syncInbox = async (): Promise<void> => {
+    if (!inboxEnabled) return
+    if (inboxSyncing) {
+      inboxDirty = true
+      return
+    }
+    inboxSyncing = true
+    try {
+      do {
+        inboxDirty = false
+        await syncInboxOnce()
+      } while (inboxDirty)
+    } catch (err) {
+      log(`inbox sync failed: ${err}`)
+    } finally {
+      inboxSyncing = false
+    }
+  }
+  // The card a message id stands for: an Inbox copy maps to its card's own message, anything
+  // else to itself. Taps on and replies to a copy go through this, so every per-card guard
+  // (`action.messageId === entry.messageId`) and card edit works unchanged. A copy left from an
+  // earlier card with the same request id maps to nothing current, so it answers no newer card.
+  const cardMessageIdFor = (messageId: number): number => {
+    const entry = inboxEntryOf(inboxState, messageId)
+    if (entry === null) return messageId
+    const card = pendingButtons.get(entry.key) ?? abandonedButtons.get(entry.key)
+    return card && card.messageId === entry.cardId ? card.messageId : messageId
   }
   // A QUEUED permission decision past QUEUED_DECISION_NOTICE_MS with no reconnect
   // gets a ONE-TIME proactive "still waiting to reconnect" notice (Alex tg#9982:
   // a long-running uncertainty must be reported, but the queued tap itself must
-  // NEVER be silently dropped/demoted on a timer). Unlike the pre-fix behavior
-  // this replaces, the queue is NOT cleared — it stays fully eligible for
-  // automatic delivery (see decideQueuedPermissionReconnect, called from the
-  // reconnect branch in handleHookSocketLine) for as long as the entry itself
-  // is retained (ABANDONED_PERMISSION_RETAIN_MS for a permission, refreshed
-  // by every tap — tg-cli#182), not bounded by THIS shorter notice threshold.
-  // `notifiedAt` makes this idempotent: a sweep that finds an
-  // already-notified entry does nothing.
-  // Returns whether anything changed, so callers know whether a persist is
-  // warranted. `now` is caller-supplied (not sampled internally) and MUST be the
-  // exact same value the caller then passes to `pruneAbandonedButtons` right
-  // after — two independent `Date.now()` reads a few instructions apart can
-  // straddle an entry's exact retention boundary, defeating the skip guard
-  // below for that narrow window (review finding: one clock reading in, not two).
+  // NEVER be silently dropped/demoted on a timer). The queue is NOT cleared — it
+  // stays eligible for automatic delivery (decideQueuedPermissionReconnect) until
+  // a relevance signal closes the card. `notifiedAt` makes this idempotent.
+  // Returns whether anything changed, so callers know whether a persist is warranted.
   const noticeStaleQueuedDecisions = (now: number): boolean => {
     let changed = false
     for (const entry of abandonedButtons.values()) {
@@ -7772,37 +7979,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // still be delivered automatically if it reconnects" would be a straight-up
       // lie for it (review finding: the notice text overpromised for exactly the
       // case the delivery gate carves out). Skip the still-waiting notice
-      // entirely here; the entry still gets the accurate, decision-naming give-up
-      // notice at its own retention window (ABANDONED_PERMISSION_RETAIN_MS — this
-      // whole function only ever processes `queuedDecision` entries, which are
-      // permission-only — notifyAbandonedLongOutage), which never
-      // claims automatic delivery in the first place.
+      // entirely here.
       if (!queuedDecisionCanAutoDeliver(entry.req)) continue
-      // Skip an entry that pruneAbandonedButtons (called right after this with the
-      // SAME `now`, same sweep — both persistQuestions and the poll loop run them
-      // back to back) is about to delete anyway: two independent fire-and-forget
-      // editMessageText calls on the SAME card (this "still waiting" edit + the
-      // long-outage give-up edit, which also clears the keyboard) could otherwise
-      // land at Telegram out of order, leaving a since-deleted entry's card
-      // claiming "still waiting … will still be delivered" with a live keyboard
-      // that resolves to nothing (review finding). Let pruneAbandonedButtons's own
-      // notify own this entry — reachable in normal production (not just
-      // misconfiguration): the daemon can be down from shortly after the tap until
-      // past the full ABANDONED_PERMISSION_RETAIN_MS, so `notifiedAt` is still unset on
-      // restore and both thresholds are crossed in the very first post-restore
-      // sweep. `>=` (not pruneAbandonedButtons's own strict `>`), deliberately
-      // ASYMMETRIC with the shared `now`: this must skip everything the prune is
-      // about to take (the double-edit hazard, never allowed), even though that
-      // means the exact boundary tick (`now - entry.at === retainMsFor(entry.req.kind, entry.req.critical)`)
-      // gets neither notice nor prune this ONE sweep (prune's `>` doesn't take it
-      // yet either) — resolved trivially on the very next sweep. A stale "neither
-      // fired for one tick" beats a card showing two contradictory edits.
-      // `queuedDecision` only ever exists on a `permission`-kind entry in
-      // practice (see the restore path's explicit `req.kind === "permission"`
-      // gate) — this branch is defense-in-depth against that convention ever
-      // drifting, matching every OTHER retention-window check in this file
-      // (review finding: this was the one site left unconditional).
-      if (now - entry.at >= retainMsFor(entry.req.kind, entry.req.critical)) continue
       qd.notifiedAt = now
       changed = true
       const label = resolveSessionName({ tmuxWindow: entry.req.windowName, cwd: entry.req.cwd }).primary
@@ -7822,47 +8000,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // Durable question state (this PR): persist pending + abandoned + answered to disk
   // on every mutation (atomic) so a daemon restart loses nothing — a late tap still
   // late-delivers and a reconnecting hook re-attaches instead of duplicating its card.
-  // `nowOverride`: when the caller already ran its OWN notice+prune sweep against
-  // a specific clock reading moments ago (the poll loop, which sweeps directly
-  // for cheapness and only calls persistQuestions() to write out what changed —
-  // see the call site below), pass that SAME reading through so this internal
-  // re-sweep doesn't sample a NEW `Date.now()` and re-run notice+prune with two
-  // different clocks in one iteration. Two different clocks reopened the exact
-  // out-of-order double-edit hazard noticeStaleQueuedDecisions's shared-`now`
-  // parameter was added to close — an entry whose retention deadline falls
-  // between the two reads got a "still waiting" edit from the FIRST sweep and a
-  // give-up edit from the SECOND, independent fire-and-forget calls that can
-  // land at Telegram out of order (review finding). Every other call site has no
-  // preceding sweep in the same tick, so they omit it and get a fresh clock.
-  // CAUTION (review finding, checked — currently safe): every call site in this
-  // file invokes `persistQuestions()`/`persistQuestions(sweepNow)` directly, and
-  // `rt.persist` (the one place this is exposed by reference, as an object
-  // property) is likewise only ever invoked as `rt.persist()` with zero args
-  // (grep confirms no `.then(rt.persist)` / event-handler / array-callback usage
-  // that would forward an incidental first argument as a bogus `nowOverride`).
-  // If a new such reference-passing call site is ever added, it MUST wrap it in
-  // an arrow (`() => persistQuestions()`), never pass the function bare.
-  const persistQuestions = (nowOverride?: number): void => {
+  // Every write is also the point the 📥 Inbox catches up with the open set (tg-cli#705).
+  const persistQuestions = (): void => {
     try {
-      // `typeof … === "number"` (not a bare `??`): a positional optional param is
-      // exactly the shape a bare-reference callback (`.then(rt.persist)`, an event
-      // handler, `arr.forEach(rt.persist)`) would corrupt by forwarding its own
-      // first argument — a Promise value, an array index, an event object — as
-      // `nowOverride`. Every current call site passes either nothing or a real
-      // `number` (see the CAUTION comment above), so this typeof guard is
-      // currently a no-op in practice; it exists so a FUTURE bare-reference usage
-      // fails safe (falls back to a fresh, correct clock) instead of silently
-      // writing disk state — or disabling both sweeps — against a bogus "now"
-      // (review finding).
-      const now = typeof nowOverride === "number" ? nowOverride : Date.now()
+      const now = Date.now()
       // Fire the still-waiting notice for any queue past its notice threshold
       // BEFORE writing, so `notifiedAt` is durable the instant it fires (a restart
-      // right after must not re-send the notice). Same `now` as the prune call
-      // right below — see noticeStaleQueuedDecisions's own doc comment for why.
+      // right after must not re-send the notice).
       noticeStaleQueuedDecisions(now)
-      // Prune BOTH maps by age before writing: parse re-filters answered on restore,
-      // but pruning here too keeps the on-disk file tight and symmetric with abandoned.
-      pruneAbandonedButtons(abandonedButtons, now, notifyAbandonedLongOutage)
       pruneAnsweredButtons(answeredButtons, now)
       const data: QuestionStoreData = {
         questions: [
@@ -7883,10 +8028,6 @@ async function runDaemon(ctx: Ctx): Promise<never> {
               req: e.req as unknown as Record<string, unknown>,
               messageId: e.messageId,
               at: e.at,
-              // tg-cli#403: a scoped (paneId-set) critical entry's reminder clock
-              // must survive a restart too — otherwise every daemon bounce would
-              // silently reset the human's reminder cadence.
-              ...(e.criticalState ? { criticalState: e.criticalState } : {}),
               pending: true as const,
             })),
           ...[...abandonedButtons.values()].map((e) => ({
@@ -7898,8 +8039,6 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             // "delivered automatically once the hook reconnects" for a decision
             // that a restart just silently threw away.
             ...(e.queuedDecision ? { queuedDecision: e.queuedDecision } : {}),
-            // tg-cli#403: see the pendingButtons mapper above — same field, same reason.
-            ...(e.criticalState ? { criticalState: e.criticalState } : {}),
           })),
         ],
         answered: [...answeredButtons].map(([key, e]) => ({
@@ -7921,6 +8060,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // forward/answer path. The state simply isn't durable until the next mutation.
       log(`question persist failed: ${err}`)
     }
+    void syncInbox()
   }
   // --- Late-approval grant protocol v1.1 (tg-cli#398): the daemon-owned stores ---
   // Loaded BEFORE the question restore below: a hatch record that expired while the
@@ -7980,23 +8120,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // re-attach to its existing card instead of posting a duplicate. Re-normalize each
   // `req` through the AUTHORITATIVE validator and drop anything that isn't scoped (and
   // for questions: carrying options). Answered entries restore the replay cache.
-  //
-  // Read with an EFFECTIVELY UNBOUNDED question window (not ABANDONED_RETAIN_MS) —
-  // deliberately wider than what we actually RESTORE to `abandonedButtons` below.
-  // An entry whose retention window elapsed WHILE THE DAEMON WAS DOWN is invisible
-  // to both the sweep and the persist-time prune (they only run while the daemon is
-  // alive), so without this a card frozen on "hook disconnected"/"queued …
-  // delivered automatically" would silently never get its long-outage notice —
-  // exactly the failure this whole notice mechanism exists to prevent (review
-  // finding). Answered entries still use the real ANSWERED_REPLAY_MS window; only
-  // the question side is widened. Bound note: parseQuestionStore still caps to
-  // MAX_RETAINED_QUESTIONS (question-store.ts) — the oldest (most-expired) records
-  // are dropped first on overflow, before this loop can notify them. The on-disk
-  // WRITE side is capped the same way, so the file can't normally exceed that count
-  // in practice; this only matters if it somehow does.
+  // Questions are read with no age window: a card stays open, however long the daemon was
+  // down, until a relevance signal closes it (tg-cli#705). parseQuestionStore still caps the
+  // file at MAX_RETAINED_QUESTIONS (question-store.ts), newest kept.
   {
     const nowRestore = Date.now()
-    const raw = parseQuestionStore(readFileOrNull(ctx.paths.questions), nowRestore, Number.MAX_SAFE_INTEGER, ANSWERED_REPLAY_MS)
+    const questionsRaw = readFileOrNull(ctx.paths.questions)
+    const raw = parseQuestionStore(questionsRaw, nowRestore, Number.MAX_SAFE_INTEGER, ANSWERED_REPLAY_MS)
     const keysOnDisk = new Set<string>()
     for (const rec of raw.questions) {
       const req = normalizeButtonRequest(rec.req)
@@ -8005,7 +8135,6 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // A decided critical card's record is kept while a stale copy of it is on disk; one
     // whose copy is gone guards nothing any more (grants.ts dropSettledDecided).
     const decidedSettled = dropSettledDecided(grantsData, keysOnDisk)
-    let expiredOnRestore = false
     let graceOnRestore = false
     let decidedOnRestore = false
     let pendingOnRestore = false
@@ -8035,38 +8164,17 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         expiredAt = req.critical ? nowRestore : Math.min(nowRestore, rec.at + ASK_LIVE_MAX_MS)
         pendingOnRestore = true
       }
-      if (isAbandonedExpired(req.kind, rec.at, nowRestore, req.critical)) {
-        // Grant protocol v1.1 (tg-cli#398): a hatch permission that expired while
-        // the daemon was DOWN never ran retireAbandonedEntry in THIS process —
-        // write its grace record here (the restore-time retire path).
-        // parseGrantStore prunes past-grace records on load, so an over-aged one
-        // simply never materializes.
-        ensureHatchGrace(req, callbackRequestId(req), rec.messageId, expiredAt)
-        // Carry the queuedDecision through (same rule as the live-abandonedButtons
-        // restore below): a tap that was never delivered before the daemon went
-        // down for the whole retention window must still be NAMED in the give-up
-        // notice (abandonedLongOutageText's queuedDecisionLabel), not silently
-        // treated as if nothing was ever chosen.
-        const queuedDecision = req.kind === "permission" ? rec.queuedDecision : undefined
-        notifyAbandonedLongOutage(callbackRequestId(req), { req, messageId: rec.messageId, at: rec.at, queuedDecision })
-        expiredOnRestore = true
-        continue
-      }
       // Only a PERMISSION can carry a queued decision (see AbandonedButton.queuedDecision) —
       // a stray one on a non-permission record (corrupt/foreign write) is dropped rather
       // than silently auto-answering a question it was never meant for.
       const queuedDecision = req.kind === "permission" ? rec.queuedDecision : undefined
-      // tg-cli#403: only meaningful when the restored req is itself critical — a
-      // stray criticalState on a non-critical record (corrupt/foreign write) is
-      // dropped rather than silently scheduling reminders nobody asked for.
-      const criticalState = req.critical === true ? rec.criticalState : undefined
-      abandonedButtons.set(callbackRequestId(req), { req, messageId: rec.messageId, at: rec.at, queuedDecision, criticalState })
+      abandonedButtons.set(callbackRequestId(req), { req, messageId: rec.messageId, at: rec.at, queuedDecision })
       // A restored hatch ask lost its live socket with the old process — a paneless
       // requester can never reconnect — so it has EXPIRED just like a socket-close
-      // retire: give it the grace record that retire would have written, so the card
-      // stays answerable for the full 24h rather than dying with the 12h retention
-      // (tg-cli#403). A pane-scoped ask that does reconnect is then answered live,
-      // which retires the record again (executeAction's answer-question case).
+      // retire: give it the grace record that retire would have written, so a late
+      // Approve can still mint a grant (tg-cli#403). A pane-scoped ask that does reconnect
+      // is then answered live, which retires the record again (executeAction's
+      // answer-question case).
       if (ensureHatchGrace(req, callbackRequestId(req), rec.messageId, expiredAt)) graceOnRestore = true
     }
     const restored = raw
@@ -8076,23 +8184,35 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (abandonedButtons.size || answeredButtons.size) {
       log(`questions restored: ${abandonedButtons.size} retained, ${answeredButtons.size} answered`)
     }
-    // A record notified-and-dropped above (or dropped as already decided) was never
-    // added to `abandonedButtons`, so it is gone from MEMORY — but the on-disk file
-    // still holds it (this block never wrote back). Left alone that stale record would:
-    // re-fire the identical (no-op) card edit on every subsequent restart until
-    // something else happens to mutate and persist, AND count against
-    // MAX_RETAINED_QUESTIONS on a future write, which could starve an actually-recent
-    // entry — or even a DIFFERENT still-expired-but-not-yet-notified entry — of its own
-    // notice (review finding). Persist once now so the file matches memory immediately
-    // — and the grants file with it (the restore-time grace upserts above).
-    // The questions write also drops a restored entry's `pending` mark: its grace window is
-    // anchored now, and a later restart must not re-anchor it (re-opening a card whose
-    // window closed) — so the grace records it anchored go to disk first.
+    // A record dropped above as already decided was never added to `abandonedButtons`, so
+    // it is gone from MEMORY — but the on-disk file still holds it. Persist once now so the
+    // file matches memory immediately — and the grants file with it (the restore-time grace
+    // upserts above). The questions write also drops a restored entry's `pending` mark: its
+    // grace window is anchored now, and a later restart must not re-anchor it (re-opening a
+    // card whose window closed) — so the grace records it anchored go to disk first.
     // The questions file is the only durable copy of a card the restore just dropped or
     // re-anchored, so a failed grants write (fail-closed) leaves it untouched: writing it
     // anyway would lose the card with no grace record to carry it on the next restart.
-    const grantsDurable = !(expiredOnRestore || graceOnRestore || decidedSettled) || persistGrants()
-    if (grantsDurable && (expiredOnRestore || decidedOnRestore || pendingOnRestore)) persistQuestions()
+    // One-shot migration (tg-cli#705): the removed #403 / #464 reminders recorded the "⏳ still
+    // waiting" pings they left in the chat — in each critical card's `criticalState` and in
+    // `tg-ctl.<bot>.unanswered-reminder.json`. Retire those pings, delete the old state file,
+    // and rewrite the questions file without the old field, so a restart finds nothing to
+    // migrate (idempotent).
+    const legacyUnansweredPath = join(ctx.configDir, `tg-ctl.${ctx.botId}.unanswered-reminder.json`)
+    const legacyReminders = legacyReminderMessages(questionsRaw, readFileOrNull(legacyUnansweredPath), ctx.chatId)
+    const hadLegacyCriticalState = hasLegacyCriticalState(questionsRaw)
+    for (const r of legacyReminders) {
+      log(`reminder migration: retiring old reminder message ${r.messageId} in chat ${r.chatId}`)
+      void retireReminderMessage(ctx, r.chatId, r.messageId, "⏰ reminders were replaced by the 📥 Inbox topic")
+    }
+    try {
+      unlinkSync(legacyUnansweredPath)
+      log("reminder migration: removed the unanswered-reminder state file")
+    } catch {
+      // absent — nothing to migrate
+    }
+    const grantsDurable = !(graceOnRestore || decidedSettled) || persistGrants()
+    if (grantsDurable && (decidedOnRestore || pendingOnRestore || hadLegacyCriticalState)) persistQuestions()
   }
   // /agent (and unrecognized-reply) selection awaiting a button tap: token →
   // message + candidate list. `prewrapped` = inject the message verbatim (a reply
@@ -8512,6 +8632,38 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   const onUnscopedRelease = (): void => {
     for (const paneId of deferred.panesWithBacklog()) onQuestionReleased(paneId)
   }
+  // Close an open card on a relevance signal (tg-cli#705) — the one place a withdraw, a newer
+  // hatch request, a sibling's decision, an answer in chat or Dismiss retires a card. A live
+  // asker gets the `null` reply (it stops waiting: the terminal or its caller takes over); the
+  // card loses its buttons and shows `status`; a hatch card's grace record goes too, so no later
+  // tap can mint a grant for it; the pane's queued inbound is released; the questions write
+  // drops the Inbox copy. False when `key` names no card.
+  const closeOpenCard = (key: string, status: string): boolean => {
+    const pending = pendingButtons.get(key)
+    const entry = pending ?? abandonedButtons.get(key)
+    if (!entry) return false
+    if (pending) {
+      pendingButtons.delete(key)
+      activeButtonKeys.delete(key)
+      clearTimeout(pending.timer)
+      dropAsk(pending.socket, "closed")
+    }
+    abandonedButtons.delete(key)
+    if (isHatchRequest(entry.req) && retireGraceRecord(grantsData.grace, key)) persistGrants()
+    if (entry.req.paneId) onQuestionReleased(entry.req.paneId)
+    else onUnscopedRelease()
+    persistQuestions()
+    const text = closedQuestionText(entry.req, status)
+    if (entry.messageId !== null) {
+      // The card is closed: no button on it may answer anything any more.
+      void clearMessageKeyboard(ctx, entry.messageId)
+      void editMessageText(ctx, entry.messageId, text, undefined, hatchParseMode(entry.req))
+    } else if (pending) {
+      pending.finalText = text
+    }
+    log(`ask-closed: ${describeAskRequest(entry.req)} key=${key} status=${status}`)
+    return true
+  }
   const questionRuntime: QuestionRuntime = {
     pending: pendingButtons,
     activeKeys: activeButtonKeys,
@@ -8524,6 +8676,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     grants: grantsData,
     persistGrants,
     onHatchExpired,
+    closeCard: closeOpenCard,
+    closableCards,
+    postCardToInbox,
   }
   let hookServer: Server | null = null
   const cleanExit = (code: number): never => {
@@ -8805,6 +8960,54 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     await sendMessage(ctx, noAgentReplyNow())
   }
 
+  // tg-cli#705: a plain message typed to a session that has open cards. With exactly ONE open
+  // card, the message is the answer to it — a live card answers its asker (a question takes the
+  // text, a permission reads yes/no, any other text denies with the text as the reason); a
+  // retained question is typed into its pane as the answer. A retained permission or hatch card
+  // is never decided from chat. With several open cards nothing is guessed: the human is asked
+  // once to reply to the card he means, and the message takes its normal path. True when the
+  // message was consumed as an answer (the caller delivers nothing else).
+  const answerOpenCardInChat = async (
+    paneId: string,
+    plain: string | undefined,
+    sourceMessageId: number | null,
+    threadId: number | null,
+    sessionKey?: string,
+  ): Promise<boolean> => {
+    if (plain === undefined || !plain.trim() || sourceMessageId === null) return false
+    const reg = sessionKey === undefined ? currentSessionRegistry() : null
+    const key = sessionKey ?? (reg ? sessionAtPane(reg, paneId)?.key : undefined)
+    const cards = sessionCardKeys(openCards(), { sessionKey: key, paneId })
+    if (cards.length === 0) return false
+    const thread = threadId !== null ? { threadId } : {}
+    if (cards.length > 1) {
+      await sendMessage(
+        ctx,
+        `this session has ${cards.length} open questions — reply to the card you mean`,
+        replyContext(threadId),
+      )
+      return false
+    }
+    const cardKey = cards[0]
+    const pending = pendingButtons.get(cardKey)
+    if (pending) {
+      log(`ask-answered-in-chat: key=${cardKey} source=${sourceMessageId}`)
+      await executeAction(
+        { kind: "answer-question", callbackQueryId: "", requestId: cardKey, value: "", messageId: pending.messageId, freeText: plain, ...thread },
+        true,
+      )
+      return true
+    }
+    const retained = abandonedButtons.get(cardKey)
+    if (!retained || retained.req.kind !== "question" || !retained.req.paneId || retained.req.multiQuestion || retained.messageId === null) return false
+    log(`ask-answered-in-chat: key=${cardKey} source=${sourceMessageId} (retained question → pane)`)
+    await handlePostTimeoutQuestionReply(
+      { kind: "post-timeout-question-reply", requestId: cardKey, questionMessageId: retained.messageId, text: plain, from: "tg", messageId: sourceMessageId, ...thread },
+      CLOSE_STATUS.answeredInChat(plain.trim()),
+    )
+    return true
+  }
+
   // Pick a target, run the plan; every failure mode turns into a TG reply so
   // the human is never left wondering whether the message landed. Returns
   // true only when the plan actually executed — the caller uses it to decide
@@ -8834,6 +9037,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     deferText?: string,
     autoBind = false,
     sourceMessageId: number | null = null,
+    // The user's own words of a plain message (tg-cli#705): may answer the target's open card.
+    plain?: string,
   ): Promise<boolean> => {
     const found = autoBind ? discoverForInject() : discover()
     if (!found.ok) {
@@ -8858,6 +9063,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         const candidates = listAgentCandidates()
         if (candidates.length === 1) {
           log(`inject: no tmux pane, sole candidate ${candidates[0].paneId}/${candidates[0].windowName}`)
+          if (await answerOpenCardInChat(candidates[0].paneId, plain, sourceMessageId, null)) return true
           return injectPrewrappedToPane(candidates[0].paneId, deferText, sourceMessageId, candidates[0].panePath ?? "/")
         }
         if (candidates.length > 1) {
@@ -8865,6 +9071,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             const anchored = resolveLastUserTargetCandidate(ctx, candidates)
             if (anchored) {
               log(`inject: no tmux pane, anchor bind ${anchored.paneId}/${anchored.windowName}`)
+              if (await answerOpenCardInChat(anchored.paneId, plain, sourceMessageId, null)) return true
               return injectPrewrappedToPane(anchored.paneId, deferText, sourceMessageId, anchored.panePath ?? "/")
             }
           }
@@ -8875,6 +9082,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
     const paneId = found.target.pane.paneId
+    if (await answerOpenCardInChat(paneId, plain, sourceMessageId, null)) {
+      if (autoBind) recordLastUserTarget(paneId, found.target.pane.panePath)
+      return true
+    }
     const textPreview = deferText?.slice(0, 60).replace(/\n/g, " ")
     log(`inject: target=${paneId} autoBind=${autoBind} text="${textPreview ?? "(key)"}"`)
     const recordIfAutoBound = () => {
@@ -9955,6 +10166,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // delivery never moves the flat-chat last-user-target anchor. `sessionKey`: the registry session
   // the pane must still host (§2.6).
   const deliverTopicPayload = async (threadId: number, paneId: string, cwd: string, payload: TopicPayload, sessionKey?: string): Promise<boolean> => {
+    if (payload.type === "text" && (await answerOpenCardInChat(paneId, payload.plain, payload.messageId, threadId, sessionKey))) return true
     const text = await renderTopicPayload(threadId, payload)
     if (text === null) return false
     return injectPrewrappedToPane(paneId, text, payload.messageId, cwd, { out: replyContext(threadId), recordAnchor: false, sessionKey })
@@ -10098,6 +10310,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   }
 
   const handleTopicHold = async (action: Extract<Action, { kind: "topic-hold" }>): Promise<boolean> => {
+    // The 📥 Inbox topic (tg-cli#705) belongs to no session: only a tap on, or a reply to, one
+    // of its copies does anything there (those never reach this hold).
+    if (inboxState.threadId === action.threadId) {
+      // Answered in General: nothing but question-card copies ever goes into the Inbox.
+      await sendMessage(ctx, "📥 the Inbox topic only lists open questions — tap a button on one, or reply to it, to answer it")
+      return false
+    }
     // The topic got a binding between triage and now (a same-batch picker tap bound it): route
     // instead of re-holding behind a second picker. Symmetric to handleTopicRoute's fallback.
     if (findTopic(loadTopics(), action.threadId) || topicOwner(action.threadId)) {
@@ -11352,15 +11571,6 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
   }
 
-  // --- unanswered-question reminder (tg-cli#464) — same load/persist shape as above ---
-  let unansweredReminderState: UnansweredReminderState = parseUnansweredReminderState(readFileOrNull(ctx.paths.unansweredReminder))
-  const persistUnansweredReminder = (): void => {
-    try {
-      atomicWrite(ctx.paths.unansweredReminder, serializeUnansweredReminderState(unansweredReminderState))
-    } catch (err) {
-      log(`persistUnansweredReminder failed: ${err}`)
-    }
-  }
   const fireAutoContinue = async (s: AutoContinueSchedule): Promise<void> => {
     // A reset > ~24.8 days out is clamped to MAX_TIMER_MS, so the timer can wake
     // BEFORE the real reset — re-arm instead of injecting early.
@@ -11515,6 +11725,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       log(`hatch-late-deny: ${describeAskRequest(req)} key=${action.requestId} revoked=${revoked ?? "-"} notice=${shouldNotify ? (delivered ? "delivered" : "failed") : "-"}`)
       const told = delivered ? " — the agent was told" : shouldNotify ? " — could not reach the agent" : ""
       await answerCallbackQuery(ctx, action.callbackQueryId, revoked ? `denied — grant ${revoked} revoked${told}` : `denied${told}`)
+      for (const key of hatchSiblingsOf(closableCards(), req, action.requestId)) closeOpenCard(key, CLOSE_STATUS.decided)
       return true
     }
     const unusedGrant = grantsData.grants.some((g) => g.request_id === req.requestId && g.consumed_at === null)
@@ -11599,11 +11810,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       action.callbackQueryId,
       delivered ? "✓ grant issued and sent to the agent" : "grant issued — could not reach the agent (the token path still works)",
     )
+    for (const key of hatchSiblingsOf(closableCards(), req, action.requestId)) closeOpenCard(key, CLOSE_STATUS.decided)
     return true
   }
 
-  // A tap on an expired hatch card whose abandoned entry is GONE (pruned at the
-  // 12h retention, or the daemon restarted since) — the grace store (grants.ts)
+  // A tap on an expired hatch card whose abandoned entry is GONE (closed by a decision, or
+  // the daemon restarted since) — the grace store (grants.ts)
   // is what keeps it addressable through 24h. Only hatch asks ever grow grace
   // records, so a non-hatch tap falls straight through to the existing toasts.
   const handleGraceStoreTap = async (action: Extract<Action, { kind: "answer-question" }>): Promise<boolean> => {
@@ -11648,27 +11860,6 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     ) {
       await answerCallbackQueryOrNotify(ctx, action, "expired")
       return true
-    }
-    // Enforce the retention window at DELIVERY time, not only on persist/restore. On a
-    // QUIET daemon (no mutation since the abandon) pruneAbandonedButtons never runs, so
-    // without this check an arbitrarily-stale answer would still be injected into a pane
-    // whose agent has long since moved on. Past the window → drop the entry, retire the
-    // now-dead card, and fall through to the "expired" toast. Applies to every kind
-    // (question, permission, multi-question member) — a permission's QUEUING below must
-    // not queue against an entry the daemon has already given up on — but a permission
-    // uses ABANDONED_PERMISSION_RETAIN_MS here, matching pruneAbandonedButtons's own
-    // per-kind window (tg-cli#182): otherwise a tap could be rejected as "expired" here
-    // for an entry pruneAbandonedButtons has NOT actually deleted yet.
-    if (isAbandonedExpired(retained.req.kind, retained.at, Date.now(), retained.req.critical)) {
-      abandonedButtons.delete(action.requestId)
-      persistQuestions()
-      const staleCardId = retained.messageId ?? action.messageId
-      if (staleCardId !== null) {
-        void clearMessageKeyboard(ctx, staleCardId)
-        void editMessageText(ctx, staleCardId, EXPIRED_TERMINAL_TEXT)
-      }
-      log(`ask-late-deliver-expired: ${describeAskRequest(retained.req)} key=${action.requestId} ageMs=${Date.now() - retained.at}`)
-      return false
     }
     // A permission's LIVE hook needs a structured JSON reply, not terminal text —
     // but once that hook has closed, the harness has ALREADY fallen back to its own
@@ -11961,7 +12152,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (!res.ok) {
       // The pane is unreachable (gone / no longer an agent). ROLL BACK the claim:
       // restore the retained entry (with its ORIGINAL `at`, so a failed attempt doesn't
-      // extend its retention window) and drop the provisional answer — so a RE-TAP can
+      // look newer than it is) and drop the provisional answer — so a RE-TAP can
       // retry and the answer isn't lost.
       answeredButtons.delete(action.requestId)
       abandonedButtons.set(action.requestId, { req: retained.req, messageId: retained.messageId, at: retained.at })
@@ -11984,32 +12175,19 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (cardId !== null) {
       // Clear the keyboard now the answer landed: this card explicitly invited a tap
       // ("window closed — tap still delivers …"), so once delivered it must stop being
-      // tappable. Otherwise a re-tap in the gap between the answered-replay window
-      // (ANSWERED_REPLAY_MS, 5 min) and the abandoned-retention window
-      // (ABANDONED_RETAIN_MS, 30 min) finds neither entry and shows a misleading
-      // "expired" on a card that WAS answered.
+      // tappable — a re-tap after the answered-replay window (ANSWERED_REPLAY_MS, 5 min)
+      // would otherwise find no entry and show a misleading "expired".
       void clearMessageKeyboard(ctx, cardId)
       void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label), undefined, hatchParseMode(retained.req))
     }
     return true
   }
 
-  const retireExpiredAbandonedQuestion = (
-    requestId: string,
-    retained: AbandonedButton,
-    messageId: number | null,
-  ): void => {
-    abandonedButtons.delete(requestId)
-    persistQuestions()
-    const staleCardId = retained.messageId ?? messageId
-    if (staleCardId !== null) {
-      void clearMessageKeyboard(ctx, staleCardId)
-      void editMessageText(ctx, staleCardId, EXPIRED_TERMINAL_TEXT)
-    }
-  }
-
+  // A text reply to a retained question card — or, with `status`, a plain message typed to the
+  // session whose only open card it is (tg-cli#705) — is typed into the asking pane as the answer.
   const handlePostTimeoutQuestionReply = async (
     action: Extract<Action, { kind: "post-timeout-question-reply" }>,
+    status?: string,
   ): Promise<boolean> => {
     const retained = abandonedButtons.get(action.requestId)
     if (
@@ -12020,12 +12198,6 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       retained.messageId !== action.questionMessageId
     ) {
       await sendMessage(ctx, "that question is no longer waiting — resend if needed", replyContext(action.threadId))
-      return false
-    }
-    if (Date.now() - retained.at > ABANDONED_RETAIN_MS) {
-      retireExpiredAbandonedQuestion(action.requestId, retained, action.questionMessageId)
-      log(`ask-post-timeout-reply-expired: ${describeAskRequest(retained.req)} key=${action.requestId} ageMs=${Date.now() - retained.at}`)
-      await sendMessage(ctx, "that question expired — resend if needed", replyContext(action.threadId))
       return false
     }
     const paneId = retained.req.paneId
@@ -12061,20 +12233,23 @@ async function runDaemon(ctx: Ctx): Promise<never> {
 
     log(`ask-post-timeout-reply-delivered: ${describeAskRequest(retained.req)} key=${action.requestId} answer=${answer} pane=${paneId}`)
     void clearMessageKeyboard(ctx, action.questionMessageId)
-    void editMessageText(ctx, action.questionMessageId, buildAnsweredQuestionText(retained.req, answer))
+    void editMessageText(ctx, action.questionMessageId, status ? closedQuestionText(retained.req, status) : buildAnsweredQuestionText(retained.req, answer))
     flushDeferred(paneId).catch((err) => log(`flushDeferred post-timeout-reply error: ${err}`))
     return true
   }
 
+  // Close / ✕ Dismiss (tg-cli#705): the human says the question is no longer relevant, on the
+  // card or its Inbox copy. Any open card closes — a live one too (its asker gets `null` and
+  // falls back to its terminal). A tap from a stale card that shares the key only loses its
+  // buttons.
   const handleCloseQuestionCard = async (
     action: Extract<Action, { kind: "close-question-card" }>,
   ): Promise<boolean> => {
-    const retained = abandonedButtons.get(action.requestId)
-    if (retained && (action.messageId === null || retained.messageId === action.messageId)) {
-      abandonedButtons.delete(action.requestId)
-      persistQuestions()
+    const entry = pendingButtons.get(action.requestId) ?? abandonedButtons.get(action.requestId)
+    const ownCard = entry && (action.messageId === null || entry.messageId === null || entry.messageId === action.messageId)
+    if (!ownCard || !closeOpenCard(action.requestId, CLOSE_STATUS.dismissed)) {
+      if (action.messageId !== null) void clearMessageKeyboard(ctx, action.messageId)
     }
-    if (action.messageId !== null) void clearMessageKeyboard(ctx, action.messageId)
     await answerCallbackQuery(ctx, action.callbackQueryId, "closed")
     return true
   }
@@ -12114,6 +12289,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // in-flight group could otherwise leak across groups) to decide whether the source message earns
   // its 👀 receipt (actions for one message are contiguous, ack last).
   const executeAction = async (action: Action, precedingOk: boolean): Promise<boolean> => {
+    // A tap on — or a reply to — a card's 📥 Inbox copy acts on the card itself (tg-cli#705):
+    // every guard and edit below compares and edits the card's own message id.
+    if ((action.kind === "answer-question" || action.kind === "close-question-card") && action.messageId !== null) {
+      action = { ...action, messageId: cardMessageIdFor(action.messageId) }
+    } else if (action.kind === "post-timeout-question-reply") {
+      action = { ...action, questionMessageId: cardMessageIdFor(action.questionMessageId) }
+    }
     switch (action.kind) {
       case "reply":
         await sendMessage(ctx, action.text, replyContext(action.threadId))
@@ -12123,8 +12305,26 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return true
       case "close-question-card":
         return handleCloseQuestionCard(action)
-      case "post-timeout-question-reply":
+      case "post-timeout-question-reply": {
+        // A text reply to a LIVE question card (or its Inbox copy) answers it down the hook
+        // socket, like a tap; a retained card's answer is typed into its pane.
+        const live = pendingButtons.get(action.requestId)
+        if (live && live.messageId === action.questionMessageId) {
+          return executeAction(
+            {
+              kind: "answer-question",
+              callbackQueryId: "",
+              requestId: action.requestId,
+              value: "",
+              messageId: action.questionMessageId,
+              freeText: action.text,
+              ...(action.threadId !== undefined ? { threadId: action.threadId } : {}),
+            },
+            precedingOk,
+          )
+        }
         return handlePostTimeoutQuestionReply(action)
+      }
       case "answer-question": {
         const pending = pendingButtons.get(action.requestId)
         if (!pending) {
@@ -12134,7 +12334,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           // do we fall back to the toasts below.
           if (await lateDeliverAbandonedQuestion(action)) return true
           // Grant protocol v1.1 (tg-cli#398): a tap on an expired HATCH card whose
-          // retained entry is gone (12h retention pruned it / daemon restarted) —
+          // retained entry is gone (a decision closed it / daemon restarted) —
           // the 24h grace store keeps it addressable, so a late Approve can still
           // mint a grant. Non-hatch taps fall straight through.
           if (await handleGraceStoreTap(action)) return true
@@ -12146,7 +12346,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           const priorAnswer = answeredButtons.get(action.requestId)
           const stillAnswered = priorAnswer !== undefined && Date.now() - priorAnswer.at <= ANSWERED_REPLAY_MS
           // Nothing answers for this card any more (e.g. a hatch card whose 24h grace
-          // window closed — it kept its buttons past the 12h retention): retire its
+          // window closed): retire its
           // buttons so they never outlive what a tap can do (tg-cli#403).
           if (!stillAnswered && action.messageId !== null) void clearMessageKeyboard(ctx, action.messageId)
           await answerCallbackQueryOrNotify(ctx, action, stillAnswered ? "already answered" : "expired")
@@ -12164,7 +12364,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           await answerCallbackQueryOrNotify(ctx, action, "expired")
           return true
         }
-        const answer = resolveButtonCallback(pending.req, { requestId: action.requestId, value: action.value })
+        // An answer typed in chat (tg-cli#705) instead of a tapped option.
+        const answer = action.freeText !== undefined ? freeTextAnswer(pending.req, action.freeText) : resolveButtonCallback(pending.req, { requestId: action.requestId, value: action.value })
         if (answer.status !== "answered") {
           await answerCallbackQueryOrNotify(ctx, action, "expired")
           return true
@@ -12221,8 +12422,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // Persist the answer so a hook that reconnects after a restart replays it
         // (no duplicate card) instead of re-forwarding the now-answered question.
         persistQuestions()
+        // A decided hatch card makes every other open card of the same (hookId, cwd) moot.
+        if (isHatchRequest(pending.req)) {
+          for (const key of hatchSiblingsOf(closableCards(), pending.req, action.requestId)) closeOpenCard(key, CLOSE_STATUS.decided)
+        }
         clearTimeout(pending.timer)
-        const finalText = buildAnsweredQuestionText(pending.req, answer.label)
+        const finalText =
+          action.freeText !== undefined
+            ? closedQuestionText(pending.req, CLOSE_STATUS.answeredInChat(action.freeText.trim()))
+            : buildAnsweredQuestionText(pending.req, answer.label)
         if (pending.messageId === null) pending.finalText = finalText
         const output = formatAgentHookOutput(pending.req, answer)
         pending.socket.end(output === null ? "null\n" : `${JSON.stringify(output)}\n`)
@@ -12279,6 +12487,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           action.text,
           true,
           action.messageId,
+          action.plain,
         )
       case "reply-route":
         return handleReplyRoute(action)
@@ -12438,164 +12647,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         cleanExit(0)
       }
 
-      // Sweep the retention window every loop iteration (roughly once per ~50s
-      // long-poll, sooner if messages keep arriving) so an entry past its
-      // applicable retention window (retainMsFor — ABANDONED_RETAIN_MS for a
-      // question, the much longer ABANDONED_PERMISSION_RETAIN_MS for a
-      // permission, tg-cli#182) gets its long-outage notice promptly even on an
-      // otherwise-idle bot — persistQuestions only runs on a mutation, and on a
-      // quiet channel nothing else may mutate for a long time. Prune directly
-      // (cheap: an in-memory Map scan) rather than calling the full persistQuestions
-      // every iteration (an atomic serialize+rename) — only persist when the sweep
-      // actually dropped something, e.g. under a fast-returning long-poll with
-      // nothing pending expiry this would otherwise be a disk write per batch
-      // (review finding).
-      if (abandonedButtons.size > 0) {
-        const before = abandonedButtons.size
-        const sweepNow = Date.now()
-        const noticed = noticeStaleQueuedDecisions(sweepNow)
-        pruneAbandonedButtons(abandonedButtons, sweepNow, notifyAbandonedLongOutage)
-        if (noticed || abandonedButtons.size !== before) persistQuestions(sweepNow)
-      }
-
-      // tg-cli#403: critical-mode reminder cadence. A critical request never
-      // times out — askDaemon skips ASK_TOTAL_TIMEOUT_MS for it and
-      // forwardAndPostQuestion never arms the raw UNSCOPED_ABANDON_MS backstop
-      // for it either — so without this sweep a decision it's waiting on could
-      // sit silently forgotten in Telegram indefinitely. This is the sanctioned
-      // exception to tg-cli#360/#380's "no new timers" rule (Alex's own
-      // verbatim ask in the tg-cli#403 ticket body). A critical entry can be
-      // waiting in EITHER map depending on whether its underlying process/
-      // socket is still connected (pendingButtons — the common case: the
-      // process is alive and simply hasn't gotten a decision yet) or has
-      // already disconnected without one (abandonedButtons, retained the same
-      // way tg-cli#349 retains any hatch/permission) — both are swept
-      // identically since a human reminder doesn't care which map it's in.
-      if (pendingButtons.size > 0 || abandonedButtons.size > 0) {
-        const sweepNow = Date.now()
-        let criticalChanged = false
-        const sweepOneCritical = async (
-          key: string,
-          req: ButtonRequest,
-          messageId: number | null,
-          priorState: DaemonCriticalState | undefined,
-          setState: (s: DaemonCriticalState) => void,
-          stillPresent: () => boolean,
-        ): Promise<void> => {
-          if (req.critical !== true) return
-          const state: DaemonCriticalState = priorState ?? {}
-          const plan = planCriticalReminder(state, sweepNow)
-          if (!plan.due) {
-            // Persist a newly-computed quiet-hours deferral so a restart mid-quiet-hours
-            // doesn't silently reset it and risk a second "morning" reminder.
-            if (plan.nextState.quietHoursDeferredUntil !== state.quietHoursDeferredUntil) {
-              setState({ ...state, quietHoursDeferredUntil: plan.nextState.quietHoursDeferredUntil })
-              criticalChanged = true
-            }
-            return
-          }
-          const hookId = parseHatchHookId(req.requestId)
-          const label = resolveSessionName({ tmuxWindow: req.windowName, cwd: req.cwd }).primary
-          const pointer = messageId !== null ? " (see the original card above)" : ""
-          const text =
-            hookId !== null
-              ? `⏳ still waiting on your decision for hatch request ${hookId}${pointer}`
-              : `⏳ still waiting on your decision — ${label}${pointer}`
-          const sentId = await sendMessage(ctx, text)
-          if (sentId === null) {
-            // Send failed — never mark sent (see markCriticalReminderSent's own doc
-            // comment): this reminder stays due and is retried next sweep instead of
-            // silently skipping a whole interval for a ping the human never saw.
-            log(`hatch-critical-reminder-send-failed: key=${key} hookId=${hookId ?? "-"}`)
-            return
-          }
-          // Review finding (round 1): the entry's underlying socket can close mid-`await`
-          // above — retainAbandonedQuestion then migrates it from pendingButtons into a
-          // NEW AbandonedButton object in abandonedButtons, carrying a COPY of the
-          // pre-send `criticalState`. `entry`/`setState` in THIS closure still point at
-          // the now-orphaned pending slot; committing here would be invisible to the
-          // freshly-migrated slot, which independently re-plans against its own stale
-          // state and would send a SECOND reminder in the very same sweep tick (and
-          // delete the wrong prior message, since its own `priorMessageId` is stale
-          // too). Bail without committing so the next sweep retries cleanly against
-          // whichever map now actually holds the entry — this reminder's Telegram
-          // message is a harmless one-off orphan in that narrow window, never a
-          // duplicate.
-          if (!stillPresent()) {
-            log(`hatch-critical-reminder-stale-entry: key=${key} hookId=${hookId ?? "-"} messageId=${sentId} — entry moved to a different map mid-send; not committing (will retry next sweep)`)
-            return
-          }
-          const priorMessageId = state.lastReminderMessageId ?? null
-          // Replace, never accumulate (acceptance criterion (c)). The ORIGINAL request
-          // card is never touched here — only prior reminder pings, in the chat they were
-          // posted in (state from before tg-cli#518 has no chat: the current one).
-          if (priorMessageId !== null) await retireReminderMessage(ctx, state.lastReminderChatId ?? ctx.chatId, priorMessageId, REMINDER_SUPERSEDED_TEXT)
-          setState(markCriticalReminderSent(sweepNow, sentId, ctx.chatId))
-          criticalChanged = true
-          log(`hatch-critical-reminder-sent: key=${key} hookId=${hookId ?? "-"} messageId=${sentId}`)
-        }
-        for (const [key, entry] of pendingButtons) {
-          await sweepOneCritical(key, entry.req, entry.messageId, entry.criticalState, (s) => {
-            entry.criticalState = s
-          }, () => pendingButtons.get(key) === entry)
-        }
-        for (const [key, entry] of abandonedButtons) {
-          // Review finding (round 1): once a tap has landed (queuedDecision set), the
-          // human's decision is already made and recorded — the card was edited to
-          // "recorded …" at tap time. Continuing to ping "still waiting on your
-          // decision" forever after the decision was already given would directly
-          // contradict the card, and nothing ever clears a critical entry's Infinity
-          // retention window to stop it on its own.
-          if (entry.queuedDecision) continue
-          await sweepOneCritical(key, entry.req, entry.messageId, entry.criticalState, (s) => {
-            entry.criticalState = s
-          }, () => abandonedButtons.get(key) === entry)
-        }
-        if (criticalChanged) persistQuestions(sweepNow)
-      }
-
-      // tg-cli#464: one reminder per agent question left unanswered past
-      // UNANSWERED_REMINDER_AFTER_MS, quiet-hours aware; each new reminder replaces
-      // the previous one, and a reminder whose cards were all answered is withdrawn.
-      // Open = a live card (pendingButtons) or a retained one no tap has decided yet
-      // (abandonedButtons without queuedDecision). Critical requests are skipped:
-      // #403's own cadence above already reminds them. Runs with reminders off too
-      // (AFTER_MS=0): the plan then only withdraws a reminder an earlier run left live
-      // (tg-cli#518). A reminder is retired in the chat it was posted in.
-      {
-        const sweepNow = Date.now()
-        const open: OpenQuestion[] = []
-        const collect = (key: string, req: ButtonRequest, messageId: number | null, openedAt: number): void => {
-          if (req.critical === true) return
-          const label = resolveSessionName({ tmuxWindow: req.windowName, cwd: req.cwd }).primary
-          open.push({ key, openedAt, label, question: req.question, html: hatchParseMode(req) === "HTML", messageId })
-        }
-        for (const [key, e] of pendingButtons) collect(key, e.req, e.messageId, e.at)
-        for (const [key, e] of abandonedButtons) if (!e.queuedDecision) collect(key, e.req, e.messageId, e.at)
-        const plan = planUnansweredReminder(open, unansweredReminderState, sweepNow)
-        unansweredReminderState = plan.state
-        let changed = plan.changed
-        const prior = unansweredReminderState.messageId
-        const priorChat = unansweredReminderState.chatId ?? ctx.chatId
-        if (plan.send) {
-          const sentId = await sendMessage(ctx, unansweredReminderText(plan.overdue, sweepNow))
-          if (sentId === null) {
-            // A failed send is never marked: the same questions stay due next sweep.
-            log(`unanswered-reminder-send-failed: open=${plan.overdue.length}`)
-          } else {
-            if (prior !== null) await retireReminderMessage(ctx, priorChat, prior, REMINDER_SUPERSEDED_TEXT)
-            unansweredReminderState = markUnansweredReminderSent(unansweredReminderState, plan.overdue, sentId, ctx.chatId)
-            changed = true
-            log(`unanswered-reminder-sent: messageId=${sentId} open=${plan.overdue.length} replaced=${prior ?? "-"}`)
-          }
-        } else if (plan.withdraw && prior !== null) {
-          await retireReminderMessage(ctx, priorChat, prior, REMINDER_CLOSED_TEXT)
-          unansweredReminderState = { ...unansweredReminderState, messageId: null, chatId: null }
-          changed = true
-          log(`unanswered-reminder-withdrawn: messageId=${prior}`)
-        }
-        if (changed) persistUnansweredReminder()
-      }
+      // The queued-decision notice (a notice, never an expiry) and the 📥 Inbox safety-net
+      // sync run every loop iteration (roughly once per ~50s long-poll, sooner if messages keep
+      // arriving): persistQuestions only runs on a mutation, and a copy whose send failed is
+      // retried here (tg-cli#705).
+      if (noticeStaleQueuedDecisions(Date.now())) persistQuestions()
+      await syncInbox()
 
       // Remind only verified original processes. Never spawn an anonymous agent
       // because a TUI has not published its bridge or its session identity is unknown.
@@ -12752,10 +12809,17 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // /new awaits its dir is the typed path. When no /new is in flight this is false and the
         // plain-text path is byte-identical to before.
         newSessionAwaitingDir,
+        // A reply to a card's 📥 Inbox copy is a reply to the card (tg-cli#705): both lookups
+        // see the card's own message id. A LIVE question card answers the same way as a
+        // retained one — executeAction sends the text down its hook socket.
         postTimeoutQuestionRequestIdForMessage: (messageId) => {
+          const cardId = cardMessageIdFor(messageId)
+          for (const [requestId, pending] of pendingButtons) {
+            if (pending.messageId === cardId && pending.req.kind === "question" && !pending.req.multiQuestion) return requestId
+          }
           for (const [requestId, retained] of abandonedButtons) {
             if (
-              retained.messageId === messageId &&
+              retained.messageId === cardId &&
               retained.req.kind === "question" &&
               !retained.req.multiQuestion &&
               retained.req.paneId
@@ -12766,11 +12830,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           return null
         },
         permissionRequestIdForMessage: (messageId) =>
-          findDecidablePermissionRequestId(pendingButtons, messageId) ??
-          findDecidablePermissionRequestId(abandonedButtons, messageId) ??
-          // A grace-only hatch card (retained entry pruned past its 12h retention) is
-          // decided by a text reply exactly like by a tap (handleGraceStoreTap).
-          findDecidablePermissionRequestId(grantsData.grace.map((g): [string, GraceRecord] => [g.key, g]), messageId),
+          findDecidablePermissionRequestId(pendingButtons, cardMessageIdFor(messageId)) ??
+          findDecidablePermissionRequestId(abandonedButtons, cardMessageIdFor(messageId)) ??
+          // A grace-only hatch card (its retained entry gone after a decision or restart) is
+          // decided by a text reply exactly like by a tap (handleGraceStoreTap) — also through an
+          // Inbox copy, which names the card it was made from.
+          findDecidablePermissionRequestId(
+            grantsData.grace.map((g): [string, GraceRecord] => [g.key, g]),
+            inboxEntryOf(inboxState, messageId)?.cardId ?? messageId,
+          ),
       })
 
       // The batch is durably journaled BEFORE this point (see the atomicWrite above), so
@@ -12959,7 +13027,7 @@ if (import.meta.main) {
   }
   // Internal one-shot child spawned by `harness-event`; intentionally absent
   // from USAGE and guarded by persisted retry state before it can inject text.
-  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event", "codex-usage-hook", "auto-continue-once", "usage-schedule", "usage-schedule-check", "inbox", "audit-delivery", "alert"].includes(cmd)) {
+  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "withdraw", "install-hooks", "voice-setup", "harness-event", "codex-usage-hook", "auto-continue-once", "usage-schedule", "usage-schedule-check", "inbox", "audit-delivery", "alert"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
   }
@@ -13082,6 +13150,9 @@ if (import.meta.main) {
   if (cmd === "inbox") {
     process.exit(runInboxCommand(ctx, process.argv.slice(3)))
   }
+  if (cmd === "withdraw") {
+    process.exit(await runWithdrawCommand(ctx, process.argv.slice(3)))
+  }
   if (cmd === "alert") {
     process.exit(await runAlertCommand(ctx, process.argv.slice(3)))
   }
@@ -13092,7 +13163,11 @@ if (import.meta.main) {
     // A generic question first: parseGenericAskArgv returns null for every
     // internal shape, so a `--verify-grant` word inside an unquoted question can
     // never reach the grant client below (which exits 0).
-    if (genericAsk) process.exit(await runGenericAsk(ctx, genericAsk.question, genericAsk.timeout))
+    if (genericAsk) {
+      const code = await runGenericAsk(ctx, genericAsk.question, genericAsk.timeout)
+      if (signalExit) await signalExit
+      process.exit(code)
+    }
     // Grant-protocol client (tg-cli#398): `--verify-grant <approval_id> --hook
     // <hook_id>` (TOKEN path) or `--verify-grant --pull --hook <hook_id>` (PULL
     // path) — stdin carries the normalized payload with the recomputed
@@ -13110,6 +13185,7 @@ if (import.meta.main) {
       process.exit(0)
     }
     await askDaemon(ctx)
+    if (signalExit) await signalExit
     process.exit(0)
   }
   if (cmd === "harness-event") {

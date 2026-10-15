@@ -63,10 +63,9 @@ export interface StepOpts {
   postTimeoutQuestionRequestIdForMessage?: (messageId: number) => string | null;
   // Plain-text-reply-as-decision (human-requested): the entrypoint owns pendingButtons/
   // abandonedButtons, so the pure step only asks "is the replied-to message_id a LIVE-or-
-  // retained PERMISSION-kind, non-multiQuestion card?" — the lookup itself does NOT check
-  // retention/expiry (a stale-but-still-retained abandoned entry can still match); that
-  // enforcement happens downstream at delivery time (lateDeliverAbandonedQuestion's
-  // isAbandonedExpired check), the same as a real button tap on the same entry.
+  // retained PERMISSION-kind, non-multiQuestion card?" — a card or its 📥 Inbox copy
+  // (tg-cli#705; the entrypoint maps a copy to its card). A retained card stays decidable
+  // until a relevance signal closes it, the same as a real button tap on the same entry.
   // Returns its callbackRequestId (the same id `resolveButtonCallback` expects), else null.
   permissionRequestIdForMessage?: (messageId: number) => string | null;
 }
@@ -519,7 +518,9 @@ function textAction(
   }
   // A plain inbound message: surface its message_id in the wrap so the agent can
   // thread its answer with `tg --reply-to <id>` (threaded replies).
-  return { kind: 'inject-text', text: opts.wrap(name, text, messageId), messageId };
+  // `plain` keeps the unwrapped words: if the target session has exactly one open card, the
+  // daemon answers it with them (tg-cli#705). Only this branch — never a reply or a command.
+  return { kind: 'inject-text', text: opts.wrap(name, text, messageId), messageId, plain: text };
 }
 
 // A harness/daemon slash-command (`/compact`, `/stop now`) vs a path-or-prose message that
@@ -618,7 +619,7 @@ function topicPayloadOf(updateId: number, m: TgMessage, name: string, opts: Step
     // group-chat `@botname` suffix is Telegram's addressing, not part of the harness verb:
     // `/compact@my_bot` reaches the harness as `/compact` (#298).
     if (isLikelySlashCommand(text)) return { type: 'text', text: text.replace(/^(\/[a-zA-Z][\w-]*)@\w+/, '$1'), from: name, messageId };
-    return { type: 'text', text: opts.wrap(name, text, messageId), from: name, messageId };
+    return { type: 'text', text: opts.wrap(name, text, messageId), from: name, messageId, plain: text };
   }
   const anchor = m.reply_to_message ? { anchor: buildReplyAnchor(m, opts) } : {};
   const voice = m.voice ?? m.audio;

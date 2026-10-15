@@ -6,6 +6,7 @@ import { parseRegistry, serializeRegistry } from '../features/tg-ctl/session-reg
 import type { SessionEntry } from '../features/tg-ctl/session-registry';
 import { tempDir, trackChild } from './helpers/test-temp';
 import { parseTopics } from '../features/tg-ctl/topics';
+import { INBOX_TOPIC_NAME } from '../features/tg-ctl/question-inbox';
 
 // End-to-end paths of one-topic-per-session (tg-cli#467, docs/specs/session-registry-and-topics.md
 // §4.2–§4.5) against a real daemon and a fake Bot API: a question card creates its session's topic
@@ -103,10 +104,17 @@ interface FakeApi {
   createdTopics: number;
   // How a send INTO a thread answers: accepted, rejected as a missing thread, or the topic is deleted.
   threadMode: 'ok' | 'not-found' | 'deleted';
+  // Every send into the 📥 Inbox topic (tg-cli#705/#717), kept apart from the session-topic ones.
+  inbox: Record<string, unknown>[];
+  // The Inbox topic was deleted by hand: sends into it fail until the daemon creates it again.
+  inboxDeleted: boolean;
+  inboxCreates: number;
 }
 
+const INBOX_THREAD = 9_999;
+
 function startApi(firstThreadId: number): FakeApi {
-  const api: FakeApi = { port: 0, sent: [], delivered: [], createdTopics: 0, threadMode: 'ok' };
+  const api: FakeApi = { port: 0, sent: [], delivered: [], createdTopics: 0, threadMode: 'ok', inbox: [], inboxDeleted: false, inboxCreates: 0 };
   let nextMessageId = 100;
   const server = Bun.serve({
     port: 0,
@@ -118,12 +126,25 @@ function startApi(firstThreadId: number): FakeApi {
         return Response.json({ ok: true, result: [] });
       }
       if (method === 'createForumTopic') {
+        // The 📥 Inbox topic (tg-cli#705) is not a session topic: it is answered but never
+        // counted, and what is posted into it never reaches the session-topic bookkeeping below.
+        const body = (await req.json()) as Record<string, unknown>;
+        if (body.name === INBOX_TOPIC_NAME) {
+          api.inboxCreates++;
+          api.inboxDeleted = false;
+          return Response.json({ ok: true, result: { message_thread_id: INBOX_THREAD, name: body.name, icon_color: 0 } });
+        }
         const threadId = firstThreadId + api.createdTopics;
         api.createdTopics++;
         return Response.json({ ok: true, result: { message_thread_id: threadId, name: 'x', icon_color: 0 } });
       }
       if (method === 'sendMessage') {
         const body = (await req.json()) as Record<string, unknown>;
+        if (body.message_thread_id === INBOX_THREAD) {
+          if (api.inboxDeleted) return Response.json({ ok: false, error_code: 400, description: 'Bad Request: TOPIC_ID_INVALID' }, { status: 400 });
+          api.inbox.push(body);
+          return Response.json({ ok: true, result: { message_id: nextMessageId++ } });
+        }
         api.sent.push(body);
         if (body.message_thread_id !== undefined && api.threadMode !== 'ok') {
           const description = api.threadMode === 'deleted' ? 'Bad Request: TOPIC_ID_INVALID' : 'Bad Request: message thread not found';
@@ -323,17 +344,18 @@ test('a headless hatch card goes, with its buttons, into the topic of the TG_SES
   pinned.kill(9);
   expect(card.message_thread_id).toBe(88);
   expect(JSON.stringify(card.reply_markup)).toContain('inline_keyboard');
-  // Without a pin the card still posts with buttons (General) — the pin is what targets the topic.
+  // Without a pin no session owns the ask: its card, with buttons, goes into the 📥 Inbox —
+  // never silently to General (tg-cli#717).
   const loose = run(null);
-  const general = await waitFor('unpinned hatch card', () => cardFor(api, 'h2'));
+  const inboxCard = await waitFor('unpinned hatch card', () => api.inbox.find((m) => String(m.text).includes('Pick one for h2?')));
   loose.kill(9);
-  expect(general.message_thread_id).toBeUndefined();
-  expect(JSON.stringify(general.reply_markup)).toContain('inline_keyboard');
+  expect(JSON.stringify(inboxCard.reply_markup)).toContain('inline_keyboard');
+  expect(cardFor(api, 'h2')).toBeUndefined();
 }, 60_000);
 
 // tg-cli#717: a critical hatch ask waits without a deadline. When the process that asked dies
-// (gh ship killed by its timeout), the orphaned `tg-ctl ask` exits, so its card is released and
-// stops holding the pane's inbound behind a question nobody is waiting on.
+// (gh ship killed by its timeout), the orphaned `tg-ctl ask` exits, so its card is released. It
+// is not withdrawn: a hatch card keeps its late-approval grace (tg-cli#398) for the retry.
 test('an orphaned hatch ask exits once its asker dies, releasing the card', async () => {
   const fx = makeFixture([]);
   const api = startApi(60);
@@ -346,7 +368,8 @@ test('an orphaned hatch ask exits once its asker dies, releasing the card', asyn
     env: { HOME: fx.cfgDir, TG_CTL_CONFIG_DIR: fx.cfgDir, TG_API_BASE: `http://127.0.0.1:${api.port}`, TMUX_PANE: '%0' },
   });
   await asker.exited;
-  await waitFor('orphan hatch card', () => cardFor(api, 'h3'));
+  // No session owns it, so the card sits in the 📥 Inbox.
+  await waitFor('orphan hatch card', () => api.inbox.find((m) => String(m.text).includes('Pick one for h3?')));
   const askPid = Number(readFileSync(pidPath, 'utf8'));
   const alive = (): boolean => {
     try {
@@ -358,4 +381,113 @@ test('an orphaned hatch ask exits once its asker dies, releasing the card', asyn
   };
   await waitFor('orphaned ask to exit', () => !alive(), 10_000);
   await waitFor('card released', () => readFileSync(join(fx.cfgDir, 'daemon.log'), 'utf8').includes('hatch-ship-skip-ci-orphan') && !readFileSync(join(fx.cfgDir, 'tg-ctl.123.questions.json'), 'utf8').includes('"pending":true'), 10_000);
+}, 60_000);
+
+// --- tg-cli#717: a card goes to the ASKING session's topic; unresolvable → the 📥 Inbox ---
+
+function ompEntry(sessionId: string, pid: number, over: Partial<SessionEntry> = {}): SessionEntry {
+  return ccEntry(sessionId, { key: `omp:${sessionId}`, harness: 'omp', name: { primary: `omp-${sessionId}`, secondary: null }, locators: { pid, tmux: null, durableSession: null }, ...over });
+}
+
+// A paneless hatch ask (agent-tools' RIG_HATCH_REQUEST_* shape) from this test process — whose
+// pid is the ask client's parent, i.e. its first ancestor. No TMUX_PANE, no harness session id.
+function startHatch(fx: Fixture, port: number, hookId: string, extraEnv: Record<string, string> = {}): Subprocess {
+  const ask = Bun.spawn([process.execPath, TG_CTL, 'ask'], {
+    env: { PATH: `${join(fx.cfgDir, 'bin')}:${process.env.PATH ?? ''}`, HOME: fx.cfgDir, TG_CTL_CONFIG_DIR: fx.cfgDir, TG_API_BASE: `http://127.0.0.1:${port}`, ...extraEnv },
+    stdin: 'pipe',
+    stdout: 'ignore',
+    stderr: 'ignore',
+  });
+  procs.push(ask);
+  ask.stdin.write(
+    `${JSON.stringify({
+      requestId: `hatch-${hookId}-aaaaaaaaaaaa`,
+      agent: 'claude',
+      kind: 'permission',
+      question: `Allow rig hatch escalation: ${hookId}?`,
+      permissionEvent: 'PermissionRequest',
+      hookId,
+      cwd: fx.cfgDir,
+    })}\n`,
+  );
+  ask.stdin.end();
+  return ask;
+}
+
+const hatchCardIn = (msgs: Record<string, unknown>[], hookId: string): Record<string, unknown> | undefined =>
+  msgs.find((m) => m.reply_markup !== undefined && String(m.text).includes(`Allow rig hatch escalation: ${hookId}?`) && !String(m.text).startsWith('📥 '));
+const daemonLog = (fx: Fixture): string => readFileSync(join(fx.cfgDir, 'daemon.log'), 'utf8');
+
+test('#717: a hatch ask from an omp session goes to THAT session\'s topic, with a notification, never a foreign topic', async () => {
+  // Our omp owns this test process (its pid is the ask's parent); a cc session elsewhere already
+  // has topic 55. tmux lists no panes, so the seeded live entries stay as written.
+  const fx = makeFixture([
+    ompEntry('own', process.pid),
+    ccEntry('other', { threadId: 55, locators: { pid: 99991, tmux: null, durableSession: null } }),
+  ]);
+  writeFileSync(join(fx.cfgDir, 'procs.txt'), '99990 1 -zsh\n99991 99990 claude\n');
+  const api = startApi(42);
+  await startDaemon(fx, api.port);
+
+  const ask = startHatch(fx, api.port, 'ship');
+  const card = await waitFor('hatch card', () => hatchCardIn(api.delivered, 'ship'));
+  expect(card.message_thread_id).toBe(42);
+  expect(card.disable_notification).toBeUndefined();
+  expect(api.delivered.some((m) => m.message_thread_id === 55)).toBe(false);
+  await waitFor('log line', () => daemonLog(fx).includes('thread=42 session=omp:own'));
+  // Plus its silent copy in the 📥 Inbox.
+  const copy = await waitFor('inbox copy', () => api.inbox.find((m) => String(m.text).startsWith('📥 ')));
+  expect(copy.disable_notification).toBe(true);
+  ask.kill(9);
+  await ask.exited;
+}, 60_000);
+
+test('#717: an explicit TG_SESSION wins: the card goes to the named session\'s topic, not the ancestor\'s', async () => {
+  const fx = makeFixture([ompEntry('named', 99995), ompEntry('ancestor', process.pid)]);
+  const api = startApi(60);
+  await startDaemon(fx, api.port);
+  const ask = startHatch(fx, api.port, 'deploy', { TG_SESSION: 'omp:named' });
+  await waitFor('log line', () => /thread=\d+ session=omp:named/.test(daemonLog(fx)));
+  expect(entryOf(fx, 'omp:named')?.threadId).toBe(60);
+  expect(entryOf(fx, 'omp:ancestor')?.threadId).toBeNull();
+  ask.kill(9);
+  await ask.exited;
+}, 60_000);
+
+test('#717: an ask no session owns goes INTO the 📥 Inbox with a notification — never General, never a foreign topic', async () => {
+  const fx = makeFixture([ccEntry('other', { threadId: 55, locators: { pid: 99991, tmux: null, durableSession: null } })]);
+  writeFileSync(join(fx.cfgDir, 'procs.txt'), '99990 1 -zsh\n99991 99990 claude\n');
+  const api = startApi(42);
+  await startDaemon(fx, api.port);
+
+  const ask = startHatch(fx, api.port, 'orphan');
+  const card = await waitFor('inbox card', () => hatchCardIn(api.inbox, 'orphan'));
+  expect(card.disable_notification).toBeUndefined();
+  await waitFor('log line', () => daemonLog(fx).includes(`thread=inbox:${INBOX_THREAD} session=-`));
+  expect(hatchCardIn(api.delivered, 'orphan')).toBeUndefined(); // not General, not topic 55
+  expect(api.createdTopics).toBe(0);
+  // The card IS the Inbox entry: no second, silent copy is posted next to it. A genuine wait
+  // over a few sync ticks of a separate daemon process, for the absence of a send.
+  await Bun.sleep(600);
+  expect(api.inbox.filter((m) => String(m.text).includes('Allow rig hatch escalation: orphan?'))).toHaveLength(1);
+  ask.kill(9);
+  await ask.exited;
+}, 60_000);
+
+test('#717: a card for an Inbox topic deleted by hand recreates the topic and lands there — never General', async () => {
+  const fx = makeFixture([]);
+  // The daemon remembers an Inbox topic that the user has since deleted.
+  writeFileSync(join(fx.cfgDir, 'tg-ctl.123.question-inbox.json'), JSON.stringify({ version: 1, chatId: -100123, threadId: INBOX_THREAD, mirrors: {} }));
+  const api = startApi(42);
+  api.inboxDeleted = true;
+  await startDaemon(fx, api.port);
+
+  const ask = startHatch(fx, api.port, 'gone');
+  const card = await waitFor('inbox card', () => hatchCardIn(api.inbox, 'gone'));
+  expect(card.disable_notification).toBeUndefined();
+  expect(api.inboxCreates).toBe(1);
+  expect(hatchCardIn(api.delivered, 'gone')).toBeUndefined();
+  await waitFor('log line', () => daemonLog(fx).includes('rejected a send'));
+  ask.kill(9);
+  await ask.exited;
 }, 60_000);

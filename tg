@@ -56,6 +56,7 @@ import {
 } from "./features/autolink-tasks/state"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { botIdFromToken, ctlPaths, readPidFile } from "./features/tg-ctl/lock"
+import { parseInboxState } from "./features/tg-ctl/question-inbox"
 import {
   appendRoute,
   fsRoutesLockIo,
@@ -2533,6 +2534,22 @@ if (import.meta.main) {
   const ctlCfg = resolveControlConfig(parseControlConfig(configYamlRaw))
   const ctlFiles = ctlPaths(configDir, botIdFromToken(BOT_TOKEN))
   const topicsOn = ctlCfg.topics || ctlCfg.privateTopics
+  // The daemon's 📥 Inbox topic (tg-cli#705) holds only its question-card copies: a `tg` send
+  // never goes there — not by --topic/TG_TOPIC, not by replying to a message posted in it, not
+  // by a session lookup. Such a send takes the session's own topic, else General.
+  let inboxThread: number | null = null
+  if (topicsOn && currentChatId !== undefined) {
+    try {
+      inboxThread = parseInboxState(readFileSync(ctlFiles.questionInbox, "utf8"), currentChatId).threadId
+    } catch {
+      // no Inbox state — no Inbox topic to keep clear of
+    }
+  }
+  if (inboxThread !== null && messageThreadId === inboxThread) {
+    console.error(`tg: topic ${inboxThread} is the 📥 Inbox (question cards only) — posting to this session's topic or General instead`)
+    messageThreadId = undefined
+    threadIdAdvisory = false
+  }
   let anchorThread: number | null | undefined
   if (messageThreadId === undefined && replyTo !== undefined && topicsOn && currentChatId !== undefined) {
     try {
@@ -2541,6 +2558,9 @@ if (import.meta.main) {
       // no readable history — the anchor is unknown
     }
   }
+  // A reply to something in the Inbox (a copy, or a message the human wrote there) is not
+  // threaded there: it goes where a reply to an unknown anchor goes — the session's topic.
+  if (inboxThread !== null && anchorThread === inboxThread) anchorThread = undefined
   if (messageThreadId === undefined && anchorThread !== undefined) {
     if (anchorThread !== null) {
       messageThreadId = anchorThread
@@ -2556,7 +2576,7 @@ if (import.meta.main) {
         sessionKey: pinned?.key ?? null,
       }, SESSION_LOOKUP_TIMEOUT_MS),
     )
-    if (resolvedSession?.threadId) {
+    if (resolvedSession?.threadId && resolvedSession.threadId !== inboxThread) {
       messageThreadId = resolvedSession.threadId
       threadIdAdvisory = true
     }

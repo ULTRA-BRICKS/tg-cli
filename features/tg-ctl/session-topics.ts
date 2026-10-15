@@ -130,6 +130,52 @@ export function findSessionForCard(
   return null;
 }
 
+// Who is asking a question (tg-cli#717): what `tg-ctl ask` knows about the process it runs
+// in — the same signals a `tg` send uses to find its session (§4.3) — so the card goes to the
+// ASKING session's topic. An explicit `TG_SESSION` pin travels separately as
+// `ButtonRequest.sessionPin` and is resolved before this (pinnedSession).
+export interface AskerIdentity {
+  ancestorPids: number[];
+  tmuxPane: string | null;
+  tmuxServerPid: number | null;
+}
+
+// The pid chain from `startPid` up to (not including) init, nearest first — every ancestor,
+// not only the ones that look like a harness: the daemon matches them against registry pids.
+export function ancestorPidChain(procs: ReadonlyArray<{ pid: number; ppid: number }>, startPid: number, max = 32): number[] {
+  const byPid = new Map(procs.map((p) => [p.pid, p]));
+  const out: number[] = [];
+  let pid: number | undefined = startPid;
+  while (pid !== undefined && pid > 1 && out.length < max && !out.includes(pid)) {
+    out.push(pid);
+    pid = byPid.get(pid)?.ppid;
+  }
+  return out;
+}
+
+// The socket/disk form of an asker → validated, or undefined. Malformed fields are dropped.
+export function parseAskerIdentity(raw: unknown): AskerIdentity | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  return {
+    ancestorPids: Array.isArray(r.ancestorPids) ? r.ancestorPids.filter(positiveInt).slice(0, 32) : [],
+    tmuxPane: typeof r.tmuxPane === 'string' && /^%\d+$/.test(r.tmuxPane) ? r.tmuxPane : null,
+    tmuxServerPid: positiveInt(r.tmuxServerPid) ? r.tmuxServerPid : null,
+  };
+}
+
+// The live session that asked: the entry owning one of the asker's ancestor pids or its tmux
+// pane (findSessionForLookup). Never a guess: no match → null, and the card goes to the
+// 📥 Inbox instead of someone else's topic.
+export function findSessionForAsker(reg: Registry, asker: AskerIdentity): SessionEntry | null {
+  return findSessionForLookup(reg, {
+    tmuxPane: asker.tmuxPane,
+    tmuxServerPid: asker.tmuxServerPid,
+    ancestorPids: asker.ancestorPids,
+    sessionFile: null,
+  });
+}
+
 // `ensureTopic(key)` serialised per key (§4.2): concurrent first outbounds of one session share
 // one in-flight create, so two first sends create one topic. `threadIdOf` reads the stored
 // binding; `create` makes and persists the topic (or adopts an existing one) and returns its

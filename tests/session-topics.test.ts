@@ -1,9 +1,12 @@
 import { expect, test } from 'bun:test';
 import { emptyRegistry, reconcile, type LiveSession, type Registry, type SessionEntry } from '../features/tg-ctl/session-registry';
 import {
+  ancestorPidChain,
   createTopicEnsurer,
+  findSessionForAsker,
   findSessionForCard,
   findSessionForLookup,
+  parseAskerIdentity,
   noteTopicMiss,
   paneLocatorOf,
   parseResolveSessionRequest,
@@ -212,4 +215,39 @@ test('deleted-topic errors are told apart from the transient private-topic "thre
   expect(isTopicDeletedError('Bad Request: topic_deleted')).toBe(true);
   expect(isTopicDeletedError('Bad Request: message thread not found')).toBe(false);
   expect(isTopicDeletedError('Bad Request: chat not found')).toBe(false);
+});
+
+// --- tg-cli#717: the asker of a question card ---
+
+test('ancestorPidChain: every ancestor, nearest first, stopping at init, a loop or the cap', () => {
+  const procs = [
+    { pid: 500, ppid: 400 },
+    { pid: 400, ppid: 300 },
+    { pid: 300, ppid: 1 },
+  ];
+  expect(ancestorPidChain(procs, 500)).toEqual([500, 400, 300]);
+  expect(ancestorPidChain([{ pid: 9, ppid: 8 }, { pid: 8, ppid: 9 }], 9)).toEqual([9, 8]);
+  expect(ancestorPidChain(procs, 500, 2)).toEqual([500, 400]);
+  expect(ancestorPidChain(procs, 777)).toEqual([777]); // unknown to ps: itself only
+});
+
+test('parseAskerIdentity drops malformed fields', () => {
+  expect(parseAskerIdentity({ ancestorPids: [400, 'y', -2], tmuxPane: 'bad', tmuxServerPid: 7 })).toEqual({
+    ancestorPids: [400],
+    tmuxPane: null,
+    tmuxServerPid: 7,
+  });
+  expect(parseAskerIdentity(null)).toBeUndefined();
+});
+
+test('findSessionForAsker: the pid chain, then the pane — never a guess', () => {
+  const reg = fleet();
+  const none = { ancestorPids: [], tmuxPane: null, tmuxServerPid: null };
+  // The asker runs under the out-of-tmux omp (pid 400).
+  expect(keyOf(findSessionForAsker(reg, { ...none, ancestorPids: [9001, 400] }))).toBe('omp:out-of-tmux');
+  // The pane counts only on its own tmux server.
+  expect(keyOf(findSessionForAsker(reg, { ...none, tmuxPane: '%3', tmuxServerPid: 7 }))).toBe(`cc:${CC_SID}`);
+  expect(findSessionForAsker(reg, { ...none, tmuxPane: '%3', tmuxServerPid: 8 })).toBeNull();
+  // Nothing matches → null (the card goes to the Inbox, never to another session).
+  expect(findSessionForAsker(reg, { ...none, ancestorPids: [9001, 9002] })).toBeNull();
 });

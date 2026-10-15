@@ -25,6 +25,11 @@ afterEach(async () => {
 
 const PANE_ID = '%1';
 const PANE_PID = 4242;
+// The inbound these tests queue is a verbatim harness command, not plain prose: since
+// tg-cli#705 a plain message to a pane whose session has exactly ONE open card is that card's
+// answer (tests/ctl-question-inbox-integration.test.ts "ANSWERED IN CHAT"), so it would never
+// reach the defer queue this file exercises. A `/command` is never taken as an answer.
+const DEFER = '/note';
 
 // A fake tmux that: answers list-panes with one claude-hosting pane rooted at
 // $TG_TEST_CWD; logs every send-keys -l / load-buffer payload to $TG_INJECT_LOG
@@ -261,7 +266,7 @@ test('inbound text deferred while a question is open, flushed (and not lost) aft
         from: { id: 1, first_name: 'Alex' },
         chat: { id: 1 },
         date: nowSec,
-        text: 'first thing',
+        text: `${DEFER} first thing`,
       },
     },
   ]);
@@ -282,7 +287,7 @@ test('inbound text deferred while a question is open, flushed (and not lost) aft
         from: { id: 1, first_name: 'Alex' },
         chat: { id: 1 },
         date: nowSec,
-        text: 'second thing',
+        text: `${DEFER} second thing`,
       },
     },
   ]);
@@ -421,7 +426,7 @@ test('a follow-up scoped question socket close during a flush drains through ter
   updateQueue.push([
     {
       update_id: 30,
-      message: { message_id: 31, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'q1 backlog' },
+      message: { message_id: 31, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: `${DEFER} q1 backlog` },
     },
   ]);
   {
@@ -468,7 +473,7 @@ test('a follow-up scoped question socket close during a flush drains through ter
   updateQueue.push([
     {
       update_id: 32,
-      message: { message_id: 33, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'q2 orphan' },
+      message: { message_id: 33, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: `${DEFER} q2 orphan` },
     },
   ]);
   {
@@ -514,7 +519,7 @@ test('a follow-up scoped question socket close during a flush drains through ter
   updateQueue.push([
     {
       update_id: 33,
-      message: { message_id: 34, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'q3 good' },
+      message: { message_id: 34, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: `${DEFER} q3 good` },
     },
   ]);
   {
@@ -615,7 +620,7 @@ test('a release racing a NEW live question re-defers (does not drop the live que
   await waitForButton();
   const q1Cb = questionCallbackData;
   const q1Msg = buttonMessageId;
-  updateQueue.push([{ update_id: 40, message: { message_id: 41, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'q1 backlog' } }]);
+  updateQueue.push([{ update_id: 40, message: { message_id: 41, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: `${DEFER} q1 backlog` } }]);
   await waitForReaction(41);
 
   // Answer Q1 → flush starts and sleeps 800ms.
@@ -629,7 +634,7 @@ test('a release racing a NEW live question re-defers (does not drop the live que
   trackProc(reg, ask2);
   await waitForButton();
   questionCallbackData = '';
-  updateQueue.push([{ update_id: 42, message: { message_id: 43, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'q2 orphan' } }]);
+  updateQueue.push([{ update_id: 42, message: { message_id: 43, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: `${DEFER} q2 orphan` } }]);
   await waitForReaction(43);
 
   // Q3 opens (a real, still-pending question) and m3 defers behind it — BEFORE we
@@ -639,7 +644,7 @@ test('a release racing a NEW live question re-defers (does not drop the live que
   await waitForButton();
   const q3Cb = questionCallbackData;
   const q3Msg = buttonMessageId;
-  updateQueue.push([{ update_id: 43, message: { message_id: 44, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'q3 live' } }]);
+  updateQueue.push([{ update_id: 43, message: { message_id: 44, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: `${DEFER} q3 live` } }]);
   await waitForReaction(44);
 
   // Now close Q2's hook. The terminal-fallback flush wakes while Q3 is pending,
@@ -746,7 +751,7 @@ test('a scoped question hook socket close drains queued text and does not wedge 
   updateQueue.push([
     {
       update_id: 20,
-      message: { message_id: 21, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'deferred one' },
+      message: { message_id: 21, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: `${DEFER} deferred one` },
     },
   ]);
   {
@@ -780,7 +785,7 @@ test('a scoped question hook socket close drains queued text and does not wedge 
   updateQueue.push([
     {
       update_id: 21,
-      message: { message_id: 22, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'after expiry' },
+      message: { message_id: 22, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: `${DEFER} after expiry` },
     },
   ]);
   // Wait for the new message to actually land in the pane (the real proof it was
@@ -792,7 +797,7 @@ test('a scoped question hook socket close drains queued text and does not wedge 
     }
   }
   // Both the fallback-drained message and the later live message landed.
-  expect(injected(cfgDir)).toContain('[TG from Alex tg#22] after expiry');
+  expect(injected(cfgDir)).toContain(`${DEFER} after expiry`);
   expect(injected(cfgDir).some((l) => l.includes('deferred one'))).toBe(true);
   // It eventually reaches DELIVERED (👀). It may briefly show ✍️ if it arrived
   // during the fallback flush window, but it must not stay there.
@@ -1146,7 +1151,7 @@ test('a SCOPED question stays open PAST the abandon bound — no "expired", the 
 
   // Inbound arrives while the question is open → DEFERRED (not pasted).
   updateQueue.push([
-    { update_id: 30, message: { message_id: 31, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'queued while waiting' } },
+    { update_id: 30, message: { message_id: 31, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: `${DEFER} queued while waiting` } },
   ]);
   {
     const t0 = Date.now();
@@ -1211,7 +1216,7 @@ test('a SCOPED question socket close keeps the Telegram card answerable and flus
 
   // Queue an inbound behind the (scoped) open question.
   updateQueue.push([
-    { update_id: 40, message: { message_id: 41, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'orphan me' } },
+    { update_id: 40, message: { message_id: 41, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: `${DEFER} orphan me` } },
   ]);
   {
     const t0 = Date.now();
@@ -1238,7 +1243,7 @@ test('a SCOPED question socket close keeps the Telegram card answerable and flus
 
   // Pane is free again: a fresh inbound on %1 injects directly (no ghost defer).
   updateQueue.push([
-    { update_id: 41, message: { message_id: 42, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'after the death' } },
+    { update_id: 41, message: { message_id: 42, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: `${DEFER} after the death` } },
   ]);
   {
     const t0 = Date.now();
@@ -1592,7 +1597,7 @@ test('an UNSCOPED expiry does NOT flush a backlog held behind a still-live SCOPE
   // 2. A message deferred behind the scoped question (this is the backlog the
   //    sweep must NOT touch).
   updateQueue.push([
-    { update_id: 60, message: { message_id: 61, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'keep me safe' } },
+    { update_id: 60, message: { message_id: 61, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: `${DEFER} keep me safe` } },
   ]);
   {
     const t0 = Date.now();
@@ -1757,7 +1762,7 @@ test('SIGTERM during an in-flight deferred flush drains the backlog before exiti
   updateQueue.push([
     {
       update_id: 30,
-      message: { message_id: 31, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'sigterm backlog' },
+      message: { message_id: 31, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: `${DEFER} sigterm backlog` },
     },
   ]);
   await waitForTelegramReaction(reactions, 31, '✍️');

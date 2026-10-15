@@ -350,13 +350,13 @@ test('attach picker: one button per session carrying tgt:<thread>:<pane>, parsed
 test('topics OFF: a topic message falls through to normal flat injection (unchanged behaviour)', () => {
   const r = stepUpdates([upd(1, { text: 'hi', message_thread_id: 99, is_topic_message: true })], makeOpts({ topicsEnabled: false }));
   expect(r.actions).toEqual([
-    { kind: 'inject-text', text: '[TG from Alex #1] hi', messageId: 1 },
+    { kind: 'inject-text', text: '[TG from Alex #1] hi', messageId: 1, plain: 'hi' },
     { kind: 'ack', messageId: 1 },
   ]);
 });
 
 test('topics ON: General (no message_thread_id) and a non-forum reply-thread stay flat', () => {
-  expect(stepUpdates([upd(1, { text: 'hi' })], bound).actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #1] hi', messageId: 1 });
+  expect(stepUpdates([upd(1, { text: 'hi' })], bound).actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #1] hi', messageId: 1, plain: 'hi' });
   // a supergroup reply thread carries a thread id but no is_topic_message — even one colliding with a bound topic
   expect(stepUpdates([upd(2, { text: 'x', message_thread_id: 50 })], bound).actions[0]).toMatchObject({ kind: 'inject-text' });
 });
@@ -400,14 +400,14 @@ test('row 1: a /command with Telegram\'s group-chat @botname suffix reaches the 
 test('row 2: prose in a BOUND topic → topic-route with the wrapped text', () => {
   const r = stepUpdates([inTopic(7, { text: 'deploy now' })], bound);
   expect(r.actions).toEqual([
-    { kind: 'topic-route', threadId: 50, payload: text('[TG from Alex #7] deploy now', 7) },
+    { kind: 'topic-route', threadId: 50, payload: { ...text('[TG from Alex #7] deploy now', 7), plain: 'deploy now' } },
     { kind: 'ack', messageId: 7 },
   ]);
 });
 
 test('row 2: a path-like prose message is wrapped, not injected as a command', () => {
   const r = stepUpdates([inTopic(14, { text: '/etc/hosts is broken' })], bound);
-  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, payload: text('[TG from Alex #14] /etc/hosts is broken', 14) });
+  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, payload: { ...text('[TG from Alex #14] /etc/hosts is broken', 14), plain: '/etc/hosts is broken' } });
 });
 
 test('row 2: a prose reply carries the quote anchor; a /command or `!` reply stays verbatim', () => {
@@ -461,7 +461,7 @@ test('row 2: photo, document and voice in a bound topic are delivered, not silen
 test('row 2/3: a topic whose session is gone or whose spawn never finished is routed — the entrypoint decides', () => {
   for (const st of ['closed', 'awaiting-model'] as const) {
     const r = stepUpdates([inTopic(9, { text: 'hello' })], makeOpts({ topicsEnabled: true, topicStatusOf: () => st }));
-    expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, payload: text('[TG from Alex #9] hello', 9) });
+    expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, payload: { ...text('[TG from Alex #9] hello', 9), plain: 'hello' } });
   }
 });
 
@@ -486,7 +486,7 @@ test('row 4: an UNKNOWN topic holds the payload — text, album parts and voice 
 
 test('row 4: with no topicStatusOf lookup a topic message is held, never leaked to a flat agent', () => {
   const r = stepUpdates([inTopic(31, { text: 'hi' }, 30)], { ...makeOpts({ topicsEnabled: true }), topicStatusOf: undefined });
-  expect(r.actions[0]).toEqual({ kind: 'topic-hold', threadId: 30, payload: text('[TG from Alex #31] hi', 31) });
+  expect(r.actions[0]).toEqual({ kind: 'topic-hold', threadId: 30, payload: { ...text('[TG from Alex #31] hi', 31), plain: 'hi' } });
 });
 
 test('nothing is silently dropped: an oversized file and an unsupported message are answered in the topic', () => {

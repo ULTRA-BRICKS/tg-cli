@@ -4,7 +4,7 @@ import { basename, join } from 'path';
 import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
 import { tempDir } from './helpers/test-temp';
-import { decideQueuedPermissionReconnect, isAbandonedExpired, retainMsFor } from '../tg-ctl';
+import { decideQueuedPermissionReconnect } from '../tg-ctl';
 
 // End-to-end durability for the CTO's question channel (issue #99). Three guarantees,
 // one mechanism (persist scoped questions + answered-replay to disk on every mutation):
@@ -665,11 +665,11 @@ test('LATE-DELIVER busy pane: a tap while another question is live is NOT falsel
   expect(await until(() => injected(cfgDir).some((l) => l.includes('Production')), 6000)).toBe(true);
 }, 25_000);
 
-test('RETENTION prune: an abandoned question past TG_CTL_ABANDONED_RETAIN_MS is dropped (a later tap → expired, not delivered)', async () => {
+test('NO RETENTION (tg-cli#705): an abandoned question stays answerable past the old 30-min window — a late tap still delivers', async () => {
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
-  // Tiny retention window so the prune fires without a 30-min wait.
+  // The removed knob, set tiny: it must no longer prune anything.
   await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '600', TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '600' });
 
   const ask = startAsk(cfgDir, tg.port, QUESTION);
@@ -679,58 +679,23 @@ test('RETENTION prune: an abandoned question past TG_CTL_ABANDONED_RETAIN_MS is 
   await ask.exited;
   expect(await until(() => tg.edits().some((e) => e.includes('Time-out expired.')), 6000)).toBe(true);
 
-  // Wait past the retention window, then a NEW forward triggers a persist → prune.
+  // Wait past the old window while the daemon's poll loop keeps sweeping (the old prune ran
+  // there). A genuine wait: the daemon is a separate process on its own clock, and the thing
+  // proved is the ABSENCE of an expiry there, which no event signals. (No second question is
+  // asked meanwhile: a live question on the same pane would rightly make the pane busy.)
   await Bun.sleep(900);
-  startAsk(cfgDir, tg.port, { requestId: 'q2_prune', agent: 'claude', kind: 'question', question: 'Other?', options: [{ label: 'Ok' }] });
-  expect(await until(() => tg.cards().length === 2, 5000)).toBe(true);
 
-  // The stale Q1 is pruned: a late tap on it is NOT delivered — it falls to "expired".
+  // Q1 is still open: a late tap on it is delivered into its pane, never "expired".
   tg.push([tap(q1Data, 740, 1)]);
-  expect(await until(() => tg.answeredCbs().some((c) => c.text === 'expired'), 6000)).toBe(true);
-  expect(injected(cfgDir).some((l) => l.includes('Production'))).toBe(false);
+  expect(await until(() => injected(cfgDir).some((l) => l.includes('Production')), 6000)).toBe(true);
+  expect(tg.answeredCbs().some((c) => c.text === 'expired')).toBe(false);
 }, 25_000);
-
-// --- deterministic unit coverage for retainMsFor/isAbandonedExpired (tg-cli#182
-// round 6 review finding — Codex, repeated round 5 and round 6): every prior
-// test proving the reconnect-time expiry check exercises it through a REAL
-// daemon process racing a REAL periodic sweep, which the sweep can win before
-// the check ever runs, so the check's own boolean logic had no test that
-// FAILS if the check is deleted. These call the pure exported functions
-// directly — no daemon, no timing race, no sweep to race against. ---
-
-test('retainMsFor: permission gets the long window, question gets the short one', () => {
-  expect(retainMsFor('permission')).toBeGreaterThan(retainMsFor('question'));
-});
-
-test('isAbandonedExpired: a permission just inside its own (longer) window is NOT expired, even though it is already past the question window', () => {
-  const permissionWindow = retainMsFor('permission');
-  const questionWindow = retainMsFor('question');
-  expect(permissionWindow).toBeGreaterThan(questionWindow);
-  const at = 0;
-  const now = questionWindow + 1; // past the SHORT window, still inside the long one
-  expect(isAbandonedExpired('permission', at, now)).toBe(false);
-  expect(isAbandonedExpired('question', at, now)).toBe(true);
-});
-
-test('isAbandonedExpired: a permission past its OWN window IS expired (this is the exact boolean the reconnect-time check in tg-ctl depends on)', () => {
-  const permissionWindow = retainMsFor('permission');
-  const at = 0;
-  const now = permissionWindow + 1;
-  expect(isAbandonedExpired('permission', at, now)).toBe(true);
-});
-
-test('isAbandonedExpired: exactly AT the window boundary is not yet expired (strict >, matching pruneAbandonedButtons)', () => {
-  const window = retainMsFor('permission');
-  expect(isAbandonedExpired('permission', 0, window)).toBe(false);
-  expect(isAbandonedExpired('permission', 0, window + 1)).toBe(true);
-});
 
 // --- deterministic unit coverage for decideQueuedPermissionReconnect (tg-cli#182
 // round 8 review finding — Codex, five straight rounds): the pure decision
 // function the reconnect branch in handleHookSocketLine calls. No daemon, no
-// sweep, no timing race — this directly tests the exact predicate the branch
-// depends on, including the specific "expired but the periodic sweep hasn't
-// caught it yet" case no integration test can reliably force. ---
+// timing race. There is no expiry outcome any more (tg-cli#705): a queued
+// decision stays deliverable until a relevance signal closes its card. ---
 
 const RECONNECT_REQ = {
   requestId: 'p_reconnect',
@@ -745,122 +710,39 @@ const QUEUED_DECISION = { value: 'allow', label: 'Approve', decision: 'allow', a
 
 test('decideQueuedPermissionReconnect: no queued decision at all -> no-queued-decision (ordinary ask reconnect, nothing to log)', () => {
   const retained = { req: RECONNECT_REQ, at: 0, queuedDecision: undefined };
-  expect(decideQueuedPermissionReconnect(retained, RECONNECT_REQ, 1000).kind).toBe('no-queued-decision');
+  expect(decideQueuedPermissionReconnect(retained, RECONNECT_REQ).kind).toBe('no-queued-decision');
 });
 
-test('decideQueuedPermissionReconnect: queued decision, reconnect well within the retention window, identity matches -> deliver', () => {
+test('decideQueuedPermissionReconnect: queued decision, identity matches -> deliver, however old the tap', () => {
   const retained = { req: RECONNECT_REQ, at: 0, queuedDecision: QUEUED_DECISION };
-  const outcome = decideQueuedPermissionReconnect(retained, RECONNECT_REQ, 1000);
+  const outcome = decideQueuedPermissionReconnect(retained, RECONNECT_REQ);
   expect(outcome.kind).toBe('deliver');
   if (outcome.kind === 'deliver') expect(outcome.queuedDecision).toEqual(QUEUED_DECISION);
-});
-
-test('decideQueuedPermissionReconnect: queued decision PAST its own retention window -> expired (THE exact race Codex round 4-8 asked to cover)', () => {
-  const window = retainMsFor('permission');
-  const retained = { req: RECONNECT_REQ, at: 0, queuedDecision: QUEUED_DECISION };
-  // The entry is logically expired (now - at > window) regardless of whether
-  // any periodic sweep has run yet — this function has no notion of "swept",
-  // only "expired", which is exactly the property the reconnect branch needs.
-  const outcome = decideQueuedPermissionReconnect(retained, RECONNECT_REQ, window + 1);
-  expect(outcome.kind).toBe('expired');
-});
-
-test('decideQueuedPermissionReconnect: SECURITY — expired takes priority over every other check (deleting this branch would silently re-deliver a stale decision)', () => {
-  const window = retainMsFor('permission');
-  const retained = { req: RECONNECT_REQ, at: 0, queuedDecision: QUEUED_DECISION };
-  // Everything else about this reconnect is a PERFECT match (same req object,
-  // same promptTurnId, payload matches) — the ONLY thing wrong is that it's
-  // past the window. If the expiry check were removed or reordered after the
-  // match checks, this would incorrectly return "deliver".
-  const outcome = decideQueuedPermissionReconnect(retained, RECONNECT_REQ, window + 1);
-  expect(outcome.kind).toBe('expired');
-  expect(outcome.kind).not.toBe('deliver');
 });
 
 test('decideQueuedPermissionReconnect: no promptTurnId proof -> no-turn-proof, never delivers on session-scoped identity alone', () => {
   const reqNoProof = { ...RECONNECT_REQ, promptTurnId: undefined };
   const retained = { req: reqNoProof, at: 0, queuedDecision: QUEUED_DECISION };
-  expect(decideQueuedPermissionReconnect(retained, reqNoProof, 1000).kind).toBe('no-turn-proof');
+  expect(decideQueuedPermissionReconnect(retained, reqNoProof).kind).toBe('no-turn-proof');
 });
 
 test('decideQueuedPermissionReconnect: reconnecting promptTurnId differs from the retained one -> turn-mismatch, never delivers onto a different invocation', () => {
   const retained = { req: RECONNECT_REQ, at: 0, queuedDecision: QUEUED_DECISION };
   const differentTurn = { ...RECONNECT_REQ, promptTurnId: 'turn_DIFFERENT' };
-  expect(decideQueuedPermissionReconnect(retained, differentTurn, 1000).kind).toBe('turn-mismatch');
+  expect(decideQueuedPermissionReconnect(retained, differentTurn).kind).toBe('turn-mismatch');
 });
 
 test('decideQueuedPermissionReconnect: reconnecting toolInput differs from the retained one -> payload-mismatch, never delivers onto a materially different action', () => {
   const retained = { req: { ...RECONNECT_REQ, toolInput: { command: 'rm -rf /tmp/a' } }, at: 0, queuedDecision: QUEUED_DECISION };
   const mutatedPayload = { ...RECONNECT_REQ, toolInput: { command: 'rm -rf /' } };
-  expect(decideQueuedPermissionReconnect(retained, mutatedPayload, 1000).kind).toBe('payload-mismatch');
+  expect(decideQueuedPermissionReconnect(retained, mutatedPayload).kind).toBe('payload-mismatch');
 });
 
-test('RETENTION prune: a permission survives past TG_CTL_ABANDONED_RETAIN_MS on its own longer TG_CTL_ABANDONED_PERMISSION_RETAIN_MS window (tg-cli#182)', async () => {
+test('RESTORE: a retained permission survives a daemon-down gap and is still tappable after the restart', async () => {
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
-  // The QUESTION window is tiny; the PERMISSION window is deliberately much
-  // longer — this is the whole point of tg-cli#182 (Alex reported a permission
-  // going stale and being told "never delivered" long before he'd had a
-  // realistic chance to check his phone).
-  await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '600', TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '30000' });
-
-  const ask = startAsk(cfgDir, tg.port, PERMISSION);
-  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
-  ask.kill(9);
-  await ask.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 6000)).toBe(true);
-
-  // Past the QUESTION window but still well inside the PERMISSION window: a
-  // fresh question forward triggers a persist -> prune sweep, but the
-  // permission must NOT be pruned yet, and a tap on it must still be honored
-  // (queued for reconnect), never "expired".
-  await Bun.sleep(900);
-  startAsk(cfgDir, tg.port, { requestId: 'q_after_perm', agent: 'claude', kind: 'question', question: 'Other?', options: [{ label: 'Ok' }] });
-  expect(await until(() => tg.cards().length === 2, 5000)).toBe(true);
-
-  tg.push([tap('tgq:p_durable:allow', 812, 1)]);
-  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 6000)).toBe(true);
-  expect(tg.answeredCbs().some((c) => c.text === 'expired')).toBe(false);
-}, 25_000);
-
-test('RETENTION prune (unequal windows, full round trip): a permission is pruned/notified at its OWN window, not the shorter question one, and not never (tg-cli#182 round-1 review finding)', async () => {
-  const cfgDir = makeCfgDir();
-  const tg = mockTelegram();
-  servers.push(tg);
-  // Permission window intentionally longer than the question one, with a wide
-  // margin on both sides of the mid-point sleep (review finding, round 4: the
-  // original 400/1200/600ms timings left only a few hundred ms of margin
-  // against poll/disconnect-detection latency, flaking the "tap honored"
-  // assertion under CI load) — proves the permission's OWN longer window is
-  // what actually gates its give-up (not the shorter question window, and not
-  // an unbounded/never-fires window either).
-  await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '800', TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '4000' });
-
-  const ask = startAsk(cfgDir, tg.port, PERMISSION);
-  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
-  ask.kill(9);
-  await ask.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 6000)).toBe(true);
-
-  // Past the QUESTION window (800ms) but not yet the PERMISSION window
-  // (4000ms): still fully alive, a tap is honored, never "expired".
-  await Bun.sleep(1500);
-  tg.push([tap('tgq:p_durable:allow', 833, 1)]);
-  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
-  expect(tg.answeredCbs().some((c) => c.text === 'expired')).toBe(false);
-
-  // Now past its OWN (longer) window too — the daemon must eventually give up
-  // and report it, exactly like the question case, just on its own timer.
-  expect(await until(() => tg.edits().some((e) => e.includes('still no connection')), 8000)).toBe(true);
-  expect(daemonLog(cfgDir)).toContain('ask-abandoned-long-outage');
-}, 25_000);
-
-test('RESTORE (unequal windows): a permission queued across a daemon-down window survives past the QUESTION window but is still tappable, restored correctly on restart (tg-cli#182 round 4 review finding)', async () => {
-  const cfgDir = makeCfgDir();
-  const tg = mockTelegram();
-  servers.push(tg);
-  const daemon1 = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '600', TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '20000' });
+  const daemon1 = await startDaemon(cfgDir, tg.port);
 
   const ask = startAsk(cfgDir, tg.port, PERMISSION);
   expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
@@ -869,20 +751,15 @@ test('RESTORE (unequal windows): a permission queued across a daemon-down window
   expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
   expect(await until(() => hasPersistedQuestion(cfgDir, 'p_durable'), 4000)).toBe(true);
 
-  // Kill the daemon, then wait past the QUESTION window (600ms) but well
-  // inside the PERMISSION window (20s) — this is specifically the RESTORE
-  // path (tg-ctl:4124's restoreRetainMs), not the live sweep, since the
-  // daemon is fully down for this whole wait.
+  // Kill the daemon: the restart goes through the RESTORE path, not the live sweep. There is
+  // no retention window to outlast any more (tg-cli#705).
   daemon1.kill(9);
   await daemon1.exited;
-  await Bun.sleep(1500);
 
-  const daemon2 = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '600', TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '20000' });
+  const daemon2 = await startDaemon(cfgDir, tg.port);
 
-  // Must NOT have been given up on during restore — no "still no connection"
-  // notice, and a tap right after restart must still be honored (queued),
-  // never "expired". If the restore path used the QUESTION window instead of
-  // the permission's own, this entry would have already been dropped.
+  // Restored open, never given up on: a tap right after restart is honored (queued), never
+  // "expired".
   expect(tg.edits().some((e) => e.includes('still no connection'))).toBe(false);
   tg.push([tap('tgq:p_durable:allow', 861, 1)]);
   expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 6000)).toBe(true);
@@ -890,196 +767,6 @@ test('RESTORE (unequal windows): a permission queued across a daemon-down window
 
   daemon2.kill('SIGTERM');
   await daemon2.exited;
-}, 25_000);
-
-test('LONG OUTAGE: an abandoned question past the retention window is proactively reported, never left silent', async () => {
-  const cfgDir = makeCfgDir();
-  const tg = mockTelegram();
-  servers.push(tg);
-  // Tiny retention window. The daemon's poll loop sweeps every iteration (this
-  // repo's fake Telegram returns an empty getUpdates batch every ~60ms when idle),
-  // so the past-window entry is dropped and its card proactively re-edited WITHOUT
-  // any tap or other mutation — closing the "connection lost and nobody was ever
-  // told" gap (Alex tg requirement: a long-running uncertainty must eventually be
-  // reported, not left on a stale card forever).
-  await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '600', TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '600' });
-
-  const ask = startAsk(cfgDir, tg.port, QUESTION);
-  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
-  const q1Data = tg.optionData(1)!;
-  ask.kill(9);
-  await ask.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('Time-out expired.')), 6000)).toBe(true);
-
-  // No tap, no other mutation — the daemon must still proactively surface the
-  // outage once the retention window elapses.
-  expect(await until(() => tg.edits().some((e) => e.includes('still no connection')), 6000)).toBe(true);
-  expect(daemonLog(cfgDir)).toContain('ask-abandoned-long-outage');
-  expect(tg.keyboardClears()).toBeGreaterThanOrEqual(1); // the now-dead card is retired
-
-  // A later tap on the now-gone entry gets a plain "expired" toast — never silently
-  // dropped, never falsely claims delivery.
-  tg.push([tap(q1Data, 745, 1)]);
-  expect(await until(() => tg.answeredCbs().some((c) => c.text === 'expired'), 6000)).toBe(true);
-  expect(injected(cfgDir).some((l) => l.includes('Production'))).toBe(false);
-}, 25_000);
-
-test('LONG OUTAGE (queued permission): a queued decision that never reconnects gets the same proactive notice', async () => {
-  const cfgDir = makeCfgDir();
-  const tg = mockTelegram();
-  servers.push(tg);
-  await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '600', TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '600' });
-
-  const ask = startAsk(cfgDir, tg.port, PERMISSION);
-  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
-  ask.kill(9);
-  await ask.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
-
-  // Tap Approve — queued, refreshing the retention clock (see the LAST-TAP-WINS
-  // test for the overwrite semantics; here we prove the clock refresh itself).
-  tg.push([tap('tgq:p_durable:allow', 815, 1)]);
-  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
-
-  // No reconnect ever comes. Even with a QUEUED decision sitting on the entry, the
-  // daemon must still eventually give up and say so plainly — a queued card is not
-  // exempt from the "long silence must be reported" guarantee. The give-up text
-  // must NAME the queued decision ("Approve") rather than implying nothing was
-  // ever chosen — that's the whole point of threading queuedDecisionLabel through
-  // abandonedLongOutageText (a tapped decision that never got delivered is a
-  // materially different situation from a card nobody ever touched).
-  expect(await until(() => tg.edits().some((e) => e.includes('still no connection')), 6000)).toBe(true);
-  expect(daemonLog(cfgDir)).toContain('ask-abandoned-long-outage');
-  const giveUpEdit = tg.edits().find((e) => e.includes('still no connection'));
-  expect(giveUpEdit).toContain('queued "Approve"');
-  expect(giveUpEdit).toContain('never delivered');
-}, 25_000);
-
-test('LONG OUTAGE (daemon down across the window): the notice still fires on restore, never silently discarded', async () => {
-  const cfgDir = makeCfgDir();
-  const tg = mockTelegram();
-  servers.push(tg);
-  const daemon1 = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '600', TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '600' });
-
-  const ask = startAsk(cfgDir, tg.port, PERMISSION);
-  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
-  ask.kill(9);
-  await ask.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
-  expect(await until(() => hasPersistedQuestion(cfgDir, 'p_durable'), 4000)).toBe(true);
-
-  // Kill the daemon itself BEFORE the retention window elapses, then wait past the
-  // window with the daemon fully DOWN — this is the case the sweep and the
-  // persist-time prune can never see (they only run while the daemon is alive).
-  daemon1.kill(9);
-  await daemon1.exited;
-  await Bun.sleep(900);
-
-  // Restart. The entry is now past its retention window — it must NOT just vanish
-  // from `abandonedButtons` silently: the human tapped nothing wrong and deserves
-  // the same "still no connection" notice as the daemon-stays-up case, not an
-  // unexplained gap where the card is simply never touched again.
-  const daemon2 = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '600', TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '600' });
-  expect(await until(() => tg.edits().some((e) => e.includes('still no connection')), 8000)).toBe(true);
-  expect(daemonLog(cfgDir)).toContain('ask-abandoned-long-outage');
-  const noticeCountAfterFirstRestore = (daemonLog(cfgDir).match(/ask-abandoned-long-outage/g) ?? []).length;
-  expect(noticeCountAfterFirstRestore).toBe(1);
-
-  daemon2.kill('SIGTERM');
-  await daemon2.exited;
-
-  // The notified entry must have been written OUT of the on-disk file (not just
-  // dropped from memory) — otherwise a THIRD restart would re-notify the identical
-  // stale record forever. daemonLog() accumulates across restarts (append mode), so
-  // a stable count proves it. startDaemon already blocks until the new daemon's
-  // socket exists, which happens AFTER the restore block runs, so restore (and its
-  // persistQuestions() call) has already completed by the time it returns.
-  const daemon3 = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '600', TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '600' });
-  const noticeCountAfterSecondRestore = (daemonLog(cfgDir).match(/ask-abandoned-long-outage/g) ?? []).length;
-  expect(noticeCountAfterSecondRestore).toBe(1);
-
-  daemon3.kill('SIGTERM');
-  await daemon3.exited;
-}, 35_000);
-
-test('LONG OUTAGE (both thresholds crossed while the daemon was DOWN): the restore path gives up and names the queued decision, no "still waiting" notice', async () => {
-  const cfgDir = makeCfgDir();
-  const tg = mockTelegram();
-  servers.push(tg);
-  // Both thresholds tiny and equal-ish, so the daemon-down gap below crosses BOTH
-  // before restore even runs — this exercises the RESTORE-loop give-up branch
-  // (tg-ctl's bootstrap block, `nowRestore - rec.at > ABANDONED_RETAIN_MS`), which
-  // never adds the entry to `abandonedButtons` at all, so `noticeStaleQueuedDecisions`
-  // never sees it. It's a DIFFERENT code path from the live-sweep skip guard (see
-  // "LONG OUTAGE (live sweep crosses both thresholds together)" below) — this one
-  // proves the restore path's own give-up correctly threads queuedDecision through
-  // to notifyAbandonedLongOutage (a real bug this diff also fixed: the restore-time
-  // give-up used to construct an AbandonedButton with no queuedDecision at all).
-  const daemon1 = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '600', TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '600', TG_CTL_QUEUED_DECISION_NOTICE_MS: '300' });
-
-  const ask = startAsk(cfgDir, tg.port, PERMISSION);
-  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
-  ask.kill(9);
-  await ask.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
-
-  tg.push([tap('tgq:p_durable:allow', 820, 1)]);
-  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
-
-  // Kill the daemon RIGHT after the tap (notifiedAt still unset) and wait past
-  // BOTH thresholds with the daemon fully down.
-  daemon1.kill(9);
-  await daemon1.exited;
-  await Bun.sleep(900);
-
-  const daemon2 = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '600', TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '600', TG_CTL_QUEUED_DECISION_NOTICE_MS: '300' });
-  expect(await until(() => tg.edits().some((e) => e.includes('still no connection')), 8000)).toBe(true);
-
-  // The give-up notice must name the queued decision, and the "still waiting to
-  // reconnect" notice must NEVER have fired for this entry (it's being pruned in
-  // the very same sweep that would have fired it).
-  const lastEdit = tg.edits().at(-1);
-  expect(lastEdit).toContain('queued "Approve"');
-  expect(daemonLog(cfgDir)).not.toContain('ask-permission-decision-queue-still-waiting-notice');
-  expect(daemonLog(cfgDir)).toContain('ask-abandoned-long-outage');
-
-  daemon2.kill('SIGTERM');
-  await daemon2.exited;
-}, 35_000);
-
-test('LONG OUTAGE (live sweep crosses both thresholds together): the running daemon\'s own poll-loop sweep skips the "still waiting" notice for an entry it is about to give up on', async () => {
-  const cfgDir = makeCfgDir();
-  const tg = mockTelegram();
-  servers.push(tg);
-  // NOTICE_MS === RETAIN_MS (not merely "tiny and close"): with a single value,
-  // the FIRST live sweep to observe the entry past that shared threshold sees
-  // BOTH `now - qd.at > NOTICE_MS` (notice-eligible) AND `now - entry.at >=
-  // RETAIN_MS` (skip-guard-active) true at once — this is the actual
-  // noticeStaleQueuedDecisions skip-guard race (no daemon restart involved),
-  // proving the LIVE sweep — not just the restore path — never lets a
-  // since-pruned card keep claiming "still waiting … will still be delivered"
-  // with a live keyboard.
-  const daemon = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '500', TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '500', TG_CTL_QUEUED_DECISION_NOTICE_MS: '500' });
-
-  const ask = startAsk(cfgDir, tg.port, PERMISSION);
-  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
-  ask.kill(9);
-  await ask.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
-
-  tg.push([tap('tgq:p_durable:allow', 822, 1)]);
-  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
-
-  // No reconnect, no further tap — the daemon stays UP and running the whole
-  // time, so its own poll-loop sweep (not a restart/restore) is what has to get
-  // this right.
-  expect(await until(() => daemonLog(cfgDir).includes('ask-abandoned-long-outage'), 8000)).toBe(true);
-  expect(daemonLog(cfgDir)).not.toContain('ask-permission-decision-queue-still-waiting-notice');
-  const lastEdit = tg.edits().at(-1);
-  expect(lastEdit).toContain('queued "Approve"');
-
-  daemon.kill('SIGTERM');
-  await daemon.exited;
 }, 25_000);
 
 test('QUEUED DECISION NOTICE survives a daemon restart (notifiedAt persisted): the notice never re-fires after a bounce', async () => {
@@ -1533,29 +1220,6 @@ test('PERM QUEUE LAST-TAP-WINS: a second tap overwrites the queued decision (cov
   await daemon.exited;
 }, 30_000);
 
-test('PERM QUEUE EXPIRE: a tap past the retention window is refused (expired), never queued', async () => {
-  const cfgDir = makeCfgDir();
-  const tg = mockTelegram();
-  servers.push(tg);
-
-  // Tiny retention window so the delivery-time check (not just the periodic sweep)
-  // is what rejects a too-late tap.
-  const daemon = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '600', TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '600' });
-  const ask1 = startAsk(cfgDir, tg.port, PERMISSION);
-  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
-  ask1.kill(9);
-  await ask1.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
-
-  await Bun.sleep(900);
-  tg.push([tap('tgq:p_durable:allow', 812, 1)]);
-  expect(await until(() => tg.answeredCbs().some((c) => c.text === 'expired'), 6000)).toBe(true);
-  expect(tg.answeredCbs().some((c) => c.text.includes('queued'))).toBe(false);
-
-  daemon.kill('SIGTERM');
-  await daemon.exited;
-}, 30_000);
-
 test('PERM QUEUE RESTART: a queued decision survives a daemon crash and still delivers on reconnect', async () => {
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
@@ -1590,55 +1254,6 @@ test('PERM QUEUE RESTART: a queued decision survives a daemon crash and still de
   daemon2.kill('SIGTERM');
   await daemon2.exited;
 }, 35_000);
-
-test('PERM QUEUE EXPIRED AT RECONNECT: a queued decision past its own window is NOT auto-delivered on a late reconnect (tg-cli#182 round 4 review finding — Codex High)', async () => {
-  const cfgDir = makeCfgDir();
-  const tg = mockTelegram();
-  servers.push(tg);
-
-  // Tiny permission window so the entry is genuinely past it by the time the
-  // reconnect (ask2) lands — proves the synchronous age check at the
-  // reconnect-delivery point, not just the periodic sweep, since the sweep
-  // could otherwise race a reconnect arriving in the same tick.
-  const daemon = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_PERMISSION_RETAIN_MS: '700' });
-  const ask1 = startAsk(cfgDir, tg.port, PERMISSION);
-  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
-  ask1.kill(9);
-  await ask1.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
-
-  tg.push([tap('tgq:p_durable:allow', 863, 1)]);
-  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
-
-  // Wait past the permission's own window, then reconnect. In this daemon's
-  // real timing the periodic sweep (running on the same ~60ms idle-poll
-  // cadence used elsewhere in this file) is very likely to have already
-  // pruned the entry via the ordinary abandoned-long-outage path before the
-  // reconnect lands — that's a SAFE outcome too, not a test bug: either that
-  // sweep OR this diff's new synchronous check (queued-decision-expired-at-
-  // reconnect, exercised when a reconnect genuinely races the sweep) must
-  // prevent the stale delivery. The property under test is the OUTCOME
-  // (never deliver a decision past its own window), not which of the two
-  // safety nets caught it — deterministically forcing the exact race window
-  // between "expired" and "swept" from outside the process isn't reliable.
-  await Bun.sleep(1200);
-  const ask2 = startAsk(cfgDir, tg.port, PERMISSION);
-
-  // Must NOT receive the stale queued "allow" under ANY code path: whichever
-  // safe path fired (reattached to a fresh live prompt, or a genuinely new
-  // card because the sweep already pruned the old entry), ask2 stays BLOCKED
-  // waiting for a real decision — it must NOT resolve immediately with the
-  // stale answer. Give the daemon a moment to have processed the reconnect
-  // either way, then confirm ask2 is still running (never exited/resolved).
-  await Bun.sleep(1500);
-  expect(ask2.exitCode).toBeNull();
-  expect(daemonLog(cfgDir)).not.toContain('ask-forward queued-decision-delivered');
-
-  ask2.kill(9);
-  await ask2.exited;
-  daemon.kill('SIGTERM');
-  await daemon.exited;
-}, 30_000);
 
 test('PERM QUEUE MISMATCH GUARD: a reconnect with a DIFFERENT question under the same requestId does not auto-approve', async () => {
   const cfgDir = makeCfgDir();
@@ -2175,7 +1790,7 @@ test('TEXT-REPLY DECISION: a multiQuestion permission card is NOT resolved by a 
   await daemon.exited;
 }, 20_000);
 
-test('TEXT-REPLY DECISION: a question-kind card is NOT resolved by a text reply (permission-only scope)', async () => {
+test('TEXT-REPLY to a LIVE question card answers it with the text — never through the permission decision path (tg-cli#705)', async () => {
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
@@ -2185,7 +1800,8 @@ test('TEXT-REPLY DECISION: a question-kind card is NOT resolved by a text reply 
   expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
 
   // "yes" is a recognized decision token, but the card is a QUESTION, not a
-  // PERMISSION — permissionRequestIdForMessage must never match it.
+  // PERMISSION — permissionRequestIdForMessage must never match it. Since tg-cli#705 a text
+  // reply to a live question card is its answer: the text itself, as the question's value.
   tg.push([
     {
       update_id: 912,
@@ -2205,15 +1821,12 @@ test('TEXT-REPLY DECISION: a question-kind card is NOT resolved by a text reply 
     },
   ]);
 
-  // The pane has an OPEN question, so this reply is deferred (queued behind it,
-  // features/tg-ctl's defer-while-waiting model) rather than injected immediately
-  // — either way, the important property is that it never resolves the question
-  // card itself via the decision path.
-  await Bun.sleep(800);
-  expect(ask.exitCode).toBeNull();
+  const out = JSON.parse(await new Response(ask.stdout).text());
+  expect(out.hookSpecificOutput.permissionDecision).toBe('allow');
+  expect(out.hookSpecificOutput.updatedInput.answers).toEqual({ 'Where should I deploy?': 'yes' });
+  expect(await until(() => tg.edits().some((e) => e.includes('✓ answered in chat: yes')), 4000)).toBe(true);
   expect(tg.edits().some((e) => e.includes('Selected answer'))).toBe(false);
 
-  ask.kill(9);
   await ask.exited;
   daemon.kill('SIGTERM');
   await daemon.exited;

@@ -4,6 +4,7 @@
 // answerCallbackQuery, hook sockets, and native adapter I/O.
 
 import type { AgentKind, Registration } from './types';
+import type { AskerIdentity } from './session-topics';
 import { escapeHtml } from '../render/html';
 
 export type ButtonRequestKind = 'question' | 'permission';
@@ -105,8 +106,7 @@ export interface ButtonRequest {
   multiQuestion?: boolean;
   opencode?: OpencodeRequestRef;
   // The identity proof tg-ctl requires before AUTOMATICALLY delivering a QUEUED
-  // permission decision to a reconnecting hook within its retention window
-  // (tg-cli#182: ABANDONED_PERMISSION_RETAIN_MS): without this proof,
+  // permission decision to a reconnecting hook (tg-cli#182): without this proof,
   // requestId equality alone doesn't prove the reconnect is the SAME invocation
   // rather than a later, unrelated one that merely asks an identical question —
   // see permissionPayloadMatches and tg-ctl's reconnect branch. SOURCED
@@ -130,13 +130,10 @@ export interface ButtonRequest {
   promptTurnId?: string;
   // tg-cli#403 / agent-tools#754: opt-in "critical" hatch/permission mode. When
   // true, the daemon removes ASK_TOTAL_TIMEOUT_MS's bound for this ask (waits
-  // indefinitely for a human decision instead of reporting a timeout) and runs
-  // the quiet-hours-aware reminder cadence (features/tg-ctl/hatch-critical-reminder.ts)
-  // while it stays undecided. Alex's explicit, verbatim ask (tg-cli#403 ticket
-  // body) is the sanctioned exception to tg-cli#360/#380's "no new timers" rule
-  // for the reminder cadence this enables — cite this field's origin, don't
-  // re-litigate it. Default/absent === false: every existing (non-critical)
-  // call site is byte-for-byte unaffected.
+  // indefinitely for a human decision instead of reporting a timeout). While it
+  // stays undecided its card is listed in the 📥 Inbox topic like every open
+  // question (tg-cli#705 replaced the old repeating reminder). Default/absent ===
+  // false: every existing (non-critical) call site is byte-for-byte unaffected.
   critical?: boolean;
   // --- Late-approval grant protocol v1.1 additive fields (tg-cli#398) ---
   // All optional; absent on every pre-v1.1 payload. Both normalizers
@@ -165,6 +162,9 @@ export interface ButtonRequest {
   // question: a late answer is typed into `paneId` only while that pane still
   // hosts this session (spec §2.6, tg-cli#100).
   sessionKey?: string;
+  // Who asked (tg-cli#717), set by the `tg-ctl ask` client: the process's explicit session,
+  // pid chain and tmux pane, so the daemon can post the card in the ASKING session's topic.
+  asker?: AskerIdentity;
 }
 
 export interface ButtonMessagePayload {
@@ -198,6 +198,10 @@ export type ButtonAnswer =
       label: string;
       value: string;
       decision?: PermissionDecision;
+      // A model-facing deny reason (tg-cli#705: a permission answered in chat with prose —
+      // "no, use the staging db" — denies WITH that text as the reason). Overrides the
+      // relabeled-deny label reason below.
+      reason?: string;
     }
   | { status: 'unsupported'; requestId: string; reason: string };
 
@@ -491,68 +495,27 @@ export function abandonedMultiText(req: ButtonRequest, label: string): string {
   return [buildQuestionText(req), status].join('\n\n');
 }
 
-// Reconnect never happened within the applicable retention window
-// (ABANDONED_RETAIN_MS for a question, the much longer
-// ABANDONED_PERMISSION_RETAIN_MS for a permission — tg-cli#182 — tg-ctl's
-// retainMsFor): the daemon is giving up on this entry (see pruneAbandonedButtons's
-// notify callback) rather than leaving the human staring at a stale "queued" or
-// "hook disconnected" card forever with no further signal (Alex tg requirement:
-// a long-running uncertainty must eventually be reported, not left silent). The
-// keyboard is cleared for this one (see tg-ctl's notifyAbandonedLongOutage) — the
-// original prompt still rides along so the human knows what was never delivered.
-// `queuedDecisionLabel`, when set, means the human HAD already tapped a decision
-// (still QUEUED at the moment the daemon gave up) — the text then says so
-// explicitly instead of the generic "never delivered", since simply saying
-// "answer in the terminal" would understate that a real choice was made and is
-// about to be discarded along with this entry.
-export function abandonedLongOutageText(req: ButtonRequest, label: string, queuedDecisionLabel?: string): string {
-  const status = queuedDecisionLabel
-    ? `still no connection for ${label} after a long wait — your queued "${queuedDecisionLabel}" was never delivered and this card is giving up on it; answer directly in the terminal.`
-    : `still no connection for ${label} after a long wait — this was never delivered over Telegram; answer directly in the terminal.`;
-  return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
-}
-
-// Hatch counterpart to abandonedLongOutageText, adjusted for the grant
-// protocol (tg-cli#398): the entry's 12h retention is over, but the 24h GRACE
-// window (grants.ts) may still be open — a tap past retention still mints a
-// grant from the grace record. So this never claims the card is dead, only
-// that no live delivery path remains and a grant is now the only channel.
-export function hatchAbandonedLongOutageText(req: ButtonRequest, hookId: string, queuedDecisionLabel?: string): string {
-  const status = queuedDecisionLabel
-    ? `hatch request ${hookId}: no retry arrived after a long wait — your recorded "${queuedDecisionLabel}" was never applied and this card is giving up on it. A fresh retry will prompt again from scratch.`
-    : `hatch request ${hookId}: a long wait has passed with no decision. The card stays tappable until the 24h grace window closes — an Approve tap mints a one-time grant routed to the agent; past that, the agent must re-request.`;
-  return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
-}
-
 // A QUEUED permission decision has been waiting past QUEUED_DECISION_NOTICE_MS
 // with no reconnect — a PROACTIVE heads-up (Alex tg#9982: if the connection
 // doesn't recover for a long time, say so), fired ONCE per queued tap
 // (tg-ctl tracks `queuedDecision.notifiedAt` so this never repeats on every
-// sweep). Unlike the pre-fix "demoted" text this replaced, the decision is
-// NEVER cleared here — it stays fully queued and deliverable the instant a
-// genuine reconnect lands within its retention window; this is a notice, not
-// an expiry (the entry's own later expiry, if the window runs out with no
-// reconnect, is handled elsewhere — see the next comment).
-// `decisionLabel` is deliberately NOT promised "however long that takes" — the
-// entry is still bound by its retention window (ABANDONED_PERMISSION_RETAIN_MS
-// for a permission — tg-cli#182 — the daemon's genuine give-up point,
-// tg-ctl's notifyAbandonedLongOutage), so a human who never re-taps and
-// never sees that later give-up notice would be misled by an unconditional
-// guarantee (review finding). This says only what's true right now: not
-// discarded YET, still queued, will keep trying until reconnect OR the
-// retention window runs out (at which point the human gets a SEPARATE,
-// explicit notice — this text is never the last word on it). Self-gates on
-// queuedDecisionCanAutoDeliver like abandonedPermissionText and
-// queuedPermissionDecisionText — the CALLER (tg-ctl's noticeStaleQueuedDecisions)
-// already gates before ever calling this, so this is defense-in-depth, not a
-// change in current behavior: a FUTURE caller that skips that gate must not be
-// able to reintroduce the overclaim just by calling this function directly
-// (two review models independently flagged this as the one builder relying
-// solely on its caller's discipline instead of its own).
+// sweep). The decision is NEVER cleared here — it stays queued and deliverable
+// the instant a genuine reconnect lands; the card stays open (and in the 📥 Inbox
+// topic) until a relevance signal closes it (tg-cli#705 — there is no give-up
+// timer any more). Self-gates on queuedDecisionCanAutoDeliver like
+// abandonedPermissionText and queuedPermissionDecisionText, so a caller that
+// skips the gate cannot reintroduce the overclaim.
 export function queuedDecisionStillWaitingText(req: ButtonRequest, label: string, decisionLabel: string): string {
   const status = queuedDecisionCanAutoDeliver(req)
-    ? `still waiting to reconnect for ${label} — your queued "${decisionLabel}" has NOT been discarded and will still be delivered automatically if it reconnects. If the connection stays down much longer you'll get a separate notice. Tap again to change it, or answer in the terminal now.`
-    : `still waiting to reconnect for ${label} — your queued "${decisionLabel}" has NOT been discarded, but this daemon can't prove a later reconnect is the SAME request, so it won't auto-deliver; you'll need to tap again once it reconnects. If the connection stays down much longer you'll get a separate notice. You can also answer in the terminal now.`;
+    ? `still waiting to reconnect for ${label} — your queued "${decisionLabel}" has NOT been discarded and will still be delivered automatically if it reconnects. Tap again to change it, or answer in the terminal now.`
+    : `still waiting to reconnect for ${label} — your queued "${decisionLabel}" has NOT been discarded, but this daemon can't prove a later reconnect is the SAME request, so it won't auto-deliver; you'll need to tap again once it reconnects. You can also answer in the terminal now.`;
+  return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
+}
+
+// A card closed by a relevance signal (tg-cli#705): withdrawn by its asker, superseded by a
+// newer hatch request, decided on a sibling card, answered in chat, dismissed. The original
+// prompt stays visible above the status line, like every other card edit.
+export function closedQuestionText(req: ButtonRequest, status: string): string {
   return [buildQuestionText(req), hatchSafeStatus(req, status)].join('\n\n');
 }
 
@@ -672,7 +635,7 @@ export function formatAgentHookOutput(req: ButtonRequest, answer: ButtonAnswer):
     // label as the reason so the model gets the INTENT, not an unexplained block
     // (a bare deny on ExitPlanMode can leave it re-prompting or looping). A plain
     // Approve/Reject deny carries no extra reason (the default "Reject" is noise).
-    const denyReason = behavior === 'deny' && req.decisionLabels ? answer.label : undefined;
+    const denyReason = behavior === 'deny' ? (answer.reason ?? (req.decisionLabels ? answer.label : undefined)) : undefined;
 
     // PreToolUse output (hookEventName REQUIRED): permissionDecision, with the deny
     // reason in the event's own `permissionDecisionReason`. For an ALLOW the live
@@ -705,7 +668,7 @@ export function formatAgentHookOutput(req: ButtonRequest, answer: ButtonAnswer):
       hookSpecificOutput: {
         hookEventName: 'PermissionRequest',
         decision: behavior === 'deny'
-          ? { behavior, message: 'Rejected from Telegram' }
+          ? { behavior, message: answer.reason ?? 'Rejected from Telegram' }
           : { behavior },
       },
     };
@@ -857,7 +820,7 @@ function callbackData(requestId: string, value: string): string {
   return `${CALLBACK_PREFIX}:${requestId}:${value}`;
 }
 
-function closeQuestionCallbackData(requestId: string): string {
+export function closeQuestionCallbackData(requestId: string): string {
   return `${CLOSE_CALLBACK_PREFIX}:${requestId}`;
 }
 

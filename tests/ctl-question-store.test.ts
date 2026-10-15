@@ -32,8 +32,9 @@ test('serialize → parse round-trips questions and answered within the window',
   expect(restored.answered).toEqual([{ key: 'q0', value: 'Production', label: 'Production', decision: undefined, at: NOW - 2000, delivery: 'socket' }]);
 });
 
-test('a critical reminder keeps the chat its ping lives in across a restart (#518)', () => {
-  const data: QuestionStoreData = {
+test('a questions file written before tg-cli#705 still restores: its old criticalState field is ignored', () => {
+  const raw = JSON.stringify({
+    v: 1,
     questions: [
       {
         req: { requestId: 'c1', agent: 'claude', kind: 'permission', paneId: '%1', question: 'Allow?', critical: true },
@@ -43,9 +44,14 @@ test('a critical reminder keeps the chat its ping lives in across a restart (#51
       },
     ],
     answered: [],
-  };
-  const restored = parseQuestionStore(serializeQuestionStore(data), NOW, 60_000, 60_000);
-  expect(restored.questions[0].criticalState).toEqual({ lastReminderAt: NOW - 500, lastReminderMessageId: 501, lastReminderChatId: -100777 });
+  });
+  const restored = parseQuestionStore(raw, NOW, 60_000, 60_000);
+  expect(restored.questions).toHaveLength(1);
+  expect(restored.questions[0]).toEqual({
+    req: { requestId: 'c1', agent: 'claude', kind: 'permission', paneId: '%1', question: 'Allow?', critical: true },
+    messageId: 12,
+    at: NOW - 1000,
+  });
 });
 
 test('a queued permission decision survives the round-trip (a daemon restart must not lose it)', () => {

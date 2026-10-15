@@ -190,7 +190,9 @@ export type SpawnHarness = 'claude' | 'codex' | 'opencode';
 
 // Actions are data; the entrypoint executes them in order.
 export type Action =
-  | { kind: 'inject-text'; text: string; messageId: number } // already wrapped, OR verbatim passthrough (`/cmd` or `!shell`)
+  // `plain`: the user's own words, set only for a plain (non-reply, non-command) message — what
+  // the daemon answers an open card with when the session has exactly one (tg-cli#705).
+  | { kind: 'inject-text'; text: string; messageId: number; plain?: string } // already wrapped, OR verbatim passthrough (`/cmd` or `!shell`)
   | { kind: 'inject-key'; key: 'Escape' } // /stop
   | { kind: 'kill-agent' } // /kill — SIGINT to the registered pane's agent pid
   | { kind: 'status'; threadId?: number | null } // /status — entrypoint composes the reply
@@ -254,6 +256,9 @@ export type Action =
       // The forum topic a TEXT-reply answer came from: its "expired"/"already answered" notice
       // (no callback query to toast) is posted there, not to General (tg-cli#551).
       threadId?: number;
+      // An answer typed in chat instead of tapped (tg-cli#705): the card's session had exactly
+      // one open card, so this text answers it; `value` is unused.
+      freeText?: string;
     }
   | {
       kind: 'close-question-card';
@@ -517,7 +522,7 @@ export interface CtlPaths {
   // checks it so a replayed message is never sent twice (tg-cli#299, delivery-ledger.ts)
   deliveryLedger: string;
   awarenessNudge: string; // durable per-agent silence-nudge state (tg-ctl#363)
-  unansweredReminder: string; // which open questions got their one reminder + the live reminder message (tg-cli#464)
+  questionInbox: string; // the 📥 Inbox topic and the copy of each open question (tg-cli#705); not the Stop-hook inbox/
   runInfo: string; // which commit the running daemon loaded (pid + sha), for stale-code detection (tg-cli#279)
   sessions: string; // session registry keyed by harness session id; the daemon is its ONLY writer (#487)
   authPending: string; // `tg auth` one-time /start binding the daemon claims (docs/specs/tg-auth.md §4)
@@ -572,7 +577,7 @@ export interface TopicBinding {
 // `replyTo`: the message it replies to — a reply in the topic of a gone session takes the
 // flat reply fallback (lineage parent or picker) instead of "not running" (tg-cli#709).
 export type TopicPayload =
-  | { type: 'text'; text: string; from: string; messageId: number; replyTo?: number }
+  | { type: 'text'; text: string; from: string; messageId: number; replyTo?: number; plain?: string }
   | {
       type: 'media';
       mediaKind: 'photo' | 'document';

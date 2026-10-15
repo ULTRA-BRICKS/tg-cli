@@ -226,13 +226,13 @@ test('a plain text message forwards its message_id to the wrap (for tg --reply-t
     `[TG from ${name}${messageId !== undefined ? ` #${messageId}` : ''}] ${msg}`;
   const opts = { ...makeOpts(), wrap: wrapWithId };
   const r = stepUpdates([upd(4321, { text: 'do the thing' })], opts);
-  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #4321] do the thing', messageId: 4321 });
+  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #4321] do the thing', messageId: 4321, plain: 'do the thing' });
 });
 
 test('the default injectWrap template renders the inbound id as tg#<id>', () => {
   // The SHIPPED template + the real wrapInbound binding the daemon uses.
   const r = stepUpdates([upd(77, { text: 'hi' })], { ...makeOpts(), wrap: (name, msg, messageId) => wrapInbound(DEFAULT_CONTROL.injectWrap, name, msg, messageId) });
-  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex tg#77] hi', messageId: 77 });
+  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex tg#77] hi', messageId: 77, plain: 'hi' });
 });
 
 test('text reply to a post-timeout question card is routed as the deferred answer', () => {
@@ -409,7 +409,7 @@ test('a valid decision token to a non-decidable message_id falls through normall
 test('sender matching chatId is allowed', () => {
   const r = stepUpdates([upd(1, { text: 'hi' })], makeOpts());
   expect(r.actions).toEqual([
-    { kind: 'inject-text', text: '[TG from Alex] hi', messageId: 1 },
+    { kind: 'inject-text', text: '[TG from Alex] hi', messageId: 1, plain: 'hi' },
     { kind: 'ack', messageId: 1 },
   ]);
 });
@@ -425,7 +425,7 @@ test('extra sender in allowedSenders is allowed', () => {
   const opts = makeOpts({ cfg: { ...DEFAULT_CONTROL, allowedSenders: [666] } });
   const r = stepUpdates([upd(1, { text: 'hi', from: { id: 666, username: 'eve' } })], opts);
   expect(r.actions).toEqual([
-    { kind: 'inject-text', text: '[TG from eve] hi', messageId: 1 },
+    { kind: 'inject-text', text: '[TG from eve] hi', messageId: 1, plain: 'hi' },
     { kind: 'ack', messageId: 1 },
   ]);
 });
@@ -659,7 +659,7 @@ test('`!cmd` sent as a REPLY routes to the origin pane but stays VERBATIM (codex
 
 test('a leading space before `!` is NOT passthrough — wrapped like prose (strict column-0)', () => {
   const r = stepUpdates([upd(1, { text: ' !git status' })], makeOpts());
-  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex]  !git status', messageId: 1 });
+  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex]  !git status', messageId: 1, plain: ' !git status' });
 });
 
 test('non-owner `!cmd` gets NO raw passthrough — rejected before any action', () => {
@@ -730,17 +730,17 @@ test('owner replying with `!!rm -rf /` (confirmed) reply-routes VERBATIM, one `!
 test('plain text is wrapped with first_name', () => {
   const r = stepUpdates([upd(1, { text: 'do the thing' })], makeOpts());
   expect(r.actions).toEqual([
-    { kind: 'inject-text', text: '[TG from Alex] do the thing', messageId: 1 },
+    { kind: 'inject-text', text: '[TG from Alex] do the thing', messageId: 1, plain: 'do the thing' },
     { kind: 'ack', messageId: 1 },
   ]);
 });
 
 test('name falls back to username, then "tg"', () => {
   const byUsername = stepUpdates([upd(1, { text: 'a', from: { id: CHAT_ID, username: 'ult' } })], makeOpts());
-  expect(byUsername.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from ult] a', messageId: 1 });
+  expect(byUsername.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from ult] a', messageId: 1, plain: 'a' });
 
   const anonymous = stepUpdates([upd(1, { text: 'b', from: { id: CHAT_ID } })], makeOpts());
-  expect(anonymous.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from tg] b', messageId: 1 });
+  expect(anonymous.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from tg] b', messageId: 1, plain: 'b' });
 });
 
 // --- photo inbound (spec §5.2: daemon-chosen filename, largest rendition) ---
@@ -1026,13 +1026,13 @@ test('batch: ordered actions, old message still delivered, intruder dropped, off
   ];
   const r = stepUpdates(updates, makeOpts());
   expect(r.actions).toEqual([
-    { kind: 'inject-text', text: '[TG from Alex] hello', messageId: 10 },
+    { kind: 'inject-text', text: '[TG from Alex] hello', messageId: 10, plain: 'hello' },
     { kind: 'ack', messageId: 10 },
     { kind: 'status' },
     { kind: 'ack', messageId: 11 },
-    { kind: 'inject-text', text: '[TG from Alex] late', messageId: 13 },
+    { kind: 'inject-text', text: '[TG from Alex] late', messageId: 13, plain: 'late' },
     { kind: 'ack', messageId: 13 },
-    { kind: 'inject-text', text: '[TG from Alex] world', messageId: 15 },
+    { kind: 'inject-text', text: '[TG from Alex] world', messageId: 15, plain: 'world' },
     { kind: 'ack', messageId: 15 },
   ]);
   expect(r.skippedStale).toBe(0);

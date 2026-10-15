@@ -231,3 +231,59 @@ test('a topic that is lost midway through a split reply leaves the chunks alread
     acceptThreadedFirst = 0;
   }
 });
+
+// tg-cli#705: the daemon's 📥 Inbox topic carries ONLY its question-card copies. A `tg` send never
+// lands there — a report from a session, a reply to a message sitting in the Inbox (a card copy or
+// the human's own reply there), an explicit --topic / TG_TOPIC naming it — it goes to the
+// session's topic, else General.
+const INBOX = 77_777;
+function withInbox(h: Home): Home {
+  writeFileSync(join(h.cfg, 'tg-ctl.123.question-inbox.json'), JSON.stringify({ version: 1, chatId: CHAT, threadId: INBOX, mirrors: { k: { messageId: 30_000 } } }));
+  return h;
+}
+
+test('Inbox: a `tg --tag report` from a session posts to its session topic, never the Inbox', async () => {
+  const h = withInbox(makeHome([]));
+  startDaemon(h.cfg, { key: 'cc:x', name: 'alpha', threadId: SESSION_TOPIC });
+  const { exitCode } = await tg(h, ['--tag', 'report', 'build green']);
+  expect(exitCode).toBe(0);
+  expect(sent.map((b) => b.message_thread_id)).toEqual([SESSION_TOPIC]);
+});
+
+test('Inbox: even a session lookup answering the Inbox thread never posts there — General instead', async () => {
+  const h = withInbox(makeHome([]));
+  startDaemon(h.cfg, { key: 'cc:x', name: 'alpha', threadId: INBOX });
+  await tg(h, ['--tag', 'report', 'build green']);
+  expect('message_thread_id' in sent[0]).toBe(false);
+});
+
+test('Inbox: a reply to a card copy (no history row) goes to the session topic, not the Inbox', async () => {
+  const h = withInbox(makeHome([]));
+  startDaemon(h.cfg, { key: 'cc:x', name: 'alpha', threadId: SESSION_TOPIC });
+  await tg(h, ['--reply-to', '30000', 'on it']);
+  expect(sent[0].message_thread_id).toBe(SESSION_TOPIC);
+});
+
+test('Inbox: a reply to a message the human wrote inside the Inbox goes to the session topic, not the Inbox', async () => {
+  const h = withInbox(makeHome([userRow(30_001, INBOX)]));
+  startDaemon(h.cfg, { key: 'cc:x', name: 'alpha', threadId: SESSION_TOPIC });
+  await tg(h, ['--reply-to', '30001', 'answering that']);
+  expect(sent[0].message_thread_id).toBe(SESSION_TOPIC);
+  expect(sent[0].reply_to_message_id).toBe(30_001);
+});
+
+test('Inbox: outside any session such a reply goes to General', async () => {
+  const h = withInbox(makeHome([userRow(30_001, INBOX)]));
+  await tg(h, ['--reply-to', '30001', 'answering that'], { TMUX: '', TMUX_PANE: '' });
+  expect('message_thread_id' in sent[0]).toBe(false);
+});
+
+test('Inbox: an explicit --topic or TG_TOPIC naming the Inbox is refused — session topic instead', async () => {
+  const h = withInbox(makeHome([]));
+  startDaemon(h.cfg, { key: 'cc:x', name: 'alpha', threadId: SESSION_TOPIC });
+  const explicit = await tg(h, ['--topic', String(INBOX), 'x']);
+  expect(explicit.stderr).toContain('📥 Inbox');
+  expect(sent[0].message_thread_id).toBe(SESSION_TOPIC);
+  await tg(h, ['y'], { TG_TOPIC: String(INBOX) });
+  expect(sent[0].message_thread_id).toBe(SESSION_TOPIC);
+});

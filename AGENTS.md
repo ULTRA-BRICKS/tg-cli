@@ -485,14 +485,8 @@ after Telegram took it is sent again by the retry or the replay.
   died) injects the chosen option into the asking pane (the text-reply inject path) instead of
   hitting the `!pending` drop; the retained card keeps its keyboard. A socket-closed scoped question
   moves out of `pendingButtons` into `abandonedButtons` (so it never defers its pane's inbound) and
-  is retained for `TG_CTL_ABANDONED_RETAIN_MS` (default 30 min) — a window enforced at delivery time
-  (not only on restore), so a tap past the window expires rather than injecting a long-stale answer,
-  even on a quiet daemon with no intervening mutation. A `permission`-kind entry uses the separate,
-  much longer `TG_CTL_ABANDONED_PERMISSION_RETAIN_MS` (default 12h) instead — tg-cli#182: a
-  permission's answer is still fully actionable hours later (the harness may still be sitting on its
-  own terminal fallback prompt, or a hook may still reconnect), unlike a question, whose value fades
-  fast if stale; every retention/expiry check (`pruneAbandonedButtons`, restore, delivery-time
-  enforcement) branches on `req.kind` to use the right window. (b) **lossless reconnect** — the
+  stays there, answerable, until a relevance signal closes it (tg-cli#705 — there is no retention
+  timer; see "Question Inbox" below). (b) **lossless reconnect** — the
   `tg-ctl ask` client for a SCOPED question reconnect-and-resends the same requestId across a
   mid-block socket drop; the restored daemon re-attaches the pending entry (no duplicate card) or
   replays the stored answer (#98, now persisted). (c) **dead-card UX** — a genuinely-dead card (an
@@ -556,11 +550,8 @@ after Telegram took it is sent again by the retry or the replay.
   the same requestId AND its full payload (question text + `toolInput`, `permissionPayloadMatches`)
   still matches — guarding against a stale requestId reused against a materially different action.
   While a decision is pending, its Telegram card stays pending, and it is never silently cleared
-  without 100% confirmation it was actually delivered. Delivery IS still bounded, but by the
-  permission's own much longer window (`ABANDONED_PERMISSION_RETAIN_MS`, default 12h — tg-cli#182),
-  not the 30-min question one; a reconnect past that window falls through to a fresh live prompt
-  instead of auto-delivering the stale decision (enforced synchronously at the reconnect point itself,
-  not only by the periodic sweep — tg-cli#182 round 4). What makes delivery WITHIN that window safe is
+  without 100% confirmation it was actually delivered. Delivery is not time-bounded (tg-cli#705);
+  what makes it safe is
   the identity check upstream in `hook-normalize.ts`, applied ONLY to
   `permission`/plan-approval requests (never `question`-kind — see below): `env.invocationNonce`
   (`HookEnv`), a random id `askDaemon` generates ONCE PER `tg-ctl ask` PROCESS. The harness spawns a
@@ -595,11 +586,42 @@ after Telegram took it is sent again by the retry or the replay.
   the queue (last tap wins). Past `TG_CTL_QUEUED_DECISION_NOTICE_MS` (default 10 min) with no
   reconnect, the human gets a ONE-TIME proactive "still waiting to reconnect" notice
   (`queuedDecision.notifiedAt` makes it idempotent) — the queue is NOT cleared by this notice, only
-  reported. An entry that never reconnects within the full `TG_CTL_ABANDONED_PERMISSION_RETAIN_MS`
-  (default 12h, refreshed by every tap — tg-cli#182, NOT the 30-min `ABANDONED_RETAIN_MS` questions
-  use) is the daemon's genuine give-up point and gets its own proactive "still no connection" notice
-  (mentioning the queued decision by name if one was pending) — both from the daemon's poll-loop
-  sweep while it is up, and on restore if the window elapsed while the daemon was down.
+  reported. The card stays open until a relevance signal closes it (tg-cli#705).
+
+- **Question Inbox and close signals (tg-cli#705, spec `docs/specs/2026-10-13-question-inbox-design.md`):**
+  `features/tg-ctl/question-inbox.ts` (PURE: `planInboxSync`, the copy's rendering, hatch sibling
+  selection, `freeTextAnswer`, the withdraw line/argv, the state file, the reminder migration) + the
+  daemon's `syncInbox`/`closeOpenCard`. In topics mode (`topics`/`private_topics` and a
+  topics-capable bot) every open card — `pendingButtons` plus `abandonedButtons` with no
+  `queuedDecision` — has a silent copy in one "📥 Inbox" topic (`tg-ctl.<bot>.question-inbox.json`,
+  not the Stop-hook `inbox/`) with the card's own callback_data plus "✕ Dismiss"; `cardMessageIdFor`
+  maps a copy to its card for taps and replies. The Inbox holds ONLY those copies (CTO rule): every
+  other send — `tg` reports and replies, daemon notices, /status — goes to the session topic or
+  General. Enforced at the choke points: `tg` drops an Inbox thread from --topic/TG_TOPIC, the
+  reply anchor and the session lookup; the daemon's `outsideInbox` strips it in sendMessage/
+  sendRich, sendToSessionTopic and sessionTopic() refuse it, and only the inbox sync posts there
+  (directly via botPostResult). One exception: a card no session topic can hold (tg-cli#717).
+  A card goes to the ASKING session's topic with a notification — the session is the hook's
+  session id, else the asker's `sessionPin` (TG_SESSION, resolved by `pinnedSession`), else the
+  asker's ancestor pid chain / pane (`findSessionForAsker`, after one forced registry rescan) —
+  never another session's topic. An orphaned `tg-ctl ask` (its asker exited) withdraws its cards
+  (not a hatch ask's: it keeps the #398 grace record so a late Approve still mints a grant).
+  With topics on and no topic for it, `postCardToInbox` posts the card ITSELF into the Inbox with
+  a notification, recorded as a `card: true` entry (no copy, never deleted on close); never
+  silently to General. Sync runs after every `persistQuestions` and every
+  poll tick. There is NO timer that closes a question and NO "⏳ still waiting" reminder (the #403 /
+  #464 reminders are deleted; do not bring them back). A card closes only through
+  `closeOpenCard(key, status)` on: an answer (tap/reply, on card or copy); a plain message to a
+  session with exactly ONE open non-hatch card (live: answered down the socket, prose to a permission = deny
+  with the text as reason; retained question: typed into its pane; retained permission/hatch: never
+  decided from chat) — with several open cards the daemon sends one "reply to the card you mean"
+  notice; a newer hatch request with the same (hookId, cwd) ("↻ superseded"); a decision or consumed
+  grant on a sibling hatch card ("✓ decided"); Dismiss; and **withdraw**. Withdraw protocol: a hook
+  socket line `{"withdraw":"<requestId>","reason":"…"}` or `{"withdrawHookId":"<id>","cwd":"…",
+  "reason":"…"}` → reply `{"tgctl":"withdrawn","closed":N}`; `tg-ctl withdraw <requestId> | --hook-id
+  <id> [--cwd <dir>] [--reason <text>]` sends it (exit 0 closed ≥1, 1 none, 2 usage, 69 unreachable);
+  `tg-ctl ask` sends it for its own non-hatch requests on SIGTERM/SIGINT/SIGHUP before exiting 128+n. A
+  SIGKILLed asker cannot withdraw: its card stays open (accepted; Dismiss closes it).
 
 - **Generic blocking approval (`tg-ctl ask "<question>" [--timeout SEC]`, tg-cli#149):** the
   human yes/no primitive for scripts and safety hooks (agent-tools' `agent_hooks.approval_cmd`;

@@ -13,8 +13,7 @@
 // what a NAIVE (unclamped) implementation would have fired at — the shortened
 // TG_CTL_ASK_TOTAL_TIMEOUT_MS below stands in for that would-be-immediate
 // firing, since actually waiting out 2^31-1 ms (~24.8 days) in a test is
-// impractical; the pure-module test (hatch-critical-reminder.test.ts) covers
-// the arithmetic at the scheduler layer directly.
+// impractical.
 //
 // Harness mirrors ctl-hatch-approval-retry-integration.test.ts exactly (same
 // mockTelegram/hermetic-host/daemon-lifecycle helpers) — hatch requests are
@@ -259,38 +258,6 @@ test('CRITICAL WAIT (tg-cli#403): a critical-mode ask ignores the shortened budg
   // Still never timed out, even after resolving.
   expect(daemonLog(cfgDir)).not.toContain('ask-forward timed-out');
 
-  daemon.kill('SIGTERM');
-  await daemon.exited;
-}, 20_000);
-
-test('CRITICAL REMINDER REPLACEMENT (tg-cli#403 acceptance criterion c): a new reminder deletes the previous reminder message, never the original card', async () => {
-  const cfgDir = makeCfgDir();
-  const tg = mockTelegram();
-  servers.push(tg);
-  // Shrink the reminder interval so two reminders fire within the test window,
-  // and force "never quiet" (start === end) so the cadence isn't at the mercy
-  // of the CI runner's local clock landing inside the default 23-8 window.
-  const daemon = await startDaemon(cfgDir, tg.port, {
-    TG_CTL_CRITICAL_REMINDER_INTERVAL_MS: '500',
-    TG_CTL_QUIET_HOURS_START_HOUR: '0',
-    TG_CTL_QUIET_HOURS_END_HOUR: '0',
-  });
-
-  const ask = startAsk(cfgDir, tg.port, hatchRequest(true), { TG_CTL_ASK_TOTAL_TIMEOUT_MS: SHORT_TIMEOUT_MS });
-  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
-
-  // Wait for at least TWO reminder sends (each a plain sendMessage with no
-  // inline keyboard, so mockTelegram's `cards()` — keyboard-bearing sends only
-  // — never counts them; every reminder increments cardSeq regardless).
-  expect(await until(() => tg.deletes().length >= 1, 8000)).toBe(true);
-
-  // The deleted message id must be a REMINDER's id, never the original card's.
-  // The original card was the very first sendMessage (message_id 901, given
-  // cardSeq starts at 900 and increments before assignment); nothing deletes it.
-  expect(tg.deletes()).not.toContain(901);
-
-  ask.kill(9);
-  await ask.exited;
   daemon.kill('SIGTERM');
   await daemon.exited;
 }, 20_000);

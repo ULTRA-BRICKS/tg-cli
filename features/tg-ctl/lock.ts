@@ -35,7 +35,7 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     pendingBatch: join(configDir, `${base}.pending-batch.json`),
     deliveryLedger: join(configDir, `${base}.delivery.jsonl`),
     awarenessNudge: join(configDir, `${base}.awareness-nudge.json`),
-    unansweredReminder: join(configDir, `${base}.unanswered-reminder.json`),
+    questionInbox: join(configDir, `${base}.question-inbox.json`),
     runInfo: join(configDir, `${base}.run.json`),
     sessions: join(configDir, `${base}.sessions.json`),
     authPending: join(configDir, `${base}.auth-pending.json`),

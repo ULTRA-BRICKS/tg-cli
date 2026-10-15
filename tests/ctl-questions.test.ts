@@ -1,6 +1,5 @@
 import { expect, test } from 'bun:test';
 import {
-  abandonedLongOutageText,
   abandonedMultiText,
   abandonedPermissionText,
   buildAnsweredQuestionText,
@@ -310,32 +309,14 @@ test('abandonedMultiText identifies which pane disconnected, points at the termi
   expect(text).toContain('Where should I deploy?');
 });
 
-test('abandonedLongOutageText reports the persisted uncertainty instead of leaving it silent, and keeps the original prompt visible', () => {
-  const text = abandonedLongOutageText(PERMISSION, 'rig');
-  expect(text).toContain('rig');
-  expect(text.toLowerCase()).toContain('long wait');
-  expect(text).toContain('terminal');
-  expect(text).toContain('rm -rf /tmp/test');
-});
-
-test('abandonedLongOutageText names the queued decision when one was pending instead of implying nothing was ever chosen', () => {
-  const text = abandonedLongOutageText(PERMISSION, 'rig', 'Approve');
-  expect(text).toContain('queued "Approve"');
-  expect(text).toContain('never delivered');
-  expect(text).toContain('rig');
-});
-
-test('queuedDecisionStillWaitingText: WITH promptTurnId, keeps the queue alive and visible, and does NOT overpromise unbounded delivery', () => {
+test('queuedDecisionStillWaitingText: WITH promptTurnId, keeps the queue alive and visible', () => {
   const text = queuedDecisionStillWaitingText({ ...PERMISSION, promptTurnId: 'turn-a' }, 'rig', 'Approve');
   expect(text).toContain('still waiting to reconnect for rig');
   expect(text).toContain('queued "Approve"');
   expect(text).toContain('NOT been discarded');
   expect(text).toContain('will still be delivered automatically');
-  // Must not promise delivery with no bound at all — the daemon still gives up
-  // at ABANDONED_RETAIN_MS and sends a SEPARATE notice when it does (review
-  // finding: "however long that takes" overpromised past that point).
-  expect(text).not.toContain('however long that takes');
-  expect(text.toLowerCase()).toContain('separate notice');
+  // No give-up notice exists any more (tg-cli#705 removed the retention timer), so none is promised.
+  expect(text.toLowerCase()).not.toContain('separate notice');
 });
 
 test('queuedDecisionStillWaitingText: WITHOUT promptTurnId, self-gates and does NOT promise automatic delivery (defense-in-depth, review finding)', () => {
@@ -345,7 +326,7 @@ test('queuedDecisionStillWaitingText: WITHOUT promptTurnId, self-gates and does 
   expect(text).toContain('NOT been discarded');
   expect(text).not.toContain('will still be delivered automatically');
   expect(text.toLowerCase()).toContain("won't auto-deliver");
-  expect(text.toLowerCase()).toContain('separate notice');
+  expect(text.toLowerCase()).not.toContain('separate notice');
 });
 
 test('buildAnsweredQuestionText keeps the prompt context with the selected answer', () => {

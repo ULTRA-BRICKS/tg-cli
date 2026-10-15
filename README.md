@@ -291,14 +291,13 @@ alert and the omp-supervisor watcher's OVERLOAD/EMERGENCY reports feed it.
 ### Q→buttons (v1.5.0, seamless setup in v1.6.0)
 Agent questions and permission prompts are forwarded to Telegram as inline buttons — no need to touch the terminal. Tap to answer; the answer is injected back into the pane immediately. Supports Claude Code question/permission shapes, Codex `PermissionRequest`, and opencode `question.asked`/`permission.asked` events.
 
-**Unanswered reminder (tg-cli#464):** a question/permission card left unanswered for
-20 minutes (counted from when the card opened) gets one reminder listing every card still
-waiting (session, question, `tg#<card id>`, age). Each new reminder deletes the previous
-one, so at most one sits in the chat, and it is closed once no card it listed is still
-open (answered or expired). Quiet hours (default 23:00-08:00 local, `TG_CTL_QUIET_HOURS_START_HOUR` /
-`TG_CTL_QUIET_HOURS_END_HOUR`) hold it until they end. `TG_CTL_UNANSWERED_REMINDER_AFTER_MS`
-sets the threshold (`0` = off); keep it under the 30-min question retention, or unanswered
-questions expire before their reminder. Critical hatch requests keep their own repeating reminder.
+**📥 Inbox (tg-cli#705):** in topics mode every question/permission/hatch card still open
+gets a silent copy in one "📥 Inbox" forum topic, with the card's own buttons plus
+"✕ Dismiss"; a tap or reply on the copy acts on the card. A card stays open until something
+makes it irrelevant — an answer (tap, reply, or a plain message to a session with exactly one
+open card), a newer hatch request for the same hook and directory, a decision on a sibling
+hatch card, the asker withdrawing (`tg-ctl withdraw`, or the `tg-ctl ask` client being
+stopped), or Dismiss — never on a timer. The old "⏳ still waiting" reminders are gone.
 
 **Setup:** run `tg-ctl install-hooks` once — it idempotently wires the Claude Code hooks into `~/.claude/settings.json` and the Codex usage collector into Codex's hooks file (`$CODEX_HOME/hooks.json` when set, otherwise `~/.codex/hooks.json`; backup first, existing hooks preserved), then restart the agent session. If either settings file is malformed, `install-hooks` reports it and exits without clobbering the file. `tg-ctl status` reports q→buttons, StopFailure, Claude statusLine usage telemetry, and Codex usage telemetry separately, including project/local Claude `statusLine` overrides that shadow the user-level collector. If you run `install-hooks` from such a project, it wraps that local statusLine too and backs the file up. Codex requires a manual `/hooks` trust review for the new `tg-ctl codex-usage-hook` Stop hook before it can run. (opencode: see the command's printed guidance.)
 

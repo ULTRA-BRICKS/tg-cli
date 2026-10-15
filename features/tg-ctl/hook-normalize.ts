@@ -133,8 +133,7 @@ function readAskOperation(raw: unknown): ButtonRequest['operation'] {
 // Build a ButtonRequest from an already-known field set, folding in the env.
 // `promptTurnId`, when non-empty, rides along as ButtonRequest.promptTurnId —
 // the identity proof tg-ctl requires before auto-delivering a QUEUED
-// PERMISSION decision to a reconnecting hook within its retention window
-// (tg-cli#182: ABANDONED_PERMISSION_RETAIN_MS, not a tight one — see the
+// PERMISSION decision to a reconnecting hook (tg-cli#182 — see the
 // field's own doc comment in questions.ts). DELIBERATELY per-KIND, not
 // blanket-applied: a `permission` gets the STRICT per-process
 // `env.invocationNonce` (see HookEnv.invocationNonce) because that's the one
