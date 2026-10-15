@@ -66,13 +66,15 @@ import {
 } from "./features/tg-ctl/routes"
 import { type HistoryRecord, parseHistory, threadOfMessageInBlob } from "./features/replies/history"
 import { appendHistoryFile } from "./features/replies/history-file"
-import { callerSessionKey, parseRegistry } from "./features/tg-ctl/session-registry-store"
+import { callerSessionKey, parseRegistry, pinnedSession } from "./features/tg-ctl/session-registry-store"
+import { HARNESS_AGENT, paneLocatorOf, SYSTEM_ORIGIN } from "./features/tg-ctl/session-topics"
+import type { AgentAncestor } from "./features/tg-ctl/discover"
 import type { Registry } from "./features/tg-ctl/session-registry"
 import { buildOutboundHistoryRecords, outboundHistoryText } from "./features/replies/outbound"
 import { runReplies } from "./features/replies/cli"
 import { resolveWindowPanes } from "./features/replies/window"
 import { agentNameFromDisplayLine } from "./features/tg-ctl/agent-name"
-import { detectAgentAncestry, detectAgentViaAncestry, isProcessRunning } from "./features/branding/detect"
+import { detectAgentAncestry, detectAgentViaAncestry, detectSenderAncestry, isProcessRunning } from "./features/branding/detect"
 import { lineageParentOriginId, outboundOriginPaneId, parseLsofJsonlPaths, parseOmpSessionMeta, pickPrimaryOmpSessionFile } from "./features/tg-ctl/omp"
 import { hostDisplayName } from "./features/tg-ctl/host-registry"
 import { readOwnHostRecord } from "./features/tg-ctl/host-registry-fs"
@@ -246,6 +248,15 @@ Options:
   --session-topic      print the forum topic id of the session this shell runs
                        in (created on first ask), or nothing. A launcher of a
                        detached child exports it: TG_TOPIC=$(tg --session-topic).
+  --session-id         print the registry key of the session this shell runs in
+                       (e.g. omp:01a1…), or nothing. Hand it to a background job
+                       as TG_SESSION: omp runs its jobs under a shared broker whose
+                       process tree names no session.
+  --session <id>       pin the send to a registry session (its id or omp:<id> key):
+                       header title, session topic and reply route name it instead
+                       of the process tree. Falls back to the TG_SESSION env; the
+                       flag wins. A pin naming no live session warns and sends
+                       with no session (General).
   --reply-to <id>      thread the outbound message UNDER an inbound Telegram
                        message (sets reply_to_message_id). The id is the inbound
                        message's Telegram message_id — the tg-ctl daemon surfaces
@@ -1117,13 +1128,45 @@ if (import.meta.main) {
   // pay for ps/lsof/tmux subprocesses they never read.
   // Agent ancestors of this `tg`, nearest first: the nearest is the sender, the
   // rest its process lineage (the route's parent, #503). One ps read for both.
-  const ancestry = detectAgentAncestry()
+  // The climb stops at omp's shared worker broker, whose parent omp does not own the
+  // background jobs it hosts (tg-cli#709). A session pin (`--session <id>` / TG_SESSION)
+  // replaces the tree with the pinned session's own process, so every lookup below — the
+  // header title, the session topic, the route and history session — names that session;
+  // a pin naming no live session leaves no ancestry and no session at all.
+  const senderTree = detectSenderAncestry()
+  const pinId = (parsed.action === "send" ? parsed.session : undefined) ?? (env.TG_SESSION?.trim() || null)
+  const sessionsPath = ctlPaths(configDir, botIdFromToken(env.TG_BOT_TOKEN ?? "")).sessions
+  const pinned = pinId === null ? null : pinnedSession(readSessionRegistry(sessionsPath), pinId)
+  // undefined: no pin, the tree decides; null: the pin named no live session.
+  const pinnedKey = pinId === null ? undefined : (pinned?.key ?? null)
+  const ancestry: AgentAncestor[] =
+    pinned && pinned.locators.pid !== null
+      ? [{ agent: HARNESS_AGENT[pinned.harness], pid: pinned.locators.pid }]
+      : pinId === null
+        ? senderTree.agents
+        : []
+  if (parsed.action === "send" && pinnedKey === null) {
+    const safe = (pinId ?? "").replace(/[^\x20-\x7e]/g, "?").slice(0, 80)
+    console.error(`tg: ${parsed.session !== undefined ? "--session" : "TG_SESSION"} '${safe}' names no live session — sending with no session (no session topic, no reply route to an agent)`)
+  } else if (parsed.action === "send" && pinId === null && senderTree.viaOmpBroker && senderTree.agents.length === 0) {
+    console.error(
+      "tg: running as an omp background job (shared worker broker) — the process tree cannot name its session, so this is sent with none. " +
+        "Launch the job with TG_SESSION=<id> (run `tg --session-id` in the agent's own shell) to post into its session.",
+    )
+  }
+  // A send with NO session: a pin that named no live session, or an unpinned omp background
+  // job (nothing below the broker). Its inherited $TMUX / pane is not trusted either — no
+  // session name in the header, no topic ask, no route or history row a reply could follow,
+  // so a reply to it reaches the agent picker (tg-cli#709).
+  const sessionless = pinnedKey === null || (pinId === null && senderTree.viaOmpBroker && senderTree.agents.length === 0)
   const ancestor = ancestry[0] ?? null
   const ompAncestorPid = ancestor?.agent === "omp" ? ancestor.pid : null
   const tmuxPane = getTmuxPane()
   const ompSession = getOmpSession(ompAncestorPid)
-  // omp's adapter title wins; any other agent's title comes from its pane title.
-  const harnessTitle = ompSession.title || (ancestor && ancestor.agent !== "omp" ? getPaneTitle() : "")
+  // omp's adapter title wins, then a pinned session's registry title; any other agent's
+  // title comes from its pane title.
+  const harnessTitle =
+    ompSession.title || (pinned ? (pinned.name.secondary ?? pinned.name.primary) : "") || (ancestor && ancestor.agent !== "omp" ? getPaneTitle() : "")
   // The record of the rig-wrapper abduco session this `tg` runs in ($RIG_SESSION): outside tmux
   // its label is the `[window]` name and `host:<name>` the route origin
   // (docs/specs/2026-09-30-harness-agnostic-control.md §2–§3).
@@ -1131,15 +1174,19 @@ if (import.meta.main) {
   // A session identity exists inside tmux, under an agent ancestor or in a wrapper-hosted session.
   // A bare, non-agent invocation outside tmux (a cron job, a plain script) gets NO bracket.
   const hasSessionIdentity = tmuxPane !== null || Boolean(process.env.TMUX) || ancestor !== null || ownHost !== null
+  // A pinned session is named by its registry entry outright: an inherited $TMUX pane must not
+  // put another window's name on its header (tg-cli#709).
   const sessionNameFor = (title: string) =>
-    hasSessionIdentity
-      ? resolveSessionName({
-          tmuxWindow: tmuxPane?.windowName ?? null,
-          cwd: tmuxPane?.panePath || ompSession.cwd || ownHost?.cwd || process.cwd(),
-          harnessTitle: title,
-          hostLabel: ownHost?.label,
-        })
-      : { primary: "", secondary: null }
+    pinned
+      ? { primary: pinned.name.primary, secondary: pinned.name.secondary }
+      : hasSessionIdentity && !sessionless
+        ? resolveSessionName({
+            tmuxWindow: tmuxPane?.windowName ?? null,
+            cwd: tmuxPane?.panePath || ompSession.cwd || ownHost?.cwd || process.cwd(),
+            harnessTitle: title,
+            hostLabel: ownHost?.label,
+          })
+        : { primary: "", secondary: null }
   if (parsed.action === "detectAgent") {
     // The auto `[window]` label this session's messages get with no flag (the
     // resolver's primary name, or "(none)"), the harness title on a second line
@@ -1184,17 +1231,28 @@ if (import.meta.main) {
   // launcher's `$(...)` stays harmless.
   if (parsed.action === "sessionTopic") {
     const ctl = resolveControlConfig(parseControlConfig(configYamlRaw))
-    if (hasSessionIdentity && (ctl.topics || ctl.privateTopics) && BOT_TOKEN) {
+    if (hasSessionIdentity && !sessionless && (ctl.topics || ctl.privateTopics) && BOT_TOKEN) {
       const answer = parseResolvedSession(
         await askDaemon(ctlPaths(configDir, botIdFromToken(BOT_TOKEN)).socket, {
           kind: "resolve-session",
-          tmuxPane: process.env.TMUX_PANE ?? null,
+          tmuxPane: pinned ? null : (process.env.TMUX_PANE ?? null),
           tmuxServerPid: tmuxServerPidFromEnv(process.env.TMUX),
           ancestorPids: ancestor ? [ancestor.pid] : [],
+          sessionKey: pinned?.key ?? null,
         }, SESSION_LOOKUP_TIMEOUT_MS),
       )
       if (answer?.threadId) console.log(String(answer.threadId))
     }
+    process.exit(0)
+  }
+
+  // `tg --session-id`: the registry key of the session this shell runs in, for a launcher to
+  // pin a background job to it (`TG_SESSION=<key>`): omp runs such jobs under a shared worker
+  // broker the job's own `tg` cannot see past (tg-cli#709). Read from the daemon's registry, no
+  // daemon round-trip. Prints the key, or nothing — never an error exit.
+  if (parsed.action === "sessionId") {
+    const key = sessionless ? null : pinnedKey !== undefined ? pinnedKey : ownSessionKey(readSessionRegistry(sessionsPath), ancestor)
+    if (key) console.log(key)
     process.exit(0)
   }
 
@@ -1250,7 +1308,9 @@ if (import.meta.main) {
   let threadIdAdvisory = false
   // Set when Telegram refused an ADVISORY thread and the send fell back to General.
   let topicFallback: string | null = null
-  if (messageThreadId === undefined && env.TG_TOPIC) {
+  // A sessionless (shared-broker) or --session/TG_SESSION-pinned send ignores the inherited
+  // TG_TOPIC: it belongs to whichever session spawned the shell, not this sender (tg-cli#709).
+  if (messageThreadId === undefined && env.TG_TOPIC && !sessionless && pinId === null) {
     // A launcher/daemon that writes TG_TOPIC via a file or with a trailing
     // newline would otherwise fail the regex and silently degrade to General;
     // trim first (the --topic flag arrives as its own argv token, no trim needed).
@@ -1759,11 +1819,18 @@ if (import.meta.main) {
   // host:<name> (docs/specs/2026-09-30-harness-agnostic-control.md). A corrupt or
   // unwritable file just degrades to the picker.
   const TMUX_PANE = process.env.TMUX_PANE
-  const originPaneId = outboundOriginPaneId({
-    tmuxPane: TMUX_PANE,
-    ompAncestorPid,
-    hostName: ownHost?.name,
-  })
+  // tg-cli#709: a pinned send's origin is the pinned session's own locator (never the sender's
+  // inherited pane or wrapper host); a sessionless send records the `system` origin, which no
+  // live agent matches, so a reply to it always gets the picker — never the lone live agent.
+  const originPaneId = pinned
+    ? (paneLocatorOf(pinned) ?? SYSTEM_ORIGIN)
+    : sessionless
+      ? SYSTEM_ORIGIN
+      : outboundOriginPaneId({
+          tmuxPane: TMUX_PANE,
+          ompAncestorPid,
+          hostName: ownHost?.name,
+        })
   // A nested out-of-tmux omp (a disposable `omp --print` child) names the omp that
   // started it: once the child exits, a reply goes there (#503). Process ancestry
   // only — a live session that merely shares this cwd is never recorded.
@@ -1802,7 +1869,7 @@ if (import.meta.main) {
   const readOriginPane = (): { path: string | null; serverPid?: number; panePid?: number } => {
     if (originPane) return originPane
     originPane = { path: null }
-    if (!TMUX_PANE) return originPane
+    if (!TMUX_PANE || pinned || sessionless) return originPane
     try {
       const result = Bun.spawnSync(
         ["tmux", "display-message", "-p", "-t", TMUX_PANE, "#{pane_current_path}\t#{pid}\t#{pane_pid}"],
@@ -1840,12 +1907,14 @@ if (import.meta.main) {
       ...(ancestor ? { agentPid: ancestor.pid } : {}),
       ...(pane.serverPid && pane.panePid ? { serverPid: pane.serverPid, panePid: pane.panePid } : {}),
     }
-    let sessionKey: string | null = null
-    try {
-      const sessionsPath = ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).sessions
-      sessionKey = resolveRouteSession(parseRegistry(readFileSync(sessionsPath, "utf8")), locators)
-    } catch {
-      // no registry yet — the daemon's next scan stamps the route
+    // A pin decides outright (tg-cli#709); otherwise the exact origin locators do.
+    let sessionKey: string | null = pinnedKey ?? null
+    if (pinnedKey === undefined) {
+      try {
+        sessionKey = resolveRouteSession(parseRegistry(readFileSync(sessionsPath, "utf8")), locators)
+      } catch {
+        // no registry yet — the daemon's next scan stamps the route
+      }
     }
     originSession = { locators, sessionKey }
     return originSession
@@ -1928,7 +1997,7 @@ if (import.meta.main) {
       // identity `tg replies` scopes on, so a later rename never splits it. It
       // also names an out-of-tmux omp, which has no pane to derive a name from.
       const registry = readSessionRegistry(CTL_PATHS.sessions)
-      const sessionKey = ownSessionKey(registry, ancestor)
+      const sessionKey = sessionless ? null : pinnedKey !== undefined ? pinnedKey : ownSessionKey(registry, ancestor)
       const entry = registry.sessions.find((e) => e.key === sessionKey)
       // randomUUID() only actually lands in a record when the send is truly
       // multi-part (buildOutboundHistoryRecords ignores it otherwise) — a
@@ -1945,7 +2014,7 @@ if (import.meta.main) {
         // SAME label the daemon stamps on inbound, so `tg replies` groups a
         // session's outbound and its inbound under one current-agent scope.
         // Out of tmux it is the registry entry's name; undefined → untagged.
-        currentPaneAgentName() ?? (ownHost ? hostDisplayName(ownHost) : undefined) ?? entry?.name.primary ?? undefined,
+        (sessionless || pinned ? undefined : currentPaneAgentName()) ?? (ownHost && !pinned ? hostDisplayName(ownHost) : undefined) ?? entry?.name.primary ?? undefined,
         sessionKey ?? undefined,
         // The thread each message actually landed in (null = General, also after a fallback): a
         // later `tg --reply-to` of any of these ids finds its topic from it (tg-cli#551).
@@ -2340,13 +2409,14 @@ if (import.meta.main) {
       messageThreadId = anchorThread
       threadIdAdvisory = true
     }
-  } else if (messageThreadId === undefined && hasSessionIdentity && topicsOn) {
+  } else if (messageThreadId === undefined && hasSessionIdentity && !sessionless && topicsOn) {
     resolvedSession = parseResolvedSession(
       await askDaemon(ctlFiles.socket, {
         kind: "resolve-session",
-        tmuxPane: process.env.TMUX_PANE ?? null,
+        tmuxPane: pinned ? null : (process.env.TMUX_PANE ?? null),
         tmuxServerPid: tmuxServerPidFromEnv(process.env.TMUX),
         ancestorPids: ancestor ? [ancestor.pid] : [],
+        sessionKey: pinned?.key ?? null,
       }, SESSION_LOOKUP_TIMEOUT_MS),
     )
     if (resolvedSession?.threadId) {

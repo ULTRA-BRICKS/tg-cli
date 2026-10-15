@@ -10,6 +10,7 @@ import {
   TOPIC_MISS_RECREATE_AFTER_MS,
   TOPIC_RECREATE_COOLDOWN_MS,
   topicTitleFor,
+  sessionTopicTitle,
 } from '../features/tg-ctl/session-topics';
 import { isTopicDeletedError } from '../features/transport/telegram';
 
@@ -59,6 +60,22 @@ test('the topic title is primary · secondary, capped at 128 characters; an unna
   expect(topicTitleFor({ ...e, name: { primary: '', secondary: null } })).toBe(`omp:${SID}`);
 });
 
+// The system "📥 Inbox" topic carries open questions only. A session whose title opens with 📥
+// or the word "inbox" (an omp session working ON the inbox feature titled itself
+// "📥 INBOX: Replace hatch reminders…") got a topic the CTO took for the system one (tg-cli#709).
+test('a session topic never opens like the system 📥 Inbox — the 📥 becomes ✉ and an Inbox word gets ✉ in front', () => {
+  const e = fleet().sessions.find((s) => s.key === `omp:${SID}`)!;
+  const titled = (primary: string) => topicTitleFor({ ...e, name: { primary, secondary: null } });
+  expect(titled('📥 INBOX: Replace hatch reminders with inbox topic')).toBe('✉ INBOX: Replace hatch reminders with inbox topic');
+  expect(titled('📥 Inbox')).toBe('✉ Inbox');
+  expect(titled('  📥📥 downloads')).toBe('✉ downloads');
+  expect(titled('Inbox cleanup')).toBe('✉ Inbox cleanup');
+  expect(titled('inbox-fix · Review')).toBe('✉ inbox-fix · Review');
+  expect(titled('tg-cli · 📥 INBOX: feature')).toBe('tg-cli · 📥 INBOX: feature');
+  expect(titled('Inboxer')).toBe('Inboxer');
+  expect(sessionTopicTitle('📥 Inbox')).toBe('✉ Inbox');
+});
+
 test('the pane locator is the tmux pane, or omp:<pid> for an omp outside tmux', () => {
   const reg = fleet();
   expect(reg.sessions.map((s) => paneLocatorOf(s))).toEqual(
@@ -73,8 +90,10 @@ test('resolve-session request: only the resolve-session kind parses; junk fields
     tmuxServerPid: 7,
     ancestorPids: [200],
     sessionFile: null,
+    sessionKey: null,
   });
-  expect(parseResolveSessionRequest({ kind: 'resolve-session' })).toEqual({ tmuxPane: null, tmuxServerPid: null, ancestorPids: [], sessionFile: null });
+  expect(parseResolveSessionRequest({ kind: 'resolve-session' })).toEqual({ tmuxPane: null, tmuxServerPid: null, ancestorPids: [], sessionFile: null, sessionKey: null });
+  expect(parseResolveSessionRequest({ kind: 'resolve-session', sessionKey: 'omp:x' })?.sessionKey).toBe('omp:x');
   expect(parseResolveSessionRequest({ tgctl: 'verify-grant' })).toBeNull();
   expect(parseResolveSessionRequest({ kind: 'resolve-session', tmuxPane: 'rm -rf' })?.tmuxPane).toBeNull();
 });
@@ -87,6 +106,12 @@ test('lookup matches the harness ancestor pid first, then the session file, then
   expect(keyOf(findSessionForLookup(reg, { tmuxPane: '%3', tmuxServerPid: 7, ancestorPids: [100], sessionFile: null }))).toBe(`omp:${SID}`);
   expect(keyOf(findSessionForLookup(reg, { tmuxPane: null, tmuxServerPid: null, ancestorPids: [], sessionFile: '/s/out.jsonl' }))).toBe('omp:out-of-tmux');
   expect(keyOf(findSessionForLookup(reg, { tmuxPane: '%3', tmuxServerPid: 7, ancestorPids: [], sessionFile: null }))).toBe(`cc:${CC_SID}`);
+});
+
+test('a pinned session key alone decides the lookup: a pid now owned by another session never swaps it', () => {
+  const reg = fleet();
+  expect(keyOf(findSessionForLookup(reg, { tmuxPane: null, tmuxServerPid: null, ancestorPids: [100], sessionFile: null, sessionKey: 'omp:out-of-tmux' }))).toBe('omp:out-of-tmux');
+  expect(findSessionForLookup(reg, { tmuxPane: '%3', tmuxServerPid: 7, ancestorPids: [100], sessionFile: null, sessionKey: 'omp:gone' })).toBeNull();
 });
 
 test('lookup never answers with a pane of another tmux server, a gone entry, or a guess', () => {

@@ -77,6 +77,17 @@ I/O, fetch, signals, `bun:ffi`):
   `--topic <id>` (post INTO a forum topic — stamps `message_thread_id` on EVERY outbound
   primitive so an agent's reply threads into its bound topic instead of General; falls back to
   the `TG_TOPIC` env, flag wins; no flag/env → General, byte-identical to before),
+  `--session <id>` (tg-cli#709: pin the send to a registry session — its session id or
+  `omp:<id>` key; falls back to `TG_SESSION`, flag wins. The pinned entry's process replaces the
+  sender's process tree, so the header title, the `resolve-session` topic and the route/history
+  `sessionKey` all name it; a pin naming no live session warns and sends with NO session — no
+  topic ask, no sessionKey. Without a pin the ancestry walk (`walkAgentAncestry`,
+  `features/tg-ctl/discover.ts`) STOPS at omp's shared `__omp_worker_daemon_broker`: the broker's
+  parent is whichever omp started it, not the session that launched the background job, so a
+  broker-hosted `tg` has no agent ancestor and is SESSIONLESS like a failed pin (no header name
+  from its inherited `$TMUX`, no topic ask, route/history origin `system` → a reply gets the picker) and warns to set `TG_SESSION`; `tg-ctl alert`'s
+  `ancestorPids` uses the same cut), `--session-id` (print this shell's registry key — what a
+  launcher hands a background job as `TG_SESSION` — or nothing),
   `--table` (render STDIN rows — TSV or `a | b` — as an aligned monospace `<pre>` table; the
   PLAIN fallback grid — a real bordered table comes from `--format html` with `<table>`),
   `tg help format` (print the supported-HTML reference, basic + rich tiers; the topic-help

@@ -2,7 +2,7 @@
 // 0b, docs/specs/tg-decomposition.md). Extracted verbatim from `tg` — behaviour
 // unchanged. Real spawns live here (the entrypoint imports these); the pure
 // process-tree parsing is reused from features/tg-ctl/discover.
-import { findAgentsInAncestry, parseProcList, type AgentAncestor } from "../tg-ctl/discover"
+import { parseProcList, walkAgentAncestry, type AgentAncestor, type SenderAncestry } from "../tg-ctl/discover"
 
 export function isProcessRunning(name: string): boolean {
   try {
@@ -25,18 +25,24 @@ export function isProcessRunning(name: string): boolean {
 // nearest hit is the sender: `tg` uses an omp's pid to stamp routes.json
 // `omp:<pid>` outside tmux and to read that omp session's own title. The hits
 // past it are the sender's lineage (the omp that started a nested omp, #503).
-export function detectAgentAncestry(): AgentAncestor[] {
+// The climb stops at omp's shared worker broker (tg-cli#709): `viaOmpBroker`
+// says this `tg` is an omp background job whose session the tree cannot name.
+export function detectSenderAncestry(): SenderAncestry {
   try {
     const result = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="], {
       stdout: "pipe",
       stderr: "pipe",
     })
-    if (result.exitCode !== 0) return []
+    if (result.exitCode !== 0) return { agents: [], viaOmpBroker: false }
     const procs = parseProcList(new TextDecoder().decode(result.stdout))
-    return findAgentsInAncestry(procs, process.ppid)
+    return walkAgentAncestry(procs, process.ppid)
   } catch {
-    return []
+    return { agents: [], viaOmpBroker: false }
   }
+}
+
+export function detectAgentAncestry(): AgentAncestor[] {
+  return detectSenderAncestry().agents
 }
 
 export function detectAgentViaAncestry(): string | null {

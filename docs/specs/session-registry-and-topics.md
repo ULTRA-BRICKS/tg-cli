@@ -166,6 +166,9 @@ longer in pane %N (now `<other>`)" and offers the picker. A cwd match is never e
 
 It feeds the `tg` header, the `/agent` picker, `tg-ctl status`, `tg replies`, question cards and
 topic names. The topic title is `primary · secondary`, truncated to Telegram's 128 characters.
+A session topic never opens like the system "📥 Inbox" topic (open questions only): a leading 📥
+becomes ✉, and a title opening with the word "inbox" gets ✉ in front (`sessionTopicTitle`,
+tg-cli#709 — a session titled "📥 INBOX: …" was taken for the Inbox itself).
 
 The harness title comes from the adapter: the omp endpoint, the omp jsonl `title`/`title_change`,
 or a harness-painted `#{pane_title}`. The omp-live extension must report `pi.getSessionName()` at
@@ -242,6 +245,15 @@ not create a topic, so idle sessions do not spam topics.
   parent session exports it for the child: `TG_TOPIC="$(tg --session-topic 2>/dev/null)"`. The
   worker's sends then follow the `TG_TOPIC` rule above. A child whose launcher ran outside any
   session still posts to General; it is never guessed into another session's topic (§4.4).
+- **omp background jobs (tg-cli#709).** omp runs bash services / watchers under ONE shared
+  `__omp_worker_daemon_broker`, whose parent is whichever omp started the broker — not the session
+  that launched the job. The ancestry walk therefore stops at the broker: a broker-hosted `tg` has
+  no agent ancestor and is SESSIONLESS: its inherited `$TMUX` pane is not trusted either — no
+  session name in the header, no topic ask, its route/history origin is `system` (a reply to it reaches the
+  picker) — and it warns. Its launcher pins it with
+  `TG_SESSION=<id>` (or `tg --session <id>`), where `tg --session-id` run in the launching session's
+  own shell prints the id. A pin replaces the process tree for every lookup (header title, §4.3
+  topic, route and history `sessionKey`); a pin naming no live session sends with no session.
 - A reply (`tg --reply-to <id>`) posts where the message it answers sits (tg-cli#551). Telegram
   does not put a reply into its anchor's topic in a private chat with topics — a send naming no
   `message_thread_id` lands in General — so every history row records `threadId` (a topic id, or
@@ -263,7 +275,7 @@ Decision table, evaluated in order for a message with `message_thread_id = T`:
 |---|---|---|
 | 1 | Daemon verb: the `TOPIC_GLOBAL_CMDS` set in `updates.ts` (`/status`, `/agent`, `/new`, `/tasks`, `/limit`, `/daily`, `/spend`) | Run it and answer **in T**, in any topic, bound or not. `/stop` and `/kill` are deliberately not in the set: in a bound topic they reach that topic's session, and in an unknown topic they go through row 4. (Motivation: today the intercept runs only in bound topics, so an unknown topic drops even `/status`.) |
 | 2 | T is bound to a `live` entry | Deliver the text, voice, photo, document or album through the **same delivery function as the flat path**, `deliverToSession(key, payload)`: the omp-live bridge → in-tmux send-keys fallback (#483) → cc/codex send-keys, voice transcription, media download. Acknowledge the way the flat path does. Never fall back to another session. |
-| 3 | T is bound to a `gone` entry | Reply in T: "`<name>` is not running — resume with `rig omp run --resume …`", or the harness's hint from the adapter. Do not deliver. Do not spawn. |
+| 3 | T is bound to a `gone` entry | Reply in T: "`<name>` is not running — resume with `rig omp run --resume …`", or the harness's hint from the adapter. Do not deliver. Do not spawn. Exception (tg-cli#709): a Telegram **reply** to a message in T takes the flat reply fallback instead — the replied-to route's lineage parent when live, else the agent picker, posted in T with the "no longer running" notice — and the daemon logs a warning. |
 | 4 | T is unknown: a user-created topic, an `is_name_implicit` topic, or a topic whose binding was lost | Queue the payload for T (FIFO, 10 min from the first item; album parts and later messages join the same queue) and post the **attach picker** in T once. The queue is its own store keyed by `threadId`, persisted with the same pattern as `deferred.json` (atomic tmp+rename, restored on bootstrap, covered by the SIGTERM drain), so a daemon restart neither loses it nor skips its expiry reply. The buttons are live entries, the most recent first. Choosing entry E delivers every queued payload to E, in order. If E has no topic, T becomes E's topic and is renamed to E's title. If E already has one, T stays unbound and the reply links E's topic. When the queue expires, the bot replies "N messages not delivered — pick a session" in T. |
 | 5 | `forum_topic_created` / `_edited` / `_closed` service messages | Record them only. There is no spawn wizard and no `tmux rename-window`. A user topic rename is left alone until the next session rename overwrites it (§4.7). |
 

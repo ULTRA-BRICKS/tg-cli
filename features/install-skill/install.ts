@@ -153,6 +153,12 @@ its messages post to General. Hand it yours when you launch it:
 \`TG_TOPIC="$(tg --session-topic 2>/dev/null)" nohup … &\` — \`tg --session-topic\` prints
 this shell's topic id, or nothing.
 
+A background job / service started by omp (a named bash service, a watcher) runs under omp's
+SHARED worker broker, so its process tree names no session: its \`tg\` posts to General with no
+session and warns. Pin it to yours: run \`tg --session-id\` in your own shell and launch the job
+with \`TG_SESSION=<that id>\` (or pass \`tg --session <id>\`) — the message then carries your
+session's header, lands in your topic, and a reply to it reaches you.
+
 (Not the same flag as \`tg-ctl\`'s own \`--agent <name>\` — that one selects a closed
 harness kind for inbound telemetry, on a different binary.)
 

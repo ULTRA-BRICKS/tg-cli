@@ -414,6 +414,38 @@ test('topics ON: a BOUND topic whose session is GONE answers "not running" in th
   await daemon.exited;
 }, 30_000);
 
+// tg-cli#709: a REPLY to one of a gone session's reports is aimed at that report, so it is not
+// left at "not running": like a flat-chat reply to a gone origin it gets the agent picker —
+// posted inside the topic — and nothing is typed anywhere until the human picks.
+test('topics ON: a REPLY in a BOUND topic whose session is GONE gets the agent picker in that topic, not "not running"', async () => {
+  const cfgDir = makeCfgDir({
+    topics: true,
+    seedTopics: [{ threadId: 50, name: 'api', status: 'bound', paneId: '%9', harness: 'omp', ts: 1 }],
+  });
+  const nowSec = Math.floor(Date.now() / 1000);
+  // The gone session's report the CTO replies to.
+  writeFileSync(join(cfgDir, 'tg-ctl.123.routes.json'), JSON.stringify([{ id: 700, paneId: '%9', cwd: cfgDir, ts: nowSec - 60 }]));
+  const updateQueue: unknown[][] = [];
+  const { server, sends } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const reply = topicMsg(15, 50, 'what did you find?', nowSec) as { message: Record<string, unknown> };
+  reply.message.reply_to_message = { message_id: 700, from: { id: 9, first_name: 'bot', is_bot: true }, chat: { id: 1 }, date: nowSec - 60, text: 'report', message_thread_id: 50 };
+  updateQueue.push([reply]);
+
+  await waitFor(() => sends.some((s) => s.reply_markup !== undefined));
+  const picker = sends.find((s) => s.reply_markup !== undefined);
+  expect(picker).toMatchObject({ message_thread_id: 50 });
+  expect(String(picker?.text)).toContain('is no longer running');
+  expect(sends.some((s) => String(s.text).includes('resume with'))).toBe(false);
+  expect(injected(cfgDir)).toEqual([]);
+  expect(readFileSync(join(cfgDir, 'daemon.log'), 'utf8')).toContain('warning: topic 50: reply to tg#700 reached a gone session');
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
 test('topics ON: an UNKNOWN topic holds messages + posts the attach picker once; a pick delivers them in order, once, and binds the topic', async () => {
   const cfgDir = makeCfgDir({ topics: true }); // no bindings: topic 77 is unknown (user-created / implicit)
   const updateQueue: unknown[][] = [];

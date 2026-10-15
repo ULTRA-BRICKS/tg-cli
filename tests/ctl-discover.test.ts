@@ -5,6 +5,8 @@ import {
   matchAgentCommand,
   findAgentInPane,
   findAgentsInAncestry,
+  walkAgentAncestry,
+  ancestorPidChain,
   pickTargetPane,
   pickTargetPaneFromSet,
   panesWithRetry,
@@ -331,6 +333,43 @@ test('stops cleanly at pid 1 / missing parent', () => {
   const procs = [proc(300, 1, '-zsh')];
   expect(findAgentsInAncestry(procs, 300)).toEqual([]);
   expect(findAgentsInAncestry(procs, 999999)).toEqual([]); // unknown start pid
+});
+
+// tg-cli#709: omp runs background jobs (bash services) under ONE shared
+// `__omp_worker_daemon_broker`, whose parent is whichever omp started the broker
+// first — not the session that launched the job. Live shape from the incident:
+// MODEL session 433553 started a watchdog that ran under broker 22222, a child of
+// the unrelated FREEZE session 14610. The walk must stop at the broker.
+const BROKER_JOB = [
+  proc(14610, 14138, '/home/ultra/.local/lib/omp/omp -r'),
+  proc(22222, 14610, '/home/ultra/.local/lib/omp/omp __omp_worker_daemon_broker'),
+  proc(2911442, 22222, '/bin/zsh -l -c python -u watchdog.py'),
+  proc(2898235, 2911442, '/venv/bin/python -u /data/watchdog.py'),
+];
+
+test('a job under the shared omp worker broker has no agent ancestor (never the omp that spawned the broker)', () => {
+  expect(findAgentsInAncestry(BROKER_JOB, 2898235)).toEqual([]);
+  expect(walkAgentAncestry(BROKER_JOB, 2898235)).toEqual({ agents: [], viaOmpBroker: true });
+});
+
+test('an agent BETWEEN tg and the broker is still found — a nested omp started by a background job', () => {
+  const procs = [...BROKER_JOB, proc(2900000, 2898235, '/home/ultra/.local/lib/omp/omp -p child'), proc(2900001, 2900000, 'bash -lc tg')];
+  expect(walkAgentAncestry(procs, 2900001)).toEqual({ agents: [{ agent: 'omp', pid: 2900000 }], viaOmpBroker: true });
+});
+
+test('a plain omp bash command (no broker) keeps its omp ancestor and reports no broker', () => {
+  const procs = [proc(433553, 1, '/home/ultra/.local/lib/omp/omp'), proc(433600, 433553, 'bash -lc tg hi')];
+  expect(walkAgentAncestry(procs, 433600)).toEqual({ agents: [{ agent: 'omp', pid: 433553 }], viaOmpBroker: false });
+});
+
+test('ancestorPidChain stops at the shared omp worker broker', () => {
+  expect(ancestorPidChain(BROKER_JOB, 2898235)).toEqual([2911442]);
+  expect(ancestorPidChain([proc(700, 1, 'omp'), proc(710, 700, 'bash'), proc(720, 710, 'tg-ctl alert')], 720)).toEqual([710, 700]);
+});
+
+test('a shell line that merely MENTIONS the broker marker is not the broker', () => {
+  const procs = [proc(433553, 1, '/home/ultra/.local/lib/omp/omp'), proc(433600, 433553, 'bash -lc tg "why __omp_worker_daemon_broker"')];
+  expect(walkAgentAncestry(procs, 433600)).toEqual({ agents: [{ agent: 'omp', pid: 433553 }], viaOmpBroker: false });
 });
 
 // --- pickTargetPane ---

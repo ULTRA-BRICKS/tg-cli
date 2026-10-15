@@ -237,7 +237,9 @@ export type Action =
   // For a prose reply it is wrapped + carries the quote anchor (items 2,3); for a
   // `!shell` reply it is the RAW `!…` text with no wrap/anchor (codex #192) so `!`
   // stays at column 0 for the harness passthrough while still routing to origin.
-  | { kind: 'reply-route'; replyToMessageId: number; injectText: string; from: string; messageId: number }
+  // threadId: the forum topic the reply was written in — the fallback picker and notices are
+  // answered there (a reply in a gone session's topic, tg-cli#709); absent = General.
+  | { kind: 'reply-route'; replyToMessageId: number; injectText: string; from: string; messageId: number; threadId?: number }
   | { kind: 'reply'; text: string; threadId?: number | null } // sendMessage back to the chat (threadId: reply inside a bound topic)
   | { kind: 'answer-callback'; callbackQueryId: string; text: string }
   // messageId is the Telegram message the tapped button belongs to (null when
@@ -566,8 +568,10 @@ export interface TopicBinding {
 // One inbound topic message, in the form the entrypoint delivers (and the unknown-topic
 // hold persists). Text is already wrapped, or verbatim for a `/cmd` / `!shell` passthrough;
 // media and voice carry the Telegram file id and are downloaded/transcribed at delivery.
+// `replyTo`: the message it replies to — a reply in the topic of a gone session takes the
+// flat reply fallback (lineage parent or picker) instead of "not running" (tg-cli#709).
 export type TopicPayload =
-  | { type: 'text'; text: string; from: string; messageId: number }
+  | { type: 'text'; text: string; from: string; messageId: number; replyTo?: number }
   | {
       type: 'media';
       mediaKind: 'photo' | 'document';
@@ -577,5 +581,6 @@ export type TopicPayload =
       anchor?: string; // quote anchor when the media itself is a reply
       from: string;
       messageId: number;
+      replyTo?: number;
     }
-  | { type: 'voice'; fileId: string; suggestedName: string; anchor?: string; from: string; messageId: number };
+  | { type: 'voice'; fileId: string; suggestedName: string; anchor?: string; from: string; messageId: number; replyTo?: number };

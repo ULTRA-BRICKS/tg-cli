@@ -129,6 +129,18 @@ export function callerSessionKey(reg: Registry, caller: { agentPid: number | nul
   return caller.locator ? resolveLocatorToSession(reg, caller.locator, undefined) : null;
 }
 
+// The live session an explicit `tg --session <id>` / TG_SESSION pin names (tg-cli#709): by
+// registry key (`omp:<id>`), or by bare session id when exactly one live entry carries it (ids
+// are harness-scoped), never by prefix. Only an entry with a process qualifies — its pid stands
+// in for the sender's process tree in every later lookup.
+export function pinnedSession(reg: Registry, id: string): SessionEntry | null {
+  const live = reg.sessions.filter((e) => e.state === 'live' && e.locators.pid !== null);
+  const byKey = live.find((e) => e.key === id);
+  if (byKey) return byKey;
+  const byId = live.filter((e) => e.sessionId === id);
+  return byId.length === 1 ? byId[0] : null;
+}
+
 export interface MigrationIo {
   read(store: MigrationStore): string | null;
   // null deletes the file.

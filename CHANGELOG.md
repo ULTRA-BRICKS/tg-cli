@@ -3,6 +3,28 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.61.0
+
+- **A background job started by omp no longer posts as another session (#709).** omp runs bash
+  services and watchers under ONE shared `__omp_worker_daemon_broker`, whose parent is whichever
+  omp started the broker. `tg` climbed through it and took that omp as the sender: a U1 vision
+  watchdog launched by the MODEL session posted with the FREEZE session's header and into FREEZE's
+  topic, and the CTO's replies went to FREEZE. The ancestry walk now stops at the broker (also for
+  `tg-ctl alert`): such a send carries no session — its inherited tmux pane is not trusted either,
+  so its route origin is `system`, which no agent matches (a reply reaches the picker) — goes to General and
+  warns on stderr.
+- **`tg --session <id>` / `TG_SESSION` pin a send to a session (#709).** The pinned session's
+  process replaces the process tree for the header title, the session topic and the route/history
+  session, so a reply reaches it. `tg --session-id` prints the id to hand a background job. A pin
+  naming no live session warns and sends with no session — never the tree's or the pane's.
+- **A reply in a gone session's topic gets the agent picker (#709).** Instead of the dead-end
+  "not running — resume with …", a Telegram reply to a message in that topic takes the flat reply
+  fallback: the replied-to message's lineage parent when live, else the picker, posted in the topic
+  with the "no longer running" notice; the daemon logs a warning. A plain message still gets the
+  "not running" reply.
+- **A session topic never looks like the system 📥 Inbox (#709).** A leading 📥 in a session topic
+  title becomes ✉, and a title opening with the word "inbox" gets ✉ in front — a session titled
+  "📥 INBOX: …" was taken for the Inbox topic.
 ## 1.60.3
 
 - **`dependency-review` audits the call sidecar's Python pins and passes again (#714).** Since

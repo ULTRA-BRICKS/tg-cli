@@ -42,6 +42,7 @@ export type ParseResult =
   | { action: 'detectModel' }
   | { action: 'detectAgent' }
   | { action: 'sessionTopic' }
+  | { action: 'sessionId' }
   | { action: 'formatHelp' }
   | { action: 'error'; message: string }
   | {
@@ -88,6 +89,11 @@ export type ParseResult =
       // flag is absent; an explicit flag wins. Absent (and no TG_TOPIC) keeps
       // no-flag send results byte-identical for the 1:1 path.
       topic?: number;
+      // Session pin (`--session <id>`, tg-cli#709): the registry session this send belongs to
+      // — a session id or its `omp:<id>` key, as `tg --session-id` prints it. It replaces the
+      // process-tree lookup for the header title, the session topic and the reply route. The
+      // entrypoint falls back to the TG_SESSION env; the flag wins.
+      session?: string;
       // `tg --table`: read delimited rows from stdin, render an aligned <pre>
       // monospace table, and send it (composes with --tag/--title). The flag is
       // a boolean; the rows come from stdin, not argv. Absent when not given.
@@ -318,7 +324,7 @@ export interface ParseOptions {
  *
  * Precedence (the reconciliation point for "unknown dashed → error"):
  *   1. -h/--help and -v/--version win anywhere, before everything else.
- *   2. Info-only flags --ls-emoji-helpers / --detect-model / --detect-agent / --session-topic win next.
+ *   2. Info-only flags --ls-emoji-helpers / --detect-model / --detect-agent / --session-topic / --session-id win next.
  *   3. Real flags are matched: --format (with value validation), --photo,
  *      --file (each consuming a path value).
  *   4. ONLY a dashed token that matched none of the above is "unknown" → error.
@@ -353,6 +359,9 @@ export function parseArgs(
     if (a === '--session-topic') return { action: 'sessionTopic' };
   }
   for (const a of args) {
+    if (a === '--session-id') return { action: 'sessionId' };
+  }
+  for (const a of args) {
     if (a === '--format-help') return { action: 'formatHelp' };
   }
 
@@ -370,6 +379,7 @@ export function parseArgs(
   let pdfDevice: string | undefined;
   let replyTo: number | undefined;
   let topic: number | undefined;
+  let session: string | undefined;
   let table: true | undefined;
   // `--dry-run` — validate/render locally, never send. See the flag comment
   // below and the `dryRun` field on the `send` action type.
@@ -535,6 +545,16 @@ export function parseArgs(
       i += 2;
       continue;
     }
+    // Session pin: `--session <id>` — one non-empty token (a session id or `omp:<id>` key).
+    if (arg === '--session') {
+      const nextArg = args[i + 1];
+      if (!nextArg || nextArg.startsWith('--') || /\s/.test(nextArg)) {
+        return { action: 'error', message: '--session requires a session id (tg --session-id prints it)' };
+      }
+      session = nextArg;
+      i += 2;
+      continue;
+    }
     // `--table` is a boolean — the rows are read from stdin by the entrypoint.
     if (arg === '--table') {
       table = true;
@@ -660,6 +680,7 @@ export function parseArgs(
     pdfDevice,
     replyTo,
     topic,
+    session,
     table,
     dryRun,
     terminalQuestion,

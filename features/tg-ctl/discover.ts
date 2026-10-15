@@ -285,6 +285,26 @@ export interface AgentAncestor {
   pid: number;
 }
 
+// omp runs background jobs (bash tool services) under ONE shared
+// `__omp_worker_daemon_broker`. The broker's parent is whichever omp happened to
+// start it, not the session that launched the job, so nothing above a broker says
+// who sent a message from inside it (tg-cli#709: a watchdog started by one session
+// posted under another session's name, topic and reply route).
+export function isOmpWorkerBroker(command: string): boolean {
+  // The broker's own argv (`<…>/omp __omp_worker_daemon_broker`), never a shell line that merely
+  // mentions the marker.
+  const [argv0 = '', sub] = command.trim().split(/\s+/);
+  return sub === '__omp_worker_daemon_broker' && basename(argv0) === 'omp';
+}
+
+export interface SenderAncestry {
+  // Agent ancestors below the first omp worker broker, nearest first.
+  agents: AgentAncestor[];
+  // The walk stopped at an omp worker broker: an omp background job whose
+  // session the process tree cannot name.
+  viaOmpBroker: boolean;
+}
+
 // Walk UP the ppid chain from `startPid`, returning every ancestor that matches
 // an agent, nearest first. This is the outbound mirror of findAgentInPane (which
 // walks DOWN to a pane's children): when `tg` runs, it asks "which agent launched
@@ -293,24 +313,43 @@ export interface AgentAncestor {
 // tree is the reliable signal — and a background ollama daemon is a sibling,
 // never an ancestor, so it is correctly ignored. The hits past the first are the
 // sender's lineage: a nested omp's parent omp is the orchestrator a reply to the
-// exited child goes to (#503). The visited set guards against pid-reuse cycles
-// in the ps snapshot, matching findAgentInPane's robustness.
-export function findAgentsInAncestry(procs: ProcInfo[], startPid: number): AgentAncestor[] {
+// exited child goes to (#503). The walk stops at an omp worker broker (above).
+// The visited set guards against pid-reuse cycles in the ps snapshot, matching
+// findAgentInPane's robustness.
+export function walkAgentAncestry(procs: ProcInfo[], startPid: number): SenderAncestry {
   const byPid = new Map<number, ProcInfo>();
   for (const p of procs) byPid.set(p.pid, p);
 
-  const found: AgentAncestor[] = [];
+  const agents: AgentAncestor[] = [];
   const seen = new Set<number>();
   let pid: number | undefined = startPid;
   while (pid !== undefined && pid > 1 && !seen.has(pid)) {
     seen.add(pid);
     const proc = byPid.get(pid);
     if (!proc) break;
+    if (isOmpWorkerBroker(proc.command)) return { agents, viaOmpBroker: true };
     const agent = matchAgentCommand(proc.command);
-    if (agent) found.push({ agent, pid: proc.pid });
+    if (agent) agents.push({ agent, pid: proc.pid });
     pid = proc.ppid;
   }
-  return found;
+  return { agents, viaOmpBroker: false };
+}
+
+export function findAgentsInAncestry(procs: ProcInfo[], startPid: number): AgentAncestor[] {
+  return walkAgentAncestry(procs, startPid).agents;
+}
+
+// `pid`'s ancestors, nearest first (at most 64), stopping below pid 1 and below an
+// omp worker broker — the same ownership boundary as walkAgentAncestry.
+export function ancestorPidChain(procs: ProcInfo[], pid: number): number[] {
+  const byPid = new Map<number, ProcInfo>();
+  for (const p of procs) byPid.set(p.pid, p);
+  const out: number[] = [];
+  for (let cur = byPid.get(pid)?.ppid; cur !== undefined && cur > 1 && out.length < 64; cur = byPid.get(cur)?.ppid) {
+    if (isOmpWorkerBroker(byPid.get(cur)?.command ?? '')) break;
+    out.push(cur);
+  }
+  return out;
 }
 
 // Pick the injection target (spec §10 priority chain):

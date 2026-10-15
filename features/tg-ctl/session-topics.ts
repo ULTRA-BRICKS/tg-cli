@@ -22,7 +22,16 @@ export const TOPIC_RECREATE_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 export function topicTitleFor(entry: Pick<SessionEntry, 'name' | 'key'>): string {
   const { primary, secondary } = entry.name;
   const name = [primary, secondary].filter((part): part is string => Boolean(part)).join(' · ');
-  return topicTitle(name || entry.key);
+  return sessionTopicTitle(name || entry.key);
+}
+
+// A session topic's title, which must never open like the system "📥 Inbox" topic (open
+// questions only): a leading 📥 becomes ✉, and a title opening with the word "inbox" gets ✉ in
+// front (tg-cli#709 — a session titled "📥 INBOX: …" was taken for the Inbox itself).
+export function sessionTopicTitle(name: string): string {
+  const trimmed = name.trimStart();
+  const rest = trimmed.replace(/^(?:📥\uFE0F?\s*)+/u, '');
+  return topicTitle(rest !== trimmed || /^inbox\b/i.test(rest) ? `✉ ${rest}` : name);
 }
 
 // The topics.json pane locator of a live entry: its tmux pane, or `omp:<pid>` for an omp
@@ -33,6 +42,11 @@ export function paneLocatorOf(entry: Pick<SessionEntry, 'harness' | 'locators'>)
   return null;
 }
 
+// The route origin of a sessionless `tg` send (an unpinned omp background job, a failed pin —
+// tg-cli#709). No pane, pid or host ever matches it, so a reply to such a message is recognized
+// as aimed at a gone sender and always gets the agent picker, never the lone live agent.
+export const SYSTEM_ORIGIN = 'system';
+
 // What `tg` knows about the session it runs in (§4.3): its tmux pane and that pane's server
 // (the second field of $TMUX), the harness ancestor pid(s), and the omp session file.
 export interface SessionLookup {
@@ -40,6 +54,9 @@ export interface SessionLookup {
   tmuxServerPid: number | null;
   ancestorPids: number[];
   sessionFile: string | null;
+  // A `--session`/TG_SESSION pin's registry key: when set it alone decides (no pid/pane
+  // fallback), so a resumed or pid-reused session can't swap the topic (tg-cli#709).
+  sessionKey?: string | null;
 }
 
 const positiveInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0;
@@ -56,6 +73,7 @@ export function parseResolveSessionRequest(raw: unknown): SessionLookup | null {
     tmuxServerPid: positiveInt(r.tmuxServerPid) ? r.tmuxServerPid : null,
     ancestorPids: pids,
     sessionFile: typeof r.sessionFile === 'string' && r.sessionFile.length > 0 ? r.sessionFile : null,
+    sessionKey: typeof r.sessionKey === 'string' && r.sessionKey.length > 0 ? r.sessionKey : null,
   };
 }
 
@@ -76,6 +94,7 @@ export function parseTopicResult(raw: unknown): { key: string; threadId: number;
 // match: a dead session has no outbound.
 export function findSessionForLookup(reg: Registry, q: SessionLookup): SessionEntry | null {
   const live = reg.sessions.filter((e) => e.state === 'live');
+  if (q.sessionKey) return live.find((e) => e.key === q.sessionKey) ?? null;
   const byPid = live.find((e) => e.locators.pid !== null && q.ancestorPids.includes(e.locators.pid));
   if (byPid) return byPid;
   if (q.sessionFile) {

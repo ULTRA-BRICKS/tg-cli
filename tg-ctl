@@ -77,6 +77,7 @@ import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
 import { serializeDeferredStore, parseDeferredStore } from "./features/tg-ctl/deferred-store"
 import { TargetDispatchQueues, groupActionsByAckBoundary } from "./features/tg-ctl/concurrent-dispatch"
 import {
+  ancestorPidChain,
   findAgentInPane,
   panesWithRetry,
   parsePaneList,
@@ -253,6 +254,7 @@ import {
   paneLocatorOf,
   parseResolveSessionRequest,
   parseTopicResult,
+  sessionTopicTitle,
   topicTitleFor,
   type SessionLookup,
 } from "./features/tg-ctl/session-topics"
@@ -466,7 +468,6 @@ import {
   splitExpiredHolds,
   topicForPane,
   topicLink,
-  topicTitle,
   type TopicHold,
 } from "./features/tg-ctl/topics"
 import { findModel, harnessLabel, MODEL_CATALOG, modelsForHarness, spawnArgv, spawnArgvWithTask } from "./features/tg-ctl/models"
@@ -2836,18 +2837,15 @@ function tgBinary(): string {
   return existsSync(sibling) ? sibling : "tg"
 }
 
-// This process's ancestors, nearest first, from one `ps` snapshot.
+// This process's ancestors, nearest first, from one `ps` snapshot — cut at an omp
+// worker broker, whose parent omp does not own the jobs it hosts (tg-cli#709).
 function ancestorPids(pid: number): number[] {
-  const parentOf = new Map<number, number>()
   try {
     const ps = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
-    for (const p of parseProcList(ps.stdout.toString())) parentOf.set(p.pid, p.ppid)
+    return ancestorPidChain(parseProcList(ps.stdout.toString()), pid)
   } catch {
     return []
   }
-  const out: number[] = []
-  for (let cur = parentOf.get(pid); cur !== undefined && cur > 1 && out.length < 64; cur = parentOf.get(cur)) out.push(cur)
-  return out
 }
 
 // A failed plan; `sessionMismatch`: the §2.6 guard refused (the pane hosts a
@@ -9450,6 +9448,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   ): Promise<boolean> => {
     const routes = parseRoutes(readFileOrNull(ctx.paths.routes))
     const recognized = recognizeRoute(routes, action.replyToMessageId)
+    // A reply handed over from a gone session's topic (tg-cli#709) is answered in that topic.
+    const out = replyContext(action.threadId)
     // `sessionKey`: the session this reply is for, when known — a deferred copy
     // carries it, and the pane is re-verified to host it right before typing (§2.6).
     const injectVerbatim = async (paneId: string, sessionKey?: string): Promise<boolean> => {
@@ -9507,9 +9507,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const token = `a${++agentTokenSeq}`
       // preserveOrder: keep the LRU/MRU ranking — groupBySession must not re-sort.
       const payload = buildAgentSelectMessage(ctx.chatId, sorted, token, action.injectText, true, notice)
-      const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
+      const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup, ...out })
       if (messageId === null) {
-        await sendMessage(ctx, "couldn't post the reply picker")
+        await sendMessage(ctx, "couldn't post the reply picker", out)
         return false
       }
       armPendingAgent(token, {
@@ -9559,14 +9559,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           if (parent.panePath) recordLastUserTarget(parent.paneId, parent.panePath)
           // Fire-and-forget, never delaying delivery: the reply did not land where
           // the CTO replied, so say where it went (#446).
-          void sendMessage(ctx, `↩️ ${name} is gone — routed to ${labelFor(parent, candidates)}, the session that started it`)
+          void sendMessage(ctx, `↩️ ${name} is gone — routed to ${labelFor(parent, candidates)}, the session that started it`, out)
         }
         return delivered
       }
       const lineage = parentId === undefined ? "" : `, lineage parent ${parentId} not live`
       log(`reply-route: replyTo=${replyTo} → ${why} → picker (${candidates.length} candidates${lineage})`)
       if (candidates.length > 0) return postReplyPicker(candidates, goneNotice(name))
-      await sendMessage(ctx, noAgentReplyNow())
+      await sendMessage(ctx, noAgentReplyNow(), out)
       return false
     }
 
@@ -9689,12 +9689,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const candidates = listAgentCandidates()
     if (candidates.length === 0) {
       log(`reply-route: replyTo=${action.replyToMessageId} → no candidates recognized=${!!recognized}`)
-      await sendMessage(ctx, noAgentReplyNow())
+      await sendMessage(ctx, noAgentReplyNow(), out)
       return false
     }
     // An UNRECOGNIZED reply (no origin known) with a single agent is unambiguous —
-    // inject there. The recognized-but-unconfirmed case above never reaches here.
-    if (!recognized && candidates.length === 1) {
+    // inject there. The recognized-but-unconfirmed case above never reaches here. A reply
+    // from a gone session's topic is not: its session is gone, so the human picks (tg-cli#709).
+    if (!recognized && candidates.length === 1 && action.threadId === undefined) {
       log(`reply-route: replyTo=${action.replyToMessageId} → unrecognized, single candidate ${candidates[0].paneId}/${candidates[0].windowName} → inject msg="${msgPreview}"`)
       const delivered = await injectVerbatim(candidates[0].paneId)
       // Still a confirmed CTO-explicit delivery — record it as the tg-cli#78
@@ -9874,18 +9875,32 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return { kind: "sent", ok: await deliverTopicPayload(threadId, paneId, target.cwd, payload, key) }
   }
 
+  // A gone topic session (§4.4 row 3). A plain message gets the "not running — resume with …"
+  // reply in the topic. A REPLY to one of the topic's messages takes the flat reply fallback
+  // instead (tg-cli#709): the replied-to message's lineage parent when live, else the agent
+  // picker — answered in this topic, never a dead end for a message aimed at a specific report.
+  const answerGoneTopic = async (threadId: number, payload: TopicPayload, goneReply: string): Promise<boolean> => {
+    if (payload.replyTo === undefined) {
+      await sendToTopic(threadId, goneReply)
+      return false
+    }
+    log(`warning: topic ${threadId}: reply to tg#${payload.replyTo} reached a gone session — reply fallback (lineage parent or picker)`)
+    const injectText = await renderTopicPayload(threadId, payload)
+    if (injectText === null) return false
+    return handleReplyRoute({ kind: "reply-route", replyToMessageId: payload.replyTo, injectText, from: payload.from, messageId: payload.messageId, threadId })
+  }
+
   // §4.4 rows 2–3 for a topic the registry knows: its session gets the message wherever it runs;
-  // a gone one gets the "not running — resume with …" reply in the topic.
+  // a gone one is answered by answerGoneTopic.
   const routeTopicToSession = async (threadId: number, entry: SessionEntry, payload: TopicPayload): Promise<boolean> => {
     const res = await deliverToSession(entry.key, threadId, payload)
     if (res.kind === "sent") return res.ok
     log(`topic ${threadId}: session ${entry.key} is not running`)
-    await sendToTopic(threadId, goneTopicReply({ name: res.name ?? entry.name.primary, harness: HARNESS_AGENT[entry.harness] }))
-    return false
+    return answerGoneTopic(threadId, payload, goneTopicReply({ name: res.name ?? entry.name.primary, harness: HARNESS_AGENT[entry.harness] }))
   }
 
-  // §4.4 rows 2–3: a message in a known topic. A live session gets it; a gone one gets the "not
-  // running — resume with …" reply. Never a spawn, never a fallback to another session.
+  // §4.4 rows 2–3: a message in a known topic. A live session gets it; a gone one is answered by
+  // answerGoneTopic. Never a spawn, never an automatic fallback to another session.
   const handleTopicRoute = async (action: Extract<Action, { kind: "topic-route" }>): Promise<boolean> => {
     const binding = findTopic(loadTopics(), action.threadId)
     const entry = resolveTopicSession(action.threadId, binding)
@@ -9906,16 +9921,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       updateTopics((topics) => removeTopic(topics, action.threadId))
       return holdUnknownTopicPayload({ kind: "topic-hold", threadId: action.threadId, payload: action.payload })
     }
-    if (binding.status === "closed" || !binding.paneId) {
-      await sendToTopic(action.threadId, goneTopicReply(binding))
-      return false
-    }
+    if (binding.status === "closed" || !binding.paneId) return answerGoneTopic(action.threadId, action.payload, goneTopicReply(binding))
     const session = topicSessionState({ ...binding, paneId: binding.paneId })
     if (session.state === "gone") {
       log(`topic ${action.threadId}: session ${binding.paneId} is gone — marking closed`)
       updateTopics((topics) => appendTopic(topics, markClosed(binding, Math.floor(Date.now() / 1000))))
-      await sendToTopic(action.threadId, goneTopicReply(binding))
-      return false
+      return answerGoneTopic(action.threadId, action.payload, goneTopicReply(binding))
     }
     if (session.state === "unconfirmed") {
       await sendToTopic(action.threadId, session.reply)
@@ -10052,7 +10063,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       } else {
         if (entry) patchSessionEntry(ctx, entry.key, { threadId: action.threadId })
         updateTopics((current) => appendTopic(current, attachTopic(action.threadId, session, Math.floor(Date.now() / 1000))))
-        await editSessionTopic(ctx, action.threadId, entry ? topicTitleFor(entry) : topicTitle(label))
+        await editSessionTopic(ctx, action.threadId, entry ? topicTitleFor(entry) : sessionTopicTitle(label))
         outcome = `this topic is now ${label}`
       }
       if (entry) {
@@ -10542,7 +10553,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const spawnToken = `new-${session.token}-${Math.floor(Date.now() / 1000)}`
     // Private-chat topic: try to create a per-session topic BEFORE spawning so the window is born
     // with TG_TOPIC already set. Failure (capability/API error) → graceful flat fallback.
-    const privateTopic = ctx.cfg.privateTopics ? await createPrivateTopic(session.name) : null
+    const privateTopic = ctx.cfg.privateTopics ? await createPrivateTopic(sessionTopicTitle(session.name)) : null
     if (privateTopic?.kind === "topic") {
       return spawnNewSessionWithTopic(session, modelId, privateTopic.threadId, slug, promptMessageId)
     }

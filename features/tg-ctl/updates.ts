@@ -593,6 +593,12 @@ function topicActionFor(updateId: number, m: TgMessage, name: string, opts: Step
 // The deliverable form of a topic message, or the reply text when it cannot be delivered.
 function topicPayloadOf(updateId: number, m: TgMessage, name: string, opts: StepOpts): TopicPayload | string {
   const messageId = m.message_id;
+  // A real reply (not the topic's own creation message) keeps its anchor id: a prose, voice or
+  // media reply in a gone session's topic takes the flat reply fallback (tg-cli#709). A `!shell`
+  // or `/command` reply does not: it is a verbatim harness verb for THIS topic's session, and the
+  // fallback picker would type it into another agent.
+  const rtm = m.reply_to_message;
+  const replyTo = rtm && !rtm.forum_topic_created ? { replyTo: rtm.message_id } : {};
   if (m.text) {
     const text = m.text;
     // A `!shell` passthrough is VERBATIM (harness `!` convention): no wrap and no quote-anchor,
@@ -605,7 +611,7 @@ function topicPayloadOf(updateId: number, m: TgMessage, name: string, opts: Step
     // A prose reply carries the same ↩ «…» quote-anchor as a flat-chat reply; a /command reply
     // stays verbatim.
     if (m.reply_to_message && !text.startsWith('/')) {
-      return { type: 'text', text: buildReplyInject(m, name, opts), from: name, messageId };
+      return { type: 'text', text: buildReplyInject(m, name, opts), from: name, messageId, ...replyTo };
     }
     // The command test is narrow (`/word` …, no second slash) so a path-like message —
     // `/etc/hosts is broken` — is prose and gets wrapped, not injected as a command. A
@@ -618,7 +624,7 @@ function topicPayloadOf(updateId: number, m: TgMessage, name: string, opts: Step
   const voice = m.voice ?? m.audio;
   if (voice) {
     if ((voice.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return TOO_LARGE_REPLY;
-    return { type: 'voice', fileId: voice.file_id, suggestedName: `${updateId}.ogg`, ...anchor, from: name, messageId };
+    return { type: 'voice', fileId: voice.file_id, suggestedName: `${updateId}.ogg`, ...anchor, from: name, messageId, ...replyTo };
   }
   const file = m.photo?.length ? largestPhoto(m.photo) : m.document;
   if (file) {
@@ -633,6 +639,7 @@ function topicPayloadOf(updateId: number, m: TgMessage, name: string, opts: Step
       ...anchor,
       from: name,
       messageId,
+      ...replyTo,
     };
   }
   return UNSUPPORTED_TOPIC_MESSAGE_REPLY;
