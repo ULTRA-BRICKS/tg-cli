@@ -1481,6 +1481,43 @@ test('a generic `tg-ctl ask "<question>"` does not defer inbound to agent panes 
   await daemon.exited;
 }, 20_000);
 
+// tg-cli#717: a hatch ask inherits its shell's TMUX_PANE, but no prompt waits in that pane. An
+// open (critical, possibly orphaned) hatch card on the agent's own pane must not hold the user's
+// messages to that agent.
+test('an open hatch card scoped to the agent pane does not defer inbound to it', async () => {
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const server = recordingServer(updateQueue, [], []);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+  const ask = trackProc(
+    reg,
+    Bun.spawn([process.execPath, TG_CTL, 'ask', '--agent', 'claude'], {
+      cwd: cfgDir,
+      env: { PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`, HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: `http://127.0.0.1:${server.port}`, TMUX_PANE: PANE_ID },
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    }),
+  );
+  ask.stdin.write(JSON.stringify({ requestId: 'hatch-ship-skip-ci-pane', agent: 'claude', kind: 'permission', question: 'merge?', critical: true, cwd: cfgDir }));
+  ask.stdin.end();
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
+    expect(server.cb()).not.toBe('');
+  }
+  updateQueue.push([
+    { update_id: 95, message: { message_id: 96, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'still there?' } },
+  ]);
+  await waitForInjected(cfgDir, 'still there?', 8000);
+  expect(ask.exitCode).toBeNull();
+  ask.kill(9);
+  await ask.exited;
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 20_000);
+
 // The dangerous failure mode of the #58 sweep: an unscoped question's expiry must
 // NOT flush/drop a backlog that belongs to a DIFFERENT, still-live question on
 // the same pane. The deferred queue is keyed by PANE, not question, so a naive

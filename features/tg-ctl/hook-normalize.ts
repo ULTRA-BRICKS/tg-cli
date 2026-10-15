@@ -35,6 +35,7 @@ export interface HookEnv {
   // ButtonRequest.promptTurnId — see that field's own doc comment (questions.ts)
   // for why it exists and what it gates.
   invocationNonce: string;
+  sessionPin?: string; // the hook process's TG_SESSION (tg-cli#717)
 }
 
 // djb2 — a short stable id so a repeated identical prompt reuses its callback key.
@@ -218,6 +219,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
         typeof p.timeoutMs === 'number' && Number.isFinite(p.timeoutMs) && p.timeoutMs > 0 ? p.timeoutMs : undefined,
       origin: readAskOrigin(p.origin),
       operation: readAskOperation(p.operation),
+      sessionPin: typeof p.sessionPin === 'string' && p.sessionPin ? p.sessionPin : env.sessionPin,
     };
   }
 

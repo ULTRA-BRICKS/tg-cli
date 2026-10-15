@@ -296,3 +296,66 @@ test('a resumed session is re-adopted into its old topic with a "reattached" pos
   expect(card.message_thread_id).toBe(77);
   expect(api.createdTopics).toBe(0);
 }, 60_000);
+
+// tg-cli#717: a hatch ask (agent-tools' request_hatch_approval) is headless — no harness session
+// id, and an inherited TMUX_PANE that hosts no live session — so its card fell into General,
+// where nobody saw it. The asker's TG_SESSION pin now names the session whose topic gets it.
+test('a headless hatch card goes, with its buttons, into the topic of the TG_SESSION-pinned session', async () => {
+  const fx = makeFixture([
+    ccEntry('sess3', { threadId: 88, locators: { pid: 99993, tmux: { serverPid: SERVER_PID, paneId: '%5', panePid: 99992 }, durableSession: null } }),
+  ]);
+  writeFileSync(join(fx.cfgDir, 'procs.txt'), '99992 1 -zsh\n99993 99992 claude\n');
+  writeFileSync(join(fx.cfgDir, 'tg-ctl.123.topics.json'), JSON.stringify([{ threadId: 88, name: 'alpha', status: 'bound', path: '/tmp', paneId: '%5', ts: 1 }]));
+  const api = startApi(50);
+  await startDaemon(fx, api.port);
+  const run = (pin: string | null): Subprocess => {
+    const ask = Bun.spawn([process.execPath, TG_CTL, 'ask', '--agent', 'claude'], {
+      env: { HOME: fx.cfgDir, TG_CTL_CONFIG_DIR: fx.cfgDir, TG_API_BASE: `http://127.0.0.1:${api.port}`, TMUX_PANE: '%0', ...(pin ? { TG_SESSION: pin } : {}) },
+      stdin: 'pipe', stdout: 'ignore', stderr: 'ignore',
+    });
+    procs.push(ask);
+    ask.stdin.write(`${JSON.stringify({ requestId: `hatch-ship-skip-ci-${pin ? 'pinned' : 'loose'}`, agent: 'claude', kind: 'permission', question: `Pick one for ${pin ? 'h1' : 'h2'}?`, critical: true, cwd: '/x' })}\n`);
+    ask.stdin.end();
+    return ask;
+  };
+  const pinned = run('cc:sess3');
+  const card = await waitFor('pinned hatch card', () => cardFor(api, 'h1'));
+  pinned.kill(9);
+  expect(card.message_thread_id).toBe(88);
+  expect(JSON.stringify(card.reply_markup)).toContain('inline_keyboard');
+  // Without a pin the card still posts with buttons (General) — the pin is what targets the topic.
+  const loose = run(null);
+  const general = await waitFor('unpinned hatch card', () => cardFor(api, 'h2'));
+  loose.kill(9);
+  expect(general.message_thread_id).toBeUndefined();
+  expect(JSON.stringify(general.reply_markup)).toContain('inline_keyboard');
+}, 60_000);
+
+// tg-cli#717: a critical hatch ask waits without a deadline. When the process that asked dies
+// (gh ship killed by its timeout), the orphaned `tg-ctl ask` exits, so its card is released and
+// stops holding the pane's inbound behind a question nobody is waiting on.
+test('an orphaned hatch ask exits once its asker dies, releasing the card', async () => {
+  const fx = makeFixture([]);
+  const api = startApi(60);
+  await startDaemon(fx, api.port);
+  const reqPath = join(fx.cfgDir, 'req.json');
+  writeFileSync(reqPath, JSON.stringify({ requestId: 'hatch-ship-skip-ci-orphan', agent: 'claude', kind: 'permission', question: 'Pick one for h3?', critical: true, cwd: '/x' }));
+  const pidPath = join(fx.cfgDir, 'ask.pid');
+  // The asker: a shell that starts the ask in the background and exits at once.
+  const asker = Bun.spawn(['sh', '-c', `"${process.execPath}" "${TG_CTL}" ask --agent claude < "${reqPath}" >/dev/null 2>/dev/null & echo $! > "${pidPath}"`], {
+    env: { HOME: fx.cfgDir, TG_CTL_CONFIG_DIR: fx.cfgDir, TG_API_BASE: `http://127.0.0.1:${api.port}`, TMUX_PANE: '%0' },
+  });
+  await asker.exited;
+  await waitFor('orphan hatch card', () => cardFor(api, 'h3'));
+  const askPid = Number(readFileSync(pidPath, 'utf8'));
+  const alive = (): boolean => {
+    try {
+      process.kill(askPid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  await waitFor('orphaned ask to exit', () => !alive(), 10_000);
+  await waitFor('card released', () => readFileSync(join(fx.cfgDir, 'daemon.log'), 'utf8').includes('hatch-ship-skip-ci-orphan') && !readFileSync(join(fx.cfgDir, 'tg-ctl.123.questions.json'), 'utf8').includes('"pending":true'), 10_000);
+}, 60_000);

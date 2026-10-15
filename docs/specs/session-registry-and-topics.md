@@ -254,6 +254,9 @@ not create a topic, so idle sessions do not spam topics.
   `TG_SESSION=<id>` (or `tg --session <id>`), where `tg --session-id` run in the launching session's
   own shell prints the id. A pin replaces the process tree for every lookup (header title, §4.3
   topic, route and history `sessionKey`); a pin naming no live session sends with no session.
+  `tg-ctl ask` forwards the same `TG_SESSION` as the request's `sessionPin` (tg-cli#717): a headless
+  hatch ask carries no harness session id, so the daemon stamps the card's session (and topic)
+  from the pin, after the hook's own session id and before the asking pane's occupant.
 - A reply (`tg --reply-to <id>`) posts where the message it answers sits (tg-cli#551). Telegram
   does not put a reply into its anchor's topic in a private chat with topics — a send naming no
   `message_thread_id` lands in General — so every history row records `threadId` (a topic id, or

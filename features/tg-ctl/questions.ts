@@ -156,6 +156,10 @@ export interface ButtonRequest {
   // OPAQUE: computed by the agent-tools lib; the daemon only compares it when
   // consuming a grant (grants.ts).
   operation?: AskOperation;
+  // The asker's `TG_SESSION` pin, verbatim (tg-cli#717): a headless hatch ask has no pane or
+  // harness session id, so without it the card lands in General. The daemon resolves it
+  // against its own registry (pinnedSession); only a live session counts.
+  sessionPin?: string;
   // The session registry key of the asking session, stamped by the DAEMON when
   // the ask arrives (never trusted from the client) and persisted with the
   // question: a late answer is typed into `paneId` only while that pane still

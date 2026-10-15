@@ -3,6 +3,20 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.61.1
+
+- **A hatch approval card reaches the session that asked for it (#717).** A
+  `RIG_HATCH_REQUEST_*` ask is headless: no harness session id, and the `TMUX_PANE` it inherits
+  may host no live session. The card then had no topic and went to General, where nobody saw
+  it, and the approval timed out. `tg-ctl ask` now forwards the asker's `TG_SESSION` pin, and
+  the daemon posts the card, with its buttons, in that session's topic.
+- **An open hatch card no longer holds the user's messages (#717).** The card's `TMUX_PANE` is
+  only inherited — no prompt waits in that pane — yet the daemon deferred the pane's inbound
+  behind it as if one did. A critical hatch ask also outlived its asker (a `gh ship` killed by
+  its timeout): it waited forever, so its card stayed open and the agent in that pane got none of
+  the user's messages. Hatch cards never defer pane inbound now, and `tg-ctl ask` exits once the
+  process that asked is gone, which releases the card.
+
 ## 1.61.0
 
 - **A background job started by omp no longer posts as another session (#709).** omp runs bash

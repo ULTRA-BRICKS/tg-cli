@@ -232,7 +232,7 @@ import {
   type PendingHookSighting,
 } from "./features/tg-ctl/harness-sessions"
 import { reconcile, RENAME_DEBOUNCE_MS, sessionKey, type PendingRenames, type Registry, type RegistryEvent, type SessionEntry, type SessionKey } from "./features/tg-ctl/session-registry"
-import { parseRegistry, rekeyStores, resolveLocatorToSession, runMigration, serializeRegistry, type MigrationIo, type MigrationStore } from "./features/tg-ctl/session-registry-store"
+import { parseRegistry, pinnedSession, rekeyStores, resolveLocatorToSession, runMigration, serializeRegistry, type MigrationIo, type MigrationStore } from "./features/tg-ctl/session-registry-store"
 import {
   checkPaneSession,
   goneRouteSession,
@@ -4982,6 +4982,7 @@ export function normalizeButtonRequest(value: unknown): ButtonRequest | null {
       typeof rec.timeoutMs === "number" && Number.isFinite(rec.timeoutMs) && rec.timeoutMs > 0 ? rec.timeoutMs : undefined,
     origin: readAskAdditiveOrigin(rec.origin),
     operation: readAskAdditiveOperation(rec.operation),
+    sessionPin: typeof rec.sessionPin === "string" && rec.sessionPin ? rec.sessionPin.slice(0, 128) : undefined,
     // Daemon-stamped at arrival (handleHookSocketLine overwrites whatever a
     // client sent); read back here so it survives the disk restore.
     sessionKey: typeof rec.sessionKey === "string" && rec.sessionKey ? rec.sessionKey : undefined,
@@ -5489,10 +5490,12 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
     return
   }
 
-  // The asking session (spec §2.6): the hook's own session id, else the
-  // registry's occupant of the asking pane. Overwrites any client-sent value.
+  // The asking session (spec §2.6): the hook's own session id, else the asker's TG_SESSION pin
+  // (a headless hatch ask has neither pane nor harness id — tg-cli#717), else the registry's
+  // occupant of the asking pane. Overwrites any client-sent sessionKey.
   const askReg = currentSessionRegistry()
-  req = { ...req, sessionKey: hookSessionKey(req) ?? (req.paneId && askReg ? sessionAtPane(askReg, req.paneId)?.key : undefined) }
+  const pinKey = req.sessionPin && askReg ? pinnedSession(askReg, req.sessionPin)?.key : undefined
+  req = { ...req, sessionKey: hookSessionKey(req) ?? pinKey ?? (req.paneId && askReg ? sessionAtPane(askReg, req.paneId)?.key : undefined) }
   log(`ask-forward arrived: ${describeAskRequest(req)}`)
   recordHookSession(req)
 
@@ -6024,6 +6027,8 @@ const ASK_TOTAL_TIMEOUT_MS = (() => {
   const TIMEOUT_MAX = 2_147_483_647
   return Number.isFinite(raw) && raw > 0 ? Math.min(raw, TIMEOUT_MAX) : 115_000
 })()
+// How often `tg-ctl ask` checks that the process that asked is still alive (tg-cli#717).
+const ORPHAN_CHECK_MS = 2_000
 // Backoff between reconnect attempts. Also lets a LIVE daemon's socket-close handler
 // run (moving the entry to `abandoned`) BEFORE the resend lands, so the resend
 // re-attaches instead of racing the in-flight dedup.
@@ -6205,7 +6210,19 @@ async function askDaemon(ctx: Ctx): Promise<void> {
     windowName: tmuxWindowName(),
     subagent: envRole(process.env).label,
     invocationNonce: crypto.randomUUID(),
+    sessionPin: process.env.TG_SESSION?.trim() || undefined,
   }
+  // tg-cli#717: whoever asked waits on our stdout. If it dies (a `gh ship` killed by its
+  // timeout) we are reparented, nobody can use the answer, and a critical ask would otherwise
+  // wait forever and keep its card open. Exit, so the socket close retires the card.
+  const askerPid = process.ppid
+  setInterval(() => {
+    // ppid 1: the asker may already be gone before this process read its ppid.
+    if (process.ppid !== askerPid || process.ppid === 1) {
+      log(`ask-forward orphaned: asker pid ${askerPid} exited — giving up`)
+      process.exit(0)
+    }
+  }, ORPHAN_CHECK_MS).unref()
   const reqs = normalizeHookRequests(payload, env)
   if (!reqs) {
     // Unsupported payload shape (multi-select / free-form / an event we don't
@@ -8148,6 +8165,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // approval gate, not a prompt in any pane, and may wait up to 15 min — it
       // must never hold every agent's inbound behind it.
       if (isGenericAskRequest(pb.req)) continue
+      // tg-cli#717: a hatch ask is a shell gate too — its TMUX_PANE is merely inherited, and no
+      // prompt waits in that pane. Holding the pane's inbound behind it lost the user's messages
+      // for as long as an (orphaned, critical) hatch card stayed open.
+      if (isHatchPermissionRequest(pb.req)) continue
       if (!pb.req.paneId && pb.req.critical !== true) return true
       if (pb.req.paneId === paneId) return true
     }
