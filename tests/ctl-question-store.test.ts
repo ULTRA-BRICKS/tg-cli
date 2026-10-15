@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import {
-  MAX_RETAINED_QUESTIONS,
+  MAX_ANSWERED_RECORDS,
   parseQuestionStore,
   serializeQuestionStore,
   type QuestionStoreData,
@@ -247,37 +247,59 @@ test('a null messageId is preserved (card not yet confirmed)', () => {
   expect(restored.questions[0].messageId).toBeNull();
 });
 
-test('serialize caps each array to MAX_RETAINED_QUESTIONS on WRITE (the file is bounded, not only on the next parse)', () => {
-  const questions = Array.from({ length: MAX_RETAINED_QUESTIONS + 30 }, (_, i) => ({
+// tg-cli#707: every record in `questions` is an OPEN card (pending or abandoned) — it closes only
+// on a relevance signal (#705), never by age or count. Only the answered-replay cache (closed
+// records) is count-capped.
+const OPEN_OVER_CAP = MAX_ANSWERED_RECORDS + 51;
+
+test('serialize keeps EVERY open question and caps only the answered (closed) records on WRITE', () => {
+  const questions = Array.from({ length: OPEN_OVER_CAP }, (_, i) => ({
     req: scopedQuestionReq(`q${i}`),
     messageId: i,
     at: NOW - i, // higher i = older
   }));
-  const answered = Array.from({ length: MAX_RETAINED_QUESTIONS + 30 }, (_, i) => ({
+  const answered = Array.from({ length: MAX_ANSWERED_RECORDS + 30 }, (_, i) => ({
     key: `a${i}`,
     value: 'v',
     label: 'l',
     at: NOW - i,
     delivery: 'socket' as const,
   }));
-  // Inspect the RAW serialized JSON directly (NOT via parseQuestionStore, which also
-  // caps) to prove the WRITE itself bounds the file.
+  // Inspect the RAW serialized JSON directly (NOT via parseQuestionStore) to prove the WRITE
+  // itself keeps every open card and bounds the closed ones.
   const raw = JSON.parse(serializeQuestionStore({ questions, answered }));
-  expect(raw.questions).toHaveLength(MAX_RETAINED_QUESTIONS);
-  expect(raw.answered).toHaveLength(MAX_RETAINED_QUESTIONS);
-  expect(raw.questions[0].req.requestId).toBe('q0'); // freshest kept
-  expect(raw.answered[0].key).toBe('a0');
+  expect(raw.questions).toHaveLength(OPEN_OVER_CAP);
+  expect(raw.answered).toHaveLength(MAX_ANSWERED_RECORDS);
+  expect(raw.answered[0].key).toBe('a0'); // freshest closed record kept
 });
 
-test('the questions array is capped to MAX_RETAINED_QUESTIONS, keeping the freshest', () => {
-  const questions = Array.from({ length: MAX_RETAINED_QUESTIONS + 50 }, (_, i) => ({
+test('a restart restores every one of 250+ open questions, the oldest included; the answered cache stays capped', () => {
+  const questions = Array.from({ length: OPEN_OVER_CAP }, (_, i) => ({
     req: scopedQuestionReq(`q${i}`),
     messageId: i,
     at: NOW - i, // higher i = older
+    ...(i % 2 === 0 ? { pending: true as const } : {}),
   }));
-  const restored = parseQuestionStore(serializeQuestionStore({ questions, answered: [] }), NOW, 10 * 60_000, 10 * 60_000);
-  expect(restored.questions).toHaveLength(MAX_RETAINED_QUESTIONS);
-  // Freshest kept (i=0 newest); the oldest 50 dropped.
-  expect(restored.questions[0].req.requestId).toBe('q0');
-  expect(restored.questions.every((q) => Number((q.req.requestId as string).slice(1)) < MAX_RETAINED_QUESTIONS)).toBe(true);
+  const answered = Array.from({ length: MAX_ANSWERED_RECORDS + 50 }, (_, i) => ({
+    key: `a${i}`,
+    value: 'v',
+    label: 'l',
+    at: NOW - i,
+    delivery: 'socket' as const,
+  }));
+  const restored = parseQuestionStore(serializeQuestionStore({ questions, answered }), NOW, Number.MAX_SAFE_INTEGER, 10 * 60_000);
+  expect(restored.questions).toHaveLength(OPEN_OVER_CAP);
+  expect(new Set(restored.questions.map((q) => q.req.requestId))).toEqual(new Set(questions.map((q) => q.req.requestId)));
+  expect(restored.answered).toHaveLength(MAX_ANSWERED_RECORDS);
+  // Freshest closed records kept (i=0 newest); the oldest 50 dropped.
+  expect(restored.answered.every((a) => Number(a.key.slice(1)) < MAX_ANSWERED_RECORDS)).toBe(true);
+});
+
+test('a file an older daemon left above the old 200 cap still restores every open question', () => {
+  const raw = JSON.stringify({
+    v: 1,
+    questions: Array.from({ length: OPEN_OVER_CAP }, (_, i) => ({ req: scopedQuestionReq(`q${i}`), messageId: i, at: NOW - i })),
+    answered: [],
+  });
+  expect(parseQuestionStore(raw, NOW, Number.MAX_SAFE_INTEGER, 60_000).questions).toHaveLength(OPEN_OVER_CAP);
 });

@@ -3,6 +3,20 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.64.1
+
+- **Open question cards are never dropped on restart (#707).** `tg-ctl.<bot>.questions.json`
+  kept only the 200 newest records, so with more than 200 open cards a restart silently lost the
+  oldest: their Inbox copies went and a tap said "expired". Every open card (pending or
+  abandoned) is now kept on write and restored on read; only the answered-replay cache (closed
+  records) is capped at 200 (`MAX_ANSWERED_RECORDS`).
+- **An edit that changes nothing is success, not a logged failure (#728).** Telegram answers
+  `editMessageText` / `editMessageReplyMarkup` with HTTP 400 "message is not modified" when the
+  message already shows that text and keyboard (a card closed twice, a keyboard already cleared,
+  a restored card re-rendered). The daemon's one Bot API path (`botPostResult`) now treats that
+  as success, so restarts and withdraws no longer log false `… failed: 400` lines. Any other
+  refusal of an edit is still logged.
+
 ## 1.64.0
 
 - **Intent gate: questions, problems and reports must be in their format, tagged or not

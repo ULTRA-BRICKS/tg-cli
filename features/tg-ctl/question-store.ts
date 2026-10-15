@@ -2,7 +2,7 @@
 // (CtlPaths.questions). The tg-ctl entrypoint owns the file I/O (atomic write +
 // readFileOrNull) and the AUTHORITATIVE request normalization
 // (normalizeButtonRequest); this module owns only the on-disk FORMAT — the
-// versioned envelope, answered-record validation, and age/count pruning. `req` is
+// versioned envelope, answered-record validation, age pruning and the answered-cache cap. `req` is
 // kept un-normalized here (returned as a plain object the entrypoint re-validates)
 // so normalizeButtonRequest stays the single source of truth for what a
 // ButtonRequest is.
@@ -67,34 +67,23 @@ export interface QuestionStoreData {
 
 const STORE_VERSION = 1;
 
-// Far above any plausible concurrent-question count; bounds the on-disk file on a
-// long-lived bot so a flood (or a never-tapped backlog) can't grow it without limit.
-// On overflow the FRESHEST entries are kept (most likely to still be tapped). The cap
-// is applied at BOTH serialize (so the persisted file is bounded the moment it is
-// written, not only after the next restart's parse) and parse (defense in depth on
-// read), to BOTH retained questions and the answered-replay cache. The in-memory maps
-// the entrypoint holds are bounded by the age-prune it runs before every persist.
+// The answered-replay cache holds CLOSED records only, so it is bounded by count: a burst of
+// answers inside the replay window can't grow the file without limit. On overflow the FRESHEST
+// are kept (the likeliest to be replayed). Applied at BOTH serialize (the file is bounded the
+// moment it is written) and parse (defense in depth on read).
 //
-// Accepted divergence (memory vs disk): this cap bounds the FILE by count, but the
-// in-memory maps are bounded only by AGE, not count. In the implausible case of >200
-// questions live inside the retention window at once, all stay tappable in memory
-// while the daemon runs, yet only the 200 freshest survive a restart (the rest expire
-// post-restart). This is accepted because the realistic concurrent-question count on a
-// single human's channel is tiny — far below 200; bounding the maps by count too would
-// drop a still-deliverable entry from memory before its age window, for no real gain.
-export const MAX_RETAINED_QUESTIONS = 200;
-
-// Keep the freshest MAX_RETAINED_QUESTIONS records (newest `at` first). Shared by
-// serialize (bound the file on write) and parse (bound on read).
-function capByRecency<T extends { at: number }>(records: T[]): T[] {
-  return [...records].sort((a, b) => b.at - a.at).slice(0, MAX_RETAINED_QUESTIONS);
-}
+// The `questions` array is NEVER count-capped: every record there is an OPEN card (live pending
+// or abandoned), which closes only on a relevance signal, never by age or count (tg-cli#705). A
+// cap evicted the oldest open cards on every restart — their Inbox copies vanished and a tap
+// said "expired" with no visible close reason (tg-cli#707). The open set is bounded by the cards
+// actually posted and not yet closed.
+export const MAX_ANSWERED_RECORDS = 200;
 
 export function serializeQuestionStore(data: QuestionStoreData): string {
   return JSON.stringify({
     v: STORE_VERSION,
-    questions: capByRecency(data.questions),
-    answered: capByRecency(data.answered),
+    questions: [...data.questions].sort((a, b) => b.at - a.at),
+    answered: [...data.answered].sort((a, b) => b.at - a.at).slice(0, MAX_ANSWERED_RECORDS),
   });
 }
 
@@ -155,8 +144,8 @@ function parseQuestions(value: unknown, now: number, maxAgeMs: number): Retained
       ...(rec.pending === true ? { pending: true as const } : {}),
     });
   }
-  // Newest first, capped: on overflow keep the freshest (most likely still tappable).
-  return capByRecency(out);
+  // Newest first, every one kept: an open card is never dropped for count (tg-cli#707).
+  return out.sort((a, b) => b.at - a.at);
 }
 
 // A malformed queuedDecision must never corrupt the whole retained-question record
@@ -209,7 +198,6 @@ function parseAnswered(value: unknown, now: number, maxAgeMs: number): RetainedA
     const delivery = rec.delivery === 'pane' ? 'pane' : 'socket';
     out.push({ key: rec.key, value: rec.value, label: rec.label, decision, at: rec.at, delivery });
   }
-  // Same recency cap as questions: a burst of answers inside the replay window can't
-  // grow the file (or the in-memory map) without limit.
-  return capByRecency(out);
+  // Closed records only, so capped (see MAX_ANSWERED_RECORDS); the freshest are kept.
+  return out.sort((a, b) => b.at - a.at).slice(0, MAX_ANSWERED_RECORDS);
 }

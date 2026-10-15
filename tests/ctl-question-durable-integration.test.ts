@@ -157,7 +157,9 @@ interface MockTg {
   delaySend: (ms: number) => void;
 }
 
-function mockTelegram(callbackDelayMs = 0): MockTg {
+// `editError`: answer every editMessageText / editMessageReplyMarkup with Telegram's HTTP 400
+// carrying this description (after recording it), the way the real API refuses an edit.
+function mockTelegram(callbackDelayMs = 0, editError: string | null = null): MockTg {
   const updateQueue: unknown[][] = [];
   const cards: unknown[] = [];
   const edits: string[] = [];
@@ -196,10 +198,12 @@ function mockTelegram(callbackDelayMs = 0): MockTg {
       }
       if (url.pathname.endsWith('/editMessageText')) {
         edits.push(String(((await req.json()) as Record<string, unknown>).text ?? ''));
+        if (editError) return Response.json({ ok: false, error_code: 400, description: editError }, { status: 400 });
         return Response.json({ ok: true, result: true });
       }
       if (url.pathname.endsWith('/editMessageReplyMarkup')) {
         keyboardClears += 1;
+        if (editError) return Response.json({ ok: false, error_code: 400, description: editError }, { status: 400 });
         return Response.json({ ok: true, result: true });
       }
       if (url.pathname.endsWith('/answerCallbackQuery')) {
@@ -1888,3 +1892,92 @@ test('TEXT-REPLY DECISION: a same-batch race (button tap resolves the card a mom
   daemon.kill('SIGTERM');
   await daemon.exited;
 }, 25_000);
+
+test('251 OPEN CARDS ACROSS RESTARTS (tg-cli#707): every one is restored and kept on disk; a tap on the oldest still late-delivers', async () => {
+  const cfgDir = makeCfgDir();
+  const statePath = join(cfgDir, 'tg-ctl.123.questions.json');
+  const OPEN = 251;
+  const now = Date.now();
+  // q0 is the OLDEST card (the first an old count cap evicted). Every entry is a live pending
+  // ask the old process held, so the restore rewrites the file — the write path is exercised too.
+  writeFileSync(
+    statePath,
+    JSON.stringify({
+      v: 1,
+      questions: Array.from({ length: OPEN }, (_, i) => ({
+        req: { ...QUESTION, requestId: `q${i}`, paneId: PANE_ID, cwd: cfgDir },
+        messageId: i + 1,
+        at: now - (OPEN - i) * 1000,
+        pending: true,
+      })),
+      answered: [],
+    }),
+  );
+  const onDisk = (): number => {
+    const state: unknown = JSON.parse(readFileSync(statePath, 'utf8'));
+    return state && typeof state === 'object' && 'questions' in state && Array.isArray(state.questions) ? state.questions.length : -1;
+  };
+  const pendingOnDisk = (): boolean => readFileSync(statePath, 'utf8').includes('"pending":true');
+  const tg = mockTelegram();
+  servers.push(tg);
+
+  const daemon1 = await startDaemon(cfgDir, tg.port);
+  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), RESTORE_WAIT_MS)).toBe(true);
+  expect(daemonLog(cfgDir)).toContain(`questions restored: ${OPEN} retained`);
+  // The restore's own write (it drops the pending marks) keeps every open card.
+  expect(await until(() => !pendingOnDisk(), 4000)).toBe(true);
+  expect(onDisk()).toBe(OPEN);
+
+  daemon1.kill('SIGTERM');
+  await daemon1.exited;
+  const daemon2 = await startDaemon(cfgDir, tg.port);
+  expect(await until(() => daemonLog(cfgDir).split('questions restored').length >= 3, RESTORE_WAIT_MS)).toBe(true);
+  expect(daemonLog(cfgDir).split('questions restored: ')[2]).toStartWith(`${OPEN} retained`);
+
+  // The oldest card is still answerable: the tap reaches the asking pane, not "expired".
+  tg.push([tap('tgq:q0:o1', 811, 1)]);
+  expect(await until(() => injected(cfgDir).some((l) => l.includes('Production')), 6000)).toBe(true);
+  expect(await until(() => tg.answeredCbs().some((c) => c.text === '✓ sent to the agent'), 4000)).toBe(true);
+  expect(tg.answeredCbs().some((c) => c.text === 'expired')).toBe(false);
+  expect(await until(() => onDisk() === OPEN - 1, 4000)).toBe(true);
+  daemon2.kill('SIGTERM');
+  await daemon2.exited;
+}, 40_000);
+
+// tg-cli#728: abandon a question, then tap it — the expiry edit, the keyboard clear and the
+// answered edit all reach a Telegram that refuses every edit with `editError`. Returns the log.
+async function tapThroughRefusedEdits(editError: string): Promise<{ log: string; cfgDir: string }> {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram(0, editError);
+  servers.push(tg);
+  const daemon = await startDaemon(cfgDir, tg.port);
+  const ask = startAsk(cfgDir, tg.port, QUESTION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+  const productionData = tg.optionData(1)!;
+  ask.kill(9);
+  await ask.exited;
+  expect(await until(() => tg.edits().some((e) => e.includes('Time-out expired.')), 6000)).toBe(true);
+  tg.push([tap(productionData, 820, 1)]);
+  expect(await until(() => injected(cfgDir).some((l) => l.includes('Production')), 6000)).toBe(true);
+  expect(await until(() => tg.keyboardClears() > 0 && tg.edits().some((e) => e.includes('Production')), 4000)).toBe(true);
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+  return { log: daemonLog(cfgDir), cfgDir };
+}
+
+test("EDIT NOT MODIFIED (tg-cli#728): Telegram's 400 'message is not modified' on an edit is success — no failure line, the card flow completes", async () => {
+  const { log, cfgDir } = await tapThroughRefusedEdits(
+    'Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message',
+  );
+  expect(log).not.toContain('editMessageText failed');
+  expect(log).not.toContain('editMessageReplyMarkup failed');
+  expect(log).toContain('ask-late-delivered');
+  // No divergence: the answer is recorded as delivered and the card is no longer open.
+  expect(hasPersistedQuestion(cfgDir, 'q_durable')).toBe(false);
+}, 30_000);
+
+test('EDIT REFUSED (tg-cli#728): any other 400 on an edit is still logged as a failure', async () => {
+  const { log } = await tapThroughRefusedEdits('Bad Request: message to edit not found');
+  expect(log).toContain('editMessageText failed: 400');
+  expect(log).toContain('editMessageReplyMarkup failed: 400');
+}, 30_000);

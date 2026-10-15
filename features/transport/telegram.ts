@@ -126,6 +126,15 @@ export function isTopicDeletedError(description: string): boolean {
   return d.includes('topic_id_invalid') || d.includes('topic_deleted');
 }
 
+// Telegram refuses an edit whose new text and markup equal the message's current ones with
+// HTTP 400 "Bad Request: message is not modified: …" — a card closed twice, a keyboard already
+// cleared, a restored card re-rendered unchanged. The message already shows what the edit asked
+// for, so the daemon treats it as success: no failure log, no retry (tg-cli#728). Only the
+// editMessage* methods qualify; any other refusal stays a failure.
+export function isEditNotModified(method: string, description: string): boolean {
+  return method.startsWith('editMessage') && description.toLowerCase().includes('message is not modified');
+}
+
 // Exit-on-error response check, shared by every send. A non-2xx response or an
 // { ok:false } body prints to stderr and exits 1; otherwise the `result`
 // payload is returned (a Message or an array of Messages).

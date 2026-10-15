@@ -264,7 +264,7 @@ import {
 } from "./features/tg-ctl/session-topics"
 import { tmuxServerPidFromEnv } from "./features/cli/session-topic"
 import { createTopicRenamer, type TopicRenamer } from "./features/tg-ctl/topic-rename"
-import { isThreadRejection, isTopicDeletedError } from "./features/transport/telegram"
+import { isEditNotModified, isThreadRejection, isTopicDeletedError } from "./features/transport/telegram"
 import { installOmpLiveExtension, runOmpLiveCommand } from "./tools/omp-live-cli.mjs"
 import {
   DEFAULT_TASK_VIEW,
@@ -878,6 +878,12 @@ function telegramErrorDescription(text: string): { description: string; json?: R
   return { description: text.slice(0, 200) }
 }
 
+// Telegram's success answer to an edit, standing in for a "message is not modified" refusal.
+const EDIT_UNCHANGED: Record<string, unknown> = { ok: true, result: true }
+
+// The one path every daemon Bot API call takes, so an edit that changed nothing
+// (isEditNotModified, tg-cli#728) is success here for every edit call site: no failure line,
+// and the caller sees ok.
 async function botPostResult(ctx: Ctx, method: string, body: unknown): Promise<BotPostResult> {
   try {
     const resp = await fetch(`${api(ctx)}/${method}`, {
@@ -889,6 +895,7 @@ async function botPostResult(ctx: Ctx, method: string, body: unknown): Promise<B
     if (!resp.ok) {
       const text = await resp.text()
       const error = telegramErrorDescription(text)
+      if (isEditNotModified(method, error.description)) return { ok: true, json: EDIT_UNCHANGED }
       log(`${method} failed: ${resp.status} ${text.slice(0, 200)}`)
       return { ok: false, status: resp.status, ...error }
     }
@@ -897,6 +904,7 @@ async function botPostResult(ctx: Ctx, method: string, body: unknown): Promise<B
     if (json.ok === false) {
       const description =
         typeof json.description === "string" ? json.description : JSON.stringify(json).slice(0, 200)
+      if (isEditNotModified(method, description)) return { ok: true, json: EDIT_UNCHANGED }
       return { ok: false, description, json }
     }
     return { ok: true, json }
@@ -5787,7 +5795,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       // Telegram's editMessageText DETACHES the inline keyboard when
       // reply_markup is omitted. Best-effort like every card edit (a restart-
       // restored card that was never edited yields "message is not modified",
-      // which botPost swallows).
+      // which botPostResult counts as success — tg-cli#728).
       if (retained.messageId !== null) {
         const restored = buildButtonMessage(ctx.chatId, req)
         void editMessageText(ctx, retained.messageId, restored.text, restored.reply_markup, restored.parse_mode)
@@ -8120,9 +8128,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // re-attach to its existing card instead of posting a duplicate. Re-normalize each
   // `req` through the AUTHORITATIVE validator and drop anything that isn't scoped (and
   // for questions: carrying options). Answered entries restore the replay cache.
-  // Questions are read with no age window: a card stays open, however long the daemon was
-  // down, until a relevance signal closes it (tg-cli#705). parseQuestionStore still caps the
-  // file at MAX_RETAINED_QUESTIONS (question-store.ts), newest kept.
+  // Questions are read with no age window and no count cap: a card stays open, however long the
+  // daemon was down and however many are open, until a relevance signal closes it (tg-cli#705,
+  // #707). Only the answered-replay cache is capped (question-store.ts MAX_ANSWERED_RECORDS).
   {
     const nowRestore = Date.now()
     const questionsRaw = readFileOrNull(ctx.paths.questions)
