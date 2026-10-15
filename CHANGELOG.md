@@ -3,6 +3,10 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.64.3
+
+- **A session with a browser relay gets its Telegram messages again (#731).** An omp session that ran `omp browser-relay` had that helper listed as a second live omp in its tmux pane. Pane delivery picked it (the lower pid) instead of the session, and every message failed with `Original OMP bridge: endpoint_unavailable … Save/stop the original before resuming it`, although the session's bridge was up. `omp browser-relay` as omp spawns it (the subcommand right after the program) is no longer an agent. A pane now belongs only to the agent it runs (its shallowest one), never to an omp nested under it, and a pane delivery that knows that agent's pid targets exactly it. A relay started by hand with global flags before the subcommand is still listed outside panes (#737).
+
 ## 1.64.2
 
 - **📥 Inbox copies and old reminders survive a Telegram outage (#722, #723).** A copy whose

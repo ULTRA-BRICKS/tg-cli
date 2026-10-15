@@ -22,6 +22,7 @@ import {
   liveOmpLabel,
   liveOmpPaneId,
   matchLiveOmp,
+  liveOmpForPane,
   mergeLiveOmpCandidates,
   ompSessionFileFromBreadcrumb,
   ompTerminalId,
@@ -52,6 +53,10 @@ function pane(
 
 function proc(pid: number, ppid: number, command: string): ProcInfo {
   return { pid, ppid, command };
+}
+
+function liveAgent(pid: number): LiveOmpAgent {
+  return { pid, cwd: '/home/u/work', sessionFile: null, sessionId: null, title: null, paneId: null, tty: null };
 }
 
 // --- 243 still classifies omp, including version-string pane_current_command ---
@@ -332,6 +337,64 @@ test('findLiveOmpAgents includes a headless omp session with neither a tty nor a
   const agents = findLiveOmpAgents(panes, procs, ttyByPid);
   expect(agents).toHaveLength(1);
   expect(agents[0]).toMatchObject({ pid: 700, paneId: null, tty: null });
+});
+
+// tg-cli#731: an omp session's `omp browser-relay` helper sits in the same pane as the
+// session and sorts first by pid; pane routing picked it, and the send to its (absent)
+// endpoint failed with endpoint_unavailable although the session's own bridge was live.
+test('the omp browser-relay helper is not an omp session, so it never shares the pane with one (tg-cli#731)', () => {
+  const preload = 'bun --preload /Users/u/xp/oh-my-pi/packages/coding-agent/scripts/omp.ts /Users/u/xp/oh-my-pi/packages/coding-agent/src/cli.ts';
+  // The bun launcher shape is omp; only its browser-relay subcommand is excluded.
+  expect(matchAgentCommand(preload)).toBe('omp');
+  expect(matchAgentCommand(`${preload} browser-relay --port 9224`)).toBeNull();
+  expect(matchAgentCommand('/home/u/.local/lib/omp/omp browser-relay --port 9224')).toBeNull();
+  expect(isOmpLiveSessionCommand('/home/u/.local/lib/omp/omp browser-relay --port 9224')).toBe(false);
+  expect(matchAgentCommand('bun /tmp/shim/bin/omp browser-relay --port 9224')).toBeNull();
+  // Only the subcommand position: a session started in a directory of that name stays one.
+  expect(matchAgentCommand('/home/u/.local/lib/omp/omp --cwd browser-relay')).toBe('omp');
+  expect(matchAgentCommand(`${preload} --cwd browser-relay`)).toBe('omp');
+  const panes = [pane('%5', 100, 'omp', '/home/u/work')];
+  const procs = [
+    proc(1, 0, '/sbin/init'),
+    proc(100, 1, '-zsh'),
+    proc(300, 100, '/home/u/.local/lib/omp/omp'),
+    proc(150, 300, '/home/u/.local/lib/omp/omp __omp_worker_daemon_broker'),
+    proc(160, 150, '/home/u/.local/lib/omp/omp browser-relay --port 9224'),
+  ];
+  const agents = findLiveOmpAgents(panes, procs, new Map());
+  expect(agents.map((a) => [a.pid, a.paneId])).toEqual([[300, '%5']]);
+  // A pane running only a relay hosts no agent, so nothing is ever typed into it.
+  const relayOnly = [proc(1, 0, '/sbin/init'), proc(200, 1, '-zsh'), proc(210, 200, '/home/u/.local/lib/omp/omp browser-relay --port 9224')];
+  expect(findAgentInPane(pane('%7', 200, 'omp', '/tmp'), relayOnly)).toBeNull();
+});
+
+test('an omp nested in a session pane never takes the pane, whatever its argv (tg-cli#731)', () => {
+  const panes = [pane('%5', 100, 'omp', '/home/u/work')];
+  const procs = [
+    proc(1, 0, '/sbin/init'),
+    proc(100, 1, '-zsh'),
+    proc(300, 100, '/home/u/.local/lib/omp/omp'),
+    proc(150, 300, '/home/u/.local/lib/omp/omp __omp_worker_daemon_broker'),
+    // Flags before the subcommand: the argv check cannot tell it from a session.
+    proc(160, 150, '/home/u/.local/lib/omp/omp --cwd /tmp browser-relay --port 9224'),
+  ];
+  const agents = findLiveOmpAgents(panes, procs, new Map());
+  expect(agents.map((a) => [a.pid, a.paneId])).toEqual([[300, '%5'], [160, null]]);
+  // Pane-only delivery (no hosted pid at hand) still reaches the session, not the helper.
+  expect(liveOmpForPane(agents, '%5')?.pid).toBe(300);
+});
+
+test('liveOmpForPane prefers the exact hosted pid over another omp listed in the same pane (tg-cli#731)', () => {
+  const other = { ...liveAgent(160), paneId: '%5' };
+  const hosted = { ...liveAgent(300), paneId: '%5' };
+  expect(liveOmpForPane([other, hosted], '%5', 300)?.pid).toBe(300);
+  // Exact pid, even when that process is not attributed to the pane at all.
+  expect(liveOmpForPane([other, { ...hosted, paneId: null }], '%5', 300)?.pid).toBe(300);
+  // No hosted pid known: the pane is the only key.
+  expect(liveOmpForPane([other, hosted], '%5')?.pid).toBe(160);
+  expect(liveOmpForPane([other], '%9', 300)).toBeNull();
+  // A known hosted pid absent from the list is never substituted by the pane's other omp.
+  expect(liveOmpForPane([other], '%5', 300)).toBeNull();
 });
 
 test('findLiveOmpAgents includes a headless omp session entirely absent from the tty map', () => {

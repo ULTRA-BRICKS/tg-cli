@@ -152,6 +152,7 @@ import {
   describeUnbridgedOmp,
   findLiveOmpAgents,
   liveOmpLabel,
+  liveOmpForPane,
   liveOmpPaneId,
   matchLiveOmp,
   matchLiveOmpOrigin,
@@ -1867,11 +1868,6 @@ async function typeIntoHostOfOmp(pid: number, text: string): Promise<SinkResult 
   return typeIntoHost(host.name, text, `omp pid ${pid}`, pid)
 }
 
-function liveOmpForPane(paneId: string, agentPid?: number): LiveOmpAgent | null {
-  const agents = listLiveOmpAgents()
-  return agents.find((a) => a.paneId === paneId || (agentPid !== undefined && a.pid === agentPid)) ?? null
-}
-
 // --- Session registry (docs/specs/session-registry-and-topics.md §2, tg-cli#487) ---
 // The daemon is the ONLY writer of sessions.json. Off the poll hot path: at most
 // once per SESSION_SCAN_INTERVAL_MS (sooner when a hook sighting needs binding),
@@ -2414,7 +2410,7 @@ async function routeGrantNotice(ctx: Ctx, req: ButtonRequest, text: string, deli
   let target: OriginalOmpTarget | null = null
   if (req.origin?.sessionId) target = { cwd: req.cwd, sessionId: req.origin.sessionId }
   else if (req.paneId) {
-    const live = liveOmpForPane(req.paneId)
+    const live = liveOmpForPane(listLiveOmpAgents(), req.paneId)
     if (live) target = live
   }
   // No exact session/pane identity: retain in scoped inbox, never guess by cwd.
@@ -9191,7 +9187,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         recordIfAutoBound()
         return true
       }
-      const live = liveOmpForPane(paneId, found.target.agentPid)
+      const live = liveOmpForPane(listLiveOmpAgents(), paneId, found.target.agentPid)
       const cwd = found.target.pane.panePath || live?.cwd || "/"
       log(`inject: omp original-process pane=${paneId} cwd=${cwd} (endpoint first; own-pane tmux only without one)`)
       const result = await deliverOriginalOmp(live ?? { cwd, pid: found.target.agentPid }, deferText, sourceMessageId ?? undefined, paneId)
@@ -9260,7 +9256,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const pane = panes.find((p) => p.paneId === paneId)
     const hosted = pane ? findAgentInPane(pane, procs) : null
     if (hosted?.agent === "omp") {
-      const live = liveOmpForPane(paneId, hosted.pid)
+      const live = liveOmpForPane(listLiveOmpAgents(), paneId, hosted.pid)
       const cwd = pane?.panePath || live?.cwd || "/"
       log(`injectToPane: omp original-process pane=${paneId} cwd=${cwd} (endpoint first; own-pane tmux only without one)`)
       const res = await deliverOriginalOmp(live ?? { cwd, pid: hosted.pid }, wrapped, sourceMessageId ?? undefined, paneId)
@@ -9465,7 +9461,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const pane = panes.find((p) => p.paneId === paneId)
     const hosted = pane ? findAgentInPane(pane, procs) : null
     if (hosted?.agent === "omp") {
-      const live = liveOmpForPane(paneId, hosted.pid)
+      const live = liveOmpForPane(listLiveOmpAgents(), paneId, hosted.pid)
       log(`injectPrewrapped: omp original-process pane=${paneId} cwd=${cwd} (endpoint first; own-pane tmux only without one)`)
       const res = await deliverOriginalOmp(live ?? { cwd: cwd || "/", pid: hosted.pid }, prewrappedText, sourceMessageId ?? undefined, paneId)
       if (!res.ok) {
@@ -12228,7 +12224,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     answeredButtons.set(action.requestId, { value: answer.value, label: answer.label, decision: answer.decision, at: answeredAt, delivery: "pane" })
     persistQuestions()
     const res = retained.req.agent === "omp"
-      ? await deliverOriginalOmp(liveOmpForPane(paneId) ?? { cwd: retained.req.cwd ?? "/" }, wrapInbound(ctx.cfg.injectWrap, "tg", answer.label), `answer:${action.requestId}`, paneId)
+      ? await deliverOriginalOmp(liveOmpForPane(listLiveOmpAgents(), paneId) ?? { cwd: retained.req.cwd ?? "/" }, wrapInbound(ctx.cfg.injectWrap, "tg", answer.label), `answer:${action.requestId}`, paneId)
       : await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
     // Typed but still in the input box after the retry Enter (#463): keep the claim
     // — a re-tap would type the answer a second time — and tell the CTO in the chat.

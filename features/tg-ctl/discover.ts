@@ -98,21 +98,36 @@ function isOmpFilenameStem(t: string | undefined): boolean {
 // and this match silently misses — same limitation every whitespace-split
 // check in this file already has.
 function isBunOmpLaunch(tokens: string[]): boolean {
-  if (isOmpFilenameStem(tokens[1])) return true;
+  return isOmpFilenameStem(tokens[1]) || leadingPreloads(tokens).values.some(isOmpFilenameStem);
+}
+
+// bun's leading run of `--preload <v>` / `--preload=<v>` flags: their values, and the
+// index of the first token after them (the script positional).
+function leadingPreloads(tokens: string[]): { values: string[]; end: number } {
+  const values: string[] = [];
   let i = 1;
   while (i < tokens.length) {
     const t = tokens[i];
     if (t === '--preload') {
-      if (isOmpFilenameStem(tokens[i + 1])) return true;
+      values.push(tokens[i + 1] ?? '');
       i += 2;
     } else if (t.startsWith('--preload=')) {
-      if (isOmpFilenameStem(t.slice('--preload='.length))) return true;
+      values.push(t.slice('--preload='.length));
       i += 1;
     } else {
       break;
     }
   }
-  return false;
+  return { values, end: i };
+}
+
+// The argument right after the omp program: `omp <sub>`, `bun <shim> <sub>`, or
+// `bun --preload … <cli.ts> <sub>` — the shape omp itself spawns its helpers with.
+// Position only: the same word as an option value (`omp --cwd browser-relay`) is a
+// session. Global flags before a subcommand are not parsed (their arity is omp's);
+// such a helper nested in a session's pane still never owns it (findLiveOmpAgents).
+function ompSubcommand(tokens: string[], base: string): string | undefined {
+  return base === 'omp' ? tokens[1] : tokens[leadingPreloads(tokens).end + 1];
 }
 
 // Match a single process command line to an agent. Shells (-zsh, bash, …) and
@@ -138,16 +153,17 @@ export function matchAgentCommand(command: string): AgentKind | null {
   // 'omp' (e.g. /opt/homebrew/bin/omp). One row feeds every inbound gate
   // (findAgentInPane BFS, inject verify-pane, reply-route liveness) AND the
   // outbound ancestry branding (findAgentsInAncestry). EXACT basename only:
-  // a merely-containing binary ('ompi-info') never matches. Worker helpers
-  // (`__omp_worker_daemon_broker`, `__omp_worker_js_eval_process`) share the
-  // same argv0 — they are not the user session (243 still matches the TUI).
+  // a merely-containing binary ('ompi-info') never matches. Helpers sharing the
+  // same argv0 — workers (`__omp_worker_daemon_broker`, `__omp_worker_js_eval_process`)
+  // and `browser-relay`, the browser bridge a session runs as its child in its own
+  // pane (tg-cli#731) — are not the user session (243 still matches the TUI).
   // This is shape 1 of 2: `isBunOmpLaunch` below recognizes omp run FROM
   // SOURCE via bun, where argv0 is 'bun', not 'omp'.
-  const isOmpWorker = /\b__omp_worker_/.test(trimmed);
+  const isOmpHelper = /\b__omp_worker_/.test(trimmed) || ompSubcommand(tokens, base) === 'browser-relay';
   if (base === 'omp') {
-    return isOmpWorker ? null : 'omp';
+    return isOmpHelper ? null : 'omp';
   }
-  if (base === 'bun' && !isOmpWorker && isBunOmpLaunch(tokens)) return 'omp';
+  if (base === 'bun' && !isOmpHelper && isBunOmpLaunch(tokens)) return 'omp';
   return null;
 }
 

@@ -6,7 +6,7 @@
 
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { matchAgentCommand, paneIdByPid, type AgentAncestor } from './discover';
+import { findAgentInPane, matchAgentCommand, paneIdByPid, type AgentAncestor } from './discover';
 import type { AgentKind, PaneInfo, ProcInfo } from './types';
 import { uniqueProjectSelectorHits, type AgentCandidate } from './agent-match';
 import { hostOriginId } from './host-registry';
@@ -179,10 +179,22 @@ export function findLiveOmpAgents(
   ttyByPid: Map<number, string>,
 ): LiveOmpAgent[] {
   const paneByPid = paneIdByPid(panes, procs);
+  // A pane hosts ONE agent, its shallowest (findAgentInPane). An omp nested under it —
+  // a helper the session started, however its argv reads — is not that pane's session
+  // and must never take its messages (tg-cli#731).
+  const hostedPidByPane = new Map<string, number | undefined>();
+  const hostedPid = (paneId: string): number | undefined => {
+    if (!hostedPidByPane.has(paneId)) {
+      const pane = panes.find((p) => p.paneId === paneId);
+      hostedPidByPane.set(paneId, pane ? findAgentInPane(pane, procs)?.pid : undefined);
+    }
+    return hostedPidByPane.get(paneId);
+  };
   const out: LiveOmpAgent[] = [];
   for (const p of procs) {
     if (!isOmpLiveSessionCommand(p.command)) continue;
-    const paneId = paneByPid.get(p.pid) ?? null;
+    const paneOfPid = paneByPid.get(p.pid);
+    const paneId = paneOfPid !== undefined && hostedPid(paneOfPid) === p.pid ? paneOfPid : null;
     out.push({
       pid: p.pid,
       cwd: null,
@@ -222,6 +234,17 @@ export function matchLiveOmp(selector: string, agents: LiveOmpAgent[]): LiveOmpA
   // Untitled sessions have no title/jsonl; only a unique cwd basename is safe.
   if (byCwd.length === 1) return byCwd;
   return uniqueProjectSelectorHits(selector, agents, (a) => (a.cwd ? basename(a.cwd) : ''));
+}
+
+/**
+ * The live omp a pane delivery targets. When the caller knows the pid hosted in the pane,
+ * only that exact process qualifies: a pane can list more than one omp (a helper child of
+ * the session), and the first pane match then took the session's messages to a process
+ * with no endpoint (tg-cli#731).
+ */
+export function liveOmpForPane(agents: readonly LiveOmpAgent[], paneId: string, agentPid?: number): LiveOmpAgent | null {
+  if (agentPid !== undefined) return agents.find((a) => a.pid === agentPid) ?? null;
+  return agents.find((a) => a.paneId === paneId) ?? null;
 }
 
 /** Synthetic picker pane id for an omp that is not a tmux pane. Inject routes this to ACP. */
