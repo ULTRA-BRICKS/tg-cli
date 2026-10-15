@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { accessSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs"
+import { accessSync, appendFileSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { dirname, join, resolve } from "path"
 // Explicit import (not the global `crypto`) so the multi-part groupId token
@@ -115,7 +115,9 @@ import { buildPrefix } from "./features/render/prefix"
 import { toTablePre, detectTableKind, pipeTableToHtml } from "./features/render/table"
 import { formatHelp } from "./features/render/format-help"
 import { colorizeHelp, shouldColorize } from "./features/render/help-color"
-import { createTelegramTransport } from "./features/transport/telegram"
+import { writeOutboxEntry, type OutboxHistory, type OutboxRoute } from "./features/transport/outbox"
+import { sendRetryPolicyFromEnv } from "./features/transport/send-retry"
+import { createTelegramTransport, type QueuedSend } from "./features/transport/telegram"
 import { doneReactionForSend } from "./features/tg-ctl/reactions"
 import { isEscalationTag } from "./features/render/tag"
 // How long `tg` waits for the daemon's session-topic answer (or its result ack) before
@@ -439,7 +441,10 @@ Only those HTML tags are supported. Escape raw <, >, and & outside tags as
 &lt;, &gt;, and &amp;.
 
 Exit codes (send):
-  0   sent        1   failed (Telegram/network error, a guard blocked it)
+  0   sent        1   failed (Telegram refused it, a guard blocked it)
+  75  queued: Telegram kept failing (5xx, 429, timeout, connection reset) through
+      the retry budget (TG_SEND_RETRY_BUDGET_MS, default 60000) — the unsent rest is
+      in the outbox and the tg-ctl daemon delivers it, marked as delayed
   78  not connected to Telegram (no bot token or chat configured) — run \`tg auth\`
   (tg auth has its own codes: tg help auth)
 `
@@ -1995,7 +2000,9 @@ if (import.meta.main) {
   // `buildOutboundHistoryRecords` (features/replies/outbound.ts) for why.
   // Called AFTER transmit so the ids are known.
   const CTL_PATHS = originPaneId ? ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)) : null
-  const recordOutboundHistory = (body: string): void => {
+  // `write` defaults to the history file; a queued send (tg-cli#710) takes the rows as
+  // the template its replayed message ids are recorded with.
+  const recordOutboundHistory = (body: string, write?: (recs: HistoryRecord[]) => void): void => {
     if (!CTL_PATHS || !originPaneId) return
     const text = outboundHistoryText(body, { photos: plan.photos.length, documents: plan.documents.length })
     if (text === null) return
@@ -2028,7 +2035,8 @@ if (import.meta.main) {
         outboundThreads,
       )
       // Under the history lock shared with the daemon's inbound writer (tg-cli#136).
-      appendHistoryFile(CTL_PATHS.history, recs)
+      if (write) write(recs)
+      else appendHistoryFile(CTL_PATHS.history, recs)
     } catch {
       // best-effort: never let history bookkeeping break a send
     }
@@ -2438,6 +2446,10 @@ if (import.meta.main) {
   // caption-overflow + the >4096 split + the photos→text→documents ordering on
   // top of the four send primitives. replyTo threads the first outbound message
   // under the referenced inbound Telegram message_id (Feature: threaded replies).
+  // A 5xx / 429 / timeout / reset is retried within the budget; past it the
+  // transport hands the unsent rest of the send to `queuedSends` (tg-cli#710).
+  const sendStartedAt = Date.now()
+  const queuedSends: QueuedSend[] = []
   const transport = createTelegramTransport({
     api: API,
     chatId: CHAT_ID,
@@ -2447,6 +2459,8 @@ if (import.meta.main) {
     threadIdAdvisory,
     ...(sessionTopic ? { threadRetryDelayMs: 1000 } : {}),
     ...(threadIdAdvisory ? { onThreadFallback: (description: string) => void (topicFallback = description) } : {}),
+    retry: sendRetryPolicyFromEnv(process.env),
+    queue: (send) => void queuedSends.push(send),
   })
   // fileCheckDeps: defined earlier (before code-as-pdf/md-as-pdf), reused here
   // unchanged so the pre- and post-conversion checks agree on what "ok" means.
@@ -2454,6 +2468,82 @@ if (import.meta.main) {
     checkFile: (path) => checkAttachmentFile(path, fileCheckDeps),
     allowFlood: !floodCapOn,
   })
+
+  // Generated code→pdf / md→pdf artifacts are dropped once uploaded or copied into the
+  // outbox, so repeated reports don't pile up in the OS tmp (codex review finding).
+  const removePdfTempDirs = (): void => {
+    for (const dir of pdfTempDirs) {
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        // best-effort cleanup
+      }
+    }
+  }
+
+  // tg-cli#710: Telegram stayed unavailable through the retry budget. Persist the unsent
+  // rest of this send for the daemon to replay (marked as delayed) — with the ids that did
+  // go out, so the replay writes the history of the whole send as one group — and exit 75
+  // (EX_TEMPFAIL), not 1: nothing is lost.
+  if (queuedSends.length > 0) {
+    const ctl = ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN))
+    const reason = queuedSends.find((s) => s.reason !== undefined)?.reason ?? "Telegram unavailable"
+    let history: OutboxHistory | undefined
+    recordOutboundHistory(caption, ([r]) => {
+      if (!r?.pane) return
+      history = {
+        ts: r.ts,
+        text: r.text,
+        pane: r.pane,
+        ...(r.chat_id !== undefined ? { chatId: r.chat_id } : {}),
+        ...(r.targetAgent ? { targetAgent: r.targetAgent } : {}),
+        ...(r.sessionKey ? { sessionKey: r.sessionKey } : {}),
+        groupToken: r.groupId ?? randomUUID(),
+      }
+    })
+    // The route recordRoute would have written, for the replayed message ids.
+    let route: OutboxRoute | undefined
+    if (ROUTES_PATH && originPaneId) {
+      const origin = resolveOriginSession()
+      route = {
+        cwd: resolveRouteCwd({ queryPanePath, fallbackCwd: process.cwd() }),
+        ...origin.locators,
+        ...(origin.sessionKey ? { sessionKey: origin.sessionKey } : {}),
+        ...(parentPaneId ? { parentPaneId } : {}),
+      }
+    }
+    let id: string | undefined
+    let writeError: unknown
+    try {
+      // `home` falls back to a literal "~": never create a ./~ tree in the cwd.
+      if (!process.env.TG_CTL_CONFIG_DIR && !process.env.HOME) throw new Error("no config dir: HOME and TG_CTL_CONFIG_DIR are unset")
+      const delivered = outboundIds.map((messageId) => ({ id: messageId, threadId: outboundThreads.get(messageId) ?? null }))
+      // A queued `--tag answer --reply-to` answer marks its question done when it is replayed.
+      const done = doneReactionForSend({ tag, replyToMessageId: replyTo })
+      const reaction = done ? { chatId: CHAT_ID, messageId: done.messageId, emoji: done.emoji } : undefined
+      ;({ id } = await writeOutboxEntry(ctl.outbox, { sends: queuedSends, createdAt: sendStartedAt, route, history, delivered, reaction }))
+    } catch (err) {
+      writeError = err
+    }
+    // Only now: a queued upload of a generated PDF is read from its temp dir by the write.
+    removePdfTempDirs()
+    if (id === undefined) {
+      if (outboundIds.length > 0) recordOutboundHistory(caption)
+      console.error(`Telegram API error: ${reason}; the outbox write failed too (${writeError}) — the message was NOT sent`)
+      process.exit(1)
+    }
+    try {
+      appendFileSync(ctl.log, `[${new Date().toISOString()}] outbox: queued ${id} (${queuedSends.length} request(s), ${reason})\n`)
+    } catch {
+      // best-effort: the daemon logs the entry again when it replays it
+    }
+    console.error(
+      `tg: Telegram did not answer (${reason}) — queued ${queuedSends.length} part(s); the tg-ctl daemon delivers them, marked as delayed, when Telegram answers again`,
+    )
+    process.exit(75)
+  }
+  removePdfTempDirs()
+
   // Tell the daemon how the threaded send went (§4.5): a success clears the session's miss
   // counter; a General fallback counts a miss, and the daemon posts the notice and, once
   // the topic is proven gone, recreates it. Best-effort, bounded like the lookup.
@@ -2495,16 +2585,6 @@ if (import.meta.main) {
   // agent meant to say, not the branded envelope. Best-effort; never blocks
   // the (already-sent) send.
   recordOutboundHistory(caption)
-
-  // Generated code→pdf / md→pdf artifacts are uploaded by now — drop their temp
-  // dirs so repeated reports don't pile up in the OS tmp (codex review finding).
-  for (const dir of pdfTempDirs) {
-    try {
-      rmSync(dir, { recursive: true, force: true })
-    } catch {
-      // best-effort cleanup
-    }
-  }
 
   // --- tg-ctl lazy auto-start (control spec §7): fires only AFTER a fully
   // successful send, only inside tmux with a DETECTED AI AGENT (MODEL — the

@@ -175,6 +175,14 @@ Alex keeps a machine-readable dictionary of banned words with their replacements
 - A **missing** file at the default path turns the gate off silently; an explicit `TG_DICT_PATH` (environment or `~/.config/tg-cli/.env`) that does not exist refuses every send — a misconfiguration, not an off-switch. A **malformed** file — bad JSON, wrong shape, a rule whose regex does not compile — refuses every send with a warning naming the file (and the rule) until it is fixed: fail closed, because a silently dead gate is exactly how the words would leak.
 - Format: `{"version": 1, "rules": [{"id", "pattern", "flags": "iu", "only_if_cyrillic"?: true, "replacement", "why"}]}`. `pattern` is a JavaScript regex source, always compiled with the `u` flag added; `\b` is rewritten to a **Unicode-aware** word boundary at load time (JS `\b` is ASCII-only even under `u`, which would leave Cyrillic stem rules dead). A rule with `only_if_cyrillic` applies only when the message (title + body) contains Cyrillic — e.g. English `landing` is banned inside Russian text but fine in an all-English message. `tg help format` prints the same reference.
 
+### When Telegram is down — retry, then the outbox
+
+A Bot API answer of `429`, `500`, `502`, `503` or `504`, a dropped or refused connection, or an attempt that hangs past 30 s (120 s for a photo/file upload) is retried with backoff (1 s, 2 s, 4 s, 8 s, 8 s …; a `429` waits Telegram's `retry_after`), one short stderr line per retry, until 60 s have passed (`TG_SEND_RETRY_BUDGET_MS` overrides it; `0` = no retry; the first attempt always runs to its own timeout, so a hung upload takes up to 120 s to queue). Any other error (`400 chat not found`, `403`) still fails at once with exit `1`. If Telegram is still failing when the budget runs out, the part of the send that did not go out — parts already delivered are not repeated — is saved, with copies of its photos and files, in `~/.config/tg-cli/tg-ctl.<bot>.outbox/`, and `tg` exits `75` (EX_TEMPFAIL): nothing is lost. The `tg-ctl` daemon sends the queue, oldest first, on startup and after each successful poll of Telegram; every delayed message starts with `⏳ доставлено с задержкой, написано в HH:MM UTC` and lands in its original topic, under its original reply anchor. A queued message Telegram then refuses (a `4xx`) is moved to `outbox/failed/` and logged, never retried forever (tg-cli#710).
+
+Retries are at-least-once: when Telegram took a request but its answer was lost (a timeout or a reset after the upload), the retry or the replay sends that message a second time. A duplicate was judged better than a lost report.
+
+Send exit codes: `0` sent, `1` failed, `75` queued for later delivery, `78` not connected (`tg auth`).
+
 ### Autolinks
 
 **Linear tickets** (`HYP-576` style) — verified via the `linear` CLI, title inlined or appended. Requires `brew install schpet/tap/linear` + `linear auth login`. Disable: `--no-feature autolink-tasks`.

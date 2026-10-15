@@ -39,6 +39,11 @@ process.env.TMUX_TMPDIR = tmuxTmpDir;
 delete process.env.TMUX;
 delete process.env.TMUX_PANE;
 
+// A test's fake Bot API that fails a send (or a closed port that refuses it) gets ONE attempt:
+// the real retry budget (tg-cli#710, 60 s of backoff) would outlast bun's 5 s test timeout.
+// A test that exercises the retry sets TG_SEND_RETRY_BUDGET_MS itself.
+process.env.TG_SEND_RETRY_BUDGET_MS ??= '0';
+
 // Bun gives a child spawned with NO `env` the environment bun STARTED with — the PATH,
 // TMUX_TMPDIR and TMUX changes above are invisible to it — and a child whose `env` names no PATH
 // a built-in default (/usr/bin:/bin). Either way the child ran the real `ps` and then lsof'd every
@@ -50,7 +55,7 @@ type SpawnEnv = Record<string, string | undefined>;
 function hermeticEnv(env: SpawnEnv | undefined): SpawnEnv {
   if (env === undefined) return { ...process.env };
   const out = { ...env };
-  for (const key of ['PATH', 'TMUX_TMPDIR']) out[key] ??= process.env[key];
+  for (const key of ['PATH', 'TMUX_TMPDIR', 'TG_SEND_RETRY_BUDGET_MS']) out[key] ??= process.env[key];
   return out;
 }
 

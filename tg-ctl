@@ -411,14 +411,18 @@ import {
 import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
 import {
   aggregateUsage,
+  appendRoute,
   fsRoutesLockIo,
   type RoutesLockIo,
   orderByLruMru,
   parseRoutes,
   recognizeRoute,
   routeMatchesPane,
+  serializeRoutes,
   withRoutesLock,
 } from "./features/tg-ctl/routes"
+import { flushOutbox } from "./features/transport/outbox"
+import { DEFAULT_SEND_RETRY } from "./features/transport/send-retry"
 import { parseLastUserTarget, serializeLastUserTarget, withSessionKey, type LastUserTarget } from "./features/tg-ctl/last-user-target"
 import { parseHistory, threadOfMessageInBlob, type HistoryRecord } from "./features/replies/history"
 import {
@@ -889,6 +893,48 @@ async function sendMessage(ctx: Ctx, text: string, extra: Record<string, unknown
   if (!result || typeof result !== "object") return null
   const messageId = (result as { message_id?: unknown }).message_id
   return typeof messageId === "number" ? messageId : null
+}
+
+// tg-cli#710: replay the sends `tg` queued while Telegram kept failing (outbox.ts), each
+// marked as delayed, with the route + history rows `tg` would have written. Kicked on
+// startup and after every successful getUpdates; single-flight and never awaited, so a
+// backlog never holds up inbound handling. A transient failure ends the pass and pauses
+// the next one (Telegram's retry_after on a 429, else OUTBOX_RETRY_PAUSE_MS), so a busy
+// chat's getUpdates batches don't each re-read the backlog and fire a doomed request.
+const OUTBOX_RETRY_PAUSE_MS = 5_000
+let outboxFlushing = false
+let outboxFlushNotBefore = 0
+function kickOutboxFlush(ctx: Ctx): void {
+  if (outboxFlushing || Date.now() < outboxFlushNotBefore) return
+  outboxFlushing = true
+  flushOutbox(ctx.paths.outbox, {
+    post: (method, init) =>
+      fetch(`${api(ctx)}/${method}`, {
+        ...init,
+        signal: AbortSignal.timeout(init.body instanceof FormData ? DEFAULT_SEND_RETRY.uploadAttemptTimeoutMs : DEFAULT_SEND_RETRY.attemptTimeoutMs),
+      }),
+    now: Date.now,
+    log,
+    recordRoutes: (routes) => {
+      const done = withRoutesLock(
+        fsRoutesLockIo(`${ctx.paths.routes}.lock`),
+        () => {
+          writeFileSync(ctx.paths.routes, serializeRoutes(routes.reduce(appendRoute, parseRoutes(readFileOrNull(ctx.paths.routes)))))
+          return true
+        },
+        { onContended: "skip" },
+      )
+      if (!done) log(`outbox: routes lock contended, ${routes.length} route(s) not recorded`)
+    },
+    appendHistory: (records) => appendHistory(ctx.paths.history, records),
+  })
+    .then((res) => {
+      if (res.stopped) outboxFlushNotBefore = Date.now() + (res.retryAfterMs ?? OUTBOX_RETRY_PAUSE_MS)
+    })
+    .catch((err) => log(`outbox: flush error: ${err}`))
+    .finally(() => {
+      outboxFlushing = false
+    })
 }
 
 // Shared by every initial-post call site so the parse_mode/reply_markup shape can't drift
@@ -12356,6 +12402,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       recoveryQueue = leftover
     }
   }
+  // Sends `tg` queued while Telegram was failing (tg-cli#710): try them now, and again after
+  // every successful getUpdates.
+  kickOutboxFlush(ctx)
 
   // A chat `tg auth` bound in the previous batch (claimAuthBinding); applied between batches.
   let authChatSwitch: number | null = null
@@ -12643,6 +12692,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
       consecutive409 = 0
       warned409 = false
+      kickOutboxFlush(ctx)
       }
 
       // Durably journal the raw batch BEFORE stepUpdates/offset-advance (tg-cli#322): if this

@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tempDir } from './helpers/test-temp';
 
@@ -115,6 +115,33 @@ test('an outbound send from a hosted session carries the label and records route
     const history = readFileSync(join(f.configDir, 'tg-ctl.123.history.jsonl'), 'utf8').trim().split('\n');
     expect(history).toHaveLength(1);
     expect(JSON.parse(history[0])).toMatchObject({ direction: 'agent', pane: `host:${NAME}`, targetAgent: 'landing-page', text: 'hello from a hosted claude' });
+  } finally {
+    server.stop(true);
+  }
+}, 20_000);
+
+test('a send queued by an outage (tg-cli#710) keeps its route and history template for the replay', async () => {
+  const f = fixture(RECORD);
+  const server = Bun.serve({
+    port: 0,
+    fetch: () => Response.json({ ok: false, error_code: 502, description: 'Bad Gateway' }, { status: 502 }),
+  });
+  try {
+    const proc = Bun.spawn(['bun', TG, 'report during an outage'], {
+      env: { ...f.env, TG_API_BASE: `http://127.0.0.1:${server.port}`, TG_SEND_RETRY_BUDGET_MS: '0' },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(75);
+    const dir = join(f.configDir, 'tg-ctl.123.outbox');
+    const [name] = readdirSync(dir).filter((n) => n.endsWith('.json'));
+    const entry = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+    expect(entry.route).toMatchObject({ paneId: `host:${NAME}`, cwd: '/Users/u/work/landing' });
+    expect(entry.history).toMatchObject({ pane: `host:${NAME}`, targetAgent: 'landing-page', text: 'report during an outage' });
+    expect(entry.delivered).toEqual([]);
+    // nothing went out, so nothing is recorded until the replay
+    expect(existsSync(join(f.configDir, 'tg-ctl.123.routes.json'))).toBe(false);
+    expect(existsSync(join(f.configDir, 'tg-ctl.123.history.jsonl'))).toBe(false);
   } finally {
     server.stop(true);
   }

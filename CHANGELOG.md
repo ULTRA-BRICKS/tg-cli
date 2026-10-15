@@ -3,6 +3,23 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.63.0
+
+- **A Telegram outage no longer loses a send (#710).** On 2026-10-14 the Bot API answered
+  `sendMessage` with `504 Gateway Timeout` after ~2 minutes and `tg` exited 1 — the message was
+  gone. A send now retries a `429`/`500`/`502`/`503`/`504`, a dropped/refused connection or an
+  attempt hung past 30 s (120 s for an upload), with backoff (1 s, 2 s, 4 s, 8 s …, Telegram's `retry_after` on a
+  `429`) until 60 s have passed (`TG_SEND_RETRY_BUDGET_MS`), one stderr line per retry. Past that, the
+  undelivered rest of the send (with copies of its photos and files) goes to the bot's outbox
+  under the config dir and `tg` exits **75** (EX_TEMPFAIL). The `tg-ctl` daemon sends the queue
+  on startup and after each successful getUpdates, oldest first, into the original topic and
+  under the original reply anchor, each message marked `⏳ доставлено с задержкой, написано в
+  HH:MM UTC`; the replayed ids get their routes and `tg replies` history like a normal send. A
+  queued message Telegram refuses (`4xx`) is moved to `outbox/failed/` and logged. A `400` or
+  `403` still fails at once with exit 1, as before. The outbox is bounded: a queued send older
+  than 24 h, or the oldest beyond 200 queued sends or 200 MB, moves to `outbox/archive/`
+  unsent, with a warning in the daemon log; the daemon checks the limits before each replay.
+
 ## 1.62.0
 
 - **`tg voice setup` installs a fast, prebuilt Whisper on macOS and Linux (#711).** With no

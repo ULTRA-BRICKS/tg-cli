@@ -225,6 +225,28 @@ captures — add a new harness or version there from a live capture, never a han
 Every plan that types into a pane (text, digit, key) takes the pane's turn (`paneTypingKey`, then the
 `pane-locks/` lock file) — a retry Enter is only safe while nothing else is typing into that box.
 
+### Send retry and the outbox (#710)
+
+Every Bot API send of `tg` goes through `postWithRetry` (`features/transport/send-retry.ts`):
+a per-attempt timeout (30 s; 120 s for an upload) and budgeted backoff (60 s total, `TG_SEND_RETRY_BUDGET_MS`) on
+TRANSIENT failures only — fetch threw (reset, refused, timeout), or HTTP 429/500/502/503/504.
+Every other answer goes to the caller unchanged, so the advisory-thread fallback and the
+exit-1 path behave as before. When the budget runs out the transport (`features/transport/
+telegram.ts`) switches to queueing: that send and every later one of the transmitter's sends is
+handed to `ctx.queue` unsent, in order, and `tg` writes them as ONE entry to
+`CtlPaths.outbox` (`features/transport/outbox.ts`: `<id>.json` + copied upload files in
+`<id>.files/`, tmp+fsync+rename, 0600 in a 0700 dir) with the route and history template of the
+send and the ids of its parts that did go out (their history waits for the replay, so the whole
+send stays one `tg replies` group), then exits 75. The daemon (`kickOutboxFlush` in `tg-ctl`)
+replays the outbox on startup and after every successful getUpdates: FIFO, one request at a time,
+a delay mark on each message (`markOp` — in the text/caption when it fits, else a separate message
+before it), routes.json and history rows for the replayed ids, the entry rewritten after every
+request, stop at the first transient failure (and pause: 429 retry_after, else 5 s), a 4xx or an
+unreadable entry/upload moves the entry to `failed/`. The test preload sets
+`TG_SEND_RETRY_BUDGET_MS=0` for every child, so a fake API's 5xx costs one attempt. Delivery is
+at-least-once by design: the Bot API has no idempotency key, so a request whose answer was lost
+after Telegram took it is sent again by the retry or the replay.
+
 ### Existing Features
 
 - `features/agent-role/` — pure coordinator-vs-subagent model (`docs/specs/agent-role-model.md`,

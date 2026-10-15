@@ -16,6 +16,7 @@ import { type EmojiEntity } from '../branding/emoji';
 import { type Format } from '../cli/args';
 import { convertEntitiesToHtml, parseModeFor } from '../render/html';
 import { normalizeRichHtml, validateRichHtml } from '../render/rich';
+import { DEFAULT_SEND_RETRY, postWithRetry, REAL_SEND_RETRY_IO, type SendRetryIo, type SendRetryPolicy } from './send-retry';
 
 export interface TelegramCtx {
   // Bot endpoint base, e.g. `https://api.telegram.org/bot<token>`.
@@ -56,6 +57,25 @@ export interface TelegramCtx {
   // Advisory only: called once, with Telegram's description, when a send fell back
   // to General; the rest of the send then skips the topic.
   onThreadFallback?: (description: string) => void | Promise<void>;
+  // Transient-failure retry (tg-cli#710, send-retry.ts): the budget (default
+  // DEFAULT_SEND_RETRY) and the injectable fetch/sleep/clock.
+  retry?: SendRetryPolicy;
+  io?: Partial<SendRetryIo>;
+  // When a send still fails transiently after the retry budget, that send and EVERY
+  // later send of this transport is handed here unsent, in order, instead of exiting:
+  // the caller persists exactly the undelivered remainder (outbox.ts). Parts already
+  // delivered are not included. Without it the transport exits 1 as before.
+  queue?: (send: QueuedSend) => void;
+}
+
+// One Bot API send the transport did not deliver: the request as it would have gone
+// out (thread id and reply anchor already resolved). `reason` is set on the send whose
+// retry budget ran out.
+export interface QueuedSend {
+  method: string;
+  body: Record<string, unknown> | FormData;
+  threadAdvisory: boolean;
+  reason?: string;
 }
 
 // Read a send response and return its error `description` when the send FAILED —
@@ -188,12 +208,17 @@ function blobFor(item: SendItem): { body: Blob | ReturnType<typeof Bun.file>; na
   return { body: Bun.file(item.source.path) };
 }
 
+// A send that was still transiently failing when its retry budget ran out.
+class TelegramUnavailable extends Error {}
+
 // Build the transmitter's Transport bound to a bot endpoint + chat + route
 // recorder. All four send primitives funnel their result through
 // recordRouteFromResult so a reply to any sent message (including each item of
 // a media group) routes back to the producing pane.
 export function createTelegramTransport(ctx: TelegramCtx): Transport {
-  const { api, chatId, recordRoute, replyToMessageId, messageThreadId, threadIdAdvisory, threadRetryDelayMs, onThreadFallback } = ctx;
+  const { api, chatId, recordRoute, replyToMessageId, messageThreadId, threadIdAdvisory, threadRetryDelayMs, onThreadFallback, queue } = ctx;
+  const retryPolicy = ctx.retry ?? DEFAULT_SEND_RETRY;
+  const io: SendRetryIo = { ...REAL_SEND_RETRY_IO, ...ctx.io };
   // A reply threads under ONE anchor: consume the target on the first
   // sendMessage so split-continuation chunks (and any later sends) do not each
   // re-reply to the same inbound message.
@@ -202,6 +227,9 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
   // send (split chunks, attachments) go straight to General instead of each paying
   // for another rejected attempt and retry delay.
   let threadDropped = false;
+  // Set once a send outlasted its retry budget: every later part is queued unsent, in
+  // order, so the outbox replays the remainder exactly as the transmitter laid it out.
+  let queueing = false;
 
   // How one send body is built. `thread`: stamp message_thread_id. `anchor`: keep the
   // reply anchor. The forum-topic thread id rides EVERY send (NOT consumed like the
@@ -210,13 +238,28 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
   // before (the daily-critical 1:1 path).
   type BuildBody = (opts: { thread: boolean; anchor: boolean }) => Record<string, unknown> | FormData;
 
-  const post = (method: string, body: Record<string, unknown> | FormData): Promise<Response> =>
-    fetch(
+  // One request, retried on transient failures (send-retry.ts). The body is rebuilt per
+  // attempt (a FormData upload is consumed by the attempt that sent it).
+  const post = async (method: string, makeBody: () => Record<string, unknown> | FormData): Promise<Response> => {
+    let unsent: Record<string, unknown> | FormData | null = makeBody();
+    // A multipart upload gets the longer attempt timeout.
+    const upload = unsent instanceof FormData;
+    const outcome = await postWithRetry(
       `${api}/${method}`,
-      body instanceof FormData
-        ? { method: 'POST', body }
-        : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+      () => {
+        const body = unsent ?? makeBody();
+        unsent = null;
+        return body instanceof FormData
+          ? { method: 'POST', body }
+          : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+      },
+      method,
+      upload ? { ...retryPolicy, attemptTimeoutMs: retryPolicy.uploadAttemptTimeoutMs } : retryPolicy,
+      io,
     );
+    if (!outcome.ok) throw new TelegramUnavailable(outcome.reason);
+    return outcome.resp;
+  };
 
   // Is this response a rejection BECAUSE of the thread id? Peeked on a CLONE so
   // checkResponse can still read the original. A thread rejection arrives EITHER as
@@ -235,15 +278,15 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
   // moment, telegram-bot-api #905). Every other failure path is unchanged —
   // checkResponse still exits on a real error, and an explicit --topic
   // (threadIdAdvisory false) stays strict.
-  const send = async (method: string, build: BuildBody): Promise<unknown> => {
+  const deliver = async (method: string, build: BuildBody): Promise<unknown> => {
     const threaded = messageThreadId !== undefined && !threadDropped;
-    let resp = await post(method, build({ thread: threaded, anchor: true }));
+    let resp = await post(method, () => build({ thread: threaded, anchor: true }));
     if (!threaded || !threadIdAdvisory) return checkResponse(resp, method);
     let description = await threadRejection(resp);
     if (description === null) return checkResponse(resp, method);
     if (threadRetryDelayMs !== undefined && !isTopicDeletedError(description)) {
       await Bun.sleep(threadRetryDelayMs);
-      resp = await post(method, build({ thread: true, anchor: true }));
+      resp = await post(method, () => build({ thread: true, anchor: true }));
       description = await threadRejection(resp);
       if (description === null) return checkResponse(resp, method);
     }
@@ -257,7 +300,34 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
     // pointing at a message INSIDE the rejected topic would otherwise make Telegram
     // re-bind the resend to that topic's thread (un-doing the fallback) or fail again
     // on a deleted/closed anchor (message to reply not found).
-    return checkResponse(await post(method, build({ thread: false, anchor: false })), method);
+    return checkResponse(await post(method, () => build({ thread: false, anchor: false })), method);
+  };
+
+  // Deliver one send — or, once Telegram stayed unavailable through a retry budget,
+  // hand it to `queue` unsent (returns null: no message ids to record).
+  const send = async (method: string, build: BuildBody): Promise<unknown> => {
+    let reason: string | undefined;
+    if (!queueing) {
+      try {
+        return await deliver(method, build);
+      } catch (err) {
+        if (!(err instanceof TelegramUnavailable)) throw err;
+        queueing = true;
+        reason = err.message;
+      }
+    }
+    if (!queue) {
+      console.error(`Telegram API error (${method}): ${reason}`);
+      process.exit(1);
+    }
+    const threaded = messageThreadId !== undefined && !threadDropped;
+    queue({
+      method,
+      body: build({ thread: threaded, anchor: true }),
+      threadAdvisory: threaded && threadIdAdvisory === true,
+      ...(reason !== undefined ? { reason } : {}),
+    });
+    return null;
   };
 
   // The multipart upload body shared by photo/document/album sends.

@@ -523,6 +523,7 @@ export interface CtlPaths {
   authPending: string; // `tg auth` one-time /start binding the daemon claims (docs/specs/tg-auth.md §4)
   alertSubscriptions: string; // temporary alert subscriptions of live omp sessions, keyed by omp session id (tg-cli#636)
   alertThrottle: string; // last `tg-ctl alert send` per (source,key,severity), for the dedup window (tg-cli#636)
+  outbox: string; // dir of `tg` sends Telegram did not take, replayed by the daemon (tg-cli#710)
 }
 
 // --- forum topics (docs/specs/session-registry-and-topics.md §4) ---
