@@ -624,9 +624,9 @@ tg auth status                       # bot + user + caller in one view (offline 
   terminate the login itself in Telegram → Settings → Devices.
 - **Runtime**: the first account command builds a Python 3.12 venv under
   `~/.cache/tg-cli/` with `uv` from the hash-locked `requirements-call.txt`
-  (needs `uv`; calls also need `ffmpeg`; `--say` needs macOS `say` or `espeak-ng`).
+  (needs `uv`; calls also need `ffmpeg`; speech uses the explicitly configured provider in `<config>/voice.json`).
   `TG_MTPROTO_SIDECAR=<executable>` uses a runtime you built yourself instead.
-- **Calls**: one dial, never retried; success = the audio played to the end. An account
+- **Calls**: one dial, never retried; `audio_stream_ended` means outbound playback ended, without proof of listening. An account
   cannot ring itself, so `tg call me` uses the caller account.
 - **Import** instead of login (e.g. HyperCalendarBot's service account):
   `tg auth caller --import-session voice_caller.session --import-config calendar/.env`.
@@ -832,6 +832,63 @@ account owner. This is not activated by installation and needs process supervisi
 on an always-on host. Neither live auth nor a real call is established by the module
 tests. No trigger for Tony is currently configured. `requirements-call.txt` is the hash-pinned
 PyPI runtime; a patched ntgcalls binary still needs its own media acceptance.
+
+### Identified calls and private history
+
+`tg call` and the root installer's Bun `call-cli` use the same existing calling-account
+sessions under `<config>/mtproto`; no separate credentials or Python console alias are needed.
+
+```sh
+tg call me --say "Принтер остановился" --agent 3d-house --kind problem \
+  --task OPS-7 --task-title "Print Ops" --session SESSION_ID
+call-cli history list --task OPS-7 --project PROJECT_ID --json
+tg call history show CALL_UUID --json
+```
+
+The introduction is quick: `Привет! 3d-house. Проблема с Print Ops. Принтер остановился`.
+Report/question use `по`; missing agent/task remain unknown. Titles and ids are distinct,
+and all references remain in the private journal. Flags override environment/registry context.
+The calling account posts a readable status anchor and transcript replies into the exact
+resolved recipient's private chat before dialing, then edits that anchor with the outcome.
+A failure to mirror prevents dialing; a failed result edit is surfaced and retained.
+Bot topic ids have no verified private-chat mapping and are refused. `--reply-to` names a
+message in that calling-account recipient chat. No arbitrary-peer text goes to the owner bot.
+
+`--dry-run --json` is offline and creates no journal, audio or runtime. Production neural
+speech requires the explicit voice config and credential source documented in
+[the speech setup](docs/761-tts.md); examples use placeholders for personal voice ids.
+For a Fish profile, create `<config>/voice.json` with your confirmed nonsecret identifiers:
+
+```json
+{
+  "version": 1,
+  "provider": "fish_audio",
+  "model": "s2.1-pro-free",
+  "voice_id": "REPLACE_WITH_CONFIRMED_32_HEX_VOICE_ID",
+  "latency": "balanced",
+  "format": "wav",
+  "credential_source": {
+    "type": "home_assistant",
+    "path": "/absolute/path/to/homeassistant/.storage/core.config_entries",
+    "entry_id": "REPLACE_WITH_EXACT_FISH_AUDIO_ENTRY_ID"
+  }
+}
+```
+
+Keep this voice config owned by the current user, non-writable by other users (0600
+recommended). The explicitly selected credential source may be current-user or root owned,
+regular and non-writable by group/others; symlinks are refused. Only its exact unique
+`fish_audio` entry is accepted. Leave the existing source permissions and ownership intact;
+no key is copied. An explicit `{"version":1,"provider":"host"}` config selects the host
+voice when that is intended; Fish never silently falls back to it.
+
+`--audio` gets the identified prefix; a supplied `--transcript` remains explicitly unverified.
+History filters include status, agent/session/task/project ids, recipient and bounded limit.
+`watch-call` uses the shared service after its durable single-attempt trigger claim.
+Native conversational `start` explicitly refuses before connecting/preparing providers until
+audited live intro/transcript delivery is supported. Offline tests do not prove live delivery,
+listening, voice intelligibility or full conversational support; see
+[the integration evidence](docs/761-integration.md).
 
 ### Independent conversational transport checkpoint
 

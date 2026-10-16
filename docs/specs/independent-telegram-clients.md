@@ -107,13 +107,19 @@ is instant and needs no Python), and spawns the sidecar:
 
 ### Calls
 
-One dial, no redial. Success = the outbound audio stream ended (py-tgcalls `StreamEnded`
-for the microphone); ringing or a declined call is `CALL_INCOMPLETE`. `--timeout` bounds the
+One dial, no redial. `audio_stream_ended` means the outbound audio stream ended
+(py-tgcalls `StreamEnded` for the microphone), not proof the recipient heard it;
+ringing or a declined call is `CALL_INCOMPLETE`. `--timeout` bounds the
 ring (default 60 s) and the playback separately. `--say` synthesizes into a private temp dir
-deleted after the call: macOS `say` (`-v Milena` when the text has Cyrillic), else `espeak-ng`
-(`-v ru`/`-v en`); text goes through a file, never argv. Neither present → `TTS_UNAVAILABLE`
-(use `--audio`). Text over 1000 characters → `TEXT_TOO_LONG`. A peer given as `@username` is
-resolved with `get_users`; a bot is refused. A numeric id works only when Telegram lets the
+deleted after the call using configured neural TTS from canonical `voice.json`.
+Host voices (macOS `say` or `espeak-ng`) require explicit opt-in with provider `host`;
+neural failures never silently fall back to host speech. Text is private input, never argv.
+The journal is `<config>/mtproto/calls/journal.sqlite3`; offline history and dry-run
+create no journal or call state. Private JSON stdin has a 2 MiB UTF-8 byte cap,
+including JSON escaping and whitespace. This covers worst-case escaping of all legal
+fields (100,000-character transcript, 1,000-character source, twelve 512-character
+references); decoded field limits still apply. Text over 1000 characters → `TEXT_TOO_LONG`.
+A peer given as `@username` is resolved with `get_users`; a bot is refused. A numeric id works only when Telegram lets the
 account resolve it (a contact or a recent chat).
 
 ## 2. Boundaries
@@ -192,3 +198,49 @@ source hash equality and retained license; they are not included in the wheel.
 Implementation steps: red CLI/package tests; shared owner/package/JSON runner;
 consumer identity and fail-closed tests; wheel build and isolated offline install;
 VAD copy with MIT/receipt; relevant Python/Bun/type/build gates and separate commit.
+
+## Identified-call service (#761)
+
+The current one-shot call owner is `telegram_client.call_service.run_call`. `tg call`,
+`call-cli` (thin Bun entrypoint) and `tg-call call` all reach it and reuse the existing
+MTProto store. The `tg`/`call-cli` sidecar payload carries speech, transcript and context
+as JSON on stdin; subprocess argv carries routing/safety options only. The expert Python
+`--say` interface remains compatible; scripts should prefer `--say-stdin`.
+
+Preparation composes a Russian introduction in agent → kind → task/project → content order.
+`--agent`, `--task`, `--project`, `--session`, corresponding `--NAME-title`/`--NAME-url`, and
+`--kind report|question|problem` are explicit overrides. Registry ancestry supplies a session
+reference/title and agent label where available; `TG_SESSION` and `RIG_AGENT_ID` are fallbacks.
+A session name/cwd/PID is never invented as a task id. Speech is brief: `Привет! 3d-house. Проблема с Print Ops. …`; report/question use `по`. Missing agent/task remain unknown; an absent project is omitted while every supplied reference stays in history.
+
+Intent and append-only transition rows commit to private SQLite before network resolution.
+History has UUIDs, UTC times, host, caller/recipient ids, source/intro/spoken text, each TTS
+segment's sanitized metadata, mirror ids and failures. `call history list|show --json` reads
+without opening Telegram or initializing the database. Filters: status, agent/session/task/project id,
+recipient id, limit. Reusing `--idempotency-key` refuses a second attempt, even after failure.
+An intent/attempt left by a hard kill is evidence requiring manual reconciliation, not a
+retry request. No automatic redial, listening receipts, recordings or fictional reply text.
+
+The verified calling account sends into the resolved user's private chat (including when
+`me` resolves to the configured personal owner). A bounded readable anchor carries call id/status, UTC time, agent/kind, task, supplied project/session references and caller/recipient ids;
+complete transcript chunks reply to it. Explicit `ParseMode.DISABLED` preserves literal
+hostile markup. All chunks must be acknowledged before preparation/dial. Failures are
+journaled and visible; partial mirrors block dialing. An outcome edit failure preserves
+the actual transport outcome and emits a warning. Bot topics and bot reply ids are never
+reused in another account's private chat: topics fail closed; `--reply-to` explicitly names
+a message in the recipient's private chat. No transcript is redirected to the owner for
+arbitrary peers.
+
+Raw audio is prefixed using TTS plus bounded ffmpeg concatenation. Its content is unknown
+unless the caller provides `--transcript`, which is labeled unverified rather than recognized
+speech. TTS input chunks preserve the complete introduction/content within the existing
+per-request bound. TTS uses the canonical config directory and each segment's sanitized `tts.json` schema, retaining provider/model/voice identity, first audio byte time, total synthesis time and nested audio metrics; aggregates report measured generation/audio/RTF, without inventing first playback time. Offline dry-run reports the composed plan, does no TTS/network,
+creates no journal/mirror state, and never builds/downloads a runtime.
+
+Support boundary: `watch-call` routes a claimed trigger through the same identified service, journal and pre-call mirror; a watermark claim never retries automatically. Production native conversational `start` fails with `CONVERSATION_REQUIRES_IDENTIFIED_SERVICE` before connecting or preparing providers because audited real-time intro/transcript delivery is unsupported.
+Injected offline conversational library tests retain their fake backend behavior. This
+checkpoint does not claim full real-time transcript support. No production credentials,
+real call, Telegram mirror or TTS provider acceptance was exercised by the implementation
+worker. `docs/761-integration.md` records the final integration evidence and supersedes the workers’ earlier handoff gaps.
+
+`call-cli` is a Bun frontdoor installed by the root `install.sh` beside `tg`; it is not a Python console script from `pip install`. It uses the same `<config>/mtproto` sessions and voice configuration, without copying credentials.

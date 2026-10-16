@@ -3,6 +3,17 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.67.0
+
+- **Identified calls and private history (#761).** `tg call`, `call-cli`, and
+  `tg-call call` share one call service: a short identified introduction, a private
+  intent journal, an exact-recipient transcript before dialing, and a status anchor.
+  A claimed attempt is never automatically repeated. Configured Fish speech has
+  bounded synthesis, private output, and per-segment signal/timing metrics; host
+  speech requires explicit configuration. Offline dry-run inspects configuration
+  without resolving credentials or synthesizing. See `docs/761-integration.md`
+  for offline evidence and the remaining live acceptance requirements.
+
 ## 1.66.0
 
 - **One session holds a source's alerts (#747).** `tg-ctl alert subscribe --exclusive --source

@@ -16,6 +16,15 @@ for (const suite of [
   "telegram-providers.test.py",
   "telegram-call-lib.test.py",
   "telegram-user-account.test.py",
+  "telegram-call-service.test.py",
+  "telegram-call-journal.test.py",
+  "telegram-cli-hardening.test.py",
+  "telegram-call-preparation.test.py",
+  "telegram-tts.test.py",
+  "telegram-tts-metrics.test.py",
+  "telegram-761-tts-integration.test.py",
+  "telegram-761-watch.test.py",
+  "telegram-761-identity.test.py",
 ]) {
   test(suite, () => {
     const result = Bun.spawnSync(["python3", join(import.meta.dir, suite)], {

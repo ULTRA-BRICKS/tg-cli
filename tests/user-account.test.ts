@@ -17,6 +17,7 @@ import {
 } from '../features/user-account/sidecar';
 import { ensureSidecarRuntime } from '../features/user-account/sidecar-fs';
 import { describeError } from '../features/user-account/messages';
+import { USER_ACCOUNT_HELP } from '../features/user-account/help';
 
 const TG = join(import.meta.dir, '..', 'tg');
 
@@ -113,12 +114,13 @@ describe('sidecarInvocation', () => {
     expect(
       sidecarInvocation({ kind: 'call', role: 'caller', peer: 'me', say: 'Тони написал', timeout: '30', dryRun: true, json: false, sourceIdle: true }, store),
     ).toEqual({
-      args: ['caller', `--store=${store}`, 'call', '--peer=me', '--say=Тони написал', '--timeout=30', '--dry-run', '--source-session-idle-confirmed'],
+      args: ['caller', `--store=${store}`, 'call', '--peer=me', '--say-stdin', '--context-stdin', '--timeout=30', '--dry-run', '--source-session-idle-confirmed'],
+      stdin: JSON.stringify({ say: 'Тони написал' }),
     });
     // A dash-leading value reaches argparse as one `--say=…` token, never as a separate word.
     expect(
       sidecarInvocation({ kind: 'call', role: 'personal', peer: '@a', say: '-5 °C', dryRun: false, json: false, sourceIdle: false }, store).args,
-    ).toEqual(['personal', `--store=${store}`, 'call', '--peer=@a', '--say=-5 °C']);
+    ).toEqual(['personal', `--store=${store}`, 'call', '--peer=@a', '--say-stdin', '--context-stdin']);
     expect(
       sidecarInvocation({ kind: 'import', role: 'caller', session: '/s/v.session', config: '/s/.env', json: false }, store).args,
     ).toEqual(['caller', `--store=${store}`, 'import-session', '--source-session=/s/v.session', '--source-config=/s/.env']);
@@ -143,7 +145,8 @@ describe('sidecarInvocation', () => {
   test('error codes become WHAT/HOW text', () => {
     expect(describeError('SESSION_MISSING', 'caller')).toContain('tg auth caller');
     expect(describeError('SESSION_ALREADY_EXISTS', 'personal')).toContain('tg auth user logout');
-    expect(describeError('TTS_UNAVAILABLE', 'personal')).toContain('--audio');
+    expect(describeError('TTS_UNAVAILABLE', 'personal')).toContain('voice.json');
+    expect(describeError('TTS_UNAVAILABLE', 'personal')).toContain('raw audio still needs the spoken introduction');
     expect(describeError('SOMETHING_NEW', 'personal')).toContain('SOMETHING_NEW');
   });
 });
@@ -219,13 +222,15 @@ describe('tg → sidecar handoff (real binary, fake sidecar)', () => {
     expect(r.stderr).toBe('');
     expect(r.exitCode).toBe(0);
     expect(readFileSync(join(f.capture, 'argv'), 'utf8').trimEnd().split('\n')).toEqual([
-      'caller', `--store=${join(f.configDir, 'mtproto')}`, 'call', '--peer=me', '--say=Тони написал в Telegram', '--dry-run',
+      'caller', `--store=${join(f.configDir, 'mtproto')}`, 'call', '--peer=me', '--say-stdin', '--context-stdin', '--dry-run',
     ]);
+    expect(JSON.parse(readFileSync(join(f.capture, 'stdin'), 'utf8')).say).toBe('Тони написал в Telegram');
     const env = readFileSync(join(f.capture, 'env'), 'utf8');
     expect(env).toContain(`TG_CTL_CONFIG_DIR=${f.configDir}\n`);
     expect(env).toContain(`PYTHONPATH=${join(import.meta.dir, '..', 'features')}`);
-    expect(env).toContain('TG_API_ID=5\n');
-    expect(env).toContain('TG_API_HASH=dotenv-hash\n');
+    expect(env).not.toContain('TG_API_ID=');
+    expect(env).not.toContain('TG_API_HASH=');
+    expect(env).toContain('PYTHONDONTWRITEBYTECODE=1\n');
     expect(env).not.toContain('from-dotenv');
     expect(env).not.toContain('bot-token-must-not-leak'); // exported in tg's own env by tg()
     expect(r.stdout).toContain('ready');
@@ -253,11 +258,15 @@ describe('tg → sidecar handoff (real binary, fake sidecar)', () => {
   test('tg user send pipes the text on stdin, never argv, and prints the sent id', async () => {
     const f = fixture();
     loggedIn(f.configDir, 'personal');
+    writeFileSync(join(f.configDir, '.env'), 'TG_API_ID=5\nTG_API_HASH=dotenv-hash\n');
     const r = await tg(['user', 'send', '@alice'], f, { TG_FAKE_STDOUT: '{"sent": true, "chat_id": 9, "message_id": 31}' }, 'meet at 5');
     expect(r.exitCode).toBe(0);
     expect(readFileSync(join(f.capture, 'stdin'), 'utf8')).toBe('meet at 5');
     expect(readFileSync(join(f.capture, 'argv'), 'utf8')).not.toContain('meet at 5');
     expect(r.stdout).toContain('31');
+    const env = readFileSync(join(f.capture, 'env'), 'utf8');
+    expect(env).toContain('TG_API_ID=5\n');
+    expect(env).toContain('TG_API_HASH=dotenv-hash\n');
   });
 
   test('a sidecar error code becomes a human message with the same exit code; --json stays raw', async () => {
@@ -362,4 +371,16 @@ describe('tg → sidecar handoff (real binary, fake sidecar)', () => {
     expect('error' in r ? r.error : '').not.toMatch(/remove|delete|rm /i);
     expect(existsSync(join(lockDir, 'pid'))).toBe(true); // the live owner's lock is untouched
   });
+});
+
+test('call help describes configured neural TTS and honest stream completion', () => {
+  const help = USER_ACCOUNT_HELP.call;
+  expect(help).toContain('configured neural TTS');
+  expect(help).toContain('host voice requires explicit opt-in');
+  expect(help).toContain('no silent fallback');
+  expect(help).toContain('audio_stream_ended');
+  expect(help).toContain('not proof the recipient heard it');
+  expect(help).toContain('<config>/mtproto/calls/journal.sqlite3');
+  expect(help).not.toContain('Success = the audio played to the end');
+  expect(help).not.toContain('or speaks the text with macOS');
 });

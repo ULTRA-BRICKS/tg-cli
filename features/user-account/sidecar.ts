@@ -65,7 +65,7 @@ export function requiredSessions(cmd: UserAccountCommand): Role[] {
 export function sidecarInvocation(cmd: UserAccountCommand, store: string): SidecarInvocation {
   const role: Role = cmd.kind === 'send' ? 'personal' : cmd.role;
   const head = [role, `--store=${store}`];
-  const idle = cmd.kind !== 'login' && cmd.kind !== 'import' && cmd.kind !== 'logout' && cmd.sourceIdle
+  const idle = cmd.kind !== 'login' && cmd.kind !== 'import' && cmd.kind !== 'logout' && ('sourceIdle' in cmd && cmd.sourceIdle)
     ? ['--source-session-idle-confirmed']
     : [];
   const expected = 'expectedId' in cmd && cmd.expectedId ? [`--expected-id=${cmd.expectedId}`] : [];
@@ -80,18 +80,35 @@ export function sidecarInvocation(cmd: UserAccountCommand, store: string): Sidec
       return { args: [...head, 'status', ...(cmd.online ? ['--online'] : []), ...idle] };
     case 'logout':
       return { args: [...head, 'logout'] };
-    case 'call':
+    case 'call-history':
+      return { args: [...head, 'call-history', cmd.action, ...(cmd.callId ? [cmd.callId] : []),
+        ...(['status', 'agent', 'session', 'task', 'project', 'recipient', 'limit'] as const).flatMap(key => cmd[key] ? [`--${key}=${cmd[key]}`] : [])] };
+    case 'call': {
+      const payload: { [key: string]: string } = {};
+      for (const [key, wire] of [
+        ['say', 'say'], ['transcript', 'transcript'], ['callKind', 'kind'],
+        ['agent', 'agent'], ['agentTitle', 'agent_title'], ['agentUrl', 'agent_url'],
+        ['task', 'task'], ['taskTitle', 'task_title'], ['taskUrl', 'task_url'],
+        ['project', 'project'], ['projectTitle', 'project_title'], ['projectUrl', 'project_url'],
+        ['session', 'session'], ['sessionTitle', 'session_title'], ['sessionUrl', 'session_url'],
+      ] as const) { const value = cmd[key]; if (value !== undefined) payload[wire] = value; }
       return {
+        stdin: JSON.stringify(payload),
         args: [
           ...head,
           'call',
           `--peer=${cmd.peer}`,
-          cmd.say !== undefined ? `--say=${cmd.say}` : `--audio=${cmd.audio ?? ''}`,
+          cmd.say !== undefined ? '--say-stdin' : `--audio=${cmd.audio ?? ''}`,
+          '--context-stdin',
+          ...(cmd.idempotencyKey ? [`--idempotency-key=${cmd.idempotencyKey}`] : []),
+          ...(cmd.topic ? [`--topic=${cmd.topic}`] : []),
+          ...(cmd.replyTo ? [`--reply-to=${cmd.replyTo}`] : []),
           ...(cmd.timeout ? [`--timeout=${cmd.timeout}`] : []),
           ...(cmd.dryRun ? ['--dry-run'] : []),
           ...idle,
         ],
       };
+    }
     case 'send':
       return {
         args: [...head, 'send', `--peer=${cmd.peer}`, ...(cmd.dryRun ? ['--dry-run'] : []), ...idle],

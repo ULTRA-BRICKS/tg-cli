@@ -69,6 +69,10 @@ env:
   GATE_LEVELS: 'error warning'
   # Pinned CodeQL bundle (the engine) and the query suite it runs.
   CODEQL_VERSION: '2.27.1'
+  # Explicit query budget: autodetection gave a 692 MiB Java heap on shared runners (#761).
+  # Limit parallel evaluation rather than competing for every host core.
+  CODEQL_RAM_MB: '4096'
+  CODEQL_THREADS: '2'
   QUERY_SUITE: 'security-extended'
   # Optional code-scanning config (paths / paths-ignore) — empty = scan the whole repo.
   CODEQL_CONFIG_FILE: './.github/codeql/codeql-config.yml'
@@ -190,17 +194,16 @@ jobs:
           mkdir -p sarif-results
           codeql database analyze "$db" "codeql/${pack}-queries:codeql-suites/${pack}-${QUERY_SUITE}.qls" \
             --format=sarif-latest --output="sarif-results/${LANGUAGE}.sarif" \
-            --sarif-category="/language:${LANGUAGE}" --threads=0
+            --sarif-category="/language:${LANGUAGE}" --threads="$CODEQL_THREADS" --ram="$CODEQL_RAM_MB"
 
       - name: Upload SARIF artifact
         # Publish the raw SARIF even on a gate failure, so it's downloadable
         # (`gh run download`) for triage. Skipped when the language wasn't analyzed.
-        # Best effort: upload-artifact@v4 refuses non-github.com servers (it treats a Forgejo /
-        # Gitea host as GHES), and a triage copy must not fail the gate — the gate step
-        # below decides pass/fail from the SARIF on disk.
+        # The pinned Forgejo action supports this server's artifact API (#761).
+        # Upload remains best-effort; the unchanged SARIF gate below decides pass/fail.
         if: always() && steps.detect.outputs.has_source == 'true'
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: https://code.forgejo.org/forgejo/upload-artifact@16871d9e8cfcf27ff31822cac382bbb5450f1e1e
         with:
           name: codeql-sarif-${{ matrix.language }}
           path: sarif-results/*.sarif

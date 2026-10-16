@@ -16,9 +16,13 @@ import tempfile
 import time
 from .core import AuthStore, ClientError, TriggerStore, auth_origin, check_identity
 from .paths import default_store, receipt_path
-from .runtime import connected, import_session, place_call
+from .runtime import connected, import_session
 
 CALL_LIBRARIES = ("pyrogram", "pytgcalls", "ntgcalls")
+# 2 MiB covers worst-case JSON escaping (12 bytes/codepoint) for a 100,000-char
+# transcript, 1,000-char source and twelve 512-char references, plus schema keys.
+# The raw cap also bounds JSON whitespace; decoded field limits still apply.
+CALL_PAYLOAD_LIMIT = 2 * 1024 * 1024
 
 
 def emit(value):
@@ -33,6 +37,17 @@ def add_call_parser(commands):
     media = q.add_mutually_exclusive_group(required=True)
     media.add_argument("--audio", type=Path)
     media.add_argument("--say")
+    media.add_argument("--say-stdin", action="store_true")
+    q.add_argument("--context-stdin", action="store_true", help="private JSON call payload from tg")
+    q.add_argument("--transcript", help="caller-provided audio text; not verified transcription")
+    for name in ("agent", "task", "project", "session"):
+        q.add_argument("--" + name)
+        q.add_argument("--" + name + "-title")
+        q.add_argument("--" + name + "-url")
+    q.add_argument("--kind", choices=("report", "question", "problem"), default="report")
+    q.add_argument("--idempotency-key")
+    q.add_argument("--topic", type=int)
+    q.add_argument("--reply-to", type=int)
     q.add_argument("--timeout", type=int, default=60, help="ring and playback bound, seconds")
     q.add_argument("--dry-run", action="store_true")
     q.add_argument("--source-session-idle-confirmed", action="store_true")
@@ -73,6 +88,17 @@ def parser(role):
     )
     commands.add_parser("logout", help="delete the local session file only")
     add_call_parser(commands)
+    q = commands.add_parser("call-history", help="offline private call journal")
+    q.add_argument("action", choices=("list", "show"), nargs="?", default="list")
+    q.add_argument("call_id", nargs="?")
+    q.add_argument("--json", action="store_true")
+    q.add_argument("--status")
+    q.add_argument("--agent")
+    q.add_argument("--session")
+    q.add_argument("--recipient", type=int)
+    q.add_argument("--task")
+    q.add_argument("--project")
+    q.add_argument("--limit", type=int, default=50)
     if role == "caller":
         commands.add_parser(
             "library-info", help="shared package version and module path; offline"
@@ -122,12 +148,36 @@ def parser(role):
             help="prepared notification speech file",
         )
         q.add_argument("--source-session-idle-confirmed", action="store_true")
+        q.add_argument("--transcript", help="caller-provided audio text; unverified")
+        q.add_argument("--timeout", type=int, default=60)
+        q.add_argument("--kind", choices=("report", "question", "problem"), default="report")
+        for name in ("agent", "task", "project", "session"):
+            q.add_argument("--" + name)
+            q.add_argument("--" + name + "-title")
+            q.add_argument("--" + name + "-url")
     return p
 
 
-async def watch(store, args):
-    from pyrogram.handlers import MessageHandler
-    from pyrogram import filters
+class WatchEffects:
+    """Update transport only; the shared service owns every call/mirror/journal effect."""
+
+    def connection(self, store, role, idle, updates=False):
+        return connected(store, role, updates=updates, source_idle_confirmed=idle)
+
+    def subscribe(self, app, peer, incoming):
+        from pyrogram.handlers import MessageHandler
+        from pyrogram import filters
+
+        app.add_handler(MessageHandler(incoming, filters.private & filters.incoming & filters.user(peer)))
+
+    async def run_call(self, store, role, args):
+        from .call_service import run_call
+        return await run_call(store, role, args)
+
+
+async def watch(store, args, effects=None):
+    from argparse import Namespace
+    from .call_identity import prepare
 
     trigger = TriggerStore(args.trigger)
     if trigger.status() != "armed":
@@ -135,14 +185,27 @@ async def watch(store, args):
     owner, peer = trigger.config()
     if not args.audio.is_file():
         raise ClientError("AUDIO_FILE_MISSING")
+    if not 1 <= args.timeout <= 600:
+        raise ClientError("TIMEOUT_MUST_BE_1_TO_600")
     idle = args.source_session_idle_confirmed
+    # Both session ownership checks precede subscribing or any online operation.
+    for role in ("caller", "personal"):
+        auth = store.load(role)
+        if auth_origin(auth) == "import" and not idle:
+            raise ClientError("SOURCE_SESSION_OWNERSHIP_NOT_CONFIRMED")
+    call_args = Namespace(**vars(args))
+    call_args.peer = str(owner)
+    call_args.say = None
+    call_args.dry_run = False
+    call_args.reply_to = None
+    call_args.topic = None
+    prepare(call_args)
+    effects = effects or WatchEffects()
     # Verify the recipient is the personal owner before subscribing or claiming.
-    async with connected(store, "caller", source_idle_confirmed=idle) as caller:
+    async with effects.connection(store, "caller", idle) as caller:
         if caller.me.id == owner:
             raise ClientError("CALL_RECIPIENT_IS_CALLER")
-    async with connected(
-        store, "personal", updates=True, source_idle_confirmed=idle
-    ) as app:
+    async with effects.connection(store, "personal", idle, updates=True) as app:
         check_identity(owner, app.me.id, app.me.is_bot)
         finished = asyncio.Event()
 
@@ -150,36 +213,26 @@ async def watch(store, args):
             if not message.from_user or message.from_user.id != peer:
                 return
             timestamp = message.date.replace(tzinfo=timezone.utc).timestamp()
-            if not trigger.claim(
-                owner, message.chat.id, message.id, timestamp, bool(message.outgoing)
-            ):
+            if not trigger.claim(owner, message.chat.id, message.id, timestamp, bool(message.outgoing)):
                 return
             success = False
             try:
-                await place_call(
-                    store, "caller", str(owner), args.audio, source_idle_confirmed=idle
-                )
-                success = True
-            except Exception:
-                emit({"event": "call_uncertain", "automatic_retry": False})
+                # A claimed trigger never retries, including after a process crash. This key
+                # also fences accidental cross-process service re-entry for this exact event.
+                call_args.idempotency_key = f"watch:{owner}:{peer}:{message.id}"
+                result = await effects.run_call(store, "caller", call_args)
+                success = result.get("state") == "audio_stream_ended" and result.get("ok") is not False
+                emit(dict(result, event="watch_call_result", automatic_retry=False))
+            except Exception as error:
+                from .call_service import safe_error
+                emit({"event": "call_uncertain", "reason": safe_error(error), "automatic_retry": False})
             finally:
                 trigger.finish(success)
                 finished.set()
 
-        app.add_handler(
-            MessageHandler(
-                incoming, filters.private & filters.incoming & filters.user(peer)
-            )
-        )
+        effects.subscribe(app, peer, incoming)
         await app.initialize()
-        emit(
-            {
-                "watching": True,
-                "owner_id": owner,
-                "peer_id": peer,
-                "historical_messages": False,
-            }
-        )
+        emit({"watching": True, "owner_id": owner, "peer_id": peer, "historical_messages": False})
         await finished.wait()
         emit({"state": trigger.status()})
 
@@ -208,68 +261,135 @@ def session_preflight(store, role, idle_confirmed):
 
 
 def call_plan(store, role, args, which=shutil.which, find_spec=importlib.util.find_spec):
-    """Offline `call --dry-run`: everything a real call needs, without connecting."""
+    """Offline call structure checks; auth contents and account identity remain unverified."""
+    import os
+    import stat
     from .account import parse_peer
     from .tts import TEXT_LIMIT, tts_engine
+    from .call_identity import prepare
+    from .tts_config import load_config
 
     target = parse_peer(args.peer)
     if target == "me" and role != "caller":
         raise ClientError("CALL_RECIPIENT_IS_CALLER")
-    _, missing = session_preflight(store, role, args.source_session_idle_confirmed)
-    recipient = target if isinstance(target, int) else None
-    if target == "me":
+    reasons = []
+    def missing_reason(component, code=None):
+        if not any(reason["component"] == component for reason in reasons):
+            reasons.append({"component": component, "code": code or component})
+    # Auth files contain session keys: dry-run inspects filesystem metadata only.
+    def inspect_session(selected_role, component):
         try:
-            recipient = store.load("personal")["expected_id"]
-        except ClientError:
-            missing.append("personal_session")
+            getuid = getattr(os, "getuid", None)
+            if not callable(getuid):
+                raise ClientError("SESSION_OWNERSHIP_UNVERIFIED")
+            path = store.path(selected_role).absolute()
+            for parent in reversed(path.parents):
+                if parent.is_symlink():
+                    raise ClientError("INSECURE_STORE_DIRECTORY")
+            directory = store.root.lstat()
+            if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != getuid() or directory.st_mode & 0o077:
+                raise ClientError("INSECURE_STORE_DIRECTORY")
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != getuid() or info.st_mode & 0o077:
+                raise ClientError("INSECURE_STORE_FILE")
+            return True
+        except FileNotFoundError:
+            code = "SESSION_MISSING"
+        except ClientError as error:
+            code = str(error)
+        except OSError:
+            code = "SESSION_METADATA_UNAVAILABLE"
+        missing_reason(component, code)
+        return False
+
+    present = inspect_session(role, "session")
+    personal_present = inspect_session("personal", "personal_session") if target == "me" else None
+    if present:
+        missing_reason("session_identity_unverified")
+        if not args.source_session_idle_confirmed:
+            missing_reason("source_session_origin_unverified")
+    if target == "me" and personal_present:
+        missing_reason("recipient_identity_unverified")
+    recipient = None
+    prepared = prepare(args)
     engine = None
+    tts = None
+    try:
+        config = load_config(store.root.parent)
+        tts = {"provider": config.provider, "model": config.model, "voice_id": config.voice_id,
+               "latency": config.latency, "credentials_checked": False}
+        if config.provider == "host":
+            engine = tts_engine(which)
+            if engine is None:
+                missing_reason("tts", "TTS_UNAVAILABLE")
+    except ClientError as error:
+        missing_reason("tts", str(error))
+    if getattr(args, "topic", None):
+        missing_reason("verified_topic_mapping")
     if args.audio is not None:
         if not args.audio.is_file():
-            missing.append("audio_file")
+            missing_reason("audio_file")
     else:
         if not args.say.strip():
             raise ClientError("TEXT_EMPTY")
         if len(args.say) > TEXT_LIMIT:
             raise ClientError("TEXT_TOO_LONG")
-        engine = tts_engine(which)
-        if engine is None:
-            missing.append("tts")
     if not which("ffmpeg"):
-        missing.append("ffmpeg")
+        missing_reason("ffmpeg")
     if not all(find_spec(name) is not None for name in CALL_LIBRARIES):
-        missing.append("call_libraries")
+        missing_reason("call_libraries")
     return {
+        **prepared,
         "dry_run": True,
         "role": role,
         "peer": args.peer,
         "recipient_id": recipient,
+        "requested_recipient_id": target if type(target) is int else None,
+        "session_checks": {"session_file_present": present,
+                           "personal_session_file_present": personal_present,
+                           "auth_contents_checked": False, "credentials_checked": False,
+                           "identity_checked": False, "ownership_checked": False,
+                           "identity_verified": False,
+                           "origin_verified": False},
         "media": "audio" if args.audio is not None else "say",
         "tts_engine": engine,
-        "missing": missing,
-        "ready": not missing,
+        "tts": tts,
+        "missing_reasons": reasons,
+        "missing": [reason["component"] for reason in reasons],
+        "ready": not reasons,
     }
 
 
 async def call(store, role, args):
-    from .account import parse_peer
-    from .tts import synthesize
+    from .call_service import run_call
 
+    if getattr(args, "context_stdin", False):
+        # Strict schema: stdin cannot replace the recipient, store or safety options.
+        try:
+            raw = sys.stdin.read(CALL_PAYLOAD_LIMIT + 1)
+            if len(raw.encode("utf-8")) > CALL_PAYLOAD_LIMIT:
+                raise ValueError("payload limit")
+            payload = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise ClientError("CALL_PAYLOAD_INVALID") from None
+        names = {"say", "transcript", "kind"} | {
+            name + suffix for name in ("agent", "task", "project", "session")
+            for suffix in ("", "_title", "_url")}
+        if not isinstance(payload, dict) or set(payload) - names or any(not isinstance(v, str) for v in payload.values()):
+            raise ClientError("CALL_PAYLOAD_INVALID")
+        for key, value in payload.items():
+            setattr(args, key, value)
+    elif getattr(args, "say_stdin", False):
+        args.say = sys.stdin.read(100_001)
     if not 1 <= args.timeout <= 600:
         raise ClientError("TIMEOUT_MUST_BE_1_TO_600")
     if args.dry_run:
         plan = call_plan(store, role, args)
         emit(plan)
         return 0 if plan["ready"] else 3
-    parse_peer(args.peer)
-    options = dict(timeout=args.timeout, source_idle_confirmed=args.source_session_idle_confirmed)
-    if args.audio is not None:
-        await place_call(store, role, args.peer, args.audio, **options)
-    else:
-        with tempfile.TemporaryDirectory(prefix="tg-say-") as directory:
-            audio = synthesize(args.say, Path(directory) / "tts")
-            await place_call(store, role, args.peer, audio, **options)
-    emit({"state": "completed", "role": role, "peer": args.peer})
-    return 0
+    result = await run_call(store, role, args)
+    emit(result)
+    return 3 if result.get("ok") is False else 0
 
 
 async def send(store, args):
@@ -418,6 +538,14 @@ async def personal_reads(store, args):
 async def execute(role, args):
     store = AuthStore(args.store)
     command = args.command
+    if command == "call-history":
+        from .call_journal import Journal
+        if args.action == "show" and not args.call_id:
+            raise ClientError("CALL_ID_REQUIRED")
+        rows = Journal(store.root).history(call_id=args.call_id, status=args.status,
+            agent=args.agent, session=args.session, task=args.task, project=args.project, recipient=args.recipient, limit=args.limit)
+        emit({"calls": rows})
+        return 0
     if command == "library-info":
         from .call_lib import identity
 
@@ -477,13 +605,24 @@ def main(role, argv=None):
     args = parser(role).parse_args(argv)
     # These commands must never expose underlying library exceptions (which may contain
     # auth); the class name alone (PeerIdInvalid, FloodWait, …) is safe and diagnosable.
+    interrupted_result = {}
+    async def invoke():
+        nonlocal interrupted_result
+        try:
+            return await execute(role, args)
+        except (KeyboardInterrupt, asyncio.CancelledError) as error:
+            # Runner converts SIGINT cancellation into a fresh KeyboardInterrupt.
+            # Capture the service diagnostic before that conversion loses its attributes.
+            interrupted_result = getattr(error, "call_result", None) or {}
+            raise
     try:
-        return asyncio.run(execute(role, args))
+        return asyncio.run(invoke())
     except ClientError as error:
         emit({"ok": False, "error": str(error)})
         return 3
-    except KeyboardInterrupt:
-        emit({"ok": False, "error": "INTERRUPTED"})
+    except (KeyboardInterrupt, asyncio.CancelledError) as error:
+        # The call service attaches observed outcomes even if its final audit write failed.
+        emit(dict(getattr(error, "call_result", None) or interrupted_result, ok=False, error="INTERRUPTED"))
         return 130
     except Exception as error:
         emit({"ok": False, "error": "CLIENT_OPERATION_FAILED", "detail": type(error).__name__})

@@ -1,6 +1,9 @@
 // The real effects behind `runUserAccount` (the one impure module here, like
 // tg-ctl/host-registry-fs.ts): the hash-locked sidecar venv, the spawn, stdin, the console.
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
+import { parseRegistry, pinnedSession, callerSessionKey } from '../tg-ctl/session-registry-store';
+import { botIdFromToken, ctlPaths } from '../tg-ctl/lock';
+import { detectSenderAncestry } from '../branding/detect';
+import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { loadEnv } from '../config/env';
 import type { UserAccountDeps } from './cli';
@@ -117,17 +120,71 @@ export async function ensureSidecarRuntime(
   }
 }
 
+/** Reuse only the completed, matching cache during offline inspection; never build. */
+function cachedSidecarRuntime(repoDir: string, cacheHome: string): RuntimeCommand | null {
+  try {
+    const sha = new Bun.CryptoHasher('sha256')
+      .update(readFileSync(join(repoDir, 'requirements-call.txt'))).digest('hex');
+    const venv = runtimeDir(cacheHome, sha);
+    const ready = join(venv, '.tg-ready');
+    const python = join(venv, 'bin', 'python');
+    // Open once: metadata and bounded content must refer to the same inode (#761).
+    // Refuse redirected/nonregular markers; O_NONBLOCK prevents a FIFO from hanging.
+    if (typeof constants.O_NOFOLLOW !== 'number') return null;
+    const fd = openSync(ready, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    let marker: string;
+    try {
+      const info = fstatSync(fd);
+      if (!info.isFile() || info.size > 128) return null;
+      const buffer = Buffer.alloc(129);
+      let used = 0;
+      while (used < buffer.length) {
+        const count = readSync(fd, buffer, used, buffer.length - used, used);
+        if (count === 0) break;
+        used += count;
+      }
+      if (used > 128) return null;
+      marker = buffer.subarray(0, used).toString('utf8');
+    } finally {
+      closeSync(fd);
+    }
+    if (marker.trim() === sha && statSync(python).isFile()) return { argv: [python, ...MODULE] };
+  } catch { /* Absent or incomplete cache: inspect with system Python, without writes. */ }
+  return null;
+}
+
 export function userAccountDeps(configDir: string, repoDir: string, home: string): UserAccountDeps {
-  const env = sidecarEnv(process.env, loadEnv(join(configDir, '.env')), configDir, join(repoDir, 'features'));
+  let offline = false;
   return {
     configDir,
+    callContext: (cmd) => {
+      const token = process.env.TG_BOT_TOKEN || (cmd.dryRun ? '' : loadEnv(join(configDir, '.env')).TG_BOT_TOKEN) || '';
+      let raw: string | null = null;
+      try { raw = readFileSync(ctlPaths(configDir, botIdFromToken(token)).sessions, 'utf8'); } catch { /* No registry means unknown session metadata. */ }
+      const registry = parseRegistry(raw);
+      const pin = cmd.session ?? process.env.TG_SESSION;
+      const ancestry = pin ? null : detectSenderAncestry();
+      const key = pin ? pinnedSession(registry, pin)?.key : callerSessionKey(registry, { agentPid: ancestry?.agents[0]?.pid ?? null, locator: null });
+      const entry = registry.sessions.find(item => item.key === key);
+      return {
+        ...(process.env.RIG_AGENT_ID ? { agent: process.env.RIG_AGENT_ID } : {}),
+        ...(entry && !cmd.agent && !cmd.agentTitle && !process.env.RIG_AGENT_ID ? { agentTitle: entry.name.primary } : {}),
+        ...(entry ? { session: entry.key, sessionTitle: entry.name.secondary ?? entry.name.primary } : pin ? { session: pin } : {}),
+      };
+    },
     exists: existsSync,
-    sidecarCommand: async () => {
+    sidecarCommand: async (offlineMode = false) => {
+      offline = offlineMode;
       const override = process.env.TG_MTPROTO_SIDECAR;
       if (override) return { argv: [override] };
+      if (offline) return cachedSidecarRuntime(repoDir, process.env.XDG_CACHE_HOME || join(home, '.cache'))
+        ?? { argv: ['python3', ...MODULE] };
       return ensureSidecarRuntime(repoDir, process.env.XDG_CACHE_HOME || join(home, '.cache'));
     },
     spawn: async (argv, stdin) => {
+      const dotenv = offline ? {} : loadEnv(join(configDir, '.env'));
+      const env = { ...sidecarEnv(process.env, dotenv, configDir, join(repoDir, 'features')),
+        ...(offline ? { PYTHONDONTWRITEBYTECODE: '1' } : {}) };
       const proc = Bun.spawn(argv, {
         env,
         stdin: stdin !== undefined ? new TextEncoder().encode(stdin) : 'inherit',

@@ -5,11 +5,24 @@ import type { HelpTopic } from './args';
 
 const CALL = `Usage:
   tg call <peer> --say "<text>" [--from user|caller] [--timeout <s>] [--dry-run] [--json]
-  tg call <peer> --audio <file> [...]
+  tg call <peer> --audio <file> [--transcript "caller-provided text"] [...]
+  tg call history list [--status STATE] [--agent ID] [--session ID] [--task ID] [--project ID] [--recipient ID] [--limit N] --json
+  tg call history show <call-id> --json
+  call-cli <peer> --say "<text>" [...]   same parser, library and session store
   tg call <peer> --say="-text that starts with a dash"
 
-Rings <peer> once and plays the audio (or speaks the text with macOS \`say\` / espeak-ng).
-Success = the audio played to the end; a declined or unanswered call is not retried.
+Sends an identified transcript to the exact recipient BEFORE one call attempt.
+Every call starts with a Russian agent/kind/task/project introduction. Missing context is unknown.
+Private history: <config>/mtproto/calls/journal.sqlite3. No recordings/listening receipts.
+--agent/--task/--project/--session <id>, each with --NAME-title and --NAME-url.
+--kind report|question|problem; --idempotency-key <token> refuses repeated attempts.
+--reply-to <id> is in the recipient private chat; bot topics have no verified mapping and are refused.
+Raw audio is prefixed with TTS; its transcript is unknown unless explicitly supplied (unverified).
+
+Rings <peer> once and plays audio or speaks text with configured neural TTS.
+A host voice requires explicit opt-in only; no silent fallback to macOS \`say\` / espeak-ng.
+audio_stream_ended means outgoing stream completion, not proof the recipient heard it.
+A declined or unanswered call is not retried.
   <peer>             @username, numeric user id, or me
   me                 you: rung FROM the caller account (tg auth caller) — an account
                      cannot ring itself

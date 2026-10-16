@@ -167,7 +167,7 @@ class SharedConsumerTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual((owner.closed, owner.disposed), (2, 2))
 
-    async def test_mock_agent_cannot_be_used_as_production_agent(self):
+    async def test_native_provider_preparation_requires_identified_duplex_service(self):
         config = {
             "agent": {
                 "command": [
@@ -176,7 +176,7 @@ class SharedConsumerTests(unittest.IsolatedAsyncioTestCase):
                 ]
             }
         }
-        with self.assertRaisesRegex(ClientError, "AGENT_NOT_PRODUCTION_READY"):
+        with self.assertRaisesRegex(ClientError, "CONVERSATION_REQUIRES_IDENTIFIED_SERVICE"):
             await call_lib.NativeOwner().prepare(config)
 
     async def test_mock_protocol_roundtrip_and_descriptor(self):

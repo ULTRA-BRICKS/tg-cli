@@ -1,11 +1,9 @@
 """Shared call owner used by both CLI and calbot adapter; never imports calbot."""
 
 import asyncio
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-import time
 
 from .core import ClientError
 from .paths import receipt_path
@@ -81,48 +79,12 @@ class NativeOwner:
         return result
 
     async def prepare(self, config):
-        from .providers import JsonCallAgent, build_providers
+        """Duplex requires audited intro and transcript publication before provider startup."""
+        raise ClientError("CONVERSATION_REQUIRES_IDENTIFIED_SERVICE")
 
-        descriptor = await JsonCallAgent(config["agent"]["command"]).describe()
-        if (
-            descriptor.get("backend") != "production"
-            or descriptor.get("ready") is not True
-        ):
-            raise ClientError("AGENT_NOT_PRODUCTION_READY")
-        return build_providers(config)
-
-    @asynccontextmanager
-    async def open(self, store, config, prepared):
-        from .runtime import connected
-        from .conversation import Conversation
-        from .duplex import native_transport
-        from pytgcalls import PyTgCalls
-        from ntgcalls import NTgCalls
-
-        NTgCalls.enable_glib_loop(True)
-        peer = config["user_id"]
-        # start_conversation already required consent.source_idle before this point.
-        async with connected(
-            store, "caller", updates=True, source_idle_confirmed=True
-        ) as app:
-            if app.me.id == peer:
-                raise ClientError("CALL_RECIPIENT_IS_CALLER")
-            calls = PyTgCalls(app)
-            stt, agent, tts, vad, voice = prepared
-            transport = native_transport(calls, peer, vad)
-            session = Conversation(stt, agent, tts, transport, voice, time.monotonic)
-            stt.bind(session)
-            transport.session = session
-            try:
-                await app.initialize()
-                await calls.start()
-                await asyncio.wait_for(calls.play(peer, None), 30)
-                if session.ended:
-                    raise ClientError("CALL_ENDED_BEFORE_CAPTURE")
-                await transport.attach(session)
-                yield session
-            finally:
-                await session.event("CALL_ENDED")
+    def open(self, store, config, prepared):
+        """No native session exists until duplex intro/transcript auditing is integrated."""
+        raise ClientError("CONVERSATION_REQUIRES_IDENTIFIED_SERVICE")
 
     async def dispose(self, prepared):
         stt, agent, tts, _, _ = prepared

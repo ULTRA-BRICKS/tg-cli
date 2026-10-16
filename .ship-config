@@ -1,1 +1,5 @@
 SHIP_EXTERNAL_REVIEW=0
+
+# The full suite is remote: local execution overloads the workstation.
+# Run the whole current checkout; a failed or unavailable runner blocks shipping.
+SHIP_LOCAL_TEST_CMD=tg-remote-test --ephemeral -C . --timeout 1200

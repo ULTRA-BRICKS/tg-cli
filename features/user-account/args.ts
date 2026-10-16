@@ -12,11 +12,21 @@ export interface Output {
   json: boolean;
 }
 
+export interface CallContext {
+  agent?: string; agentTitle?: string; agentUrl?: string;
+  task?: string; taskTitle?: string; taskUrl?: string;
+  project?: string; projectTitle?: string; projectUrl?: string;
+  session?: string; sessionTitle?: string; sessionUrl?: string;
+  callKind?: 'report' | 'question' | 'problem';
+  transcript?: string;
+}
+
 export type UserAccountCommand =
   | ({ kind: 'login'; role: Role; qr: boolean; expectedId?: string } & Output)
   | ({ kind: 'import'; role: Role; session: string; config: string; expectedId?: string } & Output)
   | ({ kind: 'status'; role: Role; online: boolean; sourceIdle: boolean } & Output)
   | ({ kind: 'logout'; role: Role } & Output)
+  | ({ kind: 'call-history'; role: Role; action: 'list' | 'show'; callId?: string; status?: string; agent?: string; session?: string; task?: string; project?: string; recipient?: string; limit?: string } & Output)
   | ({
       kind: 'call';
       role: Role;
@@ -26,7 +36,10 @@ export type UserAccountCommand =
       timeout?: string;
       dryRun: boolean;
       sourceIdle: boolean;
-    } & Output)
+      idempotencyKey?: string;
+      topic?: string;
+      replyTo?: string;
+    } & CallContext & Output)
   | ({ kind: 'send'; peer: string; text?: string; dryRun: boolean; sourceIdle: boolean } & Output);
 
 export type HelpTopic = 'call' | 'user-send';
@@ -161,8 +174,16 @@ export function parseAccountAuth(role: Role, argv: string[]): AccountAuthArgs {
 function parseCall(argv: string[]): UserAccountArgs {
   // No `--` here: `tg call` takes no free text, so a `--`-prefixed word can never become the
   // peer (`tg call -- --dry-run --say x` is an error, not a call to "--dry-run").
+  if (argv[0] === 'history') {
+    const h = scan(argv.slice(1), { valued: ['--status', '--agent', '--session', '--task', '--project', '--recipient', '--limit'], booleans: ['--json'] });
+    if (h.error) return error(h.error, 'call');
+    const [action = 'list', callId, ...extra] = h.positionals;
+    if ((action !== 'list' && action !== 'show') || extra.length || (action === 'show' && !callId) || (action === 'list' && callId)) return error('history list | history show <call-id>.', 'call');
+    return { kind: 'call-history', role: 'caller', action, ...(callId ? { callId } : {}), json: h.flags.has('--json'),
+      task: value(h, '--task'), project: value(h, '--project'), status: value(h, '--status'), agent: value(h, '--agent'), session: value(h, '--session'), recipient: value(h, '--recipient'), limit: value(h, '--limit') };
+  }
   const s = scan(argv, {
-    valued: ['--say', '--audio', '--from', '--timeout'],
+    valued: ['--say', '--audio', '--from', '--timeout', '--agent', '--agent-title', '--agent-url', '--task', '--task-title', '--task-url', '--project', '--project-title', '--project-url', '--session', '--session-title', '--session-url', '--kind', '--transcript', '--idempotency-key', '--topic', '--reply-to'],
     booleans: ['--dry-run', '--json', '--source-idle-confirmed'],
   });
   if (s.error) return error(s.error, 'call');
@@ -180,9 +201,23 @@ function parseCall(argv: string[]): UserAccountArgs {
   }
   const timeout = value(s, '--timeout');
   if (timeout !== undefined && !POSITIVE_INT.test(timeout)) return error('--timeout is a whole number of seconds.', 'call');
+  const callKind = value(s, '--kind');
+  if (callKind !== undefined && callKind !== 'report' && callKind !== 'question' && callKind !== 'problem') return error('--kind is report, question or problem.', 'call');
+  const context: CallContext = {};
+  for (const [flag, key] of [
+    ['--agent', 'agent'], ['--agent-title', 'agentTitle'], ['--agent-url', 'agentUrl'],
+    ['--task', 'task'], ['--task-title', 'taskTitle'], ['--task-url', 'taskUrl'],
+    ['--project', 'project'], ['--project-title', 'projectTitle'], ['--project-url', 'projectUrl'],
+    ['--session', 'session'], ['--session-title', 'sessionTitle'], ['--session-url', 'sessionUrl'], ['--transcript', 'transcript'],
+  ] as const) { const item = value(s, flag); if (item !== undefined) context[key] = item; }
   const role: Role = peer === 'me' || from === 'caller' ? 'caller' : 'personal';
   return {
     kind: 'call',
+    ...context,
+    ...(callKind ? { callKind } : {}),
+    ...(value(s, '--idempotency-key') ? { idempotencyKey: value(s, '--idempotency-key') } : {}),
+    ...(value(s, '--topic') ? { topic: value(s, '--topic') } : {}),
+    ...(value(s, '--reply-to') ? { replyTo: value(s, '--reply-to') } : {}),
     role,
     peer,
     ...(say !== undefined ? { say } : { audio }),

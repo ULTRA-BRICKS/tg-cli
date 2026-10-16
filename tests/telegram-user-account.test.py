@@ -499,22 +499,29 @@ class TtsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             seen = {}
+            (Path(directory) / "voice.json").write_text('{"version":1,"provider":"host"}')
+            (Path(directory) / "voice.json").chmod(0o600)
 
             def ok(argv, **kw):
                 seen["text"] = Path(argv[argv.index("-f") + 1]).read_text()
                 seen["mode"] = Path(argv[argv.index("-f") + 1]).stat().st_mode & 0o777
-                Path(argv[-1]).write_bytes(b"RIFF")
+                import wave
+                with wave.open(str(argv[-1]), "wb") as audio:
+                    audio.setnchannels(1)
+                    audio.setsampwidth(2)
+                    audio.setframerate(8000)
+                    audio.writeframes(b"\x00\x01" * 800)
                 return SimpleNamespace(returncode=0)
 
-            out = synthesize("привет", Path(directory), run=ok, which=lambda n: n, system="Linux")
+            out = synthesize("привет", Path(directory), run=ok, which=lambda n: n, system="Linux", config_dir=directory)
             self.assertTrue(out.is_file())
             self.assertEqual(seen, {"text": "привет", "mode": 0o600})
             with self.assertRaisesRegex(ClientError, "TTS_FAILED"):
-                synthesize("x", Path(directory) / "b", run=lambda a, **k: SimpleNamespace(returncode=1), which=lambda n: n, system="Linux")
+                synthesize("x", Path(directory) / "b", run=lambda a, **k: SimpleNamespace(returncode=1), which=lambda n: n, system="Linux", config_dir=directory)
             with self.assertRaisesRegex(ClientError, "TTS_UNAVAILABLE"):
-                synthesize("x", Path(directory) / "c", run=ok, which=lambda n: None, system="Linux")
+                synthesize("x", Path(directory) / "c", run=ok, which=lambda n: None, system="Linux", config_dir=directory)
             with self.assertRaisesRegex(ClientError, "TEXT_TOO_LONG"):
-                synthesize("x" * 1001, Path(directory) / "d", run=ok, which=lambda n: n, system="Linux")
+                synthesize("x" * 1001, Path(directory) / "d", run=ok, which=lambda n: n, system="Linux", config_dir=directory)
 
 
 class EntryTests(unittest.TestCase):
@@ -569,10 +576,11 @@ class EntryTests(unittest.TestCase):
         )
         plan = json.loads(result.stdout.splitlines()[-1])
         self.assertTrue(plan["dry_run"])
-        self.assertEqual(plan["recipient_id"], 7)
+        self.assertIsNone(plan["recipient_id"])
+        self.assertFalse(plan["session_checks"]["auth_contents_checked"])
         self.assertFalse(plan["ready"])
         self.assertIn("audio_file", plan["missing"])
-        self.assertIn("source_session_idle_confirmed", plan["missing"])
+        self.assertIn("source_session_origin_unverified", plan["missing"])
         self.assertEqual(result.returncode, 3)
         self.assertNotIn("fixture", result.stdout + result.stderr)
 

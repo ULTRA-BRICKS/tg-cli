@@ -1,0 +1,14 @@
+#!/usr/bin/env bun
+// Shared user-account command frontdoor; no call implementation or separate credentials.
+// Symlinks resolve to this checkout. Speech reaches the Python service over stdin.
+import { homedir } from 'os';
+import { realpathSync } from 'fs';
+import { dirname, join } from 'path';
+import { parseUserAccountArgs } from './features/user-account/args';
+import { runUserAccount } from './features/user-account/cli';
+import { userAccountDeps } from './features/user-account/sidecar-fs';
+const home = homedir();
+const repo = dirname(realpathSync(import.meta.path));
+const parsed = parseUserAccountArgs(['call', ...process.argv.slice(2)]);
+if (parsed === null) process.exit(2);
+process.exit(await runUserAccount(parsed, userAccountDeps(process.env.TG_CTL_CONFIG_DIR || join(home, '.config', 'tg-cli'), repo, home)));

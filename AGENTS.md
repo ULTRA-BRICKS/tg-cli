@@ -137,6 +137,33 @@ Feature modules live in `features/<feature-name>/` as **pure TypeScript modules*
 all external dependencies (spawns, fetch, file reads) are injected as function parameters so
 tests can pass fakes.
 
+### Identified calls and history (#761)
+
+Use `tg call <peer> --say "…" --agent <name> --kind report|question|problem --task <id>
+--task-title "…" --project <id> --session <id>` or the identical `call-cli <peer> …`.
+Each reference also accepts `--NAME-url` and `--NAME-title`; ids and titles are separate.
+Speech is quick: `Привет! 3d-house. Проблема с Print Ops. …`; report/question use `по`. Missing agent/task is spoken honestly; absent project is omitted. Both commands use the same `features/user-account/`
+parser and `telegram_client.call_service`, with the existing `<config>/mtproto` sessions.
+`tg-call call --peer …` remains a compatible expert frontdoor into that service.
+Do not call legacy `runtime.place_call` directly from agent scripts: it is the transport,
+not the identified call service. No anonymous direct shell call routes.
+
+A private `mtproto/calls/journal.sqlite3` records intent, transcript, recipient, TTS segments,
+mirror ids and transitions before dialing. `tg call history list --json` and
+`tg call history show <call-id> --json` read it offline; filters: `--status`, `--agent`,
+`--session`, `--task`, `--project`, `--recipient`, `--limit`. `--idempotency-key` claims one attempt permanently;
+never replay an interrupted/failed token automatically. `audio_stream_ended` means outbound
+stream completion, never proof anyone heard it. No call recording or reply capture.
+
+The calling account sends a plain-text transcript to the resolved private recipient BEFORE
+ringing and updates its status anchor afterward. Mirror failure prevents dialing; a failed
+result update emits a warning and remains in history. It never falls back to the owner's bot
+chat. `--reply-to` refers to this private recipient chat, not a bot message. Bot `--topic`
+ids have no verified mapping and are refused. Raw `--audio` also gets a synthesized intro;
+`--transcript` is caller-provided and explicitly unverified, otherwise content is unknown.
+`--dry-run` is offline, selects system Python without installing dependencies, and writes no
+call state. `watch-call` preserves its one-attempt watermark claim and uses the shared identified service. Production native conversational `start` fails explicitly before provider or connection effects until audited intro/transcript support is integrated; see `docs/761-integration.md`.
+
 ### Live OMP identity (#450, #458, #462)
 
 Never use `omp acp session/load` or `omp --resume -p` to deliver to a live TUI: those
