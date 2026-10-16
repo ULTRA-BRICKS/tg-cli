@@ -25,6 +25,7 @@ two accounts next to the bot (read offline from the session files). `tg call` an
 | `tg auth user\|caller logout` | Delete the local session file. The authorization stays in Telegram's Settings → Devices until the user terminates it there (an imported key is shared with its source app; a remote log-out would kill that app). |
 | `tg call <peer> (--say TEXT \| --audio FILE) [--from user\|caller] [--timeout S] [--dry-run] [--json]` | Ring `<peer>` and play the audio (or TTS of `--say`) once. |
 | `tg user send <peer> [TEXT…]` | Send TEXT (or stdin) as the user. `--dry-run`, `--json`. |
+| `tg user send <peer> --file PATH [--file PATH…] [CAPTION…]` | Send each file as a document as the user (see "Files" below). |
 
 `<peer>`: `@username`, a numeric user id, or `me`. For `tg user send`, `me` is the user's Saved
 Messages. For `tg call`, `me` means the user's own account: an account cannot ring itself, so
@@ -115,6 +116,33 @@ deleted after the call: macOS `say` (`-v Milena` when the text has Cyrillic), el
 (use `--audio`). Text over 1000 characters → `TEXT_TOO_LONG`. A peer given as `@username` is
 resolved with `get_users`; a bot is refused. A numeric id works only when Telegram lets the
 account resolve it (a contact or a recent chat).
+
+### Files (`tg user send --file`)
+
+- One `send_document` per `--file`, in order; the caption (argv words only, optional, at most
+  1024 characters) goes on the first. Stdin is never read when `--file` is given, so an open
+  but silent stdin cannot hang the send. Relative paths resolve against `tg`'s cwd.
+- The bot send's never-attach denylist (`features/auto-attach/denylist.ts`: the `.env`
+  family, private keys, credential rc-files, …) applies by basename at parse time, to the name
+  the sidecar opens: Python's `Path()` drops trailing `/` and `/.` (`/x/.env/.` opens `/x/.env`),
+  so those are stripped before the check; `..` is kept (only the filesystem can resolve it
+  through symlinks) and the path goes to the sidecar unchanged. As in the bot path, a symlink is
+  judged by its own name. A match is a usage error (exit 2) before anything spawns. There is no
+  override on this path.
+- The sidecar stats every file before connecting: not a readable regular file →
+  `FILE_MISSING`, empty → `FILE_EMPTY`, over the limit → `FILE_TOO_LARGE` (the JSON line
+  carries `file` and `limit_mib`; `tg` names the file and prints a `split -b 1900M` recipe).
+  The limit is Telegram's per-file 2000 MiB, 4000 MiB when the connected account is Premium
+  (`me.is_premium`, read at connect). `--dry-run` connects to nothing, so it checks 2000 MiB
+  and lists `files` (`path`, `bytes`) in its plan.
+- The peer is resolved (`resolve_peer`, with the one dialog warm-up) BEFORE the first upload, so
+  a wrong peer never costs a multi-gigabyte transfer. pyrogram streams each file from disk in
+  chunks; nothing reads a whole file into memory. No upload timeout is imposed (a 2 GB file on a
+  slow uplink takes as long as it takes); upload progress goes to stderr as one line per 5 % per
+  file. Stdout gets one `{"sent_file", "bytes", "chat_id", "message_id"}` line per sent file and
+  then `{"sent": true, "message_id": <first>, "message_ids": […]}`. A failure mid-batch leaves the
+  earlier lines as the record of what was delivered, and `tg` prints `Already sent: <file>
+  (message <id>).` for each of them under the error, so a retry resends only the rest.
 
 ## 2. Boundaries
 

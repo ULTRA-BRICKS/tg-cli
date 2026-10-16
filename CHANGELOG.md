@@ -3,6 +3,19 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.66.0
+
+- **`tg user send --file` sends files as your own account (#755).** `tg user send <peer>
+  --file <path> [--file <path>…] [caption]` uploads each file as a document over MTProto — one
+  message per file, the caption on the first — so a large deliverable (up to 2000 MiB per file,
+  4000 MiB on Premium; the Bot API path stops at 50 MB) goes to a contact or to Saved Messages
+  (`me`) without a desktop client. Files stream from disk; stderr shows upload progress per file
+  in 5 % steps. The bot path's never-attach denylist applies (an `.env`, key or credential file
+  is a usage error), a missing/empty/oversized file is refused before connecting (oversized
+  with a `split -b 1900M` recipe), and the peer is resolved before the first byte is uploaded.
+  `--dry-run` checks the peer, caption, files and sizes offline; `--json` prints one line per
+  sent file, then the result.
+
 ## 1.65.2
 
 - **A pid that answers EPERM is alive (#748).** `kill(pid, 0)` fails with EPERM when the

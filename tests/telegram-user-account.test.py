@@ -475,6 +475,111 @@ class PeerTests(unittest.TestCase):
             run(send_text(App(), "me", "x" * 4097))
 
 
+def sparse_file(path, size):
+    """A file of `size` bytes that takes no disk space: size checks never read content."""
+    with open(path, "wb") as handle:
+        handle.truncate(size)
+    return path
+
+
+class FileSendTests(unittest.TestCase):
+    MIB = 1024 * 1024
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def write(self, name, text="data"):
+        path = self.dir / name
+        path.write_text(text)
+        return path
+
+    def make_app(self, premium=False, events=None):
+        events = [] if events is None else events
+
+        class App:
+            me = SimpleNamespace(id=7, is_premium=premium)
+
+            async def resolve_peer(self, peer):
+                events.append(("resolve_peer", peer))
+                return peer
+
+            async def send_document(self, chat, document, **options):
+                events.append(("send_document", chat, document, options["caption"], options["file_name"]))
+                assert options["force_document"] is True
+                size = Path(document).stat().st_size
+                options["progress"](size // 2, size)
+                options["progress"](size, size)
+                return SimpleNamespace(id=40 + len([e for e in events if e[0] == "send_document"]), chat=SimpleNamespace(id=7))
+
+        return App(), events
+
+    def test_check_files_refuses_missing_empty_and_oversized_files(self):
+        from telegram_client.account import FileRefused, check_files
+
+        ok = self.write("ok.txt")
+        self.assertEqual(check_files([ok]), [(ok, 4)])
+        for path, code in [
+            (self.dir / "missing.txt", "FILE_MISSING"),
+            (self.dir, "FILE_MISSING"),
+            (self.write("empty.txt", ""), "FILE_EMPTY"),
+            (sparse_file(self.dir / "big.tar", 2000 * self.MIB + 1), "FILE_TOO_LARGE"),
+        ]:
+            with self.assertRaises(FileRefused) as caught:
+                check_files([ok, path])
+            self.assertEqual((str(caught.exception), caught.exception.file), (code, str(path)))
+        self.assertEqual(len(check_files([sparse_file(self.dir / "edge.tar", 2000 * self.MIB)])), 1)
+
+    def test_send_files_resolves_the_peer_first_and_sends_one_document_per_file(self):
+        from telegram_client.account import send_files
+
+        a, b = self.write("a.txt", "aaaa"), self.write("b.txt", "bb")
+        app, events = self.make_app()
+        sent, progress = [], []
+        result = run(send_files(app, "me", [a, b], " caption \n", on_sent=sent.append, write=progress.append))
+        self.assertEqual(
+            events,
+            [
+                ("resolve_peer", "me"),
+                ("send_document", "me", str(a), "caption", "a.txt"),
+                ("send_document", "me", str(b), "", "b.txt"),
+            ],
+        )
+        self.assertEqual(result, {"sent": True, "chat_id": 7, "message_id": 41, "message_ids": [41, 42]})
+        self.assertEqual([s["sent_file"] for s in sent], [str(a), str(b)])
+        self.assertEqual(progress[0], "tg: uploading a.txt: 50% (0.0 of 0.0 MiB)")
+        self.assertTrue(progress[1].startswith("tg: uploading a.txt: 100%"))
+        self.assertTrue(progress[-1].startswith("tg: uploading b.txt: 100%"))
+
+    def test_send_files_refuses_before_any_upload(self):
+        from telegram_client.account import send_files
+
+        big = sparse_file(self.dir / "big.tar", 2001 * self.MIB)
+        app, events = self.make_app()
+        with self.assertRaisesRegex(ClientError, "FILE_TOO_LARGE"):
+            run(send_files(app, "me", [self.write("a.txt"), big], ""))
+        with self.assertRaisesRegex(ClientError, "CAPTION_TOO_LONG"):
+            run(send_files(app, "me", [self.write("a.txt")], "x" * 1025))
+        with self.assertRaisesRegex(ClientError, "PEER_INVALID"):
+            run(send_files(app, "a b", [self.write("a.txt")], ""))
+        self.assertEqual(events, [])
+        premium, premium_events = self.make_app(premium=True)
+        run(send_files(premium, "me", [big], "", write=lambda line: None))
+        self.assertEqual(premium_events[-1][2], str(big))
+
+    def test_upload_progress_reports_each_five_percent_once(self):
+        from telegram_client.account import upload_progress
+
+        lines = []
+        report = upload_progress("x.bin", lines.append)
+        for current in (0, 1, 4, 5, 6, 99, 100):
+            report(current, 100)
+        self.assertEqual([line.split(": ")[2].split("%")[0] for line in lines], ["0", "5", "95", "100"])
+
+
 class TtsTests(unittest.TestCase):
     def test_engine_choice_and_argv_never_carry_the_text(self):
         from telegram_client.tts import tts_argv, tts_engine
@@ -589,6 +694,31 @@ class EntryTests(unittest.TestCase):
         sent = sidecar("personal", f"--store={self.root}", "send", "--peer=-100123", "--dry-run", stdin="hi")
         self.assertNotEqual(sent.returncode, 2, sent.stderr)
         self.assertTrue(json.loads(sent.stdout.splitlines()[-1])["dry_run"])
+
+    def test_send_dry_run_with_files_validates_offline_and_lists_them(self):
+        self.store.save("personal", dict(AUTH, origin="login"))
+        small = Path(self.temp.name) / "small.txt"
+        small.write_text("hello")
+        result = sidecar("personal", f"--store={self.root}", "send", "--peer=me", f"--file={small}", "--dry-run", stdin="test")
+        plan = json.loads(result.stdout.splitlines()[-1])
+        self.assertEqual(plan["files"], [{"path": str(small), "bytes": 5}])
+        self.assertEqual((plan["characters"], plan["user_id"]), (4, 7))
+        no_caption = sidecar("personal", f"--store={self.root}", "send", "--peer=me", f"--file={small}", "--dry-run", stdin="")
+        self.assertEqual(json.loads(no_caption.stdout.splitlines()[-1])["characters"], 0)
+        big = sparse_file(Path(self.temp.name) / "big.tar", 2000 * 1024 * 1024 + 1)
+        refused = sidecar("personal", f"--store={self.root}", "send", "--peer=me", f"--file={big}", "--dry-run", stdin="")
+        self.assertEqual(refused.returncode, 3)
+        self.assertEqual(
+            json.loads(refused.stdout.splitlines()[-1]),
+            {"ok": False, "error": "FILE_TOO_LARGE", "file": str(big), "limit_mib": 2000},
+        )
+        bad_peer = sidecar("personal", f"--store={self.root}", "send", "--peer=a b", f"--file={small}", "--dry-run", stdin="")
+        self.assertEqual(json.loads(bad_peer.stdout.splitlines()[-1])["error"], "PEER_INVALID")
+
+    def test_real_send_refuses_a_missing_file_before_connecting(self):
+        # No session at all: a connect attempt would answer SESSION_MISSING instead.
+        result = sidecar("personal", f"--store={self.root}", "send", "--peer=me", "--file=/nonexistent/x.tar", stdin="")
+        self.assertEqual(json.loads(result.stdout.splitlines()[-1])["error"], "FILE_MISSING")
 
     def test_generic_failure_reports_class_name_not_message(self):
         from contextlib import redirect_stdout

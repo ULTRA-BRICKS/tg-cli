@@ -102,6 +102,45 @@ describe('parseUserAccountArgs', () => {
     expect(parseUserAccountArgs(['user', 'send'])).toMatchObject({ kind: 'error' });
     expect(parseUserAccountArgs(['user', 'send', '@a', '--dry-run=yes'])).toMatchObject({ kind: 'error' });
   });
+
+  test('tg user send --file: repeatable, caption from argv, any order', () => {
+    expect(parseUserAccountArgs(['user', 'send', 'me', '--file', '/tmp/a.tar', '--file=/tmp/b.txt', 'for', 'review'])).toEqual({
+      kind: 'send', peer: 'me', text: 'for review', files: ['/tmp/a.tar', '/tmp/b.txt'], dryRun: false, json: false, sourceIdle: false,
+    });
+    expect(parseUserAccountArgs(['user', 'send', '--dry-run', 'me', '--file', 'a.txt'])).toEqual({
+      kind: 'send', peer: 'me', files: ['a.txt'], dryRun: true, json: false, sourceIdle: false,
+    });
+    expect(parseUserAccountArgs(['user', 'send', 'me', '--file'])).toMatchObject({ kind: 'error' });
+    expect(parseUserAccountArgs(['user', 'send', 'me', '--file', '--dry-run'])).toMatchObject({ kind: 'error' });
+  });
+
+  test('tg user send --file refuses a never-attach (secret) file, whatever else is attached', () => {
+    for (const secret of [
+      '.env', '/home/u/proj/.env.local', '~/.ssh/id_rsa', 'server.pem', 'credentials.json',
+      // The sidecar's Path() drops a trailing `/` and `/.`, so these would open a `.env`.
+      '/tmp/.env/', '/tmp/.env/.', '/tmp/.env/.//./', '/tmp/x/../.env//',
+    ]) {
+      const r = parseUserAccountArgs(['user', 'send', 'me', '--file', '/tmp/ok.txt', '--file', secret, 'hi']);
+      expect(r).toMatchObject({ kind: 'error' });
+      expect(r !== null && r.kind === 'error' ? r.message : '').toContain('never-attach denylist');
+    }
+  });
+
+  test('tg user send --file hands the sidecar the path as given (`..` is the filesystem\'s to resolve)', () => {
+    const files = ['/work/current/../report.pdf', '/tmp//a/./b.tar/', './c.txt', '/tmp/a/..'];
+    expect(parseUserAccountArgs(['user', 'send', 'me', ...files.flatMap((file) => ['--file', file])])).toMatchObject({ files });
+  });
+});
+
+describe('describeError FILE_TOO_LARGE', () => {
+  test('the split recipe quotes every path as one shell word, whatever it contains', () => {
+    const file = "/tmp/O'Brien $(touch pwned) `x`;.tar";
+    const message = describeError('FILE_TOO_LARGE', 'personal', 'me', { file, limitMib: 2000 });
+    const recipe = message.slice(message.indexOf('split -b 1900M -- ') + 'split -b 1900M -- '.length, message.indexOf(' (rejoin'));
+    // The shell reads the two quoted operands back as exactly the file and its part prefix.
+    const echoed = Bun.spawnSync(['sh', '-c', `printf '%s\\n' ${recipe}`]);
+    expect(new TextDecoder().decode(echoed.stdout)).toBe(`${file}\n${file}.part-\n`);
+  });
 });
 
 describe('sidecarInvocation', () => {
@@ -125,6 +164,12 @@ describe('sidecarInvocation', () => {
     const send = sidecarInvocation({ kind: 'send', peer: '-100123', text: 'secret plan', dryRun: false, json: false, sourceIdle: false }, store);
     expect(send).toEqual({ args: ['personal', `--store=${store}`, 'send', '--peer=-100123'], stdin: 'secret plan' });
     expect(send.args.join(' ')).not.toContain('secret plan');
+    expect(
+      sidecarInvocation({ kind: 'send', peer: 'me', text: 'cap', files: ['/tmp/a b.tar', '-dash.txt'], dryRun: true, json: false, sourceIdle: false }, store),
+    ).toEqual({
+      args: ['personal', `--store=${store}`, 'send', '--peer=me', '--file=/tmp/a b.tar', '--file=-dash.txt', '--dry-run'],
+      stdin: 'cap',
+    });
   });
 
   test('a build waiter outlasts any live build and never advises deleting a live lock', () => {
@@ -258,6 +303,67 @@ describe('tg → sidecar handoff (real binary, fake sidecar)', () => {
     expect(readFileSync(join(f.capture, 'stdin'), 'utf8')).toBe('meet at 5');
     expect(readFileSync(join(f.capture, 'argv'), 'utf8')).not.toContain('meet at 5');
     expect(r.stdout).toContain('31');
+  });
+
+  test('tg user send --file never waits on stdin and hands every file to the sidecar', async () => {
+    const f = fixture();
+    loggedIn(f.configDir, 'personal');
+    const out = '{"sent": true, "chat_id": 7, "message_id": 40, "message_ids": [40, 41]}';
+    const r = await tg(['user', 'send', 'me', '--file', '/tmp/a.tar', '--file', '/tmp/b.txt'], f, { TG_FAKE_STDOUT: out }, 'stdin must not be the caption');
+    expect(r.exitCode).toBe(0);
+    expect(readFileSync(join(f.capture, 'stdin'), 'utf8')).toBe('');
+    expect(readFileSync(join(f.capture, 'argv'), 'utf8').trimEnd().split('\n')).toEqual([
+      'personal', `--store=${join(f.configDir, 'mtproto')}`, 'send', '--peer=me', '--file=/tmp/a.tar', '--file=/tmp/b.txt',
+    ]);
+    expect(r.stdout).toContain('Sent 2 files to me as you (messages 40, 41)');
+  });
+
+  test('tg user send --file of a secret is exit 2 before any sidecar', async () => {
+    const f = fixture();
+    loggedIn(f.configDir, 'personal');
+    const r = await tg(['user', 'send', 'me', '--file', '/tmp/.env', 'hi'], f);
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain('never-attach denylist');
+    expect(existsSync(join(f.capture, 'argv'))).toBe(false);
+  });
+
+  test('a batch that fails part-way names the files that were already sent', async () => {
+    const f = fixture();
+    loggedIn(f.configDir, 'personal');
+    const out = [
+      '{"sent_file": "/tmp/a.tar", "bytes": 5, "chat_id": 7, "message_id": 40}',
+      '{"ok": false, "error": "CLIENT_OPERATION_FAILED", "detail": "FloodWait"}',
+    ].join('\n');
+    const r = await tg(['user', 'send', 'me', '--file', '/tmp/a.tar', '--file', '/tmp/b.tar'], f, { TG_FAKE_STDOUT: out, TG_FAKE_EXIT: '1' });
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain('[FloodWait]');
+    expect(r.stderr).toContain('Already sent: /tmp/a.tar (message 40).');
+    expect(r.stderr).not.toContain('b.tar');
+  });
+
+  test('a sidecar killed after a receipt is a failure that names the sent files, not a success', async () => {
+    const f = fixture();
+    loggedIn(f.configDir, 'personal');
+    const receipt = '{"sent_file": "/tmp/a.tar", "bytes": 5, "chat_id": 7, "message_id": 40}';
+    const r = await tg(['user', 'send', 'me', '--file', '/tmp/a.tar', '--file', '/tmp/b.tar'], f, { TG_FAKE_STDOUT: receipt, TG_FAKE_EXIT: '137' });
+    expect(r.exitCode).toBe(137);
+    expect(r.stdout).not.toContain('Sent');
+    expect(r.stderr).toContain('exited 137 without a result');
+    expect(r.stderr).toContain('Already sent: /tmp/a.tar (message 40).');
+  });
+
+  test('an oversized file is named with a split recipe; the dry-run plan lists files', async () => {
+    const f = fixture();
+    loggedIn(f.configDir, 'personal');
+    const big = '{"ok": false, "error": "FILE_TOO_LARGE", "file": "/tmp/big.tar", "limit_mib": 2000}';
+    const r = await tg(['user', 'send', 'me', '--file', '/tmp/big.tar'], f, { TG_FAKE_STDOUT: big, TG_FAKE_EXIT: '3' });
+    expect(r.exitCode).toBe(3);
+    expect(r.stderr).toContain("'/tmp/big.tar' is over the 2000 MiB");
+    expect(r.stderr).toContain('split -b 1900M');
+    const plan = { dry_run: true, peer: 'me', characters: 4, user_id: 7, missing: [], ready: true, files: [{ path: '/tmp/a.txt', bytes: 3 * 1024 * 1024 }] };
+    const dry = await tg(['user', 'send', 'me', '--dry-run', '--file', '/tmp/a.txt', 'test'], f, { TG_FAKE_STDOUT: JSON.stringify(plan) });
+    expect(dry.exitCode).toBe(0);
+    expect(dry.stdout).toContain('Dry run: ready to send 1 file (3.0 MiB) with a 4-character caption to me as id 7.');
   });
 
   test('a sidecar error code becomes a human message with the same exit code; --json stays raw', async () => {

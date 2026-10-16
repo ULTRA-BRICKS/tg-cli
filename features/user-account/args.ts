@@ -5,6 +5,8 @@
 // Exact-match leading tokens only, like `replies`/`voice`: `null` means "not ours", so
 // `tg "call me later"` (one quoted argument) and `tg user find x` keep their old meaning.
 
+import { isNeverAttach } from '../auto-attach/denylist';
+
 /** The sidecar's two accounts: the user's own (`personal`) and a separate one that rings it. */
 export type Role = 'personal' | 'caller';
 
@@ -27,7 +29,7 @@ export type UserAccountCommand =
       dryRun: boolean;
       sourceIdle: boolean;
     } & Output)
-  | ({ kind: 'send'; peer: string; text?: string; dryRun: boolean; sourceIdle: boolean } & Output);
+  | ({ kind: 'send'; peer: string; text?: string; files?: string[]; dryRun: boolean; sourceIdle: boolean } & Output);
 
 export type HelpTopic = 'call' | 'user-send';
 
@@ -42,12 +44,16 @@ export type AccountAuthArgs = UserAccountCommand | { kind: 'help' } | { kind: 'e
 interface Scanned {
   positionals: string[];
   flags: Map<string, string | true>;
+  /** Values of the `repeated` flags, in argv order. */
+  lists: Map<string, string[]>;
   error?: string;
 }
 
 interface ScanSpec {
   valued: readonly string[];
   booleans: readonly string[];
+  /** Valued flags that may be given more than once (`--file a --file b`). */
+  repeated?: readonly string[];
   /** `--` ends options (only where free text follows: `tg user send`). */
   endOfOptions?: boolean;
 }
@@ -60,8 +66,10 @@ interface ScanSpec {
 function scan(argv: string[], spec: ScanSpec): Scanned {
   const positionals: string[] = [];
   const flags = new Map<string, string | true>();
-  const known = [...spec.valued, ...spec.booleans];
-  const fail = (error: string): Scanned => ({ positionals, flags, error });
+  const lists = new Map<string, string[]>();
+  const repeated = spec.repeated ?? [];
+  const known = [...spec.valued, ...repeated, ...spec.booleans];
+  const fail = (error: string): Scanned => ({ positionals, flags, lists, error });
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--' && spec.endOfOptions) {
@@ -81,19 +89,20 @@ function scan(argv: string[], spec: ScanSpec): Scanned {
     if (spec.booleans.includes(name)) {
       if (eq !== -1) return fail(`${name} takes no value.`);
       flags.set(name, true);
-    } else if (spec.valued.includes(name)) {
+    } else if (spec.valued.includes(name) || repeated.includes(name)) {
       const value = eq === -1 ? argv[++i] : arg.slice(eq + 1);
       if (value === undefined || value === '') return fail(`${name} needs a value.`);
       if (eq === -1 && value.startsWith('-')) {
         return fail(`${name} needs a value, got the flag-like '${value}'. For a value that starts with '-', write ${name}=<value>.`);
       }
       if (known.includes(value) || value === '--help') return fail(`${name} needs a value, not the flag ${value}.`);
-      flags.set(name, value);
+      if (repeated.includes(name)) lists.set(name, [...(lists.get(name) ?? []), value]);
+      else flags.set(name, value);
     } else {
       return fail(`unknown option ${name}.`);
     }
   }
-  return { positionals, flags };
+  return { positionals, flags, lists };
 }
 
 function value(s: Scanned, flag: string): string | undefined {
@@ -194,15 +203,32 @@ function parseCall(argv: string[]): UserAccountArgs {
 }
 
 function parseSend(argv: string[]): UserAccountArgs {
-  const s = scan(argv, { valued: [], booleans: ['--dry-run', '--json', '--source-idle-confirmed'], endOfOptions: true });
+  const s = scan(argv, {
+    valued: [],
+    repeated: ['--file'],
+    booleans: ['--dry-run', '--json', '--source-idle-confirmed'],
+    endOfOptions: true,
+  });
   if (s.error) return error(s.error, 'user-send');
   if (s.flags.has('--help')) return { kind: 'help', topic: 'user-send' };
   const [peer, ...words] = s.positionals;
   if (peer === undefined) return error('missing <peer> (@username, numeric id, or me).', 'user-send');
+  const files = s.lists.get('--file') ?? [];
+  // The bot send's never-attach denylist (features/auto-attach/denylist.ts): an explicit
+  // secret attach is almost certainly a leak, so it is an error, never a silent skip. There
+  // is no override here — the user account sends as the user, to anyone. The name checked is
+  // the one the sidecar opens: Python's Path() drops trailing `/` and `/.` (`/x/.env/.` opens
+  // `/x/.env`) but keeps `..`, which only the filesystem may resolve (symlinks), so the path
+  // itself goes over unchanged.
+  const secret = files.find((file) => isNeverAttach(file.replace(/(?:\/+\.?)+$/, '')));
+  if (secret !== undefined) {
+    return error(`refusing to attach '${secret}': matches the never-attach denylist (secrets).`, 'user-send');
+  }
   return {
     kind: 'send',
     peer,
     ...(words.length > 0 ? { text: words.join(' ') } : {}),
+    ...(files.length > 0 ? { files } : {}),
     dryRun: s.flags.has('--dry-run'),
     json: s.flags.has('--json'),
     sourceIdle: s.flags.has('--source-idle-confirmed'),

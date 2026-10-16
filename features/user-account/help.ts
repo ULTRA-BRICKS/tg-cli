@@ -29,9 +29,16 @@ Example: tg call me --say "Тони написал в Telegram"`;
 const USER_SEND = `Usage:
   tg user send <peer> [text…]      send as YOUR account (tg auth user); text or stdin
   echo "text" | tg user send <peer>
+  tg user send <peer> --file <path> [--file <path>…] [caption…]
   tg user send <peer> -- --text that starts with dashes
   <peer>   @username, numeric id (negative for groups), or me (Saved Messages)
-  --dry-run   validate without connecting (anywhere before \`--\`); --json raw output
+  --file <path>   send the file as a document (repeatable): one message per file, the
+                  caption (from the arguments only, optional) on the first; upload
+                  progress per file on stderr. Up to 2000 MiB per file (4000 MiB on a
+                  Premium account; --dry-run checks 2000) — split bigger files.
+                  Secret-looking files (.env, keys, credentials) are refused.
+  --dry-run   validate peer, text and files without connecting (anywhere before \`--\`)
+  --json      raw sidecar output (one line per sent file, then the result)
   --source-idle-confirmed   required for an imported session`;
 
 export const USER_ACCOUNT_HELP: Record<HelpTopic, string> = {

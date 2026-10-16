@@ -94,7 +94,14 @@ export function sidecarInvocation(cmd: UserAccountCommand, store: string): Sidec
       };
     case 'send':
       return {
-        args: [...head, 'send', `--peer=${cmd.peer}`, ...(cmd.dryRun ? ['--dry-run'] : []), ...idle],
+        args: [
+          ...head,
+          'send',
+          `--peer=${cmd.peer}`,
+          ...(cmd.files ?? []).map((file) => `--file=${file}`),
+          ...(cmd.dryRun ? ['--dry-run'] : []),
+          ...idle,
+        ],
         stdin: cmd.text ?? '',
       };
   }

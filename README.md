@@ -592,6 +592,7 @@ The bot can't call anyone or write as you. `tg` can, through your own Telegram a
 tg auth user                         # once: phone + code (+ 2FA) on this terminal; or --qr
 tg call @alice --say "Встреча через 5 минут"   # ring and speak (or --audio file.ogg)
 tg user send @alice "on my way"      # send as you (text or stdin)
+tg user send me --file report.tar.zst "for review"   # files as you, ≤2000 MiB each, progress on stderr
 tg auth caller                       # a SECOND account, so tg can ring you:
 tg call me --say "Тони написал в Telegram"
 tg call @alice --audio note.ogg --dry-run       # check everything, connect to nothing

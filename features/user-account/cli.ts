@@ -24,14 +24,18 @@ export interface UserAccountDeps {
   errlog: (line: string) => void;
 }
 
-function lastJson(stdout: string): Record<string, unknown> | null {
-  const lines = stdout.trim().split('\n').filter((l) => l.trim() !== '');
+function parseObject(line: string): Record<string, unknown> | null {
   try {
-    const value: unknown = JSON.parse(lines[lines.length - 1] ?? '');
+    const value: unknown = JSON.parse(line);
     return typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
   } catch {
     return null;
   }
+}
+
+function lastJson(stdout: string): Record<string, unknown> | null {
+  const lines = stdout.trim().split('\n').filter((l) => l.trim() !== '');
+  return parseObject(lines[lines.length - 1] ?? '');
 }
 
 export async function runUserAccount(parsed: UserAccountArgs, deps: UserAccountDeps): Promise<number> {
@@ -51,7 +55,9 @@ export async function runUserAccount(parsed: UserAccountArgs, deps: UserAccountD
       return 3;
     }
   }
-  if (cmd.kind === 'send' && cmd.text === undefined) {
+  // With --file the caption comes from the arguments only (none is fine): stdin is never
+  // waited on, so an agent's open-but-silent stdin cannot hang a file send.
+  if (cmd.kind === 'send' && cmd.text === undefined && cmd.files === undefined) {
     const text = await deps.readStdin();
     if (text === null) {
       deps.errlog('Error: no message text. Pass it after the peer or pipe it on stdin. See `tg user send --help`.');
@@ -71,17 +77,34 @@ export async function runUserAccount(parsed: UserAccountArgs, deps: UserAccountD
     return run.exitCode;
   }
   const out = lastJson(run.stdout);
-  if (out === null) {
+  // A `sent_file` line is the receipt for one file of a `--file` batch, never the command's
+  // result: a sidecar killed after delivering some files ends on one.
+  if (out === null || typeof out.sent_file === 'string') {
     deps.errlog(`Error: the Telegram sidecar exited ${run.exitCode} without a result.`);
+    reportAlreadySent(run.stdout, deps.errlog);
     return run.exitCode === 0 ? 1 : run.exitCode;
   }
   if (typeof out.error === 'string') {
     const role = cmd.kind === 'send' ? 'personal' : cmd.role;
     const peer = cmd.kind === 'call' || cmd.kind === 'send' ? cmd.peer : undefined;
     const detail = typeof out.detail === 'string' ? ` [${out.detail}]` : '';
-    deps.errlog(describeError(out.error, role, peer) + detail);
+    const file = typeof out.file === 'string' ? out.file : undefined;
+    const limitMib = typeof out.limit_mib === 'number' ? out.limit_mib : undefined;
+    deps.errlog(describeError(out.error, role, peer, { file, limitMib }) + detail);
+    reportAlreadySent(run.stdout, deps.errlog);
     return run.exitCode === 0 ? 1 : run.exitCode;
   }
   deps.log(describeResult(cmd, out));
   return run.exitCode;
+}
+
+/**
+ * A `--file` batch that failed part-way already delivered the earlier files: name them, so a
+ * retry resends only the rest instead of duplicating what arrived.
+ */
+function reportAlreadySent(stdout: string, errlog: (line: string) => void): void {
+  for (const line of stdout.split('\n')) {
+    const sent = parseObject(line);
+    if (typeof sent?.sent_file === 'string') errlog(`Already sent: ${sent.sent_file} (message ${String(sent.message_id)}).`);
+  }
 }

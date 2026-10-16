@@ -12,9 +12,18 @@ export function notLoggedIn(role: Role, path: string): string {
   return `Error: not logged in to ${who} (no ${path}). Run: ${authCommand(role)}`;
 }
 
-export function describeError(code: string, role: Role, peer?: string): string {
+/** The `--file` a sidecar refusal is about, and the upload limit it hit. */
+export interface FileRefusal {
+  file?: string;
+  limitMib?: number;
+}
+
+export function describeError(code: string, role: Role, peer?: string, refusal: FileRefusal = {}): string {
   const auth = authCommand(role);
   const target = peer ?? 'the peer';
+  const file = refusal.file ?? 'the file';
+  const limit = refusal.limitMib ?? 2000;
+  const parts = shellWord(`${file}.part-`);
   const text: Record<string, string> = {
     SESSION_MISSING: `not logged in. Run: ${auth}`,
     SESSION_ALREADY_EXISTS: `already logged in. To switch accounts run \`${auth} logout\`, then \`${auth}\`.`,
@@ -39,12 +48,23 @@ export function describeError(code: string, role: Role, peer?: string): string {
     TTS_FAILED: 'text-to-speech failed. Pass a recorded file with --audio <file>.',
     TEXT_EMPTY: 'the message text is empty.',
     TEXT_TOO_LONG: 'the text is too long (send: 4096 characters, --say: 1000).',
+    CAPTION_TOO_LONG: 'the caption is too long (1024 characters with --file).',
+    FILE_MISSING: `'${file}' is not a readable regular file.`,
+    FILE_EMPTY: `'${file}' is empty; Telegram does not take empty files.`,
+    FILE_TOO_LARGE:
+      `'${file}' is over the ${limit} MiB per-file upload limit. Split it and send the parts: ` +
+      `split -b 1900M -- ${shellWord(file)} ${parts} (rejoin with cat -- ${parts}* > ${shellWord(file)}).`,
     CLIENT_ALREADY_RUNNING: 'another tg process is using this account right now; try again when it finishes.',
     INSECURE_STORE_DIRECTORY: 'the session directory is not private (must be yours, mode 0700).',
     INSECURE_STORE_FILE: 'the session file is not private (must be yours, mode 0600).',
     INVALID_AUTH_STORE: `the session file is unreadable. Run \`${auth} logout\`, then \`${auth}\`.`,
   };
   return `Error: ${text[code] ?? `the Telegram sidecar failed (${code}).`}`;
+}
+
+/** One POSIX shell word, so a copied recovery command survives quotes and metacharacters. */
+function shellWord(text: string): string {
+  return `'${text.replaceAll("'", `'\\''`)}'`;
 }
 
 type Json = Record<string, unknown>;
@@ -74,11 +94,31 @@ export function describeResult(cmd: UserAccountCommand, out: Json): string {
       }
       return `Called ${cmd.peer}: the audio played to the end.`;
     case 'send': {
-      if (!out.dry_run) return `Sent to ${cmd.peer} as you (message ${out.message_id}).`;
+      if (!out.dry_run) {
+        const ids = Array.isArray(out.message_ids) ? out.message_ids : [];
+        return ids.length > 0
+          ? `Sent ${ids.length} file${ids.length === 1 ? '' : 's'} to ${cmd.peer} as you (message${ids.length === 1 ? '' : 's'} ${ids.join(', ')}).`
+          : `Sent to ${cmd.peer} as you (message ${out.message_id}).`;
+      }
       const missing = Array.isArray(out.missing) ? out.missing : [];
+      const files: unknown[] = Array.isArray(out.files) ? out.files : [];
+      const bytes = files.reduce<number>(
+        (sum, f) => sum + (typeof f === 'object' && f !== null && 'bytes' in f && typeof f.bytes === 'number' ? f.bytes : 0),
+        0,
+      );
+      const what = files.length > 0
+        ? `${files.length} file${files.length === 1 ? '' : 's'} (${size(bytes)})` +
+          (Number(out.characters) > 0 ? ` with a ${out.characters}-character caption` : '')
+        : `${out.characters} characters`;
       return missing.length === 0
-        ? `Dry run: ready to send ${out.characters} characters to ${cmd.peer} as id ${out.user_id}.`
+        ? `Dry run: ready to send ${what} to ${cmd.peer} as id ${out.user_id}.`
         : `Dry run: not ready to send to ${cmd.peer}; missing: ${missing.join(', ')}.`;
     }
   }
+}
+
+function size(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
 }

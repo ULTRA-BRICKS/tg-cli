@@ -8,7 +8,9 @@ import asyncio
 from contextlib import redirect_stdout
 import getpass
 import os
+from pathlib import Path
 import re
+import stat
 import sys
 import time
 
@@ -19,6 +21,12 @@ ROLES = ("personal", "caller")
 USERNAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,31}")
 QR_DEADLINE_SECONDS = 300
 TEXT_LIMIT = 4096
+CAPTION_LIMIT = 1024
+MIB = 1024 * 1024
+# Telegram's per-file upload limit (pyrogram's save_file enforces the same numbers). A dry run
+# connects to nothing, so it cannot see Premium and checks the 2000 MiB limit.
+UPLOAD_LIMIT_MIB = 2000
+PREMIUM_UPLOAD_LIMIT_MIB = 4000
 # pyrogram's own names for "this account cannot see that peer" (matched by name so this
 # module imports no Telegram library). A builtin like KeyError is deliberately absent: it
 # would turn an unrelated bug into a confident "peer not found".
@@ -262,3 +270,79 @@ async def send_text(app, peer, text):
     target = parse_peer(peer, allow_chats=True)
     message = await with_peer_warmup(app, lambda: app.send_message(target, text))
     return {"sent": True, "chat_id": message.chat.id, "message_id": message.id}
+
+
+class FileRefused(ClientError):
+    """A refusal about one `--file`: `tg` names the file (and the limit) in its message."""
+
+    def __init__(self, code, path, limit_mib=None):
+        super().__init__(code)
+        self.file = str(path)
+        self.limit_mib = limit_mib
+
+
+def check_files(paths, limit_mib=UPLOAD_LIMIT_MIB):
+    """[(path, bytes)] for files Telegram would take. Stat only: a file is never read here."""
+    checked = []
+    for path in paths:
+        path = Path(path).expanduser()
+        try:
+            info = path.stat()
+        except OSError:
+            raise FileRefused("FILE_MISSING", path) from None
+        if not stat.S_ISREG(info.st_mode) or not os.access(path, os.R_OK):
+            raise FileRefused("FILE_MISSING", path)
+        if info.st_size == 0:
+            raise FileRefused("FILE_EMPTY", path)
+        if info.st_size > limit_mib * MIB:
+            raise FileRefused("FILE_TOO_LARGE", path, limit_mib)
+        checked.append((path, info.st_size))
+    return checked
+
+
+def validate_caption(text):
+    if len(text) > CAPTION_LIMIT:
+        raise ClientError("CAPTION_TOO_LONG")
+    return text
+
+
+def upload_progress(name, write=err):
+    """pyrogram progress callback: one stderr line per 5% of this file, so a 2 GB upload
+    shows it is alive without flooding a captured log."""
+    shown = -1
+
+    def report(current, total):
+        nonlocal shown
+        percent = current * 100 // total if total else 100
+        step = percent - percent % 5
+        if step > shown:
+            shown = step
+            write(f"tg: uploading {name}: {step}% ({current / MIB:.1f} of {total / MIB:.1f} MiB)")
+
+    return report
+
+
+async def send_files(app, peer, files, caption, on_sent=lambda sent: None, write=err):
+    """One send_document per file, the caption on the first. The peer is resolved before any
+    upload, so a wrong peer never costs a multi-gigabyte transfer; pyrogram streams each file
+    from disk in chunks."""
+    caption = validate_caption(caption.strip())
+    target = parse_peer(peer, allow_chats=True)
+    premium = getattr(app.me, "is_premium", False) is True
+    checked = check_files(files, PREMIUM_UPLOAD_LIMIT_MIB if premium else UPLOAD_LIMIT_MIB)
+    await with_peer_warmup(app, lambda: app.resolve_peer(target))
+    ids = []
+    chat_id = None
+    for index, (path, size) in enumerate(checked):
+        message = await app.send_document(
+            target,
+            str(path),
+            caption=caption if index == 0 else "",
+            file_name=path.name,
+            force_document=True,
+            progress=upload_progress(path.name, write),
+        )
+        chat_id = message.chat.id
+        ids.append(message.id)
+        on_sent({"sent_file": str(path), "bytes": size, "chat_id": chat_id, "message_id": message.id})
+    return {"sent": True, "chat_id": chat_id, "message_id": ids[0], "message_ids": ids}

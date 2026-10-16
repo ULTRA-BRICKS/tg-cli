@@ -90,8 +90,18 @@ def parser(role):
             help="offline duplex integration with fake audio; no call or provider network",
         )
     else:
-        q = commands.add_parser("send", help="send stdin text as the user")
+        q = commands.add_parser(
+            "send", help="send stdin text as the user; with --file, stdin is the caption"
+        )
         q.add_argument("--peer", required=True, help="@username, numeric id, or me (Saved Messages)")
+        q.add_argument(
+            "--file",
+            dest="files",
+            action="append",
+            type=Path,
+            default=[],
+            help="send this file as a document (repeatable; one message each, caption on the first)",
+        )
         q.add_argument("--dry-run", action="store_true")
         q.add_argument("--source-session-idle-confirmed", action="store_true")
         q = commands.add_parser(
@@ -272,33 +282,58 @@ async def call(store, role, args):
     return 0
 
 
+def send_plan(store, args, text):
+    """Offline `send --dry-run`: the same validation a real send runs before connecting."""
+    from .account import check_files, parse_peer, validate_caption, validate_text
+
+    files = check_files(args.files)
+    if files:
+        validate_caption(text.strip())
+    else:
+        validate_text(text)
+    parse_peer(args.peer, allow_chats=True)
+    auth, missing = session_preflight(store, "personal", args.source_session_idle_confirmed)
+    if importlib.util.find_spec("pyrogram") is None:
+        missing.append("client_library")
+    plan = {
+        "dry_run": True,
+        "peer": args.peer,
+        "characters": len(text.strip()) if files else len(text),
+        "user_id": auth["expected_id"] if auth else None,
+        "missing": missing,
+        "ready": not missing,
+    }
+    if files:
+        plan["files"] = [{"path": str(path), "bytes": size} for path, size in files]
+    return plan
+
+
 async def send(store, args):
-    from .account import parse_peer, send_text, validate_text
+    from .account import (
+        PREMIUM_UPLOAD_LIMIT_MIB,
+        check_files,
+        send_files,
+        send_text,
+        validate_caption,
+    )
 
     text = sys.stdin.read()
     if args.dry_run:
-        validate_text(text)
-        parse_peer(args.peer, allow_chats=True)
-        auth, missing = session_preflight(
-            store, "personal", args.source_session_idle_confirmed
-        )
-        if importlib.util.find_spec("pyrogram") is None:
-            missing.append("client_library")
-        emit(
-            {
-                "dry_run": True,
-                "peer": args.peer,
-                "characters": len(text),
-                "user_id": auth["expected_id"] if auth else None,
-                "missing": missing,
-                "ready": not missing,
-            }
-        )
-        return 0 if not missing else 3
+        plan = send_plan(store, args, text)
+        emit(plan)
+        return 0 if plan["ready"] else 3
+    if args.files:
+        # Refuse a missing or oversized file and a long caption before connecting; send_files
+        # re-checks the size against the account's real limit (Premium or not) once connected.
+        check_files(args.files, limit_mib=PREMIUM_UPLOAD_LIMIT_MIB)
+        validate_caption(text.strip())
     async with connected(
         store, "personal", source_idle_confirmed=args.source_session_idle_confirmed
     ) as app:
-        emit(await send_text(app, args.peer, text))
+        if args.files:
+            emit(await send_files(app, args.peer, args.files, text, on_sent=emit))
+        else:
+            emit(await send_text(app, args.peer, text))
     return 0
 
 
@@ -480,7 +515,12 @@ def main(role, argv=None):
     try:
         return asyncio.run(execute(role, args))
     except ClientError as error:
-        emit({"ok": False, "error": str(error)})
+        result = {"ok": False, "error": str(error)}
+        if getattr(error, "file", None) is not None:
+            result["file"] = error.file
+        if getattr(error, "limit_mib", None) is not None:
+            result["limit_mib"] = error.limit_mib
+        emit(result)
         return 3
     except KeyboardInterrupt:
         emit({"ok": False, "error": "INTERRUPTED"})

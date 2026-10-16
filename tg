@@ -190,6 +190,8 @@ As YOUR Telegram account (MTProto; see \`tg help auth\`, \`tg call --help\`):
   tg call @alice --say "text"   ring a user and speak (or --audio file.ogg)
   tg call me --say "text"       ring YOURSELF from the caller account
   tg user send @alice "text"    send as you (text or stdin)
+  tg user send me --file a.tar "caption"   send files as you, up to 2000 MiB each
+                                (tg user send --help)
 
 The global options (--format, --tag, --title, --subagent, --reply-to, --topic, the feature
 toggles) apply to ANY of the bot send forms above — see Options below. The account
