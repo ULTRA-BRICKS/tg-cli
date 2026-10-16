@@ -171,6 +171,21 @@ in `CtlPaths.alertThrottle` (`--window`, default 10 min; `--force` bypasses). So
 (`riglib/sysmon_daemon/alert.py`) and `~/.cache/omp-supervisor/watch.sh`. Lifecycle proof:
 `tests/ctl-alert-lifecycle-integration.test.ts`.
 
+Exclusive holder (tg-cli#747): the same store carries `holders` (at most one per source,
+additive — an old store parses as `holders: []`, `STORE_VERSION` stays 1). The rules
+(`holderState`, `claimHolder`, `requestHandoff`, `grantHandoff`, `denyHandoff`, `takeHolder`,
+`releaseHolder`, `refreshHolder`, `markHolderDelivery`) are pure; every slot change runs under the
+store lock so two concurrent `subscribe --exclusive` have exactly one winner, and notes into
+sessions are sent after the lock. State: vacant (none / expired / deliveries failing ≥
+`HOLDER_GRACE_MS`) → bound (endpoint with the session id) → suspended (seen live <
+`HOLDER_GRACE_MS` ago) → vacant. `send --to-holder` never spawns `tg` and ignores
+non-exclusive subscriptions; it reads the holder state BEFORE claiming (vacant/suspended leave no
+claim), its throttle key is `holder:<holder session>:<source|key|severity>` (a handoff starts a
+fresh window), settled with `messageId: 0` (`settleHolderAlert`, fenced on the claim's `at`); a
+failed send releases its own claim. `markHolderDelivery` is fenced on the tenure (session id +
+`since`). Known limits: docs/alert-holder.md.
+`unsubscribe --all` never touches holders.
+
 ### Harness-agnostic control: tmux panes and rig-wrapper hosts (docs/specs/2026-09-30-harness-agnostic-control.md)
 
 A harness session (omp, Claude Code, Codex, opencode) is reached through the terminal that

@@ -3,6 +3,22 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.66.0
+
+- **One session holds a source's alerts (#747).** `tg-ctl alert subscribe --exclusive --source
+  sysmon` makes the calling omp session the only **holder** of that source; another session is
+  refused with exit 3 naming the holder and the `handoff-request` command. A request delivers a
+  note to the holder, which runs `handoff --to <session>` (live sessions only) or `--deny`; a
+  request unanswered for 10 minutes lets the requester `take` the slot, as does a vacant one.
+  `release` and `holder [--json]` (exit 3 when vacant) complete the set. The holder is keyed by
+  the omp session id: a resume keeps it under the new pid, a vanished endpoint keeps it for 10
+  minutes (suspended), deliveries failing for 10 minutes free it. `tg-ctl alert send
+  --to-holder` delivers `[alert <source> · <severity> · <key>] <text>` into the holder only —
+  never Telegram, never the non-exclusive subscribers — and exits 0 / 3 (`VACANT`) / 5
+  (`SUSPENDED`, `FAILED`), releasing its throttle claim when nothing was delivered so the
+  monitor's retry goes through. Stores written by older versions load unchanged; `unsubscribe
+  --all` leaves holders alone.
+
 ## 1.65.2
 
 - **A pid that answers EPERM is alive (#748).** `kill(pid, 0)` fails with EPERM when the

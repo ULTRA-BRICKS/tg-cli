@@ -292,6 +292,21 @@ under its new pid — nothing to re-run. A repeat of the same (source, key, seve
 goes through. `tg-ctl alert list` / `unsubscribe [--pid|--session|--all]`. rig sysmon's Telegram
 alert and the omp-supervisor watcher's OVERLOAD/EMERGENCY reports feed it.
 
+**Exclusive holder (v1.66.0, tg-cli#747).** For a source exactly one session should handle
+(rig sysmon), a session runs `tg-ctl alert subscribe --exclusive --source sysmon` and becomes its
+**holder**; a second session is refused (exit 3) with who holds it and how to ask:
+`tg-ctl alert handoff-request --source sysmon --reason '…'` leaves a request and delivers a note
+to the holder (one request is pending at a time), which answers `tg-ctl alert handoff --source sysmon --to <session id>` (to a live
+session) or `--deny --reason '…'`; a request unanswered for 10 minutes lets the requester
+`tg-ctl alert take --source sysmon` (as does a vacant slot). `release` gives it up;
+`holder --source sysmon [--json]` shows it (exit 3 when vacant). A monitor then fires
+`tg-ctl alert send --to-holder …`: the alert is delivered as `[alert sysmon · warning · swap] …`
+into the holder only — never Telegram — and exits 0 (`OK holder …`), 3 (`VACANT`) or 5
+(`SUSPENDED` / `FAILED`), so the monitor knows nobody got it. A holder whose endpoint vanished
+stays the holder for 10 minutes (an `omp --resume` keeps it under its new pid), as does one whose
+deliveries keep failing; after that the slot is vacant. Details and known limits:
+[docs/alert-holder.md](docs/alert-holder.md).
+
 ### Q→buttons (v1.5.0, seamless setup in v1.6.0)
 Agent questions and permission prompts are forwarded to Telegram as inline buttons — no need to touch the terminal. Tap to answer; the answer is injected back into the pane immediately. Supports Claude Code question/permission shapes, Codex `PermissionRequest`, and opencode `question.asked`/`permission.asked` events.
 

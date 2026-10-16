@@ -195,6 +195,32 @@ import {
   throttleKey,
   throttleVerdict,
   upsertAlertSubscription,
+  claimHolder,
+  denyHandoff,
+  grantHandoff,
+  handoffDeniedNote,
+  handoffGrantedNote,
+  handoffRequestNote,
+  holderRefusal,
+  holderRequestId,
+  holderState,
+  holderAlertText,
+  HOLDER_TEXT_MAX_BYTES,
+  holderTakenNote,
+  markHolderDelivery,
+  settleHolderAlert,
+  holderThrottleKey,
+  releaseHolderClaim,
+  deliverWithStaleRetry,
+  refreshHolder,
+  releaseHolder,
+  requestHandoff,
+  withdrawRequest,
+  takeHolder,
+  type AlertHolder,
+  type Claimant,
+  type HolderOutcome,
+  type HolderState,
   type AlertBinding,
   type AlertCommand,
   type AlertMessage,
@@ -614,7 +640,21 @@ export const USAGE = `Usage:
                          # one named) to monitoring alerts, keyed by its omp session id: a
                          # closed session is unbound by itself, a resumed one rebinds by
                          # itself; --ttl 0 = no expiry (tg-cli#636)
+  tg-ctl alert subscribe --exclusive --source S [--pid N | --session ID] [--ttl 12h]
+                         # become the ONLY holder of source S (exit 3 + who holds it when
+                         # taken); "send --to-holder" alerts go to that session alone (tg-cli#747)
+  tg-ctl alert handoff-request --source S [--reason R] [--pid N | --session ID]
+                         # ask the holder for S (a note reaches it; exit 5 + withdrawn when it
+                         # cannot); unanswered for 10 min → take
+  tg-ctl alert handoff --source S (--to SESSION | --deny [--reason R]) [--pid N | --session ID]
+                         # the holder hands S to a LIVE session, or denies the pending request
+  tg-ctl alert take --source S [--ttl 12h] [--pid N | --session ID]
+                         # claim S when vacant, or after your request went unanswered 10 min
+  tg-ctl alert release --source S [--pid N | --session ID]
+  tg-ctl alert holder --source S [--json]
+                         # bound | suspended (endpoint gone < 10 min) | vacant (exit 3)
   tg-ctl alert unsubscribe [--pid N | --session ID | --all]
+                         # --all removes non-exclusive subscriptions only, never a holder
   tg-ctl alert list [--json]
   tg-ctl alert send --source S --severity info|warning|critical --key K --text T
                     [--title T] [--html] [--window 10m] [--force]
@@ -622,6 +662,13 @@ export const USAGE = `Usage:
                          # агенту: <title> (pid N)" per bound session), then deliver
                          # "[alert tg#<id> · S · severity] T" into every bound session;
                          # a repeat of (source,key,severity) inside --window is throttled
+  tg-ctl alert send --to-holder --source S --severity … --key K --text T [--window 10m] [--force]
+                         # deliver "[alert S · severity · K] T" into S's holder ONLY — never
+                         # Telegram, never subscribers: exit 0 OK/throttled, 3 VACANT,
+                         # 5 SUSPENDED or FAILED (the claim is released, so a retry delivers).
+                         # Known limits: a send racing a handoff may still reach the previous
+                         # holder (the next send goes to the new one); a pre-1.66 tg-ctl that
+                         # rewrites the store drops its holders
   tg-ctl install-hooks   # wire q→buttons + StopFailure + Claude/Codex usage telemetry
                          #   (codex: delegates to rig when present — rig owns ~/.codex hooks)
   tg-ctl voice-setup [--dry-run]
@@ -2738,6 +2785,16 @@ async function runAlertCommand(ctx: Ctx, argv: string[]): Promise<number> {
       return runAlertUnsubscribe(host, command)
     case "send":
       return runAlertSend(host, command)
+    case "handoff-request":
+      return runAlertHandoffRequest(host, command)
+    case "handoff":
+      return runAlertHandoff(host, command)
+    case "take":
+      return runAlertTake(host, command)
+    case "release":
+      return runAlertRelease(host, command)
+    case "holder":
+      return runAlertHolder(host, command)
   }
 }
 
@@ -2785,8 +2842,9 @@ function resolveAlertSession(host: AlertHost, pid: number | null, sessionId: str
   return { ok: false, error: "no live omp session among this process's ancestors (a tmux pane descends from the tmux server, not from omp): pass --pid <omp pid> or --session <omp session id>" }
 }
 
-function runAlertSubscribe(host: AlertHost, command: Extract<AlertCommand, { cmd: "subscribe" }>): number {
+function runAlertSubscribe(host: AlertHost, command: Extract<AlertCommand, { cmd: "subscribe" }>): Promise<number> | number {
   if (host.registryError) return 1
+  if (command.exclusive && command.source !== null) return runAlertExclusiveSubscribe(host, command.source, command)
   const target = resolveAlertSession(host, command.pid, command.sessionId)
   if (!target.ok) {
     console.error(`tg-ctl alert: ${target.error}`)
@@ -2815,11 +2873,185 @@ function runAlertSubscribe(host: AlertHost, command: Extract<AlertCommand, { cmd
   return 0
 }
 
+// --- exclusive holder (tg-cli#747): one session per source receives `send --to-holder` ---
+// Every slot change happens under the subscription-store lock (two sessions claiming at
+// once: exactly one wins); notes into sessions are delivered after the lock is released.
+
+type HolderStep = { outcome: HolderOutcome; state: HolderState; prior: AlertHolder | null; denied?: { sessionId: string } | null }
+
+// The caller of a holder command as a claimant: --session, --pid or the nearest live omp.
+// `requireLive`: the acting session must have a live omp-live endpoint (claim, request, take).
+function resolveAlertClaimant(host: AlertHost, pid: number | null, sessionId: string | null, requireLive = false): { ok: true; claimant: Claimant } | { ok: false; error: string } {
+  const target = resolveAlertSession(host, pid, sessionId)
+  if (!target.ok) return target
+  const ep = target.endpoint
+  if (requireLive && !ep) return { ok: false, error: `session ${target.sessionId} is not live (no omp-live endpoint)` }
+  return { ok: true, claimant: { sessionId: target.sessionId, title: ep?.title ?? null, pid: ep?.pid ?? null, cwd: ep?.cwd ?? null } }
+}
+
+// Run one holder rule on the refreshed store under the lock; a refusal persists only the
+// refresh. undefined = the lock stayed busy (reported here).
+function holderStep(host: AlertHost, source: string, rule: (store: AlertSubscriptionStore) => HolderOutcome & { denied?: { sessionId: string } | null }): HolderStep | undefined {
+  const step = withAlertSubscriptions<HolderStep>(host, (raw) => {
+    const store = refreshHolder(raw, source, host.endpoints, host.now)
+    const before = holderState(store, source, host.endpoints, host.now)
+    const outcome = rule(store)
+    return { store: outcome.ok ? outcome.store : store, result: { outcome, state: before.state, prior: before.holder, denied: outcome.denied } }
+  })
+  if (step === undefined) console.error(`tg-ctl alert: ${ALERT_LOCK_BUSY}`)
+  return step
+}
+
+// Deliver a note into a session when it has a live endpoint; a failure is reported, never fatal.
+async function deliverHolderNote(host: AlertHost, source: string, sessionId: string, text: string): Promise<boolean> {
+  const ep = host.endpoints.find((e) => e.sessionId === sessionId)
+  if (!ep) return false
+  // A resume between listing and sending (new pid, same session) re-resolves once.
+  const failure = await deliverWithStaleRetry(
+    ep,
+    (e) => sendLiveMessage({ root: defaultRegistryRoot(), pid: e.pid, instanceId: e.instanceId, sessionId: e.sessionId, requestId: holderRequestId(source, sessionId, host.now, crypto.randomUUID()), text }),
+    async () => (await listLiveEndpoints(defaultRegistryRoot())).find((e) => e.sessionId === sessionId) ?? null,
+  )
+  if (failure !== null) console.error(`tg-ctl alert: note to session ${sessionId} failed: ${failure}`)
+  return failure === null
+}
+
+// A refused step: code 3 prints who holds the slot (stdout), code 1 the error (stderr).
+function reportHolderRefusal(host: AlertHost, source: string, step: HolderStep): number {
+  const { outcome } = step
+  if (outcome.ok) return 0
+  if (outcome.code === 1) console.error(`tg-ctl alert: ${outcome.error}`)
+  else console.log(outcome.holder && step.state !== "vacant" ? `${holderRefusal(source, outcome.holder, step.state, host.now)}\n(${outcome.error})` : outcome.error)
+  return outcome.code
+}
+
+const holderLine = (h: AlertHolder): string => `${h.title ?? "(untitled)"} · pid ${h.pid ?? "?"} · session ${h.sessionId}`
+const holderTtl = (h: AlertHolder, now: number): string => (h.expiresAt === null ? "no expiry" : `expires in ${formatAge(h.expiresAt - now)}`)
+
+function runAlertExclusiveSubscribe(host: AlertHost, source: string, command: Extract<AlertCommand, { cmd: "subscribe" }>): number {
+  const caller = resolveAlertClaimant(host, command.pid, command.sessionId, true)
+  if (!caller.ok) {
+    console.error(`tg-ctl alert: ${caller.error}`)
+    return 1
+  }
+  const step = holderStep(host, source, (store) => claimHolder(store, source, caller.claimant, host.endpoints, host.now, command.ttlMs))
+  if (!step) return 1
+  if (!step.outcome.ok) return reportHolderRefusal(host, source, step)
+  console.log(`holder of ${source}: ${holderLine(step.outcome.holder)} · ${holderTtl(step.outcome.holder, host.now)}`)
+  return 0
+}
+
+async function runAlertHandoffRequest(host: AlertHost, command: Extract<AlertCommand, { cmd: "handoff-request" }>): Promise<number> {
+  if (host.registryError) return 1
+  const caller = resolveAlertClaimant(host, command.pid, command.sessionId, true)
+  if (!caller.ok) {
+    console.error(`tg-ctl alert: ${caller.error}`)
+    return 1
+  }
+  const step = holderStep(host, command.source, (store) => requestHandoff(store, command.source, caller.claimant, host.endpoints, host.now, command.reason))
+  if (!step) return 1
+  if (!step.outcome.ok) return reportHolderRefusal(host, command.source, step)
+  const holder = step.outcome.holder
+  const request = holder.request!
+  const noted = await deliverHolderNote(host, command.source, holder.sessionId, handoffRequestNote(command.source, holder, request))
+  if (!noted) {
+    // The holder never saw it: withdraw it so it cannot ripen into a take.
+    withAlertSubscriptions(host, (store) => ({ store: withdrawRequest(store, command.source, request.sessionId, request.at), result: null }))
+    console.log(`FAILED request for ${command.source}: the note did not reach ${holderLine(holder)}; the request was withdrawn — retry later (a holder gone for 10 minutes frees the slot)`)
+    return 5
+  }
+  console.log(`requested ${command.source} from ${holderLine(holder)}; the holder was notified; unanswered for 10 minutes, take it with: tg-ctl alert take --source ${command.source}`)
+  return 0
+}
+
+async function runAlertHandoff(host: AlertHost, command: Extract<AlertCommand, { cmd: "handoff" }>): Promise<number> {
+  if (host.registryError) return 1
+  const caller = resolveAlertClaimant(host, command.pid, command.sessionId)
+  if (!caller.ok) {
+    console.error(`tg-ctl alert: ${caller.error}`)
+    return 1
+  }
+  const { source } = command
+  if (command.deny) {
+    const step = holderStep(host, source, (store) => denyHandoff(store, source, caller.claimant.sessionId, host.endpoints, host.now))
+    if (!step) return 1
+    if (!step.outcome.ok) return reportHolderRefusal(host, source, step)
+    const denied = step.denied!
+    await deliverHolderNote(host, source, denied.sessionId, handoffDeniedNote(source, step.outcome.holder, command.reason))
+    console.log(`denied the ${source} request of session ${denied.sessionId}`)
+    return 0
+  }
+  const to = command.to!
+  const ep = host.endpoints.find((e) => e.sessionId === to)
+  const target: Claimant = { sessionId: to, title: ep?.title ?? null, pid: ep?.pid ?? null, cwd: ep?.cwd ?? null }
+  const step = holderStep(host, source, (store) => grantHandoff(store, source, caller.claimant.sessionId, target, host.endpoints, host.now))
+  if (!step) return 1
+  if (!step.outcome.ok) return reportHolderRefusal(host, source, step)
+  if (step.prior) await deliverHolderNote(host, source, to, handoffGrantedNote(source, step.prior))
+  console.log(`handed ${source} to ${holderLine(step.outcome.holder)}`)
+  return 0
+}
+
+async function runAlertTake(host: AlertHost, command: Extract<AlertCommand, { cmd: "take" }>): Promise<number> {
+  if (host.registryError) return 1
+  const caller = resolveAlertClaimant(host, command.pid, command.sessionId, true)
+  if (!caller.ok) {
+    console.error(`tg-ctl alert: ${caller.error}`)
+    return 1
+  }
+  const step = holderStep(host, command.source, (store) => takeHolder(store, command.source, caller.claimant, host.endpoints, host.now, command.ttlMs))
+  if (!step) return 1
+  if (!step.outcome.ok) return reportHolderRefusal(host, command.source, step)
+  const prior = step.prior
+  if (prior && prior.sessionId !== caller.claimant.sessionId) await deliverHolderNote(host, command.source, prior.sessionId, holderTakenNote(command.source, step.outcome.holder))
+  console.log(`holder of ${command.source}: ${holderLine(step.outcome.holder)} · ${holderTtl(step.outcome.holder, host.now)}`)
+  return 0
+}
+
+function runAlertRelease(host: AlertHost, command: Extract<AlertCommand, { cmd: "release" }>): number {
+  const caller = resolveAlertClaimant(host, command.pid, command.sessionId)
+  if (!caller.ok) {
+    console.error(`tg-ctl alert: ${caller.error}`)
+    return 1
+  }
+  const step = holderStep(host, command.source, (store) => releaseHolder(store, command.source, caller.claimant.sessionId))
+  if (!step) return 1
+  if (!step.outcome.ok) return reportHolderRefusal(host, command.source, step)
+  console.log(`released ${command.source}`)
+  return 0
+}
+
+// The slot's state (refreshed under the lock, so a live holder's lastSeenLiveAt advances).
+// Exit 3 when vacant; 1 when the registry is unreadable (no state is trustworthy).
+function runAlertHolder(host: AlertHost, command: Extract<AlertCommand, { cmd: "holder" }>): number {
+  const { source } = command
+  const st = withAlertSubscriptions(host, (raw) => {
+    const store = refreshHolder(raw, source, host.endpoints, host.now)
+    return { store, result: holderState(store, source, host.endpoints, host.now) }
+  })
+  if (!st) {
+    console.error(`tg-ctl alert: ${ALERT_LOCK_BUSY}`)
+    return 1
+  }
+  const holder = st.state === "vacant" ? null : st.holder
+  if (command.json) {
+    const h = holder && { sessionId: holder.sessionId, title: holder.title, pid: holder.pid, cwd: holder.cwd, since: holder.since, lastSeenLiveAt: holder.lastSeenLiveAt, failingSince: holder.failingSince, expiresAt: holder.expiresAt }
+    console.log(JSON.stringify({ source, state: st.state, holder: h, request: holder?.request ?? null }, null, 1))
+  } else if (!holder) {
+    console.log(`${source}: vacant`)
+  } else {
+    const request = holder.request ? ` · request from ${holder.request.title ?? "(untitled)"} (session ${holder.request.sessionId}, ${formatAge(host.now - holder.request.at)} ago)` : ""
+    console.log(`${source}: ${st.state} · ${holderLine(holder)} · since ${formatAge(host.now - holder.since)} · ${holderTtl(holder, host.now)}${request}`)
+  }
+  if (host.registryError) return 1
+  return st.state === "vacant" ? 3 : 0
+}
+
 type AlertUnsubscribeOutcome = { removed: string } | { none: string } | { error: string }
 
 function runAlertUnsubscribe(host: AlertHost, command: Extract<AlertCommand, { cmd: "unsubscribe" }>): number {
   const outcome = withAlertSubscriptions<AlertUnsubscribeOutcome | number>(host, (store) => {
-    if (command.all) return { store: { subscriptions: [] }, result: store.subscriptions.length }
+    if (command.all) return { store: { ...store, subscriptions: [] }, result: store.subscriptions.length }
     // --pid names a LIVE omp first (a pid the OS reused belongs to that session now); only a
     // pid no live endpoint owns falls back to the recorded pid of a closed session.
     const target = resolveAlertSession(host, command.pid, command.sessionId)
@@ -2873,6 +3105,7 @@ function describeAlertBinding(b: AlertBinding): string {
 }
 
 async function runAlertSend(host: AlertHost, command: Extract<AlertCommand, { cmd: "send" }>): Promise<number> {
+  if (command.toHolder) return runAlertSendToHolder(host, command)
   const { message, windowMs, force } = command
   const key = throttleKey(message.source, message.key, message.severity)
   const boundNow = (): AlertBinding[] => {
@@ -2933,6 +3166,78 @@ async function runAlertSend(host: AlertHost, command: Extract<AlertCommand, { cm
   const names = delivered.length ? ` (${delivered.map(describeAlertBinding).join("; ")})` : ""
   console.log(`OK tg#${messageId} sessions=${delivered.length}${names}${failed.length ? ` failed=${failed.length}` : ""}`)
   return failed.length > 0 || host.registryError !== null ? 1 : 0
+}
+
+// `send --to-holder` (tg-cli#747): deliver into the source's exclusive holder ONLY — never
+// Telegram (no `tg` spawn), never the non-exclusive subscribers. The holder state is read
+// (and a bound holder's liveness refreshed) BEFORE any throttle claim, so a vacant or
+// suspended slot leaves no claim behind. A delivery then claims the holder's own throttle key
+// (holderThrottleKey: a handoff starts the new holder's window afresh); a failed one releases
+// its own claim so the monitor's retry delivers. Known limit: delivery
+// runs outside the store lock, so a send that picked the holder just before a handoff may
+// still reach the previous holder; the next send goes to the new one.
+// Exit 0 ok/throttled, 1 error, 3 vacant, 5 suspended or failed.
+async function runAlertSendToHolder(host: AlertHost, command: Extract<AlertCommand, { cmd: "send" }>): Promise<number> {
+  const { message, windowMs, force } = command
+  const { source } = message
+  if (host.registryError) return 1
+  const text = holderAlertText(message)
+  if (Buffer.byteLength(text) > HOLDER_TEXT_MAX_BYTES) {
+    console.error(`tg-ctl alert: the holder copy is ${Buffer.byteLength(text)} bytes; the omp-live limit is ${HOLDER_TEXT_MAX_BYTES} (shorten --text)`)
+    return 1
+  }
+  const st = withAlertSubscriptions(host, (raw) => {
+    const store = refreshHolder(raw, source, host.endpoints, host.now)
+    return { store, result: holderState(store, source, host.endpoints, host.now) }
+  })
+  if (st === undefined) {
+    console.error(`tg-ctl alert: ${ALERT_LOCK_BUSY}`)
+    return 1
+  }
+  if (st.state === "vacant" || !st.holder) {
+    console.log(`VACANT ${source}`)
+    return 3
+  }
+  const holder = st.holder
+  if (st.state === "suspended" || !st.endpoint) {
+    console.log(`SUSPENDED ${source} ${holder.sessionId}`)
+    return 5
+  }
+
+  const key = holderThrottleKey(holder.sessionId, source, message.key, message.severity)
+  const verdict = withAlertThrottle(host, (store) => {
+    const v: ThrottleVerdict = force ? { kind: "send" } : throttleVerdict(store, key, host.now, windowMs)
+    return { store: v.kind === "send" ? claimAlert(store, key, host.now) : store, result: v }
+  })
+  if (verdict === undefined) {
+    console.error(`tg-ctl alert: ${ALERT_LOCK_BUSY}`)
+    return 1
+  }
+  const what = `${source}/${message.key}/${message.severity}`
+  if (verdict.kind === "in-flight") {
+    console.log(`in flight: another tg-ctl alert is delivering ${what} to the holder (claimed ${formatAge(host.now - verdict.entry.at)} ago)`)
+    return 0
+  }
+  if (verdict.kind === "throttled") {
+    console.log(`throttled holder (${what} delivered ${formatAge(host.now - verdict.entry.at)} ago, window ${formatAge(windowMs)})`)
+    return 0
+  }
+
+  const failure = await deliverWithStaleRetry(
+    st.endpoint,
+    (ep) => sendLiveMessage({ root: defaultRegistryRoot(), pid: ep.pid, instanceId: ep.instanceId, sessionId: ep.sessionId, requestId: holderRequestId(source, ep.sessionId, host.now, crypto.randomUUID()), text }),
+    async () => (await listLiveEndpoints(defaultRegistryRoot())).find((e) => e.sessionId === holder.sessionId) ?? null,
+  )
+  const now = Date.now()
+  withAlertSubscriptions(host, (store) => ({ store: markHolderDelivery(store, source, holder.sessionId, holder.since, failure === null, now), result: null }))
+  const settled = withAlertThrottle(host, (store) => ({ store: failure === null ? settleHolderAlert(store, key, host.now) : releaseHolderClaim(store, key, host.now), result: true }))
+  if (settled === undefined) console.error(`tg-ctl alert: ${ALERT_LOCK_BUSY} (the claim expires by itself)`)
+  if (failure !== null) {
+    console.log(`FAILED holder ${holder.sessionId}: ${failure}`)
+    return 5
+  }
+  console.log(`OK holder ${holder.sessionId} pid ${st.endpoint.pid}`)
+  return 0
 }
 
 // The `tg` sender next to this tg-ctl (the same checkout — a worktree's alert posts with its
