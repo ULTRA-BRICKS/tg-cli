@@ -143,6 +143,49 @@ class FishTests(unittest.TestCase):
             self.synth(FakeConnection(wav_bytes()[:-2]))
 
 
+    def test_fish_streaming_sizes_are_normalized_without_changing_pcm(self):
+        original = wav_bytes()
+        streamed = bytearray(original)
+        struct.pack_into('<I', streamed, 4, 0xffffff24)
+        struct.pack_into('<I', streamed, 40, 0xffffff00)
+        out = self.synth(FakeConnection(bytes(streamed)))
+        self.assertEqual(out.read_bytes(), original)
+        self.assertEqual(out.read_bytes()[44:], bytes(streamed)[44:])
+        with wave.open(str(out), 'rb') as audio:
+            self.assertEqual(audio.getnframes(), 800)
+        report = json.loads((out.parent / 'tts.json').read_text())
+        self.assertEqual(report['voice_id'], 'a' * 32)
+
+    def test_documented_all_ones_streaming_header_is_normalized(self):
+        original = wav_bytes()
+        streamed = bytearray(original)
+        struct.pack_into('<I', streamed, 4, 0xffffffff)
+        struct.pack_into('<I', streamed, 40, 0xffffffff)
+        self.assertEqual(self.synth(FakeConnection(bytes(streamed))).read_bytes(), original)
+
+    def test_streaming_header_does_not_weaken_audio_validation(self):
+        base = bytearray(wav_bytes())
+        struct.pack_into('<I', base, 4, 0xffffff24)
+        struct.pack_into('<I', base, 40, 0xffffff00)
+        wrong_rate = bytearray(base)
+        struct.pack_into('<I', wrong_rate, 28, 999)
+        wrong_align = bytearray(base)
+        struct.pack_into('<H', wrong_align, 32, 3)
+        wrong_format = bytearray(base)
+        struct.pack_into('<H', wrong_format, 20, 3)
+        wrong_riff = bytearray(base)
+        struct.pack_into('<I', wrong_riff, 4, 123456)
+        unknown_size = bytearray(base)
+        struct.pack_into('<I', unknown_size, 40, 0xffffff01)
+        overlong = bytes(base[:44]) + bytes(8000 * 2 * 121)
+        cases = [base[:44], base[:-1], wrong_rate, wrong_align, wrong_format,
+                 wrong_riff, unknown_size, overlong]
+        for payload in cases:
+            with self.subTest(size=len(payload)), self.assertRaisesRegex(ClientError, 'TTS_AUDIO_INVALID'):
+                self.synth(FakeConnection(bytes(payload)))
+
+
+
 class WorkerBoundaryTests(unittest.TestCase):
     def test_worker_uses_stdin_for_secrets_and_preserves_timing(self):
         from telegram_client.tts_config import load_config
