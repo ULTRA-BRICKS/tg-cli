@@ -188,20 +188,34 @@ test('--dry-run prints the rendered body it would have sent', async () => {
   expect(stdout).toContain('hello from a dry run');
 });
 
-// review finding: a --dry-run OK must never imply "attachments validated too"
-// when attachments are not even inspected — reject explicitly instead of a
-// silent partial pass.
-test('--dry-run with an attachment (--photo/--file) is a hard error, not a silent partial OK', async () => {
+// --dry-run validates attachments instead of refusing them (tg-cli#775): the OK line is
+// followed by one verdict per attachment, so it never implies an attachment was checked
+// when it was not, and nothing is uploaded.
+test('--dry-run with a real --photo lists it as ok and exits 0', async () => {
+  const home = tempDir('tg-dry-run-attach-');
+  dirs.push(home);
+  const photo = join(home, 'shot.png');
+  writeFileSync(photo, 'png-bytes');
+  const { exitCode, stdout } = await run(
+    ['--dry-run', '--photo', photo, 'caption'],
+    { PATH: process.env.PATH ?? '', HOME: home },
+  );
+  expect(exitCode).toBe(0);
+  expect(stdout).toContain('tg --dry-run: OK');
+  expect(stdout).toContain('attachments (not uploaded): 1');
+  expect(stdout).toContain(`photo: ${photo} — ok`);
+});
+
+test('--dry-run with a missing --photo says it would be skipped', async () => {
   const home = tempDir('tg-dry-run-attach-');
   dirs.push(home);
   const missingPhoto = join(home, 'nonexistent.png');
-  const { exitCode, stdout, stderr } = await run(
+  const { exitCode, stdout } = await run(
     ['--dry-run', '--photo', missingPhoto, 'caption'],
     { PATH: process.env.PATH ?? '', HOME: home },
   );
-  expect(exitCode).not.toBe(0);
-  expect(stderr).toContain('--dry-run does not support attachments');
-  expect(stdout).not.toContain('tg --dry-run: OK');
+  expect(exitCode).toBe(0);
+  expect(stdout).toContain(`photo: ${missingPhoto} — would be skipped (file not found)`);
 });
 
 test('--dry-run with the removed --tag question is REFUSED even with a compliant body (tg-cli#301)', async () => {

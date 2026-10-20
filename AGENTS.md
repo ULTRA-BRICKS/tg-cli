@@ -91,7 +91,12 @@ I/O, fetch, signals, `bun:ffi`):
   `--table` (render STDIN rows — TSV or `a | b` — as an aligned monospace `<pre>` table; the
   PLAIN fallback grid — a real bordered table comes from `--format html` with `<table>`),
   `tg help format` (print the supported-HTML reference, basic + rich tiers; the topic-help
-  convention — `--format-help` is a back-compat alias).
+  convention — `--format-help` is a back-compat alias), `tg report` (structured result report;
+  `features/cli/report.ts` builds the argv and re-enters this pipeline, so repeatable
+  `--photo`/`--file` are plain passthrough flags with the plain send's guards — screenshot gate,
+  denylist, missing/empty skip, code/md→pdf; a rich report is never a caption, so photos go
+  first, then the report, then documents — and `--dry-run` lists each attachment as
+  `ok`/`would be skipped` without uploading, tg-cli#775).
 - `tg-ctl` — inbound control daemon (`run`/`start`/`status`/`stop`/`enable`/`disable`):
   singleton via real `flock(2)` over `bun:ffi`, Telegram `getUpdates` long-poll, tmux pane
   injection. The lifecycle subcommands follow the shared agent-tools service-management

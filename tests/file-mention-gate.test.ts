@@ -155,14 +155,14 @@ test('the resend command shell-quotes a path that needs it', () => {
   expect(msg).toContain(`tg --file '/home/u/a&b.md' hi`);
 });
 
-test('a long flag value is echoed as is; only the message text is elided; --dry-run is dropped', () => {
+test('a long flag value is echoed as is; only the message text is elided; --dry-run is kept', () => {
   const photo = `/home/u/very/deep/project/dir/screenshots/screenshot-2026-10-15-at-14.03.22-${'x'.repeat(20)}.png`;
   const title = 'T'.repeat(90);
   const msg = formatUnattachedFileError(
     [{ mention: '~/r.md', path: '/home/u/r.md' }],
     ['--dry-run', '--photo', photo, '--title', title, MSG_22056],
   );
-  expect(msg).toContain(`tg --file /home/u/r.md --photo ${photo} --title ${title} '<the same message text>'`);
+  expect(msg).toContain(`tg --file /home/u/r.md --dry-run --photo ${photo} --title ${title} '<the same message text>'`);
 });
 
 test('two files: the refusal says so and attaches both', () => {

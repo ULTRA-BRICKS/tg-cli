@@ -574,6 +574,7 @@ the same pipeline every other `tg` send uses (dictionary gate, autolink,
 tg report --title <text> (--ticket <id-or-url> | --pr <num-or-url>) \
           --impact <text> --verify-cmd <cmd> --verify-result <result> \
           [--evidence <text>]... [--summary <text>]... \
+          [--photo <path>]... [--file <path>]... \
           [--reply-to <id>] [--subagent <name>] [--topic <id>] [--dry-run]
 ```
 
@@ -581,6 +582,13 @@ tg report --title <text> (--ticket <id-or-url> | --pr <num-or-url>) \
 `--verify-result` are required — a report with no verification proof is
 refused before anything is sent. `--evidence`/`--summary`/`--ticket`/`--pr`
 are repeatable.
+
+`--photo`/`--file` (repeatable) attach images/documents with the same semantics as the plain
+send: the screenshot gate is satisfied by a real `--photo`, the never-attach denylist refuses
+secret-looking files, a missing/empty attachment is skipped with a warning (the report still
+goes out), and code/markdown files become PDFs as usual. A rich report cannot be a media
+caption, so the photos arrive first as their own message, then the report, then documents.
+`--dry-run` validates the attachments (`ok` / `would be skipped`) and uploads nothing.
 
 ```
 tg report --title "Fix the crash on empty input" --ticket HYP-123 \

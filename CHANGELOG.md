@@ -3,6 +3,20 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.68.0
+
+- **`tg report` takes attachments (#775).** `tg report` accepts repeatable `--photo <path>` and
+  `--file <path>` with exactly the plain send's semantics: they ride the same pipeline, so the
+  screenshot-attach gate is satisfied by a real `--photo` (a report that cites a screenshot is no
+  longer unsendable), the never-attach denylist refuses secret-looking files, a missing/empty/
+  unreadable attachment is skipped with a warning while the report still goes out, and code/
+  markdown `--file`s are converted to PDF as usual. A rich report cannot ride as a media caption,
+  so the photos arrive first as their own message (an album for 2+), then the report, then any
+  documents — the plain send's order. `--dry-run` no longer refuses attachments (it used to exit 1):
+  it lists each one as `ok` or `would be skipped (<reason>)`, uploads nothing, and the
+  unattached-file refusal's resend command now keeps `--dry-run`. The screenshot-attach error
+  of a `--tag report` send names `tg report --photo <path>`.
+
 ## 1.67.0
 
 - **Identified calls and private history (#761).** `tg call`, `call-cli`, and
