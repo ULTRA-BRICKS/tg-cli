@@ -303,6 +303,9 @@ const TAG_GATES: Record<string, TagGate> = {
 };
 
 export interface ParseOptions {
+  // Message body read from stdin. It is added to the text after the argv loop, so it is never
+  // tokenized: a body such as "- a" or "--tag x" stays text instead of an unknown flag.
+  bodyText?: string;
   // Never-attach denylist (feature `attach-denylist`, ON by default): an explicit
   // --photo/--file naming a secret-looking file (.env family, private keys,
   // credential rc-files, …) is a HARD ERROR.
@@ -340,7 +343,7 @@ export function parseArgs(
   args: string[],
   cwd: string,
   home: string,
-  { attachDenylist = true, msgrefAutolink = true, ticketAutolink = true }: ParseOptions = {},
+  { attachDenylist = true, msgrefAutolink = true, ticketAutolink = true, bodyText }: ParseOptions = {},
 ): ParseResult {
   // 1. Help / version win anywhere, before the empty check.
   for (const a of args) {
@@ -633,6 +636,7 @@ export function parseArgs(
   // x.ts:42"` renders the quote + marker copy). That match is pure path math on
   // the explicit items — the text never touches the filesystem. First spec per
   // file wins (the marker copy can only mark one range).
+  if (bodyText?.trim()) textParts.push(bodyText);
   const text = textParts.join(' ');
   if (explicit.length > 0) {
     const explicitAbs = explicit.map((it) => absolutePath(it.path, cwd, home));

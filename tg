@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { accessSync, appendFileSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "fs"
+import { accessSync, appendFileSync, constants as fsConstants, existsSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { dirname, join, resolve } from "path"
 // Explicit import (not the global `crypto`) so the multi-part groupId token
@@ -181,6 +181,7 @@ export const USAGE = `Usage:
                                  # prebuilt one when none is found; --dry-run shows the plan)
   tg report --title <t> --ticket <id> --impact <t> --verify-cmd <c> --verify-result <r> [--photo <p>]... [--file <p>]...
                                  # structured result report → Telegram (tg help report)
+  tg --tag report < msg.txt     # message body from stdin (also: cat msg.txt | tg -)
   tg obligations                # follow-ups the intent gate says you still owe (tg help obligations)
   tg --ls-emoji-helpers
 
@@ -936,11 +937,51 @@ if (import.meta.main) {
   // Same flag the body-detection `detectTicketCodesExpanded` call below gates on — threaded so
   // the --title HYP-<id> guard honours a disabled feature identically to the body.
   const ticketAutolinkOn = features["autolink-tasks"] !== false
-  const parsed = parseArgs(args, process.cwd(), home, {
+  const parseOpts = {
     attachDenylist: attachDenylistOn,
     msgrefAutolink: msgrefAutolinkOn,
     ticketAutolink: ticketAutolinkOn,
-  })
+  }
+  // Message body from stdin: a bare `-` argv token is replaced by stdin's text; with no
+  // other body, piped/redirected stdin (FIFO or file — never a TTY) is appended. `--table`
+  // keeps its own stdin handling, so it never triggers the implicit read.
+  const stdinIsData = (() => {
+    try {
+      const st = fstatSync(0)
+      return st.isFIFO() || st.isFile()
+    } catch {
+      return false
+    }
+  })()
+  // Telegram caps a message near 4 KB; reading past 1 MiB only buffers bytes that are dropped.
+  const readStdinBody = async (): Promise<string> => {
+    const limit = 1 << 20
+    const chunks: Uint8Array[] = []
+    let size = 0
+    for await (const chunk of Bun.stdin.stream()) {
+      chunks.push(chunk)
+      size += chunk.length
+      if (size >= limit) break
+    }
+    const text = Buffer.concat(chunks).toString("utf8")
+    let end = text.length
+    while (end > 0 && text.charCodeAt(end - 1) === 10) end--
+    return text.slice(0, end)
+  }
+  let parsed: ReturnType<typeof parseArgs>
+  const dashIdx = args.includes("--table") ? -1 : args.indexOf("-")
+  if (dashIdx !== -1) {
+    const body = stdinIsData ? await readStdinBody() : ""
+    parsed = parseArgs([...args.slice(0, dashIdx), ...args.slice(dashIdx + 1)], process.cwd(), home, { ...parseOpts, bodyText: body })
+  } else {
+    parsed = parseArgs(args, process.cwd(), home, parseOpts)
+    const wantsHelp = parsed.action === "help" && !args.includes("-h") && !args.includes("--help")
+    const emptySend = parsed.action === "send" && !parsed.table && !parsed.caption && parsed.items.length === 0
+    if ((wantsHelp || emptySend) && stdinIsData) {
+      const body = await readStdinBody()
+      if (body.trim()) parsed = parseArgs(args, process.cwd(), home, { ...parseOpts, bodyText: body })
+    }
+  }
 
   // No-send actions resolve BEFORE the credential gate so help/version/info
   // flags work without Telegram credentials configured.

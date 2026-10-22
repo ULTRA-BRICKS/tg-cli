@@ -3,6 +3,10 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.69.0
+
+- **Message body from stdin.** `tg --tag report < msg.txt` or `cat msg.txt | tg -` sends the piped text; an argv body still wins and a TTY stdin is never read.
+
 ## 1.68.0
 
 - **`tg report` takes attachments (#775).** `tg report` accepts repeatable `--photo <path>` and
