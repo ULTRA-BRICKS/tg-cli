@@ -74,6 +74,9 @@ import type { AgentAncestor } from "./features/tg-ctl/discover"
 import type { Registry } from "./features/tg-ctl/session-registry"
 import { buildOutboundHistoryRecords, outboundHistoryText } from "./features/replies/outbound"
 import { runReplies } from "./features/replies/cli"
+import { CHATGPT_USAGE } from "./features/chatgpt/args"
+import { runChatgptCli } from "./features/chatgpt/cli"
+import { spawnPmRunner } from "./features/chatgpt/pm-runner"
 import { resolveWindowPanes } from "./features/replies/window"
 import { agentNameFromDisplayLine } from "./features/tg-ctl/agent-name"
 import { detectAgentAncestry, detectAgentViaAncestry, detectSenderAncestry, isProcessRunning } from "./features/branding/detect"
@@ -183,6 +186,7 @@ export const USAGE = `Usage:
                                  # structured result report → Telegram (tg help report)
   tg --tag report < msg.txt     # message body from stdin (also: cat msg.txt | tg -)
   tg obligations                # follow-ups the intent gate says you still owe (tg help obligations)
+  tg chatgpt list|show|pause|resume|continue …   # ChatGPT session control via pm (tg help chatgpt)
   tg --ls-emoji-helpers
 
 As YOUR Telegram account (MTProto; see \`tg help auth\`, \`tg call --help\`):
@@ -202,6 +206,7 @@ Help topics (\`tg help <topic>\`):
   auth     connecting to Telegram: the bot (login / status / logout) and your own
            accounts (tg auth user|caller), exit codes
   obligations  the follow-up replies the intent gate recorded (list / --check / dismiss)
+  chatgpt  ChatGPT session control through pm: list, show, pause/resume/watch/continue requests
 
 Readable long messages:
   For longer status reports, avoid one dense plain-text block. Use headings,
@@ -676,6 +681,17 @@ if (import.meta.main) {
     if (code !== null) process.exit(code)
   }
 
+  // `tg chatgpt …` — ChatGPT session control through `pm chatgpt api` (features/chatgpt,
+  // docs/chatgpt.md). Handled BEFORE every other path and ALWAYS ends in process.exit with the
+  // CLI's own code, so no chatgpt invocation — valid, malformed or unknown — can fall through to
+  // the generic Telegram send below. Unknown subcommands/options exit 2 on stderr.
+  if (rawArgs[0] === "chatgpt") {
+    const result = await runChatgptCli(rawArgs.slice(1), { run: spawnPmRunner })
+    if (result.stdout) process.stdout.write(result.stdout)
+    if (result.stderr) process.stderr.write(result.stderr)
+    process.exit(result.exitCode)
+  }
+
   // `tg voice setup` — (re)configure inbound voice transcription (STT). Keeps a
   // working voice: config, else uses a local Whisper (~/xp first), else installs
   // a prebuilt one (Homebrew whisper.cpp on macOS, faster-whisper wheels on
@@ -727,13 +743,17 @@ if (import.meta.main) {
       console.log(colorizeHelp(OBLIGATIONS_USAGE, shouldColorize()))
       process.exit(0)
     }
+    if (topic === "chatgpt") {
+      console.log(colorizeHelp(CHATGPT_USAGE, shouldColorize()))
+      process.exit(0)
+    }
     if (topic === undefined) {
       console.log(colorizeHelp(USAGE, shouldColorize()))
       process.exit(0)
     }
     // A `tg help <unknown>` names a topic that does not exist — say so (3-part:
     // WHAT/WHY/HOW) on stderr and exit non-zero, rather than silently sending it.
-    console.error(`Error: unknown help topic '${topic}'. Available topics: format, report, auth, obligations. See \`tg help\`.`)
+    console.error(`Error: unknown help topic '${topic}'. Available topics: format, report, auth, obligations, chatgpt. See \`tg help\`.`)
     process.exit(1)
   }
 

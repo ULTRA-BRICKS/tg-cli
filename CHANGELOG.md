@@ -3,6 +3,40 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.70.0
+
+- **`tg-ctl capabilities --json`.** Prints `{"schema_version":1,"capabilities":["ask-owner-only-v1"]}`
+  and exits 0 with no config, env, network or daemon access; any other argv is a usage error (2).
+- **`tg-ctl ask --owner-only <question> [--timeout SEC]`.** The card can only be answered by the
+  owner: the tapping/replying user id AND the chat must equal `TG_CHAT_ID`, which must be a
+  positive private chat id (groups, non-numeric ids: exit 1 `denied`, no send). Other allowlisted
+  senders get "not allowed"; the bit survives the socket and disk restore, and a bare chat message
+  never answers an owner-only card. A missing question or `--help`/`-h` with the flag is usage
+  (exit 2, before any send). Without the flag behaviour is unchanged.
+- **`/chatgpt` owner enforcement.** `cgp:` taps now also require the tapping user to be the owner
+  in a private owner chat, and a `/chatgpt` command from any other allowlisted sender is dropped.
+- **`tg-ctl ask --help` / `-h` is help.** With exactly one argument equal to `--help` or `-h`,
+  `tg-ctl ask` now prints usage and exits 0 before any config, auth, daemon or network call (it
+  previously posted "--help" as a question). `ask '--help me?'` and `ask --help extra` remain real
+  asks. The generic ask approve/reject schema is unchanged.
+- **ChatGPT session control (#780).** `tg chatgpt accounts|list|show|events|requests|watch|unwatch|
+  pause|resume|continue|service start|stop|connector list|request guardian` is a client of the frozen
+  `pm chatgpt api` JSON contract: fixed argv (no shell), method allowlist, stdout capped at 256 KiB,
+  per-call timeouts, the child's whole process group ended on timeout/oversize, schema-bounded
+  envelope parsing, secret redaction, `--json` envelope. Mutations only queue an owner approval
+  inside pm; `continue` first reads `sessions.get` and binds the current latest turn (refused when
+  unknown). A timeout of a mutating call exits 75 and is never retried. Exit codes: 0 ok,
+  1 pm error, 2 usage (never a Telegram send), 69 pm unavailable, 75 outcome unknown. `tg help
+  chatgpt` documents it.
+- **Owner-only `/chatgpt` bot menu.** Sessions per account as escaped HTML with Details / Pause /
+  Resume / Watch / Continue buttons plus Requests / Refresh. Buttons carry opaque one-use `cgp:`
+  references resolved from a durable 0600 store with a fixed schema (`CtlPaths.chatgptRefs`); taps
+  need the configured owner chat (fail closed with none), a replayed/forged/expired ref makes no pm
+  call, a Continue is refused with "state changed" when the latest turn moved, and a tap only queues
+  an approval in pm. See `docs/chatgpt.md`.
+- **Mid-argv `-` appends the stdin body last.** `tg "Header" -` with piped text sends `Header`
+  followed by the piped body (covered by `tests/cli-stdin-body.test.ts`).
+
 ## 1.69.0
 
 - **Message body from stdin.** `tg --tag report < msg.txt` or `cat msg.txt | tg -` sends the piped text; an argv body still wins and a TTY stdin is never read.

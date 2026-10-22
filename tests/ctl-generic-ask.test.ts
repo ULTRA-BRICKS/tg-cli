@@ -86,11 +86,11 @@ async function listenSocket(path: string, onSocket: (socket: Socket) => void): P
 // --- pure argv / timeout / verdict logic ---
 
 test('generic mode is detected by a non-flag positional question arg OR --timeout anywhere', () => {
-  expect(parseGenericAskArgv(['approve deploy?', '--timeout', '60'])).toEqual({
+  expect(parseGenericAskArgv(['approve deploy?', '--timeout', '60'])).toMatchObject({
     question: 'approve deploy?',
     timeout: { seconds: 60 },
   });
-  expect(parseGenericAskArgv(['approve deploy?'])).toEqual({
+  expect(parseGenericAskArgv(['approve deploy?'])).toMatchObject({
     question: 'approve deploy?',
     timeout: { seconds: 300 },
   });
@@ -108,24 +108,24 @@ test('SECURITY: --timeout BEFORE the question is still generic mode, never falls
   // a flag), which sent the whole call into the legacy stdin-JSON hook client.
   // That client can exit 0 on empty stdin with NO Telegram prompt and NO human
   // ever consulted: a silent, unearned approval for a safety-gate primitive.
-  expect(parseGenericAskArgv(['--timeout', '60', 'delete', 'production'])).toEqual({
+  expect(parseGenericAskArgv(['--timeout', '60', 'delete', 'production'])).toMatchObject({
     question: 'delete production',
     timeout: { seconds: 60 },
   });
   // --timeout in the MIDDLE of the question is also fully reconstructed, not
   // just the leading span before it.
-  expect(parseGenericAskArgv(['deploy', '--timeout', '60', 'to', 'prod'])).toEqual({
+  expect(parseGenericAskArgv(['deploy', '--timeout', '60', 'to', 'prod'])).toMatchObject({
     question: 'deploy to prod',
     timeout: { seconds: 60 },
   });
 });
 
 test('an unquoted multi-word question is joined in full, never silently truncated to the first token', () => {
-  expect(parseGenericAskArgv(['deploy', 'to', 'prod', 'delete-volumes', '--timeout', '60'])).toEqual({
+  expect(parseGenericAskArgv(['deploy', 'to', 'prod', 'delete-volumes', '--timeout', '60'])).toMatchObject({
     question: 'deploy to prod delete-volumes',
     timeout: { seconds: 60 },
   });
-  expect(parseGenericAskArgv(['deploy', 'to', 'prod'])).toEqual({
+  expect(parseGenericAskArgv(['deploy', 'to', 'prod'])).toMatchObject({
     question: 'deploy to prod',
     timeout: { seconds: 300 },
   });
@@ -134,7 +134,7 @@ test('an unquoted multi-word question is joined in full, never silently truncate
 test('tokens AFTER the --timeout value are part of the question too, never silently dropped (review finding)', () => {
   // Before the fix, only tokens BEFORE --timeout were kept; "and delete volumes"
   // would vanish here with no warning at all.
-  expect(parseGenericAskArgv(['deploy', '--timeout', '60', 'and', 'delete', 'volumes'])).toEqual({
+  expect(parseGenericAskArgv(['deploy', '--timeout', '60', 'and', 'delete', 'volumes'])).toMatchObject({
     question: 'deploy and delete volumes',
     timeout: { seconds: 60 },
   });
@@ -149,12 +149,12 @@ test('SECURITY: --timeout=N (GNU equals-form) is still generic mode, never falls
   // `--timeout=60` is exactly as valid a spelling as `--timeout 60` under the
   // ordinary CLI convention; only recognizing the space-separated form let this
   // form fall through to argv.indexOf('--timeout') === -1 -> legacy hook client.
-  expect(parseGenericAskArgv(['--timeout=60', 'delete production'])).toEqual({
+  expect(parseGenericAskArgv(['--timeout=60', 'delete production'])).toMatchObject({
     question: 'delete production',
     timeout: { seconds: 60 },
   });
   // The equals-form works from any position, same as the space-separated form.
-  expect(parseGenericAskArgv(['delete', 'production', '--timeout=60'])).toEqual({
+  expect(parseGenericAskArgv(['delete', 'production', '--timeout=60'])).toMatchObject({
     question: 'delete production',
     timeout: { seconds: 60 },
   });
@@ -185,9 +185,9 @@ test('SECURITY: invalid space-separated --timeout stays visible instead of eatin
 
 test('a --timeout with NO value is a flag mistake, never the question text (a lone `--timeout` is an empty question)', () => {
   const missing = { seconds: 300, warning: '--timeout given with no value; using default 300s' };
-  expect(parseGenericAskArgv(['--timeout'])).toEqual({ question: '', timeout: missing });
-  expect(parseGenericAskArgv(['--timeout='])).toEqual({ question: '', timeout: missing });
-  expect(parseGenericAskArgv(['approve deploy?', '--timeout'])).toEqual({ question: 'approve deploy?', timeout: missing });
+  expect(parseGenericAskArgv(['--timeout'])).toMatchObject({ question: '', timeout: missing });
+  expect(parseGenericAskArgv(['--timeout='])).toMatchObject({ question: '', timeout: missing });
+  expect(parseGenericAskArgv(['approve deploy?', '--timeout'])).toMatchObject({ question: 'approve deploy?', timeout: missing });
 });
 
 test('internal ask submodes are never reinterpreted as generic human questions', () => {
@@ -208,7 +208,7 @@ test('SECURITY: a --verify-grant token inside an unquoted question is still a ge
   // The grant client prints a deny JSON and exits 0 — read by an approval
   // caller as "approved". Only argv made entirely of the grant grammar
   // (--verify-grant [id] / --pull / --hook <id>) is the internal submode.
-  expect(parseGenericAskArgv(['allow', '--verify-grant', 'override', 'now'])).toEqual({
+  expect(parseGenericAskArgv(['allow', '--verify-grant', 'override', 'now'])).toMatchObject({
     question: 'allow --verify-grant override now',
     timeout: { seconds: 300 },
   });

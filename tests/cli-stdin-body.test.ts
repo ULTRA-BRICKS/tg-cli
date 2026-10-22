@@ -64,3 +64,21 @@ test('multi-line body keeps its line breaks', () => {
   const r = run(['--dry-run', '-'], '- a\n- b');
   expect(r.out).toContain('- a\n- b');
 });
+
+// Pins current behaviour (not a design statement): the first `-` is dropped from argv wherever it
+// sits, and the stdin body is appended AFTER every argv text part — `tg "Header" -` and
+// `tg - "Header"` both send "Header <body>".
+test.each([
+  ['after the argv text', ['Header', '-']],
+  ['before the argv text', ['-', 'Header']],
+])('`-` %s: the stdin body is appended last', (_where, argv) => {
+  const r = run(['--dry-run', ...argv], 'piped-body');
+  expect(r.code).toBe(0);
+  expect(r.out).toContain('Header piped-body');
+});
+
+test('a second `-` is not a second stdin read: it is an unknown flag', () => {
+  const r = run(['--dry-run', '-', '-'], 'piped-body');
+  expect(r.code).toBe(1);
+  expect(r.out).toContain('unknown flag: -');
+});

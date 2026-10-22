@@ -380,6 +380,12 @@ stdout; an approval prints `approved` (or `approved: <detail>`). It needs no tmu
 session registration, and while it waits your messages to agents are delivered normally
 (it does not defer inbound the way an open agent question does).
 
+**Owner-only asks (`tg-ctl ask --owner-only <question>`, `tg-ctl capabilities --json`).** With
+`--owner-only` only the owner can answer: the tapping user id and the chat must both equal
+`TG_CHAT_ID`, which must be a positive private chat id (otherwise exit 1, nothing sent). Other
+allowlisted senders get "not allowed". `tg-ctl capabilities --json` reports `ask-owner-only-v1`
+without touching config or network, so callers can detect support first.
+
 **As rig's `agent_hooks.approval_cmd`:** agent-tools safety hooks (e.g. block-reset-hard,
 pin-primary-worktree) run the repo's committed `approval_cmd` and allow the blocked
 command only on exit 0 — nonzero or a timeout blocks. Point it at `tg-ctl ask` in the
@@ -409,6 +415,7 @@ Code's per-hook `timeout`). These keys are read by agent-tools at hook runtime; 
 | `/agent [<window>] <msg>` | Route a message to a specific agent (fuzzy window match, else selection buttons); a Claude Code / Codex outside tmux (exact `--name` / cwd basename) gets a one-line refusal naming how to start it in tmux |
 | `/daily` | What-shipped report: merged PRs since the last run (`rig daily`) |
 | `/spend [day\|week\|month]` | Token/cost usage report (`rig usage`) — also pushed automatically weekly/monthly, see `tg-ctl usage-schedule enable` |
+| `/chatgpt [home\|glide.vc\|all]` | Owner-only ChatGPT session menu: sessions per account with Details / Pause / Resume / Watch / Continue buttons (each only queues an approval in pm), see [docs/chatgpt.md](docs/chatgpt.md) |
 
 `/tasks` renders a rich task table for the resolved project. The default view is
 the attention view: blocked/stuck/problem tasks plus ready tasks, not every task.
@@ -559,6 +566,15 @@ History is an append-only `~/.config/tg-cli/tg-ctl.<botid>.history.jsonl` (one
 JSON object per line, trimmed to the last ~5000 messages). The `tg-ctl` daemon
 records inbound messages; `tg` records its own outbound. Both writers are
 best-effort and never block a send or an inject.
+
+### ChatGPT session control (`tg chatgpt`, `/chatgpt`, v1.69.0)
+
+`tg chatgpt accounts|list|show|events|requests|watch|unwatch|pause|resume|continue|service|connector …`
+is a client of `pm chatgpt api` (fixed argv, bounded stdout/time, `--json` envelope; exit 0 ok, 1 pm
+error, 2 usage, 69 pm unavailable, 75 mutation outcome unknown). Mutations only **queue** an owner
+approval inside pm; `continue` binds the session's current latest turn. The owner-only `/chatgpt` bot
+command shows the same sessions with per-session buttons backed by opaque one-use callback refs.
+Details, safety model and limits: [docs/chatgpt.md](docs/chatgpt.md); `tg help chatgpt`.
 
 ### Structured result reports (`tg report`, v1.53.0)
 

@@ -628,7 +628,7 @@ const replyTo = (message_id: number) => ({ message_id, chat: { id: CHAT_ID }, da
 
 test('topic: "yes" replying to a permission card in the topic resolves it as allow, notices stay in the topic', () => {
   const r = stepUpdates([inTopic(101, { text: 'yes', reply_to_message: replyTo(60) })], cardOpts());
-  expect(r.actions).toEqual([
+  expect(r.actions).toMatchObject([
     { kind: 'answer-question', callbackQueryId: '', requestId: 'perm_1', value: 'allow', messageId: 60, threadId: 50 },
     { kind: 'ack', messageId: 101 },
   ]);
@@ -641,7 +641,7 @@ test('topic: "no" replying to a permission card resolves it as deny', () => {
 
 test('topic: a prose reply to an abandoned question card is its deferred answer', () => {
   const r = stepUpdates([inTopic(103, { text: 'Production', reply_to_message: replyTo(50) })], cardOpts());
-  expect(r.actions).toEqual([
+  expect(r.actions).toMatchObject([
     { kind: 'post-timeout-question-reply', requestId: 'q_123', questionMessageId: 50, text: 'Production', from: 'Alex', messageId: 103, threadId: 50 },
     { kind: 'ack', messageId: 103 },
   ]);

@@ -16,23 +16,49 @@ lives in `~/.config/tg-cli/mtproto/` (0600).
 
 ---
 
-## CRITICAL: This Checkout Is the Live Binary
+## CRITICAL: The Install Clone Is the Live Binary
 
-`~/.files/bin/tg` (on PATH) is a symlink to `<repo>/tg`. Whatever branch is checked out in
-`~/.files/repos/tg-cli` **IS** the deployed tool, with immediate effect.
+On a Linux host set up by `install.sh`, `~/.local/bin/tg` and `~/.local/bin/tg-ctl` (on PATH)
+are symlinks to `tg` / `tg-ctl` in the install clone `~/.local/share/tg-cli`. Whatever branch is
+checked out in that clone **IS** the deployed tool, with immediate effect. Check with
+`readlink -f ~/.local/bin/tg` — it MUST end in `/.local/share/tg-cli/tg`. (The legacy macOS
+layout is `~/.files/bin/tg` → `~/.files/repos/tg-cli`; `tg-ctl enable` still probes
+`~/.files/bin/tg-ctl`, see tg-cli#783.)
 
-- Keep `main` checked out here at all times.
+A path under `~/.local/share/tg-cli-releases/<version>-<hash>/` is NOT the install clone: it is
+a hand-built, git-less snapshot copy (with a `release-proof.json`) made once to run unmerged
+code. Nothing in this repo produces or updates it, so it never follows a merge. Re-run
+`install.sh` from the clone to point the symlinks back; the snapshot dirs are then rollback
+copies only.
+
+- Keep `main` checked out in the install clone at all times.
 - Never leave the checkout on a half-done feature branch.
-- Do all feature work in git worktrees on separate branches.
-- **After every merge to main, deploy with `scripts/deploy.sh`** (from any checkout — it
-  resolves this live one through the `tg` symlink): fast-forward, then
-  `tg-ctl restart --if-stale`. `tg` needs no restart, but the resident `tg-ctl run`
-  daemon keeps the code it loaded until it restarts — merged ≠ running (tg-cli#279).
-  `tg-ctl status` prints a `code:` line: the commit the daemon loaded, `STALE` when the
-  checkout has newer daemon code. `tg-ctl restart` is graceful (SIGTERM drain; queued
-  messages, questions and registrations persist on disk) and verified: it exits non-zero
-  unless the old process is gone and a successor holds the lock. On this machine the live
-  daemon is supervised by rig's launchd job **`ai.hyperide.tg-ctl`**
+- Do all feature work in git worktrees on separate branches (`rig worktree create`; they
+  live under `~/.local/share/tg-cli/.worktrees/`).
+- **After every merge to main, deploy:** `scripts/deploy.sh --checkout ~/.local/share/tg-cli`
+  fast-forwards the clone, then runs `tg-ctl restart --if-stale`. With no flag it resolves the
+  checkout through the `tg` symlink, so that only works once `~/.local/bin/tg` points at the
+  clone. If it does not, first run `~/.local/share/tg-cli/install.sh` (uses the local clone,
+  relinks `tg`, `tg-ctl`, `tg-call`, `call-cli`, `tg-mtproto`, re-registers the skill), then
+  `tg-ctl restart`.
+- **Merged ≠ running (tg-cli#279).** `tg` needs no restart, but the resident `tg-ctl run` daemon
+  keeps the code it loaded until it restarts. `tg-ctl status` prints a `code:` line: the commit
+  the daemon loaded, `STALE` when the checkout has newer daemon code, `unknown` when it cannot
+  prove which code the daemon loaded (no or pid-mismatched record, or an unreadable HEAD — a
+  daemon started from a git-less release snapshot reads `unknown` until restarted from the
+  clone). `tg-ctl restart` is graceful (SIGTERM drain; queued messages, questions and
+  registrations persist on disk) and verified: it exits non-zero unless the old process is gone
+  and a successor holds the lock.
+- **Linux daemon supervision:** the live `tg-ctl run` is a plain detached process (parent pid 1)
+  started by `tg-ctl start`/`restart`. The systemd user unit
+  `agenttools-tg-ctl-tg-ctl.service` (`ExecStart` = the clone's `tg-ctl`) may be installed but
+  disabled. A `…service.d/*.conf` drop-in pinning `ExecStart` to a
+  `tg-cli-releases/<ver>-<hash>/tg-ctl` path would make an enabled unit run that frozen
+  snapshot instead of the clone — do not leave one behind. Run `tg-ctl enable` by absolute path
+  from the clone (`~/.local/share/tg-cli/tg-ctl enable`), never from a worktree or a snapshot:
+  it records `~/.files/bin/tg-ctl` when that exists (legacy layout), else the path of the
+  script it runs from (tg-cli#783).
+- **On a macOS host** the daemon is supervised by rig's launchd job **`ai.hyperide.tg-ctl`**
   (`~/Library/LaunchAgents/ai.hyperide.tg-ctl.plist`, `KeepAlive`, stderr →
   `~/.config/tg-cli/launchd.tg-ctl.err.log`); `tg-ctl restart` brings it back under that
   job (`launchctl kickstart`). Never `launchctl bootout` it to "restart" — that unloads
@@ -115,8 +141,8 @@ I/O, fetch, signals, `bun:ffi`):
   no-op fallback that starts now but won't survive reboot. tg-ctl is Bun/TS so it
   reproduces the lib's CONTRACT, not its code; the full Python code-share happens when tg-cli
   grows a Python seam (follow-up). Spec: `docs/specs/2026-06-10-tg-ctl-control-design.md`
-  (§16 = shipped v1 scope). After merge to main it gets its own `~/.files/bin/tg-ctl` symlink
-  (same live-symlink rule as `tg`).
+  (§16 = shipped v1 scope). After merge to main it ships in the install clone and gets its own
+  `~/.local/bin/tg-ctl` symlink (same live-symlink rule as `tg`).
 - **User-account / call sidecar** (`tg auth user|caller`, `tg call`, `tg user send`; spec
   `docs/specs/independent-telegram-clients.md`). The Bot API cannot act as the user or place
   calls, so these run over MTProto in a **Python** sidecar, `features/telegram_client/`
@@ -296,6 +322,17 @@ after Telegram took it is sent again by the retry or the replay.
 
 ### Existing Features
 
+- `features/chatgpt/` — ChatGPT session control as a CLIENT of `pm chatgpt api` (tg-cli#780,
+  `docs/chatgpt.md`): pure `pm-client.ts` (fixed argv, method allowlist, bounded envelope parse,
+  typed outcomes; a timeout of a MUTATING call is `uncertain`, never retried), `args.ts` +
+  `cli.ts` (`tg chatgpt …`, exit codes 0/1/2/69/75, `--json`), `model.ts` (tolerant readers),
+  `format.ts` (redaction/truncation/rendering), `refs.ts` (fixed-schema opaque callback refs),
+  `bot.ts` (the owner-only `/chatgpt` menu + callback handler with injected effects).
+  `pm-runner.ts` is the one impure module (detached process group, whole group ended on
+  timeout/oversize). `tg` dispatches `chatgpt` before the generic send path and always exits with
+  the CLI code; `tg-ctl` routes `cgp:` taps through `stepUpdates` (owner chat required) into
+  `chatgptRefs` (0600). Taps only QUEUE an approval inside pm; never treat a tap or free-text yes as
+  approval, never add a second getUpdates poller.
 - `features/agent-role/` — pure coordinator-vs-subagent model (`docs/specs/agent-role-model.md`,
   the single source every consumer follows): `senderRole` (outbound `tg`: `--subagent` >
   `TG_AGENT` > `RIG_AGENT_ID` > `RIG_DETACHED_AGENT=1` → `detached`), `hookPayloadRole` (a Claude
@@ -699,6 +736,14 @@ after Telegram took it is sent again by the retry or the replay.
   prompt, never a client's silent exit 0. The daemon accepts a generic ask without a registration
   and never defers pane inbound behind it (it is not a prompt in a pane).
 
+- **Owner-only asks (`--owner-only`, capability `ask-owner-only-v1`):** `ButtonRequest.ownerOnly`
+  (kept by `normalizeButtonRequest`) makes `executeAction` refuse every answer-question /
+  close-question-card / post-timeout-question-reply whose `actor` (user id + chat id, set by
+  `stepUpdates`) is not the positive private `TG_CHAT_ID` (`ownerOnlyAnswerAllowed`), answering
+  "not allowed" with no state change; `answerOpenCardInChat` never answers such a card from bare
+  text; the daemon drops an ownerOnly request when `TG_CHAT_ID` is not a private owner chat.
+  `tg-ctl capabilities --json` is static (no config/network). `cgp:` taps and `/chatgpt` likewise
+  require the owner user in the private owner chat.
 - **Graceful reload — no dropped channel (`tg-ctl.<botid>.deferred.json` + cooperative SIGTERM):**
   a reload (a deliberate `tg-ctl restart`, a launchd `bootout`/`bootstrap`, or a crash-relaunch)
   used to drop the live channel two ways. (1) The **defer-while-waiting backlog** — inbound queued

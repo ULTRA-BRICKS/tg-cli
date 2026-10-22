@@ -71,6 +71,9 @@ import { mergePendingDailyReport, undeliveredReportTail } from "./features/tg-ct
 import { splitMessage } from "./features/auto-attach/split"
 import { MESSAGE_LIMIT } from "./features/auto-attach/types"
 import { escapeHtml } from "./features/render/html"
+import { randomBytes } from "node:crypto"
+import { buildMenu, handleCallback, type BotDeps, type BotReply } from "./features/chatgpt/bot"
+import { spawnPmRunner } from "./features/chatgpt/pm-runner"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { codexUsageTranscriptPath, latestCodexUsageTelemetryPayload } from "./features/tg-ctl/codex-usage"
 import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
@@ -444,9 +447,14 @@ import {
 import { applyCodexHookTrustBypass, detectRig, NO_RIG_EXIT, runRigDelegate } from "./features/tg-ctl/rig-delegate"
 import { normalizeHookRequests, type HookEnv } from "./features/tg-ctl/hook-normalize"
 import {
+  CAPABILITIES,
+  CAPABILITIES_SCHEMA_VERSION,
   GENERIC_ASK_ORIGIN_AGENT,
   genericAskDaemonAbandonMs,
   isGenericAskRequest,
+  isPrivateOwnerChatId,
+  OWNER_ONLY_FLAG,
+  ownerOnlyAnswerAllowed,
   parseGenericAskArgv,
   resolveGenericAskVerdict,
   type GenericAskTimeout,
@@ -612,6 +620,11 @@ export const USAGE = `Usage:
   tg-ctl ask             # internal: hook client, reads a ButtonRequest JSON from stdin
                          # optional per-request timeoutMs field extends the wait,
                          # capped at 15 min (agent-tools sends 600000 for hatch asks)
+  tg-ctl ask --owner-only <question> [--timeout SEC]
+                         # same, but only the owner (TG_CHAT_ID, a positive private chat id)
+                         # tapping in that private chat can answer; others get "not allowed"
+  tg-ctl capabilities --json
+                         # print feature markers (e.g. ask-owner-only-v1); no network/config
   tg-ctl ask <question> [--timeout SEC]
                          # blocking human approval for any script or hook: posts an
                          # Approve/Reject card, exit 0 ONLY on an Approve tap; reject,
@@ -5329,6 +5342,8 @@ export function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     // into the pane (all-or-nothing — see ButtonRequest.multiQuestion). Parsed
     // here so it survives BOTH the socket boundary and the disk restore.
     multiQuestion: rec.multiQuestion === true ? true : undefined,
+    // Owner-only asks (ask-owner-only-v1) keep the bit across the socket and the disk restore.
+    ownerOnly: rec.ownerOnly === true ? true : undefined,
     // The per-turn identity proof (see ButtonRequest.promptTurnId) MUST survive
     // BOTH the socket boundary and the disk restore — it's what the reconnect
     // branch requires before auto-delivering a queued permission decision
@@ -5913,6 +5928,12 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
     // `ask-forward` reason so a question that doesn't reach Telegram is visible.
     log(`ask-forward dropped: reason=unparsable-payload line=${describeHookLine(line)}`)
     dropAsk(socket, "unparsable-payload")
+    return
+  }
+
+  if (req.ownerOnly && !isPrivateOwnerChatId(ctx.chatId)) {
+    log(`ask-forward dropped: reason=owner-only-needs-private-owner-chat req=${req.requestId}`)
+    dropAsk(socket, "owner-only-needs-private-owner-chat")
     return
   }
 
@@ -6714,7 +6735,11 @@ async function askDaemon(ctx: Ctx): Promise<void> {
 // Generic blocking approval (tg-cli#149): `tg-ctl ask "<question>"` posts an
 // Approve/Reject card and waits. Only a verified Telegram tap exits 0; reject,
 // timeout, an unreachable daemon or a malformed reply exit 1 (fail closed).
-async function runGenericAsk(ctx: Ctx, question: string, timeout: GenericAskTimeout): Promise<number> {
+async function runGenericAsk(ctx: Ctx, question: string, timeout: GenericAskTimeout, ownerOnly = false): Promise<number> {
+  if (ownerOnly && !isPrivateOwnerChatId(ctx.chatId)) {
+    console.error("denied: --owner-only needs a positive private TG_CHAT_ID")
+    return 1
+  }
   if (timeout.warning) console.error(`tg-ctl ask: ${timeout.warning}`)
   const req: ButtonRequest = {
     requestId: crypto.randomUUID(),
@@ -6727,6 +6752,7 @@ async function runGenericAsk(ctx: Ctx, question: string, timeout: GenericAskTime
     timeoutMs: genericAskDaemonAbandonMs(timeout.seconds),
     origin: { agent: GENERIC_ASK_ORIGIN_AGENT },
     asker: askerIdentity(),
+    ...(ownerOnly ? { ownerOnly: true } : {}),
   }
   log(`generic-ask requested: requestId=${req.requestId} timeoutS=${timeout.seconds} cwd=${req.cwd}`)
   withdrawOnSignal(ctx, [req.requestId])
@@ -7038,6 +7064,63 @@ function projectFromPrUrl(rawUrl: string): string | undefined {
     return `${parts[pullIndex - 2]}/${parts[pullIndex - 1]}`
   } catch {
     return undefined
+  }
+}
+
+// /chatgpt — the owner-only ChatGPT session menu (features/chatgpt, docs/chatgpt.md). The pure
+// module decides everything; this wiring supplies the real pm runner and the durable ref store.
+// Handlers are NOT awaited by the action loop (a pm call may take up to its bounded timeout), at
+// most CHATGPT_MAX_IN_FLIGHT at a time. The reference is consumed synchronously inside
+// handleCallback BEFORE its first await, so action order and replay safety do not depend on that.
+const CHATGPT_MAX_IN_FLIGHT = 4
+let chatgptInFlight = 0
+
+function chatgptBotDeps(ctx: Ctx): BotDeps {
+  return {
+    run: spawnPmRunner,
+    now: Date.now,
+    randomId: () => randomBytes(16).toString("base64url"),
+    readStore: () => readFileOrNull(ctx.paths.chatgptRefs),
+    writeStore: (content) => atomicWrite(ctx.paths.chatgptRefs, content),
+    ownerChatId: ctx.chatId,
+  }
+}
+
+async function sendChatgptReply(ctx: Ctx, reply: BotReply, extra: Record<string, unknown> = {}): Promise<void> {
+  const id = await sendMessage(ctx, reply.html, { ...extra, parse_mode: "HTML", ...(reply.keyboard ? { reply_markup: reply.keyboard } : {}) })
+  if (id === null) log("chatgpt: reply could not be delivered")
+}
+
+async function runChatgptMenu(ctx: Ctx, action: Extract<Action, { kind: "chatgpt-menu" }>): Promise<void> {
+  const thread = typeof action.threadId === "number" ? { message_thread_id: action.threadId } : {}
+  if (action.workspace === null) {
+    await sendMessage(ctx, "usage: /chatgpt [home|glide.vc|all]", thread)
+    return
+  }
+  if (chatgptInFlight >= CHATGPT_MAX_IN_FLIGHT) {
+    await sendMessage(ctx, "chatgpt: busy with earlier requests — try again in a moment", thread)
+    return
+  }
+  chatgptInFlight++
+  try {
+    await sendChatgptReply(ctx, await buildMenu(chatgptBotDeps(ctx), action.workspace), thread)
+  } finally {
+    chatgptInFlight--
+  }
+}
+
+async function runChatgptCallback(ctx: Ctx, action: Extract<Action, { kind: "chatgpt-callback" }>): Promise<void> {
+  if (chatgptInFlight >= CHATGPT_MAX_IN_FLIGHT) {
+    await answerCallbackQuery(ctx, action.callbackQueryId, "busy — tap again in a moment")
+    return
+  }
+  chatgptInFlight++
+  try {
+    const result = await handleCallback(chatgptBotDeps(ctx), { data: action.data, chatId: action.chatId })
+    await answerCallbackQuery(ctx, action.callbackQueryId, result.toast)
+    if (result.reply) await sendChatgptReply(ctx, result.reply, typeof action.threadId === "number" ? { message_thread_id: action.threadId } : {})
+  } finally {
+    chatgptInFlight--
   }
 }
 
@@ -9413,6 +9496,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
     const cardKey = cards[0]
+    // An owner-only card is never answered from bare chat text: no verified actor there.
+    if ((pendingButtons.get(cardKey) ?? abandonedButtons.get(cardKey))?.req.ownerOnly) return false
     const pending = pendingButtons.get(cardKey)
     if (pending) {
       log(`ask-answered-in-chat: key=${cardKey} source=${sourceMessageId}`)
@@ -12887,6 +12972,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     } else if (action.kind === "post-timeout-question-reply") {
       action = { ...action, questionMessageId: cardMessageIdFor(action.questionMessageId) }
     }
+    // ownerOnly cards: one predicate for every answer path (tap, close, text reply).
+    if (action.kind === "answer-question" || action.kind === "close-question-card" || action.kind === "post-timeout-question-reply") {
+      const card = pendingButtons.get(action.requestId) ?? abandonedButtons.get(action.requestId)
+      if (card?.req.ownerOnly && !ownerOnlyAnswerAllowed(ctx.chatId, action.actor)) {
+        log(`ask-answer-refused: req=${action.requestId} kind=${action.kind} reason=owner-only`)
+        if ("callbackQueryId" in action && action.callbackQueryId) await answerCallbackQuery(ctx, action.callbackQueryId, "not allowed")
+        return true
+      }
+    }
     switch (action.kind) {
       case "reply":
         await sendMessage(ctx, action.text, replyContext(action.threadId))
@@ -12910,6 +13004,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
               messageId: action.questionMessageId,
               freeText: action.text,
               ...(action.threadId !== undefined ? { threadId: action.threadId } : {}),
+              ...(action.actor ? { actor: action.actor } : {}),
             },
             precedingOk,
           )
@@ -13057,6 +13152,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return true
       case "tasks":
         await runTasksCommand(ctx, action)
+        return true
+      case "chatgpt-menu":
+        runChatgptMenu(ctx, action).catch((err) => log(`chatgpt menu error: ${err}`))
+        return true
+      case "chatgpt-callback":
+        runChatgptCallback(ctx, action).catch((err) => log(`chatgpt callback error: ${err}`))
         return true
       case "limit-continue":
         return handleLimitContinue(action)
@@ -13623,9 +13724,28 @@ if (import.meta.main) {
   }
   // Internal one-shot child spawned by `harness-event`; intentionally absent
   // from USAGE and guarded by persisted retry state before it can inject text.
-  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "withdraw", "install-hooks", "voice-setup", "harness-event", "codex-usage-hook", "auto-continue-once", "usage-schedule", "usage-schedule-check", "inbox", "audit-delivery", "alert"].includes(cmd)) {
+  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "withdraw", "install-hooks", "voice-setup", "harness-event", "codex-usage-hook", "auto-continue-once", "usage-schedule", "usage-schedule-check", "inbox", "audit-delivery", "alert", "capabilities"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
+  }
+  // `ask --help` / `ask -h` (exactly one arg) is help: print usage before any config, auth,
+  // daemon or network access so it can never be posted as a question.
+  if (cmd === "ask" && process.argv.length === 4 && (process.argv[3] === "--help" || process.argv[3] === "-h")) {
+    console.log(USAGE)
+    process.exit(0)
+  }
+  // `capabilities --json`: static feature markers, no config, env, network or daemon access.
+  if (cmd === "capabilities") {
+    if (process.argv.length === 4 && process.argv[3] === "--json") {
+      console.log(JSON.stringify({ schema_version: CAPABILITIES_SCHEMA_VERSION, capabilities: [...CAPABILITIES] }))
+      process.exit(0)
+    }
+    console.error("usage: tg-ctl capabilities --json")
+    process.exit(2)
+  }
+  if (cmd === "ask" && process.argv.slice(3).includes(OWNER_ONLY_FLAG) && process.argv.slice(3).some((a) => a === "--help" || a === "-h")) {
+    console.error("usage: tg-ctl ask --owner-only <question> [--timeout SEC]")
+    process.exit(2)
   }
 
   const home = process.env.HOME ?? "~"
@@ -13645,6 +13765,10 @@ if (import.meta.main) {
   // internal hook-client shapes (parseGenericAskArgv → null) keep their exit-0
   // fast passthrough.
   const genericAsk = cmd === "ask" ? parseGenericAskArgv(process.argv.slice(3)) : null
+  if (genericAsk?.ownerOnly && !genericAsk.question.trim()) {
+    console.error("usage: tg-ctl ask --owner-only <question> [--timeout SEC]")
+    process.exit(2)
+  }
   if (genericAsk && !genericAsk.question.trim()) {
     console.error("denied: empty question")
     process.exit(1)
@@ -13760,7 +13884,7 @@ if (import.meta.main) {
     // internal shape, so a `--verify-grant` word inside an unquoted question can
     // never reach the grant client below (which exits 0).
     if (genericAsk) {
-      const code = await runGenericAsk(ctx, genericAsk.question, genericAsk.timeout)
+      const code = await runGenericAsk(ctx, genericAsk.question, genericAsk.timeout, genericAsk.ownerOnly)
       if (signalExit) await signalExit
       process.exit(code)
     }

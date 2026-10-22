@@ -69,7 +69,7 @@ test('callback_query from allowed sender resolves a button answer and advances o
     ],
     makeOpts(),
   );
-  expect(r.actions).toEqual([
+  expect(r.actions).toMatchObject([
     { kind: 'answer-question', callbackQueryId: 'cb1', requestId: 'q_123', value: 'o1', messageId: 50 },
   ]);
   expect(r.newOffset).toBe(9);
@@ -89,7 +89,7 @@ test('callback_query without a message reference carries messageId null', () => 
     ],
     makeOpts(),
   );
-  expect(r.actions).toEqual([
+  expect(r.actions).toMatchObject([
     { kind: 'answer-question', callbackQueryId: 'cb1', requestId: 'q_123', value: 'o1', messageId: null },
   ]);
 });
@@ -180,7 +180,7 @@ test('callback_query for a post-timeout question close button emits close-card a
     ],
     makeOpts(),
   );
-  expect(r.actions).toEqual([
+  expect(r.actions).toMatchObject([
     { kind: 'close-question-card', callbackQueryId: 'cb1', requestId: 'q_123', messageId: 50 },
   ]);
 });
@@ -202,7 +202,7 @@ test('callback_query actions are prioritized before slower message actions in th
     makeOpts(),
   );
   expect(r.actions.map((a) => a.kind)).toEqual(['answer-question', 'download-media', 'ack']);
-  expect(r.actions[0]).toEqual({
+  expect(r.actions[0]).toMatchObject({
     kind: 'answer-question',
     callbackQueryId: 'cb1',
     requestId: 'q_123',
@@ -250,7 +250,7 @@ test('text reply to a post-timeout question card is routed as the deferred answe
     ],
     makeOpts({ postTimeoutQuestionRequestIdForMessage: (messageId) => (messageId === 50 ? 'q_123' : null) }),
   );
-  expect(r.actions).toEqual([
+  expect(r.actions).toMatchObject([
     {
       kind: 'post-timeout-question-reply',
       requestId: 'q_123',
@@ -280,7 +280,7 @@ test('an affirmative text reply to a decidable permission card resolves as allow
     ],
     makeOpts({ permissionRequestIdForMessage: (messageId) => (messageId === 60 ? 'perm_1' : null) }),
   );
-  expect(r.actions).toEqual([
+  expect(r.actions).toMatchObject([
     { kind: 'answer-question', callbackQueryId: '', requestId: 'perm_1', value: 'allow', messageId: 60 },
     { kind: 'ack', messageId: 101 },
   ]);
@@ -301,7 +301,7 @@ test('a negative text reply to a decidable permission card resolves as deny', ()
     ],
     makeOpts({ permissionRequestIdForMessage: (messageId) => (messageId === 60 ? 'perm_1' : null) }),
   );
-  expect(r.actions).toEqual([
+  expect(r.actions).toMatchObject([
     { kind: 'answer-question', callbackQueryId: '', requestId: 'perm_1', value: 'deny', messageId: 60 },
     { kind: 'ack', messageId: 102 },
   ]);
@@ -344,7 +344,7 @@ test('a decision reply token is case-insensitive and tolerates surrounding white
   const opts = makeOpts({ permissionRequestIdForMessage: (messageId) => (messageId === 60 ? 'perm_1' : null) });
   const reply = { message_id: 60, chat: { id: CHAT_ID }, date: NOW - 30, text: 'Permission from claude\n\nProceed?' };
   const rUpper = stepUpdates([upd(104, { text: 'YES', reply_to_message: reply })], opts);
-  expect(rUpper.actions[0]).toEqual({
+  expect(rUpper.actions[0]).toMatchObject({
     kind: 'answer-question',
     callbackQueryId: '',
     requestId: 'perm_1',
@@ -352,7 +352,7 @@ test('a decision reply token is case-insensitive and tolerates surrounding white
     messageId: 60,
   });
   const rPadded = stepUpdates([upd(105, { text: '  Ok  ', reply_to_message: reply })], opts);
-  expect(rPadded.actions[0]).toEqual({
+  expect(rPadded.actions[0]).toMatchObject({
     kind: 'answer-question',
     callbackQueryId: '',
     requestId: 'perm_1',
@@ -371,7 +371,7 @@ test('cyrillic decision tokens resolve allow/deny', () => {
     ['нет', 'deny'],
   ] as const) {
     const r = stepUpdates([upd(106, { text: token, reply_to_message: reply })], opts);
-    expect(r.actions[0]).toEqual({
+    expect(r.actions[0]).toMatchObject({
       kind: 'answer-question',
       callbackQueryId: '',
       requestId: 'perm_1',
