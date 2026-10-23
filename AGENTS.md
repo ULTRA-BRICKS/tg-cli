@@ -405,6 +405,19 @@ after Telegram took it is sent again by the retry or the replay.
   no `--file`/`--photo` attaches is refused with the exact `tg --file <path> …` resend command.
   Same scope as the intent gate minus `--automated`; runs before `--dry-run`. It never attaches
   from the text (tg-cli#648); the disk is an injected `stat`.
+- `features/cli/dimension-gate.ts` (PURE, tg-cli#785) — the model-render dimension gate. An agent
+  send that attaches an image (`--photo`, or a `--file` with an image extension) from a 3D context —
+  cwd or image path under a `garage-band`/`3d-cli` checkout's `projects/` tree or below a `3d.yaml`,
+  or a caption naming 3D work (a .stl/.3mf/.scad file name/G-code/PLA·PETG filament/K1 SE/«3D print|model|render»/модель для печати/ложка) — must attach a
+  render with a `<image>.dims.json` sidecar that passes `3d dimension --check <image>` (3d-cli#477
+  owns the legibility rules; tg only calls it, `3d` resolved from PATH, a failing or unrunnable
+  check blocks). Same senders as the unattached-file gate (not `--automated`); runs before
+  `--dry-run`; always ON — no feature toggle. The one way past it for a non-model image is
+  `RIG_HATCH_REQUEST_TG_DIMENSIONS_SKIP="<why>"` (≥ 3 words, 15 characters): the reason goes to the owner as one
+  `tg-ctl ask` approval (hatch convention, deny by default); no approval = blocked. The disk, the
+  check and the approval are injected/wired in `tg`; tests: `dimension-gate.test.ts` (pure) and
+  `dimension-gate-cli.test.ts` (real `tg`, fake `3d` on PATH; the approver is the `tg-ctl` next to `tg` with
+  NO env override, so tests run a copy of `tg` beside a stand-in `tg-ctl`).
 - `features/tg-ctl/` — inbound control logic: `control:` config block parser, singleton/pidfile
   helpers, the update→action step function (allowlist, staleness, command split, `/agent`
   routing, reply-quote forwarding), tmux inject plans as data, agent pane discovery (process-tree

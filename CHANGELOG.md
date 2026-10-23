@@ -3,6 +3,14 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.71.0
+
+- **Model-render dimension gate (#785).** An agent send that attaches an image from a 3D context
+  (a `garage-band`/`3d-cli` project path or a caption naming 3D work) is refused unless the image
+  carries a `<image>.dims.json` sidecar from `3d dimension` that passes `3d dimension --check`
+  (legible labels: font, overlap, contrast, inside the frame). A non-model image goes out only
+  with `RIG_HATCH_REQUEST_TG_DIMENSIONS_SKIP="<why>"` approved by the owner. See `tg help`.
+
 ## 1.70.0
 
 - **`tg-ctl capabilities --json`.** Prints `{"schema_version":1,"capabilities":["ask-owner-only-v1"]}`
@@ -36,6 +44,8 @@ semantic versioning.
   an approval in pm. See `docs/chatgpt.md`.
 - **Mid-argv `-` appends the stdin body last.** `tg "Header" -` with piped text sends `Header`
   followed by the piped body (covered by `tests/cli-stdin-body.test.ts`).
+
+||||||| parent of 95cb98b (feat(tg): dimension gate — image from a 3D context must carry legible dimensions (Refs #785))
 
 ## 1.69.0
 
