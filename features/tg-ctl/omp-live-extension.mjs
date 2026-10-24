@@ -46,6 +46,21 @@ export default function ompLiveExtension(pi) {
     } catch { /* a torn-down binding: fall back to the header */ }
     return ctx.sessionManager.getHeader?.()?.title ?? null;
   }
+  // Pending `ask` tool calls of THIS binding's session: while one is open the human, not
+  // the agent, is the one working (tg-cli#789). Each factory binding has its own set (a
+  // subagent's binding never touches the original session's), and only the original
+  // session's binding publishes a snapshot.
+  const pendingAsks = new Set();
+  // Running task SUBAGENTS of the session (omp `getAsyncJobSnapshot().running`, type "task").
+  // Other background jobs (a dev server, a `tail -f`) are deliberately not counted: they
+  // keep running while the agent sits idle waiting for the human, and must not count as
+  // the agent working. null = this omp cannot say.
+  function runningSubagents(ctx) {
+    try {
+      const running = ctx.getAsyncJobSnapshot?.()?.running;
+      return Array.isArray(running) ? running.filter((job) => job?.type === 'task').length : null;
+    } catch { return null; }
+  }
   function contextSnapshot(ctx) {
     return {
       sessionId: ctx.sessionManager.getSessionId(),
@@ -53,6 +68,8 @@ export default function ompLiveExtension(pi) {
       cwd: ctx.cwd,
       durableSession: process.env.RIG_SESSION ?? null,
       busy: !ctx.isIdle(),
+      subagents: runningSubagents(ctx),
+      awaitingUser: pendingAsks.size > 0,
       title: sessionTitle(ctx),
     };
   }
@@ -104,7 +121,10 @@ export default function ompLiveExtension(pi) {
   pi.on('session_start', async (_event, ctx) => publish(ctx));
   pi.on('session_switch', async (_event, ctx) => publish(ctx));
   pi.on('turn_end', async (_event, ctx) => heal(ctx));
-  pi.on('agent_end', async (_event, ctx) => heal(ctx));
+  // A run that ended cannot still be waiting on a question; never leave the flag stuck.
+  pi.on('agent_end', async (_event, ctx) => { pendingAsks.clear(); await heal(ctx); });
+  pi.on('tool_execution_start', async (event) => { if (event?.toolName === 'ask') pendingAsks.add(event.toolCallId ?? 'ask'); });
+  pi.on('tool_execution_end', async (event) => { if (event?.toolName === 'ask') pendingAsks.delete(event.toolCallId ?? 'ask'); });
   pi.on('session_shutdown', async () => {
     // Only this binding's own endpoint; a subagent shutdown owns none.
     self.shutdown = true;

@@ -212,6 +212,25 @@ fixtures. `tg-ctl status` names every omp without a bridge. See `docs/omp-origin
 for setup, receipt semantics, and the one-time saved restart needed by already-running OMP.
 Cwd/title are not process identity.
 
+### Awareness nudge (`tg reminder`, tg-cli#363, #789)
+
+`features/tg-ctl/tg-awareness-nudge.ts` (PURE) decides who gets the hourly "no Telegram update"
+reminder; the daemon sweep in `tg-ctl` feeds it one `LiveAgentObservation` per verified live omp.
+It fires **only while the session is working** (`classifyActivity`): a turn is running, or task
+subagents are running (the original-process bridge publishes `busy`, `subagents` — running
+`type: "task"` jobs from `ctx.getAsyncJobSnapshot()`, never a bash dev server — and `awaitingUser`
+for a pending `ask`). Idle, waiting-for-the-human and unknown sessions are never nudged, and every
+sweep that sees one resets its silence clock (`activeSince`), so a session idle for 3 h that starts
+a task is nudged an hour into the task, not at once. A "running" turn with no transcript write for
+30 min and no subagents counts as blocked on the human (a tool-approval prompt, a hatch card); a
+bridge older than #789 reports `null` for subagents/ask, and then a transcript written in the last
+2 min (`omp-activity-fs.ts`, session + subagent `*.jsonl`) counts as working. One nudge per
+episode (a continuous working stretch without a `tg` send); a key missing from sweeps for up to
+10 min keeps its state and nudge marker, so a failed probe cannot re-arm the nudge, and a stretch
+never spans a longer gap. `tg-ctl status --verbose` prints, per remembered session, its state,
+silence, last nudge and the reason. Only omp is covered: nudging a tmux Claude/Codex pane would
+mean typing into its input box (tg-cli#792).
+
 ### Alert subscriptions (`tg-ctl alert`, tg-cli#636)
 
 `features/tg-ctl/alert-subscriptions.ts` (PURE: store format, binding resolution, throttle,

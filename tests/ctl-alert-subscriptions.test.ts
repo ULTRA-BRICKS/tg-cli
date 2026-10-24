@@ -75,6 +75,8 @@ const endpoint = (over: Partial<OriginalOmpEndpoint> = {}): OriginalOmpEndpoint 
   cwd: '/tmp',
   durableSession: null,
   busy: false,
+  subagents: null,
+  awaitingUser: null,
   title: '🕹️ AGENTS: Supervise omp agents and rig',
   ...over,
 });

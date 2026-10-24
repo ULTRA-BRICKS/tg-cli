@@ -3,6 +3,15 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.71.1
+
+- **The `tg reminder` only fires at sessions that are working (#789).** It used to nudge every live
+  omp silent for an hour, idle ones included: the nudge woke the session, it answered with a `tg`
+  status, and an hour later it was nudged again. A session now counts as working only while a turn
+  runs or task subagents run (the omp-live bridge also reports `subagents` and a pending `ask`);
+  idle and waiting sessions are never nudged and their silence clock resets, a state kept across
+  a missed sweep. `tg-ctl status --verbose` shows why each session was or was not nudged.
+
 ## 1.71.0
 
 - **Model-render dimension gate (#785).** An agent send that attaches an image from a 3D context

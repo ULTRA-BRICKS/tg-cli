@@ -207,3 +207,33 @@ test('#538: an omp with only the retired RIG_OMP_SESSION reports no durableSessi
   await f.handlers.get('session_start')({}, f.ctx);
   assert.equal((await listLiveEndpoints(f.root))[0].durableSession, null);
 });
+
+// #789: the awareness nudge needs to know whether the session is really working.
+test('#789: status reports running task subagents (not bash jobs) and a pending ask; an older omp without the snapshot reports null', async t => {
+  let jobs = [{ id: 'a', type: 'task' }, { id: 'b', type: 'task' }, { id: 'srv', type: 'bash' }];
+  const f = await setup(t);
+  f.ctx.getAsyncJobSnapshot = () => ({ running: jobs, recent: [] });
+  await f.handlers.get('session_start')({}, f.ctx);
+  let row = (await listLiveEndpoints(f.root))[0];
+  assert.equal(row.subagents, 2);
+  assert.equal(row.awaitingUser, false);
+  jobs = [];
+  await f.handlers.get('tool_execution_start')({ toolName: 'ask', toolCallId: 'q1' });
+  row = (await listLiveEndpoints(f.root))[0];
+  assert.equal(row.subagents, 0);
+  assert.equal(row.awaitingUser, true);
+  await f.handlers.get('tool_execution_start')({ toolName: 'bash', toolCallId: 'b1' });
+  await f.handlers.get('tool_execution_end')({ toolName: 'ask', toolCallId: 'q1' });
+  assert.equal((await listLiveEndpoints(f.root))[0].awaitingUser, false);
+  delete f.ctx.getAsyncJobSnapshot;
+  assert.equal((await listLiveEndpoints(f.root))[0].subagents, null);
+});
+
+test('#789: a run that ends clears a stuck pending-ask flag', async t => {
+  const f = await setup(t);
+  await f.handlers.get('session_start')({}, f.ctx);
+  await f.handlers.get('tool_execution_start')({ toolName: 'ask', toolCallId: 'q1' });
+  assert.equal((await listLiveEndpoints(f.root))[0].awaitingUser, true);
+  await f.handlers.get('agent_end')({}, f.ctx);
+  assert.equal((await listLiveEndpoints(f.root))[0].awaitingUser, false);
+});

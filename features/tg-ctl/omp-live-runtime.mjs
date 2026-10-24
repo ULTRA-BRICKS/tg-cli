@@ -86,6 +86,9 @@ function publicSnapshot(raw, pid, instanceId) {
     sessionFile: typeof raw.sessionFile === 'string' && raw.sessionFile.length <= 8192 ? raw.sessionFile : null,
     cwd: raw.cwd, durableSession: typeof raw.durableSession === 'string' ? raw.durableSession.slice(0, 256) : null,
     busy: typeof raw.busy === 'boolean' ? raw.busy : null,
+    // Absent from an older extension: null = "not reported", never "none" (tg-cli#789).
+    subagents: Number.isSafeInteger(raw.subagents) && raw.subagents >= 0 ? raw.subagents : null,
+    awaitingUser: typeof raw.awaitingUser === 'boolean' ? raw.awaitingUser : null,
     title: typeof raw.title === 'string' ? raw.title.slice(0, 1024) : null,
   };
 }
@@ -298,7 +301,9 @@ async function probed(root, exactPid) {
       // A live, private socket that accepted the connection but did not answer in
       // time is a host whose event loop is busy — alive-busy, not gone (#458).
       if (e?.code !== 'endpoint_timeout') return null;
-      try { return { meta, status: { ...publicSnapshot(meta, meta.pid, meta.instanceId), busy: true } }; } catch { return null; }
+      // `meta` is the descriptor written when the endpoint last refreshed: its subagents /
+      // awaitingUser are as old as that write, so a timed-out probe reports them as unknown.
+      try { return { meta, status: { ...publicSnapshot(meta, meta.pid, meta.instanceId), busy: true, subagents: null, awaitingUser: null } }; } catch { return null; }
     }
   }))).filter(Boolean);
   return rows.sort((a,b) => a.status.pid-b.status.pid || a.status.instanceId.localeCompare(b.status.instanceId));

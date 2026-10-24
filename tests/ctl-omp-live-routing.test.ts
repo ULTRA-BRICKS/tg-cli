@@ -1,7 +1,7 @@
 // #450: identity and delivery IDs cannot fall back to directory or user text.
 import { expect, test } from 'bun:test';
 import { selectOriginalEndpoint, originalRequestId } from '../features/tg-ctl/omp-live-routing';
-const a = { pid: 1, instanceId: 'first', sessionId: 'session-a', sessionFile: '/s/a', cwd: '/same', durableSession: null, busy: false, title: 'Same' };
+const a = { pid: 1, instanceId: 'first', sessionId: 'session-a', sessionFile: '/s/a', cwd: '/same', durableSession: null, busy: false, subagents: null, awaitingUser: null, title: 'Same' };
 const b = { ...a, pid: 2, instanceId: 'second', sessionId: 'session-b' };
 test('same directory never chooses a host; exact PID distinguishes equal names and cwd', () => {
   expect(() => selectOriginalEndpoint({ cwd: '/same' }, [a, b])).toThrow('exact_identity_required');

@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 export interface OriginalOmpEndpoint {
   pid: number; instanceId: string; sessionId: string; sessionFile: string | null;
   cwd: string; durableSession: string | null; busy: boolean | null; title: string | null;
+  // Running task subagents and a pending `ask`; null = an older bridge that does not report them.
+  subagents: number | null; awaitingUser: boolean | null;
 }
 export interface OriginalOmpTarget {
   pid?: number; instanceId?: string | null; sessionId?: string | null; cwd?: string | null;

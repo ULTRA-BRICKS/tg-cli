@@ -327,9 +327,12 @@ import {
   markAwarenessNudgeSent,
   parseAwarenessNudgeStore,
   planAwarenessNudges,
+  renderAwarenessStatus,
   serializeAwarenessNudgeStore,
   type AwarenessNudgeStore,
+  type LiveAgentObservation,
 } from "./features/tg-ctl/tg-awareness-nudge"
+import { newestTranscriptWriteMs } from "./features/tg-ctl/omp-activity-fs"
 import { normalizeRichHtml, validateRichHtml } from "./features/render/rich"
 import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
 import { daemonAuthStep, markAuthBound, markAuthFailed, serializePending, type AuthChat, type PendingAuth } from "./features/auth/binding"
@@ -588,11 +591,12 @@ export const USAGE = `Usage:
   tg-ctl start [--pane %N] [--cwd PATH] [--session NAME]
                          # background (detached) daemon, returns immediately
   tg-ctl run             # foreground (blocking) daemon — the process itself
-  tg-ctl status          # is it running? pid / bot / target pane / autostart;
+  tg-ctl status [--verbose]  # is it running? pid / bot / target pane / autostart;
                          # \`code:\` names the commit the daemon loaded — STALE when its
                          # checkout has newer daemon code (merged but not restarted);
                          # also lists sessions hosted by the rig wrapper outside tmux (typed into
-                         # their abduco PTY) and agents outside tmux AND the wrapper as unreachable
+                         # their abduco PTY) and agents outside tmux AND the wrapper as unreachable;
+                         # --verbose adds why each omp session was or was not sent the \`tg reminder\`
   tg-ctl audit-delivery [--since DATE] [--until DATE] [--json] [--transcripts DIR]...
                          # report inbound messages never delivered, delivered twice, or
                          # never received (update-id gaps), with dates; read-only
@@ -3790,6 +3794,25 @@ function topicSettingsLine(ctx: Ctx): Promise<string> | null {
       ? `${line} — ⚠ every message sent from Telegram's "New Chat" opens a new topic and waits behind the session picker; @BotFather can stop users creating topics`
       : line
   })
+}
+
+// Awareness-nudge state is keyed by the session (`omp:<sessionId>`) when omp has published
+// one, so a `--resume` into another pane keeps its silence clock and nudge marker (#459).
+// History rows only carry the pane/pid locator, so the last-send time is read through the
+// agent's locator.
+function ompLocatorOf(a: LiveOmpAgent): string {
+  return a.paneId ?? liveOmpPaneId(a.pid)
+}
+function nudgeKeyOf(a: LiveOmpAgent): string {
+  return a.sessionId ? sessionKey("omp", a.sessionId) : ompLocatorOf(a)
+}
+
+// `tg-ctl status --verbose`: why each remembered omp session was or was not sent the
+// awareness `tg reminder` (tg-cli#789), read from the daemon's persisted state.
+function awarenessStatusBlock(ctx: Ctx): string {
+  const store = parseAwarenessNudgeStore(readFileOrNull(ctx.paths.awarenessNudge))
+  const labels = new Map(listLiveOmpAgents().map((a) => [nudgeKeyOf(a), liveOmpLabel(a)]))
+  return renderAwarenessStatus(store, Date.now(), labels).join("\n")
 }
 
 // `topicSettings`: the resolved topicSettingsLine, awaited by the async caller.
@@ -12233,7 +12256,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // atomic-write-on-mutation, best-effort — a corrupt/unwritable file degrades
   // to "no nudges yet remembered", never breaks the poll loop).
   let awarenessNudgeStore: AwarenessNudgeStore = parseAwarenessNudgeStore(readFileOrNull(ctx.paths.awarenessNudge))
+  let awarenessNudgePersistedAt = 0
   const persistAwarenessNudge = (): void => {
+    awarenessNudgePersistedAt = Date.now()
     try {
       atomicWrite(ctx.paths.awarenessNudge, serializeAwarenessNudgeStore(awarenessNudgeStore))
     } catch (err) {
@@ -13354,33 +13379,41 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // Remind only verified original processes. Never spawn an anonymous agent
       // because a TUI has not published its bridge or its session identity is unknown.
       await refreshOriginalHosts()
-      const liveOmpAgentsForNudge = listLiveOmpAgents().filter(a => originalHosts.some(h => h.pid === a.pid))
+      const hostByPid = new Map(originalHosts.map((h) => [h.pid, h]))
+      const liveOmpAgentsForNudge = listLiveOmpAgents().filter((a) => hostByPid.has(a.pid))
       if (liveOmpAgentsForNudge.length > 0 || Object.keys(awarenessNudgeStore).length > 0) {
-        // Nudge state is keyed by the session (`omp:<sessionId>`) when omp has
-        // published one, so a `--resume` into another pane keeps its silence
-        // clock and nudge marker (#459). History rows only carry the pane/pid
-        // locator, so the last-send time is read through the agent's locator.
-        const locatorOf = (a: LiveOmpAgent): string => a.paneId ?? liveOmpPaneId(a.pid)
-        const nudgeKeyOf = (a: LiveOmpAgent): string => (a.sessionId ? sessionKey("omp", a.sessionId) : locatorOf(a))
         const liveOmpAgentByNudgeKey = new Map(liveOmpAgentsForNudge.map((a) => [nudgeKeyOf(a), a]))
-        const nudgeKeys = [...liveOmpAgentByNudgeKey.keys()]
-        const sessionIdByNudgeKey = new Map([...liveOmpAgentByNudgeKey].map(([key, a]) => [key, a.sessionId]))
         const sentAtByLocator = lastTgSentAtByKey(parseHistory(readFileOrNull(ctx.paths.history)))
-        const sentAtByKey = new Map<string, number>()
+        const nowMs = Date.now()
+        const observations: LiveAgentObservation[] = []
         for (const [key, a] of liveOmpAgentByNudgeKey) {
-          const locator = locatorOf(a)
-          const sentAt = sentAtByLocator.get(locator)
-          if (sentAt !== undefined) sentAtByKey.set(key, sentAt)
+          const locator = ompLocatorOf(a)
           // A pre-#459 row keyed by the locator for this same session carries
           // over, so the cutover does not restart its silence clock.
           const legacy = awarenessNudgeStore[locator]
           if (key !== locator && !awarenessNudgeStore[key] && legacy?.sessionId === a.sessionId) {
             awarenessNudgeStore = { ...awarenessNudgeStore, [key]: legacy }
           }
+          // What the session is doing right now (tg-cli#789): the verified host's own
+          // status, plus its transcripts' last write for hosts that cannot report jobs.
+          const host = hostByPid.get(a.pid)
+          observations.push({
+            key,
+            sessionId: a.sessionId,
+            lastTgSentAt: sentAtByLocator.get(locator),
+            activity: {
+              busy: host?.busy ?? null,
+              subagents: host?.subagents ?? null,
+              awaitingUser: host?.awaitingUser ?? null,
+              lastActivityAt: newestTranscriptWriteMs(host?.sessionFile ?? a.sessionFile),
+            },
+          })
         }
-        const nudgePlan = planAwarenessNudges(nudgeKeys, sentAtByKey, awarenessNudgeStore, Date.now(), sessionIdByNudgeKey)
+        const nudgePlan = planAwarenessNudges(observations, awarenessNudgeStore, nowMs)
         awarenessNudgeStore = nudgePlan.store
-        if (nudgePlan.keysChanged) persistAwarenessNudge()
+        // The per-sweep `lastObservedAt` heartbeat is persisted at most once a minute;
+        // a restart that finds an older one starts a fresh working stretch (safe side).
+        if (nudgePlan.changed || nowMs - awarenessNudgePersistedAt > 60_000) persistAwarenessNudge()
         // Only a send that actually SUCCEEDS commits the "nudged" marker
         // (via markAwarenessNudgeSent, below) — a due key stays due next
         // sweep on failure/drop instead of silently losing its one shot at
@@ -13865,6 +13898,7 @@ if (import.meta.main) {
   if (cmd === "status") {
     await refreshOriginalHosts()
     console.log(composeStatus(ctx, null, await topicSettingsLine(ctx)))
+    if (process.argv.slice(3).includes("--verbose")) console.log(awarenessStatusBlock(ctx))
     process.exit(0)
   }
   if (cmd === "inbox") {
