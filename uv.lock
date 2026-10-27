@@ -1453,7 +1453,7 @@ provides-extras = ["call", "voice"]
 
 [[package]]
 name = "tg-cli"
-version = "1.71.2"
+version = "1.71.3"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

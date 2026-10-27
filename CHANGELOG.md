@@ -3,6 +3,14 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.71.3
+
+- **Python render layer (#768).** Added HTML and emoji-entity helpers, rich-message validation,
+  table rendering, tag badges, branded prefixes and terminal help coloring for the Python port.
+  Preserved UTF-16 entity offsets, JavaScript number diagnostics and the formatting reference;
+  prefix fallbacks use the canonical Bun Unicode letter set across supported Python versions.
+  These pure modules prepare the sender migration; existing entrypoints continue using TypeScript.
+
 ## 1.71.2
 
 - **Python shared config primitives (#768).** Ported environment/config parsing, bot-scoped
