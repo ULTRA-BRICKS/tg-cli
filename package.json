@@ -1,8 +1,11 @@
 {
   "name": "tg-cli",
-  "version": "1.71.4",
+  "engines": { "bun": ">=1.2.21" },
+  "version": "1.72.0",
   "type": "module",
   "scripts": {
+    "schema:gen": "bun scripts/generate-config-schema.ts",
+    "schema:check": "bun scripts/generate-config-schema.ts --check",
     "test": "bun test"
   },
   "devDependencies": {

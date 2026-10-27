@@ -33,7 +33,7 @@ Pick one — each ends with `tg` (and `tg-ctl`) on your PATH. Needs [Bun](https:
 macOS and Linux.
 
 ```bash
-# 1. one-liner — clones to ~/.local/share/tg-cli, installs deps via bun, links tg into ~/.local/bin, registers the agent skill
+# 1. one-liner — clones to ~/.local/share/tg-cli, checks Bun, links tg into ~/.local/bin, registers the agent skill
 curl -fsSL https://git.hyperide.ai/ultrabricks/tg-cli/raw/branch/main/install.sh | bash
 
 # 2. from a clone — to hack on it; `git pull` updates the installed tool
@@ -113,6 +113,30 @@ the new file. Exit codes: `0` deployed (or up to date), `1` usage/environment er
 > `git pull --ff-only`), but does not handle the daemon.
 
 ---
+
+## Configuration
+
+Run `tg help config` for every supported setting, its type, default, and behavior.
+`tg config help`, `tg config --help`, and `tg config -h` are equivalent. Help works
+without credentials and does not read or create configuration files.
+
+`tg config validate` checks `config.yaml` read-only (no credentials, network, or
+writes; a missing file is valid) and exits 1 on errors. Errors are unknown keys,
+values the runtime would ignore or heal, and YAML the one-level readers skip.
+Legacy forms the runtime still accepts (`yes`/`no`, quoted `voice.enabled`) are
+warnings, because the editor schema recommends canonical `true`/`false`. A final
+`Bun.YAML.parse` syntax pass (Bun 1.2.21+; skipped with a warning on older Bun)
+catches plain scalars the line checks do not model.
+
+Settings live in `~/.config/tg-cli/config.yaml` (or `$TG_CTL_CONFIG_DIR/config.yaml`).
+Telegram credentials remain in the separate `.env` file managed by `tg auth`.
+Normal configuration reads and writes maintain a sibling `config.schema.json`
+and its YAML language-server comment for editor completion and diagnostics.
+
+See the [complete configuration reference](docs/configuration.md), generated from
+the same definitions as CLI help and the [editor schema](config.schema.json).
+Contributors update both tracked artifacts with `bun run schema:gen`; CI and the
+test suite check that they match the registry. No build step is required.
 
 ## Outbound — agents push to Telegram
 
@@ -436,12 +460,22 @@ Photos and documents sent from Telegram are downloaded to `~/.cache/tg-cli/inbou
 
 A successfully handled message gets a 👀 reaction as a delivery receipt.
 
-### Opt out
+### Disable lazy autostart
+
+`control.enabled` defaults to `true`. Set it to `false` to prevent `tg` from
+automatically starting `tg-ctl` after a successful send from a detected agent in
+tmux:
+
 ```yaml
 # ~/.config/tg-cli/config.yaml
 control:
   enabled: false
 ```
+
+This setting does not stop a running daemon or disable buttons, registrations,
+or explicit daemon starts. Use `tg-ctl stop` to stop the daemon now, or
+`tg-ctl disable` to remove OS autostart and stop it. See `tg help config` for the
+other control settings.
 
 > **One bot token per machine.** Telegram allows a single `getUpdates` consumer per token. Outbound `tg` is unaffected.
 

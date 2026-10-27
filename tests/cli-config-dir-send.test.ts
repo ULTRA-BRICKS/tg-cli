@@ -99,3 +99,21 @@ test('an empty HOME with no TG_CTL_CONFIG_DIR still hard-fails on missing creden
   expect(stderr).toContain('TG_BOT_TOKEN and TG_CHAT_ID must be set');
   expect(received).toHaveLength(0);
 });
+
+test('TG_CTL_CONFIG_DIR selects YAML feature flags over a conflicting HOME config during dry-run', async () => {
+  received = [];
+  const { home, configDir } = makeEmptyHomeAndConfigDir();
+  const defaultDir = join(home, '.config', 'tg-cli');
+  mkdirSync(defaultDir, { recursive: true });
+  writeFileSync(join(defaultDir, 'config.yaml'), 'features:\n  cjk-guard: true\n');
+  writeFileSync(join(configDir, 'config.yaml'), 'features:\n  cjk-guard: false\n');
+  // A stray ideograph inside a Latin word is rejected when cjk-guard is on.
+  // Both runs stay local; only the selected YAML feature configuration differs.
+  const args = ['--dry-run', 'the re中try handler is ready'];
+  const env = { PATH: process.env.PATH ?? '', HOME: home, TG_API_BASE: `http://127.0.0.1:${server.port}` };
+  const override = await run(args, { ...env, TG_CTL_CONFIG_DIR: configDir });
+  expect(override.exitCode).toBe(0);
+  const fallback = await run(args, env);
+  expect(fallback.exitCode).toBe(1);
+  expect(received).toHaveLength(0);
+});

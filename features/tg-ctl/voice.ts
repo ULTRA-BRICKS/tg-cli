@@ -144,25 +144,26 @@ export function renderVoiceConfigBlock(cfg: VoiceConfig): string {
 // whitespace; the block ends at the next such line (blank lines inside the block
 // keep the scan going). Pure — config round-trip is tested through this.
 export function upsertVoiceBlock(yaml: string, cfg: VoiceConfig): string {
-  const block = renderVoiceConfigBlock(cfg);
-  const lines = yaml.split('\n');
-  const startIdx = lines.findIndex((l) => l.length === l.trimStart().length && /^voice:\s*$/.test(l));
+  const eol = yaml.match(/\r?\n/)?.[0] ?? '\n';
+  const block = renderVoiceConfigBlock(cfg).replace(/\n/g, eol);
+  // Keep byte offsets into the original text rather than split/join: untouched
+  // blocks and comments retain their original (including mixed) line endings.
+  const lines = [...yaml.matchAll(/[^\n]*\n|[^\n]+$/g)];
+  const startIdx = lines.findIndex((match) => /^voice:\s*$/.test(match[0].replace(/\r?\n$/, '')));
   if (startIdx === -1) {
-    const sep = yaml.length === 0 || yaml.endsWith('\n') ? '' : '\n';
+    const sep = yaml.length === 0 || yaml.endsWith('\n') ? '' : eol;
     return `${yaml}${sep}${block}`;
   }
-  let end = lines.length;
+  let end = yaml.length;
   for (let i = startIdx + 1; i < lines.length; i++) {
-    const l = lines[i];
-    if (l.trim() === '') continue;
-    if (l.length === l.trimStart().length) {
-      end = i;
+    const text = lines[i][0].replace(/\r?\n$/, '');
+    if (!text.trim()) continue;
+    if (text.length === text.trimStart().length) {
+      end = lines[i].index!;
       break;
     }
   }
-  const before = lines.slice(0, startIdx).join('\n');
-  const after = lines.slice(end).join('\n');
-  return `${before === '' ? '' : `${before}\n`}${block}${after}`;
+  return `${yaml.slice(0, lines[startIdx].index!)}${block}${yaml.slice(end)}`;
 }
 
 // A voice note is configured iff enabled AND both paths are non-empty. The

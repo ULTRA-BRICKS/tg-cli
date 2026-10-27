@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { accessSync, appendFileSync, constants as fsConstants, existsSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "fs"
+import { accessSync, appendFileSync, constants as fsConstants, existsSync, fstatSync, mkdirSync, lstatSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { dirname, join, resolve } from "path"
 // Explicit import (not the global `crypto`) so the multi-part groupId token
@@ -65,6 +65,9 @@ import {
   type HintKind,
 } from "./features/autolink-tasks/state"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
+import { ensureConfigMetadata, readConfigFile } from "./features/config/config-file"
+import { renderConfigHelp } from "./features/config/schema"
+import { CONFIG_VALIDATE_USAGE, renderValidation, validateConfigText } from "./features/config/validate"
 import { botIdFromToken, ctlPaths, readPidFile } from "./features/tg-ctl/lock"
 import { parseInboxState } from "./features/tg-ctl/question-inbox"
 import {
@@ -211,6 +214,7 @@ commands take only their own flags.
 
 Help topics (\`tg help <topic>\`):
   format   what Telegram message formatting supports (HTML tags / entities)
+  config   configuration keys, types, defaults, and editor schema
   report   the structured result report (tg report)
   auth     connecting to Telegram: the bot (login / status / logout) and your own
            accounts (tg auth user|caller), exit codes
@@ -335,6 +339,10 @@ Options:
   -h, --help           print this help and exit
 
 Topic help:
+  tg help config       the configuration reference; aliases: tg config help,
+                       tg config --help, tg config -h.
+  tg config validate   check config.yaml against that reference (read-only;
+                       exit 1 on errors; see tg config validate --help).
   tg help format       the Telegram message-formatting reference (supported
                        HTML tags / entities). The canonical form; the old
                        --format-help flag still works as an alias.
@@ -665,6 +673,47 @@ if (import.meta.main) {
   // finding — this send path used to hardcode the default dir, unlike `replies`).
   const configDir = process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli")
 
+  // Configuration help is static: no config/credential reads or initialization.
+  // Match the complete command so prose beginning with "config" still sends.
+  if (
+    rawArgs.length === 2 &&
+    ((rawArgs[0] === "help" && rawArgs[1] === "config") ||
+      (rawArgs[0] === "config" && ["help", "--help", "-h"].includes(rawArgs[1])))
+  ) {
+    console.log(colorizeHelp(renderConfigHelp(configDir), shouldColorize()))
+    process.exit(0)
+  }
+
+  // `tg config validate`: read-only check of config.yaml. Exact commands only, so prose
+  // such as "config validate my file" still sends. No credential, network or write path.
+  if (rawArgs.length === 3 && rawArgs[0] === "config" && rawArgs[1] === "validate") {
+    if (["help", "--help", "-h"].includes(rawArgs[2])) {
+      process.stdout.write(CONFIG_VALIDATE_USAGE)
+      process.exit(0)
+    }
+  }
+  if (rawArgs.length === 2 && rawArgs[0] === "config" && rawArgs[1] === "validate") {
+    // A dangling symlink is a broken configuration, not an absent file.
+    const lstatExists = (path: string): boolean => { try { lstatSync(path); return true } catch { return false } }
+    const configPath = join(configDir, "config.yaml")
+    let raw: string
+    try {
+      raw = readFileSync(configPath, "utf8")
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && !lstatExists(configPath)) {
+        console.log(`${configPath}: not found; defaults apply`)
+        process.exit(0)
+      }
+      const dangling = (error as NodeJS.ErrnoException).code === "ENOENT" ? " (dangling symlink)" : ""
+      console.error(`${configPath}: error: cannot read${dangling}: ${(error as Error).message}`)
+      process.exit(1)
+    }
+    const verdict = renderValidation(configPath, validateConfigText(raw))
+    process.stderr.write(verdict.stderr)
+    process.stdout.write(verdict.stdout)
+    process.exit(verdict.code)
+  }
+
   // `tg auth …` — the bot connection AND the user's own accounts (docs/specs/tg-auth.md):
   // one parser, one help. Runs before every credential gate: it is how the credentials get
   // there. Exact-match leading token (parseAuthArgs → null for prose like
@@ -779,7 +828,7 @@ if (import.meta.main) {
     }
     // A `tg help <unknown>` names a topic that does not exist — say so (3-part:
     // WHAT/WHY/HOW) on stderr and exit non-zero, rather than silently sending it.
-    console.error(`Error: unknown help topic '${topic}'. Available topics: format, report, auth, obligations, chatgpt. See \`tg help\`.`)
+    console.error(`Error: unknown help topic '${topic}'. Available topics: format, config, report, auth, obligations, chatgpt. See \`tg help\`.`)
     process.exit(1)
   }
 
@@ -955,13 +1004,7 @@ if (import.meta.main) {
   }
   // config.yaml is read ONCE; the raw text feeds both the features: block
   // parser here and the control: block parser for tg-ctl auto-start below.
-  const configYamlRaw = (() => {
-    try {
-      return readFileSync(join(home, ".config", "tg-cli", "config.yaml"), "utf8")
-    } catch {
-      return ""
-    }
-  })()
+  const configYamlRaw = readConfigFile(configDir, { readOnly: true })
   const featureConfig = parseFeatureConfig(configYamlRaw)
   const features = resolveFeatures(featureConfig, {
     enable: flagResult.enable,
@@ -1049,6 +1092,10 @@ if (import.meta.main) {
     console.error(colorizeHelp(USAGE, shouldColorize({ isTTY: Boolean(process.stderr.isTTY) })))
     process.exit(1)
   }
+
+  // Help/version/error exits above are pure. Refresh editor metadata only for
+  // an actionable invocation; every dry-run leaves config and schema untouched.
+  if (!rawArgs.includes("--dry-run")) ensureConfigMetadata(configDir)
 
   const configEnv = loadEnv(join(configDir, ".env"))
   const env = { ...configEnv, ...process.env }

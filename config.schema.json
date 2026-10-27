@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "tg-cli configuration",
+  "description": "Canonical config.yaml settings for tg and tg-ctl. Credentials belong in .env. See tg help config for runtime compatibility and precedence.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "control": {
+      "type": "object",
+      "description": "Inbound control and daemon settings.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Allow tg's lazy autostart of tg-ctl after a successful send from a detected agent inside tmux. This switch does not disable buttons or registrations, stop a running daemon, or block explicit daemon starts.",
+          "examples": [
+            true
+          ],
+          "default": true
+        },
+        "transport": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "tmux",
+            "channel"
+          ],
+          "description": "Legacy transport selector. auto and tmux retain the current routing; channel is reserved and currently logs a warning and falls back to tmux.",
+          "examples": [
+            "auto",
+            "tmux"
+          ],
+          "default": "auto"
+        },
+        "session": {
+          "type": "string",
+          "description": "Pin tmux discovery to this session name. An explicit session registration from tg-ctl start --session takes precedence; omit to auto-discover.",
+          "examples": [
+            "agents"
+          ]
+        },
+        "inject_wrap": {
+          "type": "string",
+          "description": "Template around inbound text. Placeholders: {name} is the sender name, {msg} is the message text, and {id} is its tg# message reference.",
+          "examples": [
+            "[TG from {name} {id}] {msg}"
+          ],
+          "default": "[TG from {name} {id}] {msg}"
+        },
+        "staleness_sec": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Legacy age setting in seconds, retained for compatibility. The daemon does not drop inbound messages by age.",
+          "examples": [
+            600
+          ],
+          "default": 300
+        },
+        "idle_exit_min": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Minutes without a live agent before the daemon exits. Agents outside tmux and recent registrations also count as activity.",
+          "examples": [
+            15
+          ],
+          "default": 30
+        },
+        "allowed_senders": {
+          "type": [
+            "string",
+            "integer"
+          ],
+          "minimum": 0,
+          "pattern": "^\\s*(?:[0-9]+(?:\\s*,\\s*[0-9]+)*)?\\s*$",
+          "description": "Additional allowed Telegram user IDs as a comma-separated scalar (for example \"123, 456\") or a single integer. An empty string adds none. YAML arrays are not supported.",
+          "examples": [
+            "123456789, 987654321",
+            123456789
+          ],
+          "default": ""
+        },
+        "topics": {
+          "type": "boolean",
+          "description": "Enable forum-topic routing in a supergroup. Requires a forum supergroup with the bot allowed to manage topics.",
+          "examples": [
+            false
+          ],
+          "default": false
+        },
+        "private_topics": {
+          "type": "boolean",
+          "description": "Enable topics for sessions in a private bot chat. If the bot lacks the private-topic capability, session creation asks whether to continue without topics or cancel. Topic-creation API errors fall back to flat-chat behavior with a diagnostic.",
+          "examples": [
+            false
+          ],
+          "default": false
+        },
+        "git_state_banner": {
+          "type": "boolean",
+          "description": "Prepend a warning when a fresh non-reply message is automatically routed into a pane whose repository has uncommitted changes or a non-main branch.",
+          "examples": [
+            true
+          ],
+          "default": true
+        }
+      }
+    },
+    "voice": {
+      "type": "object",
+      "description": "Local transcription of inbound voice notes.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable local transcription of inbound voice notes. A usable binary and model are required; tg voice setup discovers or installs them and writes this block. An explicit false opts out of automatic setup.",
+          "examples": [
+            false
+          ],
+          "default": false
+        },
+        "runner": {
+          "type": "string",
+          "enum": [
+            "whisper.cpp",
+            "faster-whisper"
+          ],
+          "description": "Local Whisper runner. whisper.cpp uses a native executable; faster-whisper uses a Python environment. Setup may choose a runner suited to the host.",
+          "examples": [
+            "whisper.cpp",
+            "faster-whisper"
+          ],
+          "default": "whisper.cpp"
+        },
+        "bin_path": {
+          "type": "string",
+          "description": "Path to whisper-cli (or its legacy main executable) for whisper.cpp, or to the virtual-environment Python executable for faster-whisper.",
+          "examples": [
+            "/opt/whisper/bin/whisper-cli"
+          ],
+          "default": ""
+        },
+        "model_path": {
+          "type": "string",
+          "description": "Path to a ggml model file for whisper.cpp, or a model-size token (such as large-v3-turbo) or converted model directory for faster-whisper.",
+          "examples": [
+            "/opt/whisper/models/ggml-base.bin",
+            "large-v3-turbo"
+          ],
+          "default": ""
+        },
+        "language": {
+          "type": "string",
+          "description": "Language token passed to the runner, or auto for automatic language detection. An empty value resolves to auto.",
+          "examples": [
+            "en",
+            "auto"
+          ],
+          "default": "auto"
+        },
+        "threads": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "CPU thread count. Omit to use the physical core count. A custom faster-whisper transcription script must accept --threads when this setting is supplied.",
+          "examples": [
+            4
+          ]
+        }
+      }
+    },
+    "features": {
+      "type": "object",
+      "description": "Outbound feature flags. --feature and --no-feature override these values.",
+      "additionalProperties": false,
+      "properties": {
+        "autolink-tasks": {
+          "type": "boolean",
+          "description": "Resolve Linear task references and add task links and titles to outbound messages.",
+          "default": true,
+          "examples": [
+            true
+          ]
+        },
+        "autolink-prs": {
+          "type": "boolean",
+          "description": "Resolve GitHub issue and pull-request references against the current repository and add links and titles.",
+          "default": true,
+          "examples": [
+            true
+          ]
+        },
+        "autolink-msgrefs": {
+          "type": "boolean",
+          "description": "Recognize tg# message references and link them when the chat supports a message URL.",
+          "default": true,
+          "examples": [
+            true
+          ]
+        },
+        "autolink-msgref-preview": {
+          "type": "boolean",
+          "description": "Quote a referenced Telegram message inline when local history contains it. Requires autolink-msgrefs.",
+          "default": true,
+          "examples": [
+            true
+          ]
+        },
+        "md-as-pdf": {
+          "type": "boolean",
+          "description": "Convert explicitly attached Markdown files to PDF for readable Telegram previews.",
+          "default": true,
+          "examples": [
+            true
+          ]
+        },
+        "code-as-pdf": {
+          "type": "boolean",
+          "description": "Convert explicitly attached code and configuration files to a mobile-sized, highlighted PDF. --with-original and --no-pdf adjust attachment behavior.",
+          "default": true,
+          "examples": [
+            true
+          ]
+        },
+        "attach-denylist": {
+          "type": "boolean",
+          "description": "Refuse explicit attachments that look like secret files, including environment files, keys, and credentials.",
+          "default": true,
+          "examples": [
+            true
+          ]
+        },
+        "flood-cap": {
+          "type": "boolean",
+          "description": "Limit the number of Telegram messages produced by one fragmented send.",
+          "default": true,
+          "examples": [
+            true
+          ]
+        },
+        "cjk-guard": {
+          "type": "boolean",
+          "description": "Reject isolated CJK characters inside otherwise Latin or Cyrillic words and mixed-script garbage tokens; ordinary CJK text remains supported.",
+          "default": true,
+          "examples": [
+            true
+          ]
+        },
+        "screenshot-guard": {
+          "type": "boolean",
+          "description": "Require a photo attachment when the caption or title claims to show a screenshot.",
+          "default": true,
+          "examples": [
+            true
+          ]
+        },
+        "file-mention-guard": {
+          "type": "boolean",
+          "description": "Refuse an agent message that names an existing local document without attaching it, and suggest the explicit --file command.",
+          "default": true,
+          "examples": [
+            true
+          ]
+        },
+        "hooks": {
+          "type": "boolean",
+          "description": "Run pre-send-photo hooks when hook descriptors are installed. AGENTS_HOOKS=0 bypasses these hooks.",
+          "default": true,
+          "examples": [
+            true
+          ]
+        }
+      }
+    }
+  }
+}

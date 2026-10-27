@@ -511,6 +511,14 @@ a shell-callable human yes/no for callers that are not harness hooks (agent-tool
 
 ## 9. Config
 
+> Current implementation (2026-10-27): the [configuration reference](../configuration.md)
+> describes the shipped settings and defaults. `control.enabled` gates only `tg`'s
+> lazy daemon autostart after a successful detected-agent send inside tmux; it does
+> not gate inbound handling, stop a running daemon, or disable buttons and explicit
+> starts. `control.staleness_sec` is retained for compatibility; current inbound
+> delivery does not discard messages by age. The original design below predates
+> these behavior changes.
+
 - `~/.config/tg-cli/.env`: `TG_BOT_TOKEN`, `TG_CHAT_ID` (existing).
 - **Allowlist (corrected by review F13): sender user ids**, not chat id —
   checked on `message.from.id` AND `callback_query.from.id`. Default:

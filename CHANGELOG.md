@@ -3,6 +3,18 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.72.0
+
+- **Configuration schema, help and `tg config validate` (#809).** `tg help config` (also
+  `tg config help|--help|-h`) lists all 28 settings with type, default and behavior, generated with
+  `config.schema.json` and `docs/configuration.md` from one registry (`bun run schema:gen`,
+  `schema:check` in CI). Normal config reads and writes keep a sibling `config.schema.json` and the
+  yaml-language-server modeline. `control.enabled` semantics and the `TG_CTL_CONFIG_DIR` handling
+  are corrected. New read-only `tg config validate` reports unknown keys, values the runtime would
+  silently ignore or heal, and YAML the one-level readers skip, with line numbers (exit 1 on
+  errors; legacy yes/no forms are warnings), then runs `Bun.YAML.parse` (Bun 1.2.21+) as a final
+  syntax check. Python defaults are tested for parity with the schema.
+
 ## 1.71.4
 
 - **Per-entrypoint Python implementation switch (#768).** Added executable shims for `tg`,

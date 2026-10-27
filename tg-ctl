@@ -75,6 +75,7 @@ import { randomBytes } from "node:crypto"
 import { buildMenu, handleCallback, type BotDeps, type BotReply } from "./features/chatgpt/bot"
 import { spawnPmRunner } from "./features/chatgpt/pm-runner"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
+import { readConfigFile, updateConfigFile, withConfigModeline } from "./features/config/config-file"
 import { codexUsageTranscriptPath, latestCodexUsageTelemetryPayload } from "./features/tg-ctl/codex-usage"
 import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
 import { serializeDeferredStore, parseDeferredStore } from "./features/tg-ctl/deferred-store"
@@ -3640,16 +3641,9 @@ function fasterWhisperScriptPath(ctx: Ctx): string {
 // yet). Returns whether the write landed so the caller can avoid claiming
 // "configured" on a swallowed ENOENT.
 function persistVoiceConfigToDir(configDir: string, cfg: VoiceConfig): boolean {
-  try {
-    mkdirSync(configDir, { recursive: true })
-    const path = join(configDir, "config.yaml")
-    const existing = readFileOrNull(path) ?? ""
-    writeFileSync(path, upsertVoiceBlock(existing, cfg))
-    return true
-  } catch (err) {
-    log(`voice config persist failed: ${err}`)
-    return false
-  }
+  const written = updateConfigFile(configDir, (raw) => upsertVoiceBlock(withConfigModeline(raw), cfg))
+  if (!written) log("voice config persist failed: config unavailable, read-only, or busy")
+  return written
 }
 
 // `tg-ctl voice-setup` (invoked by `tg voice setup`): probe the host, decide,
@@ -12066,7 +12060,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // Reload the voice config from disk EVERY note: a `tg voice setup` run while
     // this daemon was already up must take effect without a restart. The parsed
     // PARTIAL is kept too, to tell "explicitly disabled" from "not configured".
-    const rawYaml = readFileOrNull(join(ctx.configDir, "config.yaml")) ?? ""
+    const rawYaml = readConfigFile(ctx.configDir)
     const voicePartial = parseVoiceConfig(rawYaml)
     ctx.voice = resolveVoiceConfig(voicePartial)
 
@@ -13794,9 +13788,13 @@ if (import.meta.main) {
       console.error(`tg-ctl voice-setup: unknown argument ${unknown[0]} (usage: tg-ctl voice-setup [--dry-run])`)
       process.exit(2)
     }
-    const configYaml = readFileOrNull(join(configDir, "config.yaml")) ?? ""
+    // Probe/install first: a failed install must not initialize config metadata.
+    const configYaml = readConfigFile(configDir, { readOnly: true })
     const current = resolveVoiceConfig(parseVoiceConfig(configYaml))
     const ok = runVoiceSetup({ configDir, home, current, dryRun: setupArgs.includes("--dry-run") })
+    // Ready configurations are persisted above; successful guidance/no-op paths
+    // also refresh editor metadata, while failures and dry-runs skip this refresh.
+    if (ok && !setupArgs.includes("--dry-run")) readConfigFile(configDir)
     process.exit(ok ? 0 : 1)
   }
 
@@ -13814,7 +13812,7 @@ if (import.meta.main) {
     process.exit(1)
   }
 
-  const configYaml = readFileOrNull(join(configDir, "config.yaml")) ?? ""
+  const configYaml = readConfigFile(configDir, { readOnly: process.argv.slice(3).some((arg) => ["--dry-run", "--help", "-h", "--version", "-v"].includes(arg)) })
   const cfg = resolveControlConfig(parseControlConfig(configYaml))
   const voice = resolveVoiceConfig(parseVoiceConfig(configYaml))
 

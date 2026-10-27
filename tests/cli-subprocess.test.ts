@@ -267,11 +267,11 @@ test('tg help report prints the report usage and exits 0 (no creds needed)', () 
   expect(out).toContain('--verify-cmd <cmd>');
 });
 
-test('`tg help <unknown>` now lists report alongside format in the topic list', () => {
+test('`tg help <unknown>` lists config alongside the existing help topics', () => {
   const proc = run(['help', 'bogus']);
   const err = proc.stderr.toString();
   expect(proc.exitCode).not.toBe(0);
-  expect(err).toContain('Available topics: format, report');
+  expect(err).toContain('Available topics: format, config, report, auth, obligations, chatgpt');
 });
 
 test('bare `tg report` and `tg report --help` both print usage and exit 0', () => {
