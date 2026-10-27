@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tg-cli"
-version = "1.71.3"
+version = "1.71.4"
 description = "Telegram CLI for agents: Python port of tg, tg-ctl and call-cli"
 requires-python = ">=3.12"
 dependencies = ["httpx>=0.28,<1", "tg-call-lib"]
@@ -34,6 +34,7 @@ testpaths = ["tests/py"]
 target-version = "py312"
 line-length = 100
 include = ["src/**/*.py", "tests/py/**/*.py"]
+extend-include = ["scripts/tg-impl"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

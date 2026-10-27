@@ -3,6 +3,15 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.71.4
+
+- **Per-entrypoint Python implementation switch (#768).** Added executable shims for `tg`,
+  `tg-ctl` and `call-cli`, plus `tg-impl` to inspect selections and perform parity-gated switches
+  and rollback. Verification preserves stopped daemons, validates service targets and proves
+  daemon flock ownership before signaling or accepting a successor. The standalone switch
+  remains usable when the project venv is broken, with Python 3.9 compatibility checked in CI.
+  Installer/caller wiring and production selection remain separate migration tasks.
+
 ## 1.71.3
 
 - **Python render layer (#768).** Added HTML and emoji-entity helpers, rich-message validation,
