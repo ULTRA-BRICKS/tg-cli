@@ -11,6 +11,9 @@ semantic versioning.
   member, and added locked dependencies and Python CI checks. Existing entrypoints keep
   running TypeScript until a later migration task installs and selects the switch shims.
 
+- **Dependency security refresh.** Lock certifi 2026.10.19, filelock 4.2.1 and setuptools
+  84.1.0; refresh the matching hashed sender and voice requirements.
+
 ## 1.71.0
 
 - **Model-render dimension gate (#785).** An agent send that attaches an image from a 3D context
