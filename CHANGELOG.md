@@ -3,6 +3,14 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.71.2
+
+- **Python shared config primitives (#768).** Ported environment/config parsing, bot-scoped
+  state paths, feature flags, send receipts and shared text helpers for the Python migration.
+  Preserved JavaScript Unicode whitespace, binary64 number conversion and nullish defaults,
+  with focused parity tests and a TypeScript-captured path fixture. These modules prepare
+  later Python send/daemon tasks; the active command entrypoints continue using TypeScript.
+
 ## 1.71.1
 
 - **Python port skeleton (#768).** Added the `tg-cli` Python package and facade with
