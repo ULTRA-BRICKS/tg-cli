@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+"""Choose entrypoint implementations without depending on the project venv."""
+
+import argparse
+import json
+import os
+import plistlib
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+NAMES = ("tg", "tg-ctl", "tg-ctl-daemon", "call-cli")
+COMPONENTS = {
+    "tg": "tg",
+    "call-cli": "call",
+    "tg-ctl": "tg-ctl-a",
+    "tg-ctl-daemon": "tg-ctl",
+}
+UNIT = "agenttools-tg-ctl-tg-ctl.service"
+LABELS = ("ai.hyperide.tg-ctl", "com.agenttools.tg-ctl.tg-ctl")
+REPO = Path(__file__).resolve().parent.parent
+_PROC_PIDS = {}
+
+
+class VerificationError(Exception):
+    pass
+
+
+def read_text(path):
+    return path.read_bytes().decode("utf-8", errors="replace")
+
+
+def selection(name, env):
+    specific = "TG_IMPL_" + name.upper().replace("-", "_")
+    if specific in env:
+        return env[specific], "env:" + specific
+    if "TG_IMPL" in env:
+        return env["TG_IMPL"], "env:TG_IMPL"
+    path = Path.home() / ".local/state/tg-cli/impl" / name
+    try:
+        lines = read_text(path).split("\n")
+        return lines[0].strip(), "state"
+    except FileNotFoundError:
+        return "ts", "default"
+
+
+def write_selection(name, value):
+    directory = Path.home() / ".local/state/tg-cli/impl"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(prefix="." + name + "-", dir=str(directory))
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write((value + "\n").encode())
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, directory / name)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def run(args, env):
+    try:
+        return subprocess.run(
+            [str(arg) for arg in args],
+            env=env,
+            capture_output=True,
+            check=False,
+            text=False,
+            timeout=40,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise VerificationError(
+            "cannot run " + str(args[0]) + ": " + str(error)
+        ) from error
+
+
+def output(result):
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def checked(args, env):
+    result = run(args, env)
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise VerificationError(
+            " ".join(str(arg) for arg in args)
+            + " failed (exit "
+            + str(result.returncode)
+            + ")"
+            + (": " + detail if detail else "")
+        )
+    return result
+
+
+def daemon_status(env):
+    result = run([REPO / "bin/tg-ctl", "status"], env)
+    text = output(result)
+    match = re.search(
+        r"^tg-ctl:\s*running\s*\([^\n)]*\bpid\s+(\d+)", text, re.MULTILINE
+    )
+    impl = re.search(r"^impl:\s*(\S+)", text, re.MULTILINE)
+    if not match and not re.search(r"^tg-ctl:\s*not running\b", text, re.MULTILINE):
+        raise VerificationError("cannot determine daemon status: " + text.strip())
+    return (
+        result.returncode,
+        int(match.group(1)) if match else None,
+        impl.group(1) if impl else None,
+    )
+
+
+def validate_command(args, hint):
+    if (
+        not isinstance(args, list)
+        or len(args) < 2
+        or not all(isinstance(arg, str) for arg in args)
+        or args[1] != "run"
+        or Path(args[0]).resolve() != (REPO / "bin/tg-ctl").resolve()
+    ):
+        raise VerificationError(
+            "service must run " + str(REPO / "bin/tg-ctl") + "; fix with: " + hint
+        )
+
+
+def disk_execstart(unit):
+    starts = []
+    fragments = [unit, *sorted(unit.with_name(unit.name + ".d").glob("*.conf"))]
+    for fragment in fragments:
+        section = ""
+        for line in read_text(fragment).replace("\\\n", " ").split("\n"):
+            line = line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                section = line
+            elif section == "[Service]" and "=" in line:
+                key, _, value = line.partition("=")
+                if key.strip() != "ExecStart":
+                    continue
+                value = value.strip()
+                if value:
+                    starts.append(value)
+                else:
+                    starts.clear()
+    if len(starts) != 1:
+        raise VerificationError("invalid ExecStart; fix with: tg-ctl enable")
+    try:
+        return shlex.split(starts[0])
+    except ValueError as error:
+        raise VerificationError("invalid ExecStart; fix with: tg-ctl enable") from error
+
+
+def loaded_execstart(env):
+    text = output(
+        checked(
+            ["systemctl", "--user", "show", UNIT, "--property=ExecStart", "--value"],
+            env,
+        )
+    ).strip()
+    match = re.fullmatch(r"\{\s*path=(.*?)\s*;\s*argv\[\]=(.*?)\s*;[^{}]*\}", text)
+    if not match:
+        raise VerificationError(
+            "cannot parse loaded ExecStart; fix with: tg-ctl enable"
+        )
+
+    # systemctl's structured property uses C escapes for non-printing bytes.
+    def unescape(value):
+        return re.sub(r"\\x([0-9a-fA-F]{2})", lambda part: chr(int(part[1], 16)), value)
+
+    path, argv = (unescape(part.strip()) for part in match.groups())
+    if not argv.startswith(path + " "):
+        raise VerificationError("invalid loaded ExecStart; fix with: tg-ctl enable")
+    try:
+        return [path, *shlex.split(argv[len(path) :])]
+    except ValueError as error:
+        raise VerificationError(
+            "invalid loaded ExecStart; fix with: tg-ctl enable"
+        ) from error
+
+
+def service_definition(env, running=False):
+    """Read disk while stopped; verify loaded systemd settings before restarting."""
+    home = Path.home()
+    for label in LABELS:
+        path = home / "Library/LaunchAgents" / (label + ".plist")
+        if path.exists():
+            try:
+                definition = plistlib.loads(path.read_bytes())
+                validate_command(
+                    definition.get("ProgramArguments", []),
+                    "rig apply" if label == LABELS[0] else "tg-ctl enable",
+                )
+                if "Program" in definition:
+                    validate_command(
+                        [definition["Program"], "run"],
+                        "rig apply" if label == LABELS[0] else "tg-ctl enable",
+                    )
+            except (ValueError, TypeError, plistlib.InvalidFileException) as error:
+                raise VerificationError("invalid launchd plist " + str(path)) from error
+            return "launchd", label
+    config_home = Path(env.get("XDG_CONFIG_HOME") or home / ".config")
+    unit = config_home / "systemd/user" / UNIT
+    if unit.exists():
+        if running:
+            validate_command(loaded_execstart(env), "tg-ctl enable")
+        else:
+            validate_command(disk_execstart(unit), "tg-ctl enable")
+        return "systemd", UNIT
+    return None
+
+
+def daemon_lock_path(env):
+    directory = Path(
+        env.get("TG_CTL_CONFIG_DIR") or Path.home() / ".config/tg-cli"
+    ).resolve()
+    file_env = {}
+    try:
+        for line in read_text(directory / ".env").split("\n"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                file_env[key.strip()] = value.strip()
+    except FileNotFoundError:
+        pass
+    token = env.get("TG_BOT_TOKEN", file_env.get("TG_BOT_TOKEN", ""))
+    match = re.match(r"^([0-9]+):", token)
+    if not match:
+        raise VerificationError(
+            "cannot identify daemon lock: no usable bot id in configured credentials"
+        )
+    return directory / ("tg-ctl." + match[1] + ".lock")
+
+
+def lsof_lock_owner(path, stat, env):
+    # lsof's W lock field denotes a whole-file write lock, unlike a generic
+    # opener. Require device+inode identity on that same descriptor. Never take
+    # the daemon flock to probe it, or infer ownership from a plain opener.
+    result = run(["lsof", "-nP", "-FpfDil", "--", path], env)
+    text = output(result)
+    if result.returncode == 1 and not text.strip():
+        return None
+    if result.returncode:
+        raise VerificationError("lsof could not establish daemon lock ownership")
+    owners = set()
+    pid = None
+    descriptor = {}
+
+    def finish():
+        try:
+            same_file = (
+                int(descriptor.get("D", ""), 16) == stat.st_dev
+                and int(descriptor.get("i", "")) == stat.st_ino
+            )
+        except ValueError:
+            same_file = False
+        if same_file and descriptor.get("l") == "W" and pid and alive(pid):
+            owners.add(pid)
+
+    for line in text.splitlines():
+        if line.startswith("p"):
+            finish()
+            descriptor = {}
+            try:
+                pid = int(line[1:])
+            except ValueError as error:
+                raise VerificationError("invalid lsof pid") from error
+        elif line.startswith("f"):
+            finish()
+            descriptor = {}
+        elif line:
+            descriptor[line[0]] = line[1:]
+    finish()
+    if len(owners) != 1:
+        raise VerificationError(
+            "lsof did not prove a unique whole-file write-lock owner"
+        )
+    return owners.pop()
+
+
+def local_lock_pid(kernel_pid):
+    # procfs can be mounted from an ancestor PID namespace (including in the
+    # hermetic test container). Only map owners in our exact namespace; depth
+    # alone would confuse sibling namespaces. Never inspect /proc/<local-pid>
+    # unless procfs uses that same numbering.
+    process = Path("/proc") / str(kernel_pid)
+    try:
+        own_namespace = Path("/proc/self/ns/pid").stat()
+        other_namespace = (process / "ns/pid").stat()
+        if (own_namespace.st_dev, own_namespace.st_ino) != (
+            other_namespace.st_dev,
+            other_namespace.st_ino,
+        ):
+            raise VerificationError(
+                "daemon flock owner is in a different PID namespace"
+            )
+        own = re.search(
+            r"^NSpid:\s*(.*)$", read_text(Path("/proc/self/status")), re.MULTILINE
+        )
+        other = re.search(
+            r"^NSpid:\s*(.*)$", read_text(process / "status"), re.MULTILINE
+        )
+        if not own or not other:
+            raise VerificationError("cannot map kernel flock pid into caller namespace")
+        own_pids = [int(value) for value in own[1].split()]
+        other_pids = [int(value) for value in other[1].split()]
+        if (
+            not own_pids
+            or own_pids[-1] != os.getpid()
+            or len(other_pids) != len(own_pids)
+        ):
+            raise VerificationError("ambiguous kernel flock PID namespace mapping")
+        pid = other_pids[-1]
+        _PROC_PIDS[pid] = kernel_pid
+        return pid
+    except FileNotFoundError:
+        return None
+
+
+def lock_owner(env):
+    path = daemon_lock_path(env)
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    if sys.platform != "linux":
+        return lsof_lock_owner(path, stat, env)
+    owners = set()
+    # Reading kernel evidence is non-contending: no lock acquire/release race.
+    for line in read_text(Path("/proc/locks")).splitlines():
+        fields = line.split()
+        if len(fields) < 8 or fields[1:4] != ["FLOCK", "ADVISORY", "WRITE"]:
+            continue
+        try:
+            major, minor, inode = fields[5].split(":")
+            matches = (
+                int(major, 16) == os.major(stat.st_dev)
+                and int(minor, 16) == os.minor(stat.st_dev)
+                and int(inode) == stat.st_ino
+            )
+            pid = int(fields[4])
+        except ValueError as error:
+            raise VerificationError("invalid kernel flock record") from error
+        if matches:
+            if pid <= 0 or fields[6:] != ["0", "EOF"]:
+                raise VerificationError("kernel cannot prove daemon lock ownership")
+            pid = local_lock_pid(pid)
+            if pid is not None and alive(pid):
+                owners.add(pid)
+    if len(owners) > 1:
+        raise VerificationError("multiple daemon flock owners")
+    return next(iter(owners), None)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    # A dead daemon can remain a zombie until its parent reaps it.
+    if sys.platform != "linux":
+        return True
+    proc_pid = _PROC_PIDS.get(pid)
+    if proc_pid is None:
+        # Unknown local PID: kill(0) proves liveness, but a differently mounted
+        # procfs cannot safely provide its zombie state.
+        return True
+    proc = Path("/proc") / str(proc_pid) / "stat"
+    try:
+        return read_text(proc).rsplit(")", 1)[1].split()[0] != "Z"
+    except FileNotFoundError:
+        return not Path("/proc").exists()
+    except (PermissionError, IndexError):
+        return True
+
+
+def stop_stray(pid, env):
+    if pid <= 1 or pid == os.getpid():
+        raise VerificationError("refusing unsafe daemon pid " + str(pid))
+    if lock_owner(env) != pid:
+        raise VerificationError(
+            "refusing to signal pid without daemon flock ownership: " + str(pid)
+        )
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 30
+    while alive(pid):
+        if time.monotonic() >= deadline:
+            raise VerificationError(
+                "daemon pid " + str(pid) + " did not stop after SIGTERM"
+            )
+        time.sleep(0.1)
+
+
+def unit_pid(env):
+    result = checked(
+        ["systemctl", "--user", "show", UNIT, "--property=MainPID", "--value"], env
+    )
+    try:
+        return int(output(result).strip())
+    except ValueError as error:
+        raise VerificationError("systemd MainPID is not a pid") from error
+
+
+def restart(service, old_pid, env):
+    if service and service[0] == "systemd":
+        if old_pid is not None and old_pid != unit_pid(env):
+            stop_stray(old_pid, env)
+        checked(["systemctl", "--user", "restart", UNIT], env)
+    elif service and service[0] == "launchd":
+        checked(
+            [
+                "launchctl",
+                "kickstart",
+                "-k",
+                "gui/" + str(os.getuid()) + "/" + service[1],
+            ],
+            env,
+        )
+    else:
+        checked([REPO / "bin/tg-ctl", "restart"], env)
+
+
+def verify_daemon(service, old_pid, env):
+    expected = (
+        "py"
+        if selection("tg-ctl", env)[0] == "py"
+        and selection("tg-ctl-daemon", env)[0] == "py"
+        else "ts"
+    )
+    deadline = time.monotonic() + 30
+    while True:
+        code, pid, impl = daemon_status(env)
+        if not code and pid is not None and pid != old_pid:
+            if lock_owner(env) != pid:
+                raise VerificationError("status pid does not hold the daemon flock")
+            if service and service[0] == "systemd" and pid != unit_pid(env):
+                stop_stray(pid, env)
+                raise VerificationError("daemon lock holder is not the systemd MainPID")
+            if impl != expected and not (expected == "ts" and impl == "unknown"):
+                raise VerificationError(
+                    "daemon impl: " + str(impl) + "; expected " + expected
+                )
+            return
+        if time.monotonic() >= deadline:
+            raise VerificationError(
+                "daemon did not acquire the lock with a new pid within 30 s"
+            )
+        time.sleep(0.1)
+
+
+def verify_cli(name, env):
+    checked([REPO / "bin" / name, "--version" if name == "tg" else "--help"], env)
+    if selection(name, env)[0] == "py":
+        checked(
+            [REPO / ".venv/bin/python", "-m", "tgcli.entry", "--self-check", name], env
+        )
+
+
+def gated_components():
+    try:
+        text = read_text(REPO / "tests/parity/gated.txt")
+    except FileNotFoundError:
+        return set()
+    return {
+        line.split("#", 1)[0].strip()
+        for line in text.splitlines()
+        if line.split("#", 1)[0].strip()
+    }
+
+
+def use(target, name, ungated, env):
+    gates = gated_components()
+    names = list(NAMES) if name == "all" else [name]
+    if target == "py":
+        if name == "all" and not ungated:
+            names = [entry for entry in names if COMPONENTS[entry] in gates]
+        for entry in names:
+            if not ungated and COMPONENTS[entry] not in gates:
+                raise VerificationError(
+                    entry + ": parity component " + COMPONENTS[entry] + " is not gated"
+                )
+        proposed = {
+            entry: target if entry in names else selection(entry, env)[0]
+            for entry in NAMES
+        }
+        if proposed["tg-ctl-daemon"] == "py" and (
+            "tg-ctl" in names or "tg-ctl-daemon" in names
+        ):
+            if proposed["tg-ctl"] != "py":
+                raise VerificationError(
+                    "tg-ctl-daemon requires tg-ctl already selected py"
+                )
+            if not ungated and "tg-ctl" not in gates:
+                raise VerificationError(
+                    "tg-ctl-daemon: parity component tg-ctl is not gated"
+                )
+    daemon_changed = any(entry in names for entry in ("tg-ctl", "tg-ctl-daemon"))
+    old_pid = None
+    service = None
+    # Selection does not change the running process. Select TS before asking its
+    # status so a broken Python interpreter cannot block the recovery command.
+    if target == "ts":
+        for entry in names:
+            write_selection(entry, target)
+    if daemon_changed:
+        code, status_pid, _ = daemon_status(env)
+        if code and status_pid is not None:
+            raise VerificationError("cannot determine pre-switch daemon status")
+        old_pid = lock_owner(env)
+        service = service_definition(env, running=old_pid is not None)
+    if target == "py":
+        for entry in names:
+            write_selection(entry, target)
+    try:
+        for entry in names:
+            if entry in ("tg", "call-cli"):
+                verify_cli(entry, env)
+        if daemon_changed:
+            if old_pid is None:
+                print(
+                    "tg-ctl: daemon stopped; selection takes effect on its next start"
+                )
+            else:
+                restart(service, old_pid, env)
+                verify_daemon(service, old_pid, env)
+    except VerificationError:
+        # A broken Python runtime must never prevent or reverse rollback.
+        for entry in names:
+            write_selection(entry, "ts")
+        if target == "py" and daemon_changed and old_pid is not None:
+            try:
+                current_pid = lock_owner(env)
+                restart(service, current_pid, env)
+                verify_daemon(service, current_pid, env)
+            except VerificationError as error:
+                print(
+                    "tg-impl: rollback verification failed: " + str(error),
+                    file=sys.stderr,
+                )
+        raise
+    print(
+        "tg-impl: selected "
+        + target
+        + (" for " + ", ".join(names) if names else " (no gated components)")
+    )
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="tg-impl")
+    sub = parser.add_subparsers(dest="command", required=True)
+    status_parser = sub.add_parser("status")
+    status_parser.add_argument("--json", action="store_true")
+    use_parser = sub.add_parser("use")
+    use_parser.add_argument("target", choices=("py", "ts"))
+    use_parser.add_argument("name", choices=(*NAMES, "all"))
+    use_parser.add_argument("--ungated", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    try:
+        if args.command == "status":
+            if any(key.startswith("TG_IMPL") for key in os.environ):
+                print(
+                    "tg-impl: warning: TG_IMPL* environment overrides are not seen by the service manager",
+                    file=sys.stderr,
+                )
+            rows = []
+            for name in NAMES:
+                value, source = selection(name, os.environ)
+                entrypoint = "tg-ctl" if name == "tg-ctl-daemon" else name
+                target = (
+                    REPO / ".venv/bin" / entrypoint
+                    if value == "py"
+                    else REPO / entrypoint
+                )
+                rows.append(
+                    {
+                        "name": name,
+                        "selection": value,
+                        "source": source,
+                        "target": str(target),
+                    }
+                )
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False, separators=(",", ":")))
+            else:
+                for row in rows:
+                    print("{name}: {selection} ({source}) -> {target}".format(**row))
+            return 0
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("TG_IMPL")
+        }
+        return use(args.target, args.name, args.ungated, env)
+    except (VerificationError, OSError) as error:
+        print("tg-impl: " + str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

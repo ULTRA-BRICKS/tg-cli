@@ -1,0 +1,51 @@
+#!/bin/sh
+# Resolve the installed link before deriving the checkout (including on macOS).
+shim=$0
+if resolved=$(readlink -f "$shim" 2>/dev/null); then
+    shim=$resolved
+else
+    while [ -L "$shim" ]; do
+        directory=$(CDPATH= cd -P "${shim%/*}" && pwd) || exit 71
+        link=$(readlink "$shim") || exit 71
+        case $link in /*) shim=$link ;; *) shim=$directory/$link ;; esac
+    done
+fi
+repo=$(CDPATH= cd -P "${shim%/*}/.." && pwd) || exit 71
+name=tg
+if [ "${TG_IMPL_TG+x}" = x ]; then
+    selection=$TG_IMPL_TG
+    source=env:TG_IMPL_TG
+elif [ "${TG_IMPL+x}" = x ]; then
+    selection=$TG_IMPL
+    source=env:TG_IMPL
+elif [ -f "$HOME/.local/state/tg-cli/impl/$name" ]; then
+    selection=$(sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;p;}' "$HOME/.local/state/tg-cli/impl/$name")
+    source=state
+else
+    selection=ts
+    source=default
+fi
+case $selection in
+    ts)
+        if [ -n "${TG_BUN:-}" ]; then
+            bun=$TG_BUN
+        elif command -v bun >/dev/null 2>&1; then
+            bun=bun
+        else
+            bun=$HOME/.bun/bin/bun
+        fi
+        exec "$bun" "$repo/$name" "$@"
+        ;;
+    py)
+        target=$repo/.venv/bin/$name
+        if [ ! -x "$target" ] || [ ! -x "$repo/.venv/bin/python" ]; then
+            printf '%s: Python implementation unusable at %s; roll back with: tg-impl use ts %s (or %s/scripts/tg-impl use ts %s)\n' "$name" "$target" "$name" "$repo" "$name" >&2
+            exit 71
+        fi
+        exec "$target" "$@"
+        ;;
+    *)
+        printf "%s: unknown implementation '%s' (from %s); expected py or ts\n" "$name" "$selection" "$source" >&2
+        exit 64
+        ;;
+esac
