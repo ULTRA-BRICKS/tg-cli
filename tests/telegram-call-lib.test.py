@@ -37,7 +37,7 @@ class CallLibTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["error"], "PROVIDERS_NOT_CONFIGURED")
 
     def test_package_declares_single_source(self):
-        path = ROOT / "pyproject.toml"
+        path = ROOT / "features/pyproject.toml"
         self.assertTrue(path.is_file(), "call-lib distribution metadata is missing")
 
 

@@ -36,3 +36,26 @@ jobs:
         # Plain `bun test` under a stall watchdog: a wedged test process fails the step
         # naming the file it hung in, instead of idling silently until the job is killed.
         run: ci/test/bun-test-watchdog.sh
+
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: Install dependencies
+        run: uv sync --frozen
+      - name: Lockfile is current
+        run: uv lock --check
+      - name: requirements-tg.txt matches uv.lock
+        run: |
+          scripts/export-requirements
+          git diff --exit-code -- requirements-tg.txt
+      - name: Lint
+        run: |
+          uv run ruff check
+          uv run ruff format --check
+      - name: Types
+        run: uv run mypy --strict src/tgcli
+      - name: Test
+        run: uv run pytest -q

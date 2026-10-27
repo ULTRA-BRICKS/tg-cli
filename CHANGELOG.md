@@ -3,6 +3,17 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.71.1
+
+- **Python port skeleton (#768).** Added the `tg-cli` Python package and facade with
+  TypeScript fall-through, JS-compatible JSON, atomic file writes and UTF-16 slicing.
+  Moved the unchanged `tg-call-lib` distribution metadata into the `features` uv workspace
+  member, and added locked dependencies and Python CI checks. Existing entrypoints keep
+  running TypeScript until a later migration task installs and selects the switch shims.
+
+- **Dependency security refresh.** Lock certifi 2026.10.19, filelock 4.2.1 and setuptools
+  84.1.0; refresh the matching hashed sender and voice requirements.
+
 ## 1.71.0
 
 - **Model-render dimension gate (#785).** An agent send that attaches an image from a 3D context
@@ -45,7 +56,6 @@ semantic versioning.
 - **Mid-argv `-` appends the stdin body last.** `tg "Header" -` with piped text sends `Header`
   followed by the piped body (covered by `tests/cli-stdin-body.test.ts`).
 
-||||||| parent of 95cb98b (feat(tg): dimension gate — image from a 3D context must carry legible dimensions (Refs #785))
 
 ## 1.69.0
 

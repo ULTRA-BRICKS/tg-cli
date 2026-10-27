@@ -8,3 +8,4 @@ bun.lock
 
 build/
 *.egg-info/
+.venv/
