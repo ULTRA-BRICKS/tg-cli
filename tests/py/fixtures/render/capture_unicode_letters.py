@@ -25,11 +25,11 @@ for (let cp=0; cp<0x110000; cp++) {
   previous = present;
 }
 if(previous) boundaries.push(0x110000);
-console.log(JSON.stringify({
+process.stdout.write(JSON.stringify({
   boundaries, count:membership.reduce((n,v)=>n+v,0),
   sha256:createHash('sha256').update(membership).digest('hex'),
   unicode:process.versions.unicode
-}));
+}) + '\n');
 """
 
 

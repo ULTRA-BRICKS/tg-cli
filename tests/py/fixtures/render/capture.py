@@ -85,8 +85,8 @@ HARNESS = (
     "lor.GREEN}};\n"
     " await Bun.write(process.env.VECTOR_DEST!,JSON.stringify({cases,states,constants"
     "},null,2)+'\\n');\n"
-    " console.log(`${cases.length} callbacks, ${cases.reduce((n,c)=>n+c.calls.length,"
-    "0)} calls`);\n"
+    " process.stdout.write(`${cases.length} callbacks, ${cases.reduce((n,c)=>n+c.calls.length,"
+    "0)} calls` + '\\n');\n"
     "}\n"
 )
 
