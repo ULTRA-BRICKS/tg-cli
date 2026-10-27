@@ -42,6 +42,7 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     alertSubscriptions: join(configDir, `${base}.alert-subscriptions.json`),
     alertThrottle: join(configDir, `${base}.alert-throttle.json`),
     outbox: join(configDir, `${base}.outbox`),
+    chatgptRefs: join(configDir, `${base}.chatgpt-refs.json`),
   };
 }
 

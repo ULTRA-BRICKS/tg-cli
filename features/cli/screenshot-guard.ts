@@ -24,11 +24,18 @@ export function mentionsScreenshot(text: string): boolean {
   return SCREENSHOT_RE.test(text);
 }
 
-/** Actionable error: attach the image; do not dodge by deleting the word. */
-export function formatScreenshotAttachError(): string {
+/**
+ * Actionable error: attach the image; do not dodge by deleting the word. `isReport` (a
+ * `--tag report` send, which is what `tg report` expands to) names the report form of the
+ * flag, since `tg report` takes `--photo` too (tg-cli#775).
+ */
+export function formatScreenshotAttachError(isReport = false): string {
+  const how = isReport
+    ? "Attach the image with `tg report --photo <path>` (a free-form `--tag report` send takes `tg --photo <path>`). "
+    : "Attach the image with `tg --photo <path>` (or equivalent). ";
   return (
     "message mentions a screenshot but no image is attached. " +
-    "Attach the image with `tg --photo <path>` (or equivalent). " +
+    how +
     "Do not dodge this gate by deleting the word — attach the screenshot."
   );
 }

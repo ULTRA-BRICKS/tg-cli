@@ -130,13 +130,13 @@ const ECHO_MAX = 80;
 
 /**
  * The refusal: each unattached file and the exact command that sends the message with them.
- * `--dry-run` is left out of that command — it refuses attachments, so the fix is a send.
+ * `--dry-run` stays in that command: a dry run validates attachments too (tg-cli#775).
  * `rowsOnStdin`: a `--table` send, whose rows argv cannot carry — the command says to pipe
  * them again.
  */
 export function formatUnattachedFileError(files: UnattachedFile[], argv: string[], rowsOnStdin = false): string {
   const fileFlags = files.flatMap((f) => ['--file', shellQuote(f.path)]);
-  const words = argv.filter((word) => word !== '--dry-run');
+  const words = argv;
   const isMessageText = (word: string, i: number): boolean =>
     (word.length > ECHO_MAX || word.includes('\n')) && !word.startsWith('-') && !(words[i - 1] ?? '').startsWith('-');
   const rest = words.map((word, i) => (isMessageText(word, i) ? "'<the same message text>'" : shellQuote(word)));

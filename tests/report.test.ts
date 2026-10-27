@@ -218,3 +218,42 @@ test('-h / --help anywhere in the argument list wins over the rest of the parse 
   const trailingArgs = buildReportSend(['--title', 'x', '--impact', 'y', '--help']);
   expect(isReportHelp(trailingArgs)).toBe(true);
 });
+
+// ── attachments (tg-cli#775): --photo/--file are repeatable and ride the normal send pipeline ──
+
+const REQUIRED = [
+  '--title', 'Fix the thing',
+  '--ticket', 'HYP-123',
+  '--impact', 'users stop seeing the crash',
+  '--verify-cmd', 'bun test',
+  '--verify-result', 'all green',
+];
+
+test('--photo and --file are accepted, repeatable, and carried into argv before the body in order', () => {
+  const result = buildReportSend([
+    ...REQUIRED, '--photo', '/tmp/a.png', '--file', '/tmp/b.txt', '--photo', '/tmp/c.png',
+  ]);
+  if (isReportError(result) || isReportHelp(result)) throw new Error('expected a send result');
+  const { argv } = result;
+  const body = argv[argv.length - 1];
+  expect(argv.slice(0, -1)).toEqual([
+    '--tag', 'report', '--format', 'html',
+    '--photo', '/tmp/a.png', '--file', '/tmp/b.txt', '--photo', '/tmp/c.png',
+  ]);
+  // the attachment paths never leak into the rendered body
+  expect(body).not.toContain('/tmp/a.png');
+});
+
+test('--photo / --file without a value error like every other value flag', () => {
+  for (const flag of ['--photo', '--file']) {
+    const result = buildReportSend([...REQUIRED, flag]);
+    expect(isReportError(result)).toBe(true);
+    if (isReportError(result)) expect(result.error).toContain(`${flag} requires a value`);
+  }
+});
+
+test('the usage text documents --photo/--file and no longer claims they are unsupported', () => {
+  expect(REPORT_USAGE).toContain('[--photo <path>]...');
+  expect(REPORT_USAGE).toContain('[--file <path>]...');
+  expect(REPORT_USAGE).not.toContain('Not supported directly: --photo/--file');
+});

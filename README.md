@@ -170,6 +170,10 @@ A message (or `--title`) that mentions **screenshot** or **скриншот** (a
 
 An agent message whose own prose names an existing local document it does **not attach** is a **hard error** before send: the reader gets only a path, which they cannot open on a phone. A document is an absolute, `~/` or `./` path to a non-empty, non-executable, group/other-readable regular file under the home or temp directory, within the 50 MB upload limit (a `:42` / `#L42` location suffix is ignored). The error lists each file and prints the exact resend command, e.g. `tg --file /home/me/work/report.md --tag report '<the same message text>'`. The text never attaches a file by itself (tg-cli#648). Paths in code (backticks, `<code>`, `<pre>`, fenced blocks), on a `$ ` command line or in a URL, directories, missing files, system files, executables, private (0600) files and never-attach secrets do not count; `--automated` sends and non-agent senders are not gated. `--dry-run` shows the refusal. Override: `--no-feature file-mention-guard`.
 
+### Model-render dimension gate
+
+An agent message that attaches an image (`--photo`, or a `--file` with an image extension) from a **3D context** is a **hard error** before send unless the image carries legible dimensions. The context is a cwd or image path under a `garage-band` / `3d-cli` checkout's `projects/` tree (or below a `3d.yaml`), or a caption naming 3D work (a .stl/.3mf/.scad file name, G-code, PLA/PETG filament, the K1 SE, "3D print/model/render", модель для печати, ложка). The image must come from `3d dimension MODEL -o render.png` — it writes `render.png.dims.json` — and pass `3d dimension --check render.png` (font ≥ 14 px at 1280 px width, labels inside the frame, not overlapping each other or the part, contrast ≥ 4.5:1). The error lists what failed and the commands to render and check. A non-model image (a thumbnail, a UI screenshot) is sent with `RIG_HATCH_REQUEST_TG_DIMENSIONS_SKIP="<why>" tg --photo …`: the written reason (≥ 3 words and 15 characters) is sent to the owner as one approval request (`tg-ctl ask`, deny by default). Always on; `--automated` sends are not gated.
+
 ### Dictionary gate (banned wording)
 
 Alex keeps a machine-readable dictionary of banned words with their replacements at `~/.claude/DICT.json` (path override: `TG_DICT_PATH`) — the twin of the "Dictionary" section of his global `CLAUDE.md`. Prose bans failed three times (an agent keeps inventing a new form of a banned stem), so `tg` enforces them at the sending tool: the `--title`, the body, and `--photo`/`--file` captions of **every** send (all tags, both formats, `--dry-run` included) are matched against every rule. A hit is a **hard refusal** (exit 1, nothing sent) that prints each match — rule id, matched text with ~20 chars of context, the replacement — so the agent rewrites the wording and resends in one step. **There is no bypass flag or env var by design**; only the human editing the file changes what is banned.
@@ -380,6 +384,12 @@ stdout; an approval prints `approved` (or `approved: <detail>`). It needs no tmu
 session registration, and while it waits your messages to agents are delivered normally
 (it does not defer inbound the way an open agent question does).
 
+**Owner-only asks (`tg-ctl ask --owner-only <question>`, `tg-ctl capabilities --json`).** With
+`--owner-only` only the owner can answer: the tapping user id and the chat must both equal
+`TG_CHAT_ID`, which must be a positive private chat id (otherwise exit 1, nothing sent). Other
+allowlisted senders get "not allowed". `tg-ctl capabilities --json` reports `ask-owner-only-v1`
+without touching config or network, so callers can detect support first.
+
 **As rig's `agent_hooks.approval_cmd`:** agent-tools safety hooks (e.g. block-reset-hard,
 pin-primary-worktree) run the repo's committed `approval_cmd` and allow the blocked
 command only on exit 0 — nonzero or a timeout blocks. Point it at `tg-ctl ask` in the
@@ -409,6 +419,7 @@ Code's per-hook `timeout`). These keys are read by agent-tools at hook runtime; 
 | `/agent [<window>] <msg>` | Route a message to a specific agent (fuzzy window match, else selection buttons); a Claude Code / Codex outside tmux (exact `--name` / cwd basename) gets a one-line refusal naming how to start it in tmux |
 | `/daily` | What-shipped report: merged PRs since the last run (`rig daily`) |
 | `/spend [day\|week\|month]` | Token/cost usage report (`rig usage`) — also pushed automatically weekly/monthly, see `tg-ctl usage-schedule enable` |
+| `/chatgpt [home\|glide.vc\|all]` | Owner-only ChatGPT session menu: sessions per account with Details / Pause / Resume / Watch / Continue buttons (each only queues an approval in pm), see [docs/chatgpt.md](docs/chatgpt.md) |
 
 `/tasks` renders a rich task table for the resolved project. The default view is
 the attention view: blocked/stuck/problem tasks plus ready tasks, not every task.
@@ -560,6 +571,15 @@ JSON object per line, trimmed to the last ~5000 messages). The `tg-ctl` daemon
 records inbound messages; `tg` records its own outbound. Both writers are
 best-effort and never block a send or an inject.
 
+### ChatGPT session control (`tg chatgpt`, `/chatgpt`, v1.69.0)
+
+`tg chatgpt accounts|list|show|events|requests|watch|unwatch|pause|resume|continue|service|connector …`
+is a client of `pm chatgpt api` (fixed argv, bounded stdout/time, `--json` envelope; exit 0 ok, 1 pm
+error, 2 usage, 69 pm unavailable, 75 mutation outcome unknown). Mutations only **queue** an owner
+approval inside pm; `continue` binds the session's current latest turn. The owner-only `/chatgpt` bot
+command shows the same sessions with per-session buttons backed by opaque one-use callback refs.
+Details, safety model and limits: [docs/chatgpt.md](docs/chatgpt.md); `tg help chatgpt`.
+
 ### Structured result reports (`tg report`, v1.53.0)
 
 `tg report` formats a structured result report — ticket/PR link(s), user impact,
@@ -574,6 +594,7 @@ the same pipeline every other `tg` send uses (dictionary gate, autolink,
 tg report --title <text> (--ticket <id-or-url> | --pr <num-or-url>) \
           --impact <text> --verify-cmd <cmd> --verify-result <result> \
           [--evidence <text>]... [--summary <text>]... \
+          [--photo <path>]... [--file <path>]... \
           [--reply-to <id>] [--subagent <name>] [--topic <id>] [--dry-run]
 ```
 
@@ -581,6 +602,13 @@ tg report --title <text> (--ticket <id-or-url> | --pr <num-or-url>) \
 `--verify-result` are required — a report with no verification proof is
 refused before anything is sent. `--evidence`/`--summary`/`--ticket`/`--pr`
 are repeatable.
+
+`--photo`/`--file` (repeatable) attach images/documents with the same semantics as the plain
+send: the screenshot gate is satisfied by a real `--photo`, the never-attach denylist refuses
+secret-looking files, a missing/empty attachment is skipped with a warning (the report still
+goes out), and code/markdown files become PDFs as usual. A rich report cannot be a media
+caption, so the photos arrive first as their own message, then the report, then documents.
+`--dry-run` validates the attachments (`ok` / `would be skipped`) and uploads nothing.
 
 ```
 tg report --title "Fix the crash on empty input" --ticket HYP-123 \

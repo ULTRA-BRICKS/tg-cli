@@ -80,3 +80,20 @@ def test_js_stringify_rejects_bytes() -> None:
         js_stringify({"a": bytearray(b"x")})
     with pytest.raises(TypeError):
         js_stringify([memoryview(b"x")])
+
+
+@pytest.mark.parametrize(
+    ("indent", "expected"),
+    [
+        (0, '{"x":[1]}'),
+        (-3, '{"x":[1]}'),
+        (20, '{\n          "x": [\n                    1\n          ]\n}'),
+    ],
+)
+def test_js_stringify_indent_uses_js_gap_limits(indent: int, expected: str) -> None:
+    assert js_stringify({"x": [1]}, indent=indent) == expected
+
+
+def test_js_stringify_long_numeric_key_is_not_an_array_index() -> None:
+    key = "1" * 5000
+    assert js_stringify({key: 1}) == '"'.join(["{", key, ":1}"])

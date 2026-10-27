@@ -6,6 +6,7 @@
 
 import type { TaskViewFilter, TasksCallbackKind } from './tasks-command';
 import type { PermissionMenuTarget } from './permission-menu';
+import type { WorkspaceScope } from '../chatgpt/model';
 
 // --- config (spec §9) ---
 
@@ -215,6 +216,12 @@ export type Action =
       chatId?: number | string | null;
       threadId?: number | null;
     }
+  // /chatgpt [home|glide.vc|all] — the owner-only ChatGPT session menu (features/chatgpt). `workspace`
+  // is null for an argument that is not a workspace (the entrypoint answers with usage).
+  | { kind: 'chatgpt-menu'; workspace: WorkspaceScope | null; threadId?: number | null }
+  // A tap on a /chatgpt button (cgp:<opaque ref>). Only the reference and the tapped chat travel:
+  // what it means lives in the durable ref store, never in the callback data.
+  | { kind: 'chatgpt-callback'; callbackQueryId: string; data: string; chatId: number; messageId: number | null; threadId?: number | null }
   // A tap on a limit-stop's "auto-continue" button (lc:<pane>:<resetAt>): the
   // entrypoint arms a timer that injects "continue" into that pane at reset time
   // (immediately if already past), persisted so a restart re-arms it (#113).
@@ -259,12 +266,14 @@ export type Action =
       // An answer typed in chat instead of tapped (tg-cli#705): the card's session had exactly
       // one open card, so this text answers it; `value` is unused.
       freeText?: string;
+      actor?: { userId: number | null; chatId: number | null };
     }
   | {
       kind: 'close-question-card';
       callbackQueryId: string;
       requestId: string;
       messageId: number | null;
+      actor?: { userId: number | null; chatId: number | null };
     }
   | {
       kind: 'post-timeout-question-reply';
@@ -275,6 +284,7 @@ export type Action =
       messageId: number;
       // The forum topic the reply came from: its refusal notices are posted there (tg-cli#551).
       threadId?: number;
+      actor?: { userId: number | null; chatId: number | null };
     }
   // Delivery receipt: set a 👀 reaction on the source message IF every action
   // emitted for it succeeded. Follows the message's delivery action(s); never
@@ -532,6 +542,7 @@ export interface CtlPaths {
   alertSubscriptions: string; // temporary alert subscriptions of live omp sessions, keyed by omp session id (tg-cli#636)
   alertThrottle: string; // last `tg-ctl alert send` per (source,key,severity), for the dedup window (tg-cli#636)
   outbox: string; // dir of `tg` sends Telegram did not take, replayed by the daemon (tg-cli#710)
+  chatgptRefs: string; // opaque one-use /chatgpt callback references (features/chatgpt/refs.ts; 0600)
 }
 
 // --- forum topics (docs/specs/session-registry-and-topics.md §4) ---

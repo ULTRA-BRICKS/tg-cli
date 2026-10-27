@@ -2,6 +2,8 @@ import json
 import tomllib
 from pathlib import Path
 
+import pytest
+
 from tgcli.version import repo_root, resolve_version
 
 
@@ -22,3 +24,21 @@ def test_versions_agree() -> None:
     root = repo_root()
     pyproject = tomllib.loads((root / "pyproject.toml").read_text())
     assert pyproject["project"]["version"] == resolve_version(root)
+
+
+@pytest.mark.parametrize("newline", [b"\r\n", b"\r"])
+def test_resolve_version_replaces_invalid_utf8_and_accepts_cr(
+    tmp_path: Path,
+    newline: bytes,
+) -> None:
+    payload = (
+        b"{"
+        + newline
+        + b'"version":"9.8.7",'
+        + newline
+        + b'"description":"a\xffb"'
+        + newline
+        + b"}"
+    )
+    (tmp_path / "package.json").write_bytes(payload)
+    assert resolve_version(tmp_path) == "9.8.7"

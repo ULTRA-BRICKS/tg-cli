@@ -3,13 +3,74 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
-## 1.67.1
+## 1.71.1
 
-- **Python port skeleton (#768).** The root `pyproject.toml` is now the `tg-cli` project
-  (`src/tgcli`: facade with TypeScript fall-through, JS-compatible JSON, atomic file
-  writes, UTF-16-safe slicing) and a uv workspace root; `tg-call-lib` moved to
-  `features/pyproject.toml` unchanged. Nothing is ported yet, so `tg`, `tg-ctl` and
-  `call-cli` behave as before.
+- **Python port skeleton (#768).** Added the `tg-cli` Python package and facade with
+  TypeScript fall-through, JS-compatible JSON, atomic file writes and UTF-16 slicing.
+  Moved the unchanged `tg-call-lib` distribution metadata into the `features` uv workspace
+  member, and added locked dependencies and Python CI checks. Existing entrypoints keep
+  running TypeScript until a later migration task installs and selects the switch shims.
+
+## 1.71.0
+
+- **Model-render dimension gate (#785).** An agent send that attaches an image from a 3D context
+  (a `garage-band`/`3d-cli` project path or a caption naming 3D work) is refused unless the image
+  carries a `<image>.dims.json` sidecar from `3d dimension` that passes `3d dimension --check`
+  (legible labels: font, overlap, contrast, inside the frame). A non-model image goes out only
+  with `RIG_HATCH_REQUEST_TG_DIMENSIONS_SKIP="<why>"` approved by the owner. See `tg help`.
+
+## 1.70.0
+
+- **`tg-ctl capabilities --json`.** Prints `{"schema_version":1,"capabilities":["ask-owner-only-v1"]}`
+  and exits 0 with no config, env, network or daemon access; any other argv is a usage error (2).
+- **`tg-ctl ask --owner-only <question> [--timeout SEC]`.** The card can only be answered by the
+  owner: the tapping/replying user id AND the chat must equal `TG_CHAT_ID`, which must be a
+  positive private chat id (groups, non-numeric ids: exit 1 `denied`, no send). Other allowlisted
+  senders get "not allowed"; the bit survives the socket and disk restore, and a bare chat message
+  never answers an owner-only card. A missing question or `--help`/`-h` with the flag is usage
+  (exit 2, before any send). Without the flag behaviour is unchanged.
+- **`/chatgpt` owner enforcement.** `cgp:` taps now also require the tapping user to be the owner
+  in a private owner chat, and a `/chatgpt` command from any other allowlisted sender is dropped.
+- **`tg-ctl ask --help` / `-h` is help.** With exactly one argument equal to `--help` or `-h`,
+  `tg-ctl ask` now prints usage and exits 0 before any config, auth, daemon or network call (it
+  previously posted "--help" as a question). `ask '--help me?'` and `ask --help extra` remain real
+  asks. The generic ask approve/reject schema is unchanged.
+- **ChatGPT session control (#780).** `tg chatgpt accounts|list|show|events|requests|watch|unwatch|
+  pause|resume|continue|service start|stop|connector list|request guardian` is a client of the frozen
+  `pm chatgpt api` JSON contract: fixed argv (no shell), method allowlist, stdout capped at 256 KiB,
+  per-call timeouts, the child's whole process group ended on timeout/oversize, schema-bounded
+  envelope parsing, secret redaction, `--json` envelope. Mutations only queue an owner approval
+  inside pm; `continue` first reads `sessions.get` and binds the current latest turn (refused when
+  unknown). A timeout of a mutating call exits 75 and is never retried. Exit codes: 0 ok,
+  1 pm error, 2 usage (never a Telegram send), 69 pm unavailable, 75 outcome unknown. `tg help
+  chatgpt` documents it.
+- **Owner-only `/chatgpt` bot menu.** Sessions per account as escaped HTML with Details / Pause /
+  Resume / Watch / Continue buttons plus Requests / Refresh. Buttons carry opaque one-use `cgp:`
+  references resolved from a durable 0600 store with a fixed schema (`CtlPaths.chatgptRefs`); taps
+  need the configured owner chat (fail closed with none), a replayed/forged/expired ref makes no pm
+  call, a Continue is refused with "state changed" when the latest turn moved, and a tap only queues
+  an approval in pm. See `docs/chatgpt.md`.
+- **Mid-argv `-` appends the stdin body last.** `tg "Header" -` with piped text sends `Header`
+  followed by the piped body (covered by `tests/cli-stdin-body.test.ts`).
+
+
+## 1.69.0
+
+- **Message body from stdin.** `tg --tag report < msg.txt` or `cat msg.txt | tg -` sends the piped text; an argv body still wins and a TTY stdin is never read.
+
+## 1.68.0
+
+- **`tg report` takes attachments (#775).** `tg report` accepts repeatable `--photo <path>` and
+  `--file <path>` with exactly the plain send's semantics: they ride the same pipeline, so the
+  screenshot-attach gate is satisfied by a real `--photo` (a report that cites a screenshot is no
+  longer unsendable), the never-attach denylist refuses secret-looking files, a missing/empty/
+  unreadable attachment is skipped with a warning while the report still goes out, and code/
+  markdown `--file`s are converted to PDF as usual. A rich report cannot ride as a media caption,
+  so the photos arrive first as their own message (an album for 2+), then the report, then any
+  documents — the plain send's order. `--dry-run` no longer refuses attachments (it used to exit 1):
+  it lists each one as `ok` or `would be skipped (<reason>)`, uploads nothing, and the
+  unattached-file refusal's resend command now keeps `--dry-run`. The screenshot-attach error
+  of a `--tag report` send names `tg report --photo <path>`.
 
 ## 1.67.0
 

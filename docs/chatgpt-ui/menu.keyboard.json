@@ -1,0 +1,82 @@
+{
+  "inline_keyboard": [
+    [
+      {
+        "text": "1 Details",
+        "callback_data": "cgp:fixture00000000000001"
+      },
+      {
+        "text": "1 Pause",
+        "callback_data": "cgp:fixture00000000000002"
+      },
+      {
+        "text": "1 Resume",
+        "callback_data": "cgp:fixture00000000000003"
+      }
+    ],
+    [
+      {
+        "text": "1 Watch",
+        "callback_data": "cgp:fixture00000000000004"
+      },
+      {
+        "text": "1 Continue",
+        "callback_data": "cgp:fixture00000000000005"
+      }
+    ],
+    [
+      {
+        "text": "2 Details",
+        "callback_data": "cgp:fixture00000000000006"
+      },
+      {
+        "text": "2 Pause",
+        "callback_data": "cgp:fixture00000000000007"
+      },
+      {
+        "text": "2 Resume",
+        "callback_data": "cgp:fixture00000000000008"
+      }
+    ],
+    [
+      {
+        "text": "2 Watch",
+        "callback_data": "cgp:fixture00000000000009"
+      },
+      {
+        "text": "2 Continue",
+        "callback_data": "cgp:fixture00000000000010"
+      }
+    ],
+    [
+      {
+        "text": "3 Details",
+        "callback_data": "cgp:fixture00000000000011"
+      },
+      {
+        "text": "3 Pause",
+        "callback_data": "cgp:fixture00000000000012"
+      },
+      {
+        "text": "3 Resume",
+        "callback_data": "cgp:fixture00000000000013"
+      }
+    ],
+    [
+      {
+        "text": "3 Watch",
+        "callback_data": "cgp:fixture00000000000014"
+      }
+    ],
+    [
+      {
+        "text": "Requests",
+        "callback_data": "cgp:fixture00000000000015"
+      },
+      {
+        "text": "Refresh",
+        "callback_data": "cgp:fixture00000000000016"
+      }
+    ]
+  ]
+}

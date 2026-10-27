@@ -21,7 +21,7 @@ _ESCAPES = {
 
 
 def _is_index(key: str) -> bool:
-    return _INDEX_KEY.fullmatch(key) is not None and int(key) <= _MAX_INDEX
+    return len(key) <= 10 and _INDEX_KEY.fullmatch(key) is not None and int(key) <= _MAX_INDEX
 
 
 def _ordered_keys(keys: Sequence[str]) -> list[str]:
@@ -132,4 +132,5 @@ def _container(open_: str, close: str, parts: list[str], indent: int | None, lev
 
 
 def js_stringify(value: object, indent: int | None = None) -> str:
-    return _dump(value, indent, 0)
+    gap = min(indent, 10) if indent is not None and indent > 0 else None
+    return _dump(value, gap, 0)

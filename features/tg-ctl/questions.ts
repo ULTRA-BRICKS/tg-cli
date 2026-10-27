@@ -128,6 +128,8 @@ export interface ButtonRequest {
   //     request that omits it, or a record persisted to disk before this field
   //     existed (pre-upgrade transient).
   promptTurnId?: string;
+  // ask-owner-only-v1: answerable only by the configured private owner (user id AND chat id).
+  ownerOnly?: boolean;
   // tg-cli#403 / agent-tools#754: opt-in "critical" hatch/permission mode. When
   // true, the daemon removes ASK_TOTAL_TIMEOUT_MS's bound for this ask (waits
   // indefinitely for a human decision instead of reporting a timeout). While it

@@ -63,6 +63,11 @@ const FLAG_KINDS: Record<string, FlagKind> = {
   subagent: 'passthroughValue',
   agent: 'passthroughValue',
   topic: 'passthroughValue',
+  // Attachments (tg-cli#775): repeatable, carried verbatim into the send argv so the
+  // plain send's guards (screenshot gate, never-attach denylist, missing/empty skip,
+  // code/md→pdf) apply unchanged.
+  photo: 'passthroughValue',
+  file: 'passthroughValue',
   'dry-run': 'passthroughBool',
 };
 
@@ -70,6 +75,7 @@ export const REPORT_USAGE = `Usage:
   tg report --title <text> (--ticket <id-or-url> | --pr <num-or-url>) \\
             --impact <text> --verify-cmd <cmd> --verify-result <result> \\
             [--evidence <text>]... [--summary <text>]... \\
+            [--photo <path>]... [--file <path>]... \\
             [--reply-to <id>] [--subagent <name>] [--topic <id>] [--dry-run]
 
 Formats a structured result report — ticket/PR link(s), user impact,
@@ -88,11 +94,20 @@ Required:
 Optional:
   --evidence <text>        supporting evidence line (repeatable)
   --summary <text>         a "what changed" bullet (repeatable)
+  --photo <path>           attach an image (repeatable) — same as the global --photo
+  --file <path>            attach a document (repeatable) — same as the global --file
   --reply-to / --subagent / --topic / --dry-run   same as the global flags
 
-Not supported directly: --photo/--file/--feature/--pdf-device and the other
-global attachment/feature flags — this subcommand's flag set is fixed to the
-fields above. A file path mentioned inside --evidence/--summary text stays
+Attachments: --photo/--file take exactly the semantics of the plain send form:
+the screenshot gate is satisfied by a real, non-empty --photo; secret-looking
+files (.env, keys, …) are refused by the never-attach denylist; a missing/empty/
+unreadable attachment is skipped with a warning and the report still goes out;
+code files and markdown given to --file are converted to PDF as usual. A rich
+report cannot ride as a media caption, so the photos arrive FIRST as their own
+message(s) (an album for 2+), then the report, then any documents — the same
+order as a plain send. --dry-run validates the attachments and uploads nothing.
+--feature/--no-feature/--pdf-device and the other global flags are not
+supported here. A file path mentioned inside --evidence/--summary text stays
 plain text; it is never attached.
 
 A --ticket value that already looks like a ticket code (HYP-123) is left as

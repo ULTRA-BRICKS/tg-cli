@@ -23,6 +23,9 @@ import { parseNewCommand, parseNewDirCallback, parseNewHarnessCallback, parseNew
 import { parseTasksCallback, parseTasksCommand } from './tasks-command';
 import { parseContinueCallback } from './limits';
 import { botCommandNames } from './bot-commands';
+import { parseChatgptMenuArg } from '../chatgpt/menu-command';
+import { REF_PREFIX, idOfRefData } from '../chatgpt/refs';
+import { isPrivateOwnerChatId } from './generic-ask';
 import { shellPassthroughGate } from './shell-danger-gate';
 import { safeSliceEnd } from './text-util';
 import { mediaLabel, messagePlainText } from './reply-preview';
@@ -139,6 +142,10 @@ function forumEventOf(m: TgMessage): 'created' | 'edited' | 'closed' | 'reopened
   return null;
 }
 
+function isChatgptCommand(text: string | undefined): boolean {
+  return typeof text === 'string' && /^\/chatgpt(@\w+)?(\s|$)/.test(text);
+}
+
 export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
   const callbackActions: Action[] = [];
   const actions: Action[] = [];
@@ -150,6 +157,22 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
     if (cb) {
       if (!senderAllowed(cb.from?.id, opts)) {
         callbackActions.push({ kind: 'answer-callback', callbackQueryId: cb.id, text: 'not allowed' });
+        continue;
+      }
+      // /chatgpt menu taps (cgp:<opaque ref>). The configured owner chat is the ONLY place such a
+      // button may be tapped from: the tapped message must sit in opts.chatId, and a missing /
+      // zero / non-integer owner fails closed — on top of the sender allowlist above. A malformed
+      // ref is answered "expired"; the daemon resolves the rest from its durable ref store.
+      if (cb.data?.startsWith(REF_PREFIX)) {
+        const tappedChat = cb.message?.chat?.id;
+        const ownerOk = isPrivateOwnerChatId(opts.chatId) && cb.from?.id === opts.chatId && tappedChat === opts.chatId;
+        if (!ownerOk) {
+          callbackActions.push({ kind: 'answer-callback', callbackQueryId: cb.id, text: 'not allowed' });
+        } else if (idOfRefData(cb.data) === null) {
+          callbackActions.push({ kind: 'answer-callback', callbackQueryId: cb.id, text: 'expired' });
+        } else {
+          callbackActions.push({ kind: 'chatgpt-callback', callbackQueryId: cb.id, data: cb.data, chatId: opts.chatId, messageId: cb.message?.message_id ?? null, threadId: cb.message?.message_thread_id ?? null });
+        }
         continue;
       }
       // Attach-picker taps (tgt:<thread>:<pane>) deliver a held topic queue. Appended to the
@@ -299,6 +322,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
           callbackQueryId: cb.id,
           requestId: closeQuestionCb.requestId,
           messageId: cb.message?.message_id ?? null,
+          actor: { userId: cb.from?.id ?? null, chatId: cb.message?.chat?.id ?? null },
         });
         continue;
       }
@@ -311,6 +335,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
               requestId: parsed.requestId,
               value: parsed.value,
               messageId: cb.message?.message_id ?? null,
+              actor: { userId: cb.from?.id ?? null, chatId: cb.message?.chat?.id ?? null },
             }
           : { kind: 'answer-callback', callbackQueryId: cb.id, text: 'expired' },
       );
@@ -327,6 +352,8 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
     // chat's, and Telegram message ids are unique per chat only — an allowed sender writing
     // from another chat would collide with, and be suppressed as, an earlier message here.
     if (m.chat.id !== opts.chatId) continue;
+    // /chatgpt is owner-only: in the owner's private chat the sender must be the owner itself.
+    if (isChatgptCommand(m.text) && !(isPrivateOwnerChatId(opts.chatId) && m.from?.id === opts.chatId)) continue;
 
     // Owner text/media inbound is NOT dropped by age (#183): a message Telegram
     // delivered after daemon downtime or while agents were busy is still a real
@@ -512,6 +539,7 @@ function textAction(
       const p = parseTasksCommand(text);
       return { kind: 'tasks', agent: p.agent, status: p.status, replyToMessageId, threadId };
     }
+    if (cmd === '/chatgpt') return { kind: 'chatgpt-menu', workspace: parseChatgptMenuArg(text.slice(verb.length)), ...topic };
     if (cmd === '/daily') return { kind: 'daily-report', ...topic };
     if (cmd === '/spend') {
       const rest = text.slice(verb.length).trim().toLowerCase();
@@ -552,14 +580,15 @@ function cardReplyAction(m: TgMessage, name: string, opts: StepOpts, threadId?: 
   const text = m.text;
   if (!reply || !text || text.startsWith('/') || text.startsWith('!')) return null;
   const thread = threadId !== undefined ? { threadId } : {};
+  const actor = { userId: m.from?.id ?? null, chatId: m.chat?.id ?? null };
   const decisionToken = parseDecisionReplyToken(text);
   const decisionRequestId = decisionToken ? (opts.permissionRequestIdForMessage?.(reply.message_id) ?? null) : null;
   if (decisionRequestId && decisionToken) {
-    return { kind: 'answer-question', callbackQueryId: '', requestId: decisionRequestId, value: decisionToken, messageId: reply.message_id, ...thread };
+    return { kind: 'answer-question', callbackQueryId: '', requestId: decisionRequestId, value: decisionToken, messageId: reply.message_id, actor, ...thread };
   }
   const postTimeoutRequestId = opts.postTimeoutQuestionRequestIdForMessage?.(reply.message_id) ?? null;
   if (postTimeoutRequestId) {
-    return { kind: 'post-timeout-question-reply', requestId: postTimeoutRequestId, questionMessageId: reply.message_id, text, from: name, messageId: m.message_id, ...thread };
+    return { kind: 'post-timeout-question-reply', requestId: postTimeoutRequestId, questionMessageId: reply.message_id, text, from: name, messageId: m.message_id, actor, ...thread };
   }
   return null;
 }

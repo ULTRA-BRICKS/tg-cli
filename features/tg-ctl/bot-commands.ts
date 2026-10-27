@@ -39,6 +39,7 @@ export const BOT_COMMANDS: readonly BotCommand[] = [
   { command: 'tasks', description: 'Task board: attention default, filters, pages' },
   { command: 'daily', description: 'What-shipped report: merged PRs since last run (rig daily)' },
   { command: 'spend', description: 'Token/cost usage report: /spend [day|week|month] (rig usage)' },
+  { command: 'chatgpt', description: 'ChatGPT sessions (owner): list + pause/resume/watch/continue requests' },
 ];
 
 export function botCommandNames(): string[] {

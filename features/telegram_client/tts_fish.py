@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import subprocess
+import struct
 import sys
 from types import SimpleNamespace
 import time
@@ -22,6 +23,38 @@ from .tts_config import resolve_credential
 MAX_AUDIO_BYTES = 8 * 1024 * 1024
 TOTAL_TIMEOUT_SECONDS = 60
 IO_TIMEOUT_SECONDS = 10
+
+
+
+def normalize_streaming_wav(payload):
+    """Finalize recognized Fish PCM stream headers after the bounded HTTP body ends.
+
+    Only the two known unknown-length header pairs are eligible. Finite WAVs
+    remain untouched, so the strict validator still detects actual truncation.
+    Audio samples are never resampled or rewritten.
+    """
+    if len(payload) < 44:
+        return payload
+    riff_size = struct.unpack_from('<I', payload, 4)[0]
+    data_size = struct.unpack_from('<I', payload, 40)[0]
+    if (riff_size, data_size) not in ((0xffffff24, 0xffffff00), (0xffffffff, 0xffffffff)):
+        return payload
+    if (len(payload) > MAX_AUDIO_BYTES or payload[:4] != b'RIFF'
+            or payload[8:16] != b'WAVEfmt ' or payload[36:40] != b'data'
+            or struct.unpack_from('<I', payload, 16)[0] != 16):
+        raise ClientError('TTS_AUDIO_INVALID')
+    encoding, channels, rate, byte_rate, block_align, bits = struct.unpack_from('<HHIIHH', payload, 20)
+    if (encoding != 1 or channels not in (1, 2) or bits not in (8, 16, 24, 32)
+            or not 8000 <= rate <= 192000 or block_align != channels * (bits // 8)
+            or byte_rate != rate * block_align):
+        raise ClientError('TTS_AUDIO_INVALID')
+    actual_size = len(payload) - 44
+    if actual_size <= 0 or actual_size % block_align or actual_size / byte_rate > 120:
+        raise ClientError('TTS_AUDIO_INVALID')
+    result = bytearray(payload)
+    struct.pack_into('<I', result, 4, len(result) - 8)
+    struct.pack_into('<I', result, 40, actual_size)
+    return bytes(result)
 
 
 def validate_wav(payload):
@@ -87,6 +120,7 @@ def fetch_audio_in_process(text, config, key=None):
         remaining()
         if size is not None and len(payload) != int(size):
             raise ClientError('TTS_AUDIO_INVALID')
+        payload = normalize_streaming_wav(payload)
         validate_wav(payload)
         total_ms = (time.monotonic() - started) * 1000
         return bytes(payload), {'time_to_first_audio_byte_ms': first_byte_ms,

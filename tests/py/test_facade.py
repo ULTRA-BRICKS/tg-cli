@@ -122,6 +122,7 @@ def test_subcommand_tables() -> None:
             "install-skill",
             "auth",
             "call",
+            "chatgpt",
             "user",
             "hooks",
             "voice",
@@ -248,18 +249,62 @@ def test_daemon_impl_invalid_state_file_defaults_to_ts(tmp_path: Path) -> None:
     assert entry.daemon_impl({"HOME": str(tmp_path)}) == "ts"
 
 
-def test_missing_bun_is_a_clean_error(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (FileNotFoundError(2, "No such file or directory"), "No such file or directory"),
+        (PermissionError(13, "Permission denied"), "Permission denied"),
+    ],
+)
+def test_bun_exec_failure_is_a_clean_ordinary_error(
+    error: OSError,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     def refuse(file: str, args: list[str], env: Mapping[str, str]) -> None:
-        raise FileNotFoundError(2, "No such file or directory")
+        raise error
 
     monkeypatch.setattr(os, "execvpe", refuse)
-    assert dispatch("tg", ["hi"], env()) == 127
-    assert capsys.readouterr().err == f"tg: cannot run bun ({BUN}): No such file or directory\n"
+    assert dispatch("tg", ["hi"], env()) == 1
+    assert capsys.readouterr().err == f"tg: cannot run bun ({BUN}): {message}\n"
 
-    def deny(file: str, args: list[str], env: Mapping[str, str]) -> None:
-        raise PermissionError(13, "Permission denied")
 
-    monkeypatch.setattr(os, "execvpe", deny)
-    assert dispatch("tg", ["hi"], env()) == 126
+@pytest.mark.parametrize(("name", "token"), [("tg", "chatgpt"), ("tg-ctl", "capabilities")])
+def test_current_main_subcommands_never_reach_send(
+    name: str,
+    token: str,
+    handlers: Callable[[str, str, object], list[list[str]]],
+    execs: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls = handlers(name, DEFAULT, 0)
+    assert dispatch(name, [token, "--json"], env(TG_NO_TS_FALLBACK="1")) == 70
+    assert calls == []
+    assert capsys.readouterr().err == f"{name}: not ported yet: {token}\n"
+
+
+@pytest.mark.parametrize("name", ["tg", "tg_ctl", "call_cli"])
+def test_console_argv_invalid_utf8_is_replaced(
+    name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def capture(entrypoint: str, argv: list[str], environ: Mapping[str, str]) -> int:
+        calls.append(argv)
+        return 0
+
+    monkeypatch.setattr(sys, "argv", [name, os.fsdecode(b"a\xffb")])
+    monkeypatch.setattr(entry, "dispatch", capture)
+    with pytest.raises(SystemExit) as caught:
+        getattr(entry, name)()
+    assert caught.value.code == 0
+    assert calls == [["a\ufffdb"]]
+
+
+def test_daemon_impl_reads_first_line_only(tmp_path: Path) -> None:
+    state = tmp_path / ".local/state/tg-cli/impl"
+    state.mkdir(parents=True)
+    (state / "tg-ctl-daemon").write_bytes(b" py \nignored\n")
+    assert entry.daemon_impl({"HOME": str(tmp_path)}) == "py"

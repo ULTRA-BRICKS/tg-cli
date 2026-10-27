@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
+from tgcli.common.fsio import read_text_lossy
 from tgcli.version import repo_root
 
 # --- Handler protocol -------------------------------------------------------------------------
@@ -46,6 +47,7 @@ SUBCOMMANDS: dict[str, frozenset[str]] = {
             "install-skill",
             "auth",
             "call",
+            "chatgpt",
             "user",
             "hooks",
             "voice",
@@ -60,6 +62,7 @@ SUBCOMMANDS: dict[str, frozenset[str]] = {
             "start",
             "run",
             "status",
+            "capabilities",
             "audit-delivery",
             "inbox",
             "stop",
@@ -88,8 +91,7 @@ HANDLERS: dict[str, dict[str, str]] = {"tg": {}, "tg-ctl": {}, "call-cli": {}}
 # --- Fall-through to the TypeScript -----------------------------------------------------------
 
 NOT_PORTED_EXIT = 70
-EXEC_NOT_FOUND_EXIT = 127  # shell convention: command not found
-EXEC_FAILED_EXIT = 126  # found but not executable
+EXEC_FAILED_EXIT = 1  # ordinary failure, within the CLI exit-code contract
 
 
 def _home(env: Mapping[str, str]) -> Path:
@@ -113,7 +115,7 @@ def fall_through(entrypoint: str, argv: list[str], env: Mapping[str, str]) -> in
         os.execvpe(bun, [bun, str(repo_root() / entrypoint), *argv], dict(env))
     except OSError as error:
         print(f"{entrypoint}: cannot run bun ({bun}): {error.strerror or error}", file=sys.stderr)
-        return EXEC_NOT_FOUND_EXIT if isinstance(error, FileNotFoundError) else EXEC_FAILED_EXIT
+        return EXEC_FAILED_EXIT
     return NOT_PORTED_EXIT  # only reached when execvpe is replaced (tests)
 
 
@@ -126,8 +128,10 @@ def daemon_impl(env: Mapping[str, str]) -> str:
         if env.get(name):
             return env[name]
     try:
-        return (_home(env) / ".local/state/tg-cli/impl/tg-ctl-daemon").read_text().strip() or "ts"
-    except (OSError, ValueError):  # unreadable or invalid UTF-8: the default selection
+        content = read_text_lossy(_home(env) / ".local/state/tg-cli/impl/tg-ctl-daemon")
+        selection = content.partition("\n")[0].strip()
+        return "ts" if "\ufffd" in selection else selection or "ts"
+    except OSError:  # unreadable state: the default selection
         return "ts"
 
 
@@ -172,16 +176,21 @@ def dispatch(entrypoint: str, argv: list[str], env: Mapping[str, str]) -> int:
 # --- Console scripts and --self-check ---------------------------------------------------------
 
 
+def _argv() -> list[str]:
+    """Decode argv bytes as Bun does, replacing invalid UTF-8 rather than surrogateescape."""
+    return [os.fsencode(arg).decode("utf-8", "replace") for arg in sys.argv[1:]]
+
+
 def tg() -> NoReturn:
-    sys.exit(dispatch("tg", sys.argv[1:], os.environ))
+    sys.exit(dispatch("tg", _argv(), os.environ))
 
 
 def tg_ctl() -> NoReturn:
-    sys.exit(dispatch("tg-ctl", sys.argv[1:], os.environ))
+    sys.exit(dispatch("tg-ctl", _argv(), os.environ))
 
 
 def call_cli() -> NoReturn:
-    sys.exit(dispatch("call-cli", sys.argv[1:], os.environ))
+    sys.exit(dispatch("call-cli", _argv(), os.environ))
 
 
 def self_check(entrypoint: str) -> int:

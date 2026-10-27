@@ -21,6 +21,33 @@ const DAEMON_ABANDON_MARGIN_MS = 15_000;
 // `origin.agent` of a generic ask: the one marker the daemon recognizes it by.
 export const GENERIC_ASK_ORIGIN_AGENT = 'tg-ctl-generic';
 
+export const OWNER_ONLY_FLAG = '--owner-only';
+
+// Capability markers `tg-ctl capabilities --json` reports; a client verifies the exact marker
+// before it relies on the behavior.
+export const CAPABILITIES_SCHEMA_VERSION = 1;
+export const CAPABILITIES = ['ask-owner-only-v1'] as const;
+
+// True only for a positive safe-integer private chat id ("5153477378"); groups and channels
+// are negative, so they and every non-numeric spelling are refused.
+export function isPrivateOwnerChatId(raw: string | number | undefined): boolean {
+  const n = typeof raw === 'number' ? raw : typeof raw === 'string' && /^[1-9][0-9]*$/.test(raw) ? Number(raw) : NaN;
+  return Number.isSafeInteger(n) && n > 0;
+}
+
+// The shared answer predicate for an ownerOnly request: the tapping/replying USER and the chat
+// the answer came from must both be the configured private owner chat id. Missing message
+// (inline), group chats, other allowlisted senders and synthesized answers (no actor) fail.
+export interface AnswerActor { userId: number | null; chatId: number | null }
+export function ownerOnlyAnswerAllowed(ownerChatId: number, actor: AnswerActor | undefined): boolean {
+  return (
+    isPrivateOwnerChatId(ownerChatId) &&
+    actor !== undefined &&
+    actor.userId === ownerChatId &&
+    actor.chatId === ownerChatId
+  );
+}
+
 // The daemon's test for a generic ask. Paneless by construction: a request that
 // names a pane is a harness prompt in that pane, whatever its origin says. Such
 // an ask needs no registration (the caller is a script, not a pane-bound
@@ -76,8 +103,13 @@ function isVerifyGrantInvocation(argv: string[]): boolean {
 // valid `--timeout N` / `--timeout=N` or a valueless `--timeout`/`--timeout=`,
 // joined in original order: an unquoted `deploy to prod --timeout 60` or
 // `--timeout 60 delete production` must show the approver the whole question.
-export function parseGenericAskArgv(argv: string[]): { question: string; timeout: GenericAskTimeout } | null {
+export function parseGenericAskArgv(argv: string[]): { question: string; timeout: GenericAskTimeout; ownerOnly: boolean } | null {
   if (isInternalAskArgv(argv)) return null;
+
+  // `--owner-only` (ask-owner-only-v1): consumed here, never shown in the question. The caller
+  // validates the private owner chat before posting and stamps ownerOnly on the request.
+  const ownerOnly = argv.includes(OWNER_ONLY_FLAG);
+  argv = argv.filter((token) => token !== OWNER_ONLY_FLAG);
 
   // Remove ONLY the timeout option itself. An invalid timeout value or an
   // unknown flag stays verbatim in the human-visible question: this primitive
@@ -112,7 +144,7 @@ export function parseGenericAskArgv(argv: string[]): { question: string; timeout
   }
 
   const question = questionTokens.join(' ');
-  return { question, timeout };
+  return { question, timeout, ownerOnly };
 }
 
 // `timeoutFlagGiven` distinguishes "the caller never passed --timeout at all" (silent

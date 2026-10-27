@@ -3,6 +3,7 @@
 import contextlib
 import os
 import secrets
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -18,7 +19,10 @@ def _fsync_dir(directory: Path) -> None:
 def _write_all(fd: int, payload: bytes) -> None:
     view = memoryview(payload)
     while view:
-        view = view[os.write(fd, view) :]
+        written = os.write(fd, view)
+        if written == 0:
+            raise OSError("write made no progress")
+        view = view[written:]
 
 
 def atomic_write(path: Path, data: str | bytes, mode: int = 0o600) -> None:
@@ -64,3 +68,8 @@ def append_lines(path: Path, lines: Sequence[str], *, fsync: bool, mode: int = 0
 def read_text_lossy(path: Path) -> str:
     """Never `read_text`: universal newlines would turn CR bytes into LF."""
     return path.read_bytes().decode("utf-8", "replace")
+
+
+def read_stdin_lossy() -> str:
+    """Read stdin bytes without newline translation and replace invalid UTF-8, as Bun does."""
+    return sys.stdin.buffer.read().decode("utf-8", "replace")

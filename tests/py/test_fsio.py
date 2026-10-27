@@ -91,3 +91,44 @@ def test_atomic_write_does_not_follow_planted_symlink(
         atomic_write(path, "pwned")
     assert victim.read_text() == "keep"
     assert not path.exists()
+
+
+@pytest.mark.parametrize("payload", [b"a\r\nb\rc", b"a\xffb"])
+def test_stdin_keeps_crlf(payload: bytes) -> None:
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from tgcli.common.fsio import read_stdin_lossy; "
+            "import sys; sys.stdout.buffer.write(read_stdin_lossy().encode('utf-8'))",
+        ],
+        input=payload,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == payload.decode("utf-8", "replace").encode("utf-8")
+
+
+def test_atomic_write_zero_write_fails_without_replacing_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"old")
+    attempts = 0
+    real_write = os.write
+
+    def zero_once(fd: int, data: bytes) -> int:
+        nonlocal attempts
+        attempts += 1
+        return 0 if attempts == 1 else real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", zero_once)
+    with pytest.raises(OSError, match="write"):
+        atomic_write(path, "new")
+    assert path.read_bytes() == b"old"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["f"]

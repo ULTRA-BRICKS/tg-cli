@@ -72,7 +72,7 @@ test('--table: a path in the stdin rows counts, and the resend command says to p
   const home = makeHome();
   const r = await tg(home, ['--dry-run', '--table', 'Итоги'], true, `draft\t${join(home, 'work', 'weekly-report-mari.md')}\n`);
   expect(r.code).toBe(1);
-  expect(r.err).toContain(`<the same table rows> | tg --file ${join(home, 'work', 'weekly-report-mari.md')} --table 'Итоги'`);
+  expect(r.err).toContain(`<the same table rows> | tg --file ${join(home, 'work', 'weekly-report-mari.md')} --dry-run --table 'Итоги'`);
   expect(calls).toEqual([]);
 });
 
@@ -96,12 +96,12 @@ test('tg#22056: an agent message naming an existing file it does not attach is r
   expect(calls).toEqual([]);
 });
 
-test('--dry-run shows the same refusal; the resend command is a real send (dry-run takes no attachments)', async () => {
+test('--dry-run shows the same refusal; the resend command keeps --dry-run (dry-run takes attachments)', async () => {
   calls = [];
   const home = makeHome();
   const r = await tg(home, ['--dry-run', '--tag', 'report', DRAFT_LINE]);
   expect(r.code).toBe(1);
-  expect(r.err).toContain(`tg --file ${join(home, 'work', 'weekly-report-mari.md')} --tag report '<the same message text>'`);
+  expect(r.err).toContain(`tg --file ${join(home, 'work', 'weekly-report-mari.md')} --dry-run --tag report '<the same message text>'`);
   expect(r.out).not.toContain('tg --dry-run: OK');
   expect(calls).toEqual([]);
 });
