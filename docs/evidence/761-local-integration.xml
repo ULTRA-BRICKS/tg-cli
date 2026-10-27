@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="verify-calls" tests="1" failures="0" errors="1" skipped="0" timestamp="2026-10-27T07:05:01Z">
+  <properties><property name="overall" value="incomplete_blocked"/><property name="tested_sha" value="218a7a45b1b265fc56094ea92ce69e0a6e58eb49"/><property name="tested_code_sha256" value="370da0af2ac4a6890992ff6bfe1654297ce500233f98d4f0e123828eee3d6da8"/><property name="tested_version" value="1.71.0"/><property name="deployed_sha" value="None"/><property name="deployed_code_sha256" value="None"/><property name="deployed_version" value="None"/><property name="tested_verification_sha256" value="9612a549b7b81c6f0154fce9a1a77ca6175cdd2e89e0935203029438d001fc6f"/></properties>
+  <testcase classname="verify-calls.hermetic.fixture" name="hermetic.integration.integration"><error type="blocked" message="prerequisite_missing"/></testcase>
+</testsuite>

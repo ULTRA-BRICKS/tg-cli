@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="verify-calls" tests="13" failures="0" errors="13" skipped="0" timestamp="2026-10-27T07:33:46Z">
+  <properties><property name="overall" value="incomplete_blocked"/><property name="tested_sha" value="218a7a45b1b265fc56094ea92ce69e0a6e58eb49"/><property name="tested_code_sha256" value="7cc77c6a2b29928ee01b5b0008fb5ef6def4b3ba1d61d24a043c047e17750b2b"/><property name="tested_version" value="1.71.1"/><property name="deployed_sha" value="None"/><property name="deployed_code_sha256" value="None"/><property name="deployed_version" value="None"/><property name="tested_verification_sha256" value="6e28476b1eef1093b50319a34afffdf7380029d98fc4d31dd33ec26031782274"/></properties>
+  <testcase classname="verify-calls.deployed.real" name="deployed.alias_realpath"><error type="blocked" message="blocked:local-scope"/></testcase>
+  <testcase classname="verify-calls.deployed.real" name="deployed.installed_version"><error type="blocked" message="blocked:local-scope"/></testcase>
+  <testcase classname="verify-calls.deployed.real" name="deployed.credential_metadata"><error type="blocked" message="blocked:local-scope"/></testcase>
+  <testcase classname="verify-calls.deployed.real" name="deployed.tg_ctl"><error type="blocked" message="blocked:local-scope"/></testcase>
+  <testcase classname="verify-calls.deployed.real" name="deployed.frontdoor_dry_run"><error type="blocked" message="blocked:local-scope"/></testcase>
+  <testcase classname="verify-calls.deployed.real" name="deployed.history_read"><error type="blocked" message="blocked:local-scope"/></testcase>
+  <testcase classname="verify-calls.deployed.real" name="deployed.voice_profile"><error type="blocked" message="blocked:local-scope"/></testcase>
+  <testcase classname="verify-calls.call.real" name="call.run_claim"><error type="blocked" message="dependency_blocked:tts:tool-denied"/></testcase>
+  <testcase classname="verify-calls.telegram.real" name="telegram.sessions_online"><error type="blocked" message="blocked:not-authorized"/></testcase>
+  <testcase classname="verify-calls.telegram.real" name="telegram.mirror_roundtrip"><error type="blocked" message="blocked:not-authorized"/></testcase>
+  <testcase classname="verify-calls.tts.real" name="tts.synthesis"><error type="blocked" message="blocked:tool-denied"/></testcase>
+  <testcase classname="verify-calls.call.real" name="call.dial"><error type="blocked" message="dependency_blocked:call.run_claim"/></testcase>
+  <testcase classname="verify-calls.call.real" name="call.two_way"><error type="blocked" message="unsupported:CONVERSATION_REQUIRES_IDENTIFIED_SERVICE"/></testcase>
+</testsuite>

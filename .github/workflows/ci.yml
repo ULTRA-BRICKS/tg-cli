@@ -21,11 +21,11 @@ jobs:
         run: bun install
       - name: Check generated configuration schema and reference
         run: bun run schema:check
-      - name: Install pandoc + lsof + Chrome (md-pdf integration test; tg-ctl status lock holder)
+      - name: Install media and status tools (PDF, call concatenation, daemon status)
         run: |
           sudo apt-get update
           # lsof: `tg-ctl status` finds the poller lock holder with `lsof -t`; stock Ubuntu images lack it
-          sudo apt-get install -y pandoc lsof
+          sudo apt-get install -y pandoc lsof ffmpeg python3-venv python3-dev build-essential
           # Google Chrome is preinstalled on GitHub's ubuntu-latest (/usr/bin/google-chrome,
           # which findChrome() probes) but not on a stock Ubuntu runner image (Forgejo / GARM),
           # so install it when missing. curl, not wget: a stock image ships no wget.
@@ -34,6 +34,31 @@ jobs:
             curl -fsSL -o "$deb" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
             sudo apt-get install -y "$deb"
           }
+      - name: Verify clean call runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime="$(mktemp -d "${RUNNER_TEMP}/call-verification.XXXXXX")"
+          mkdir "$runtime/reports"
+          command -v ffmpeg
+          command -v ffprobe
+          python3 -m venv "$runtime"
+          "$runtime/bin/python" -m pip install --require-hashes -r requirements-call.txt
+          "$runtime/bin/python" -m pip check
+          "$runtime/bin/python" tests/call-runtime-lock.test.py \
+            CallRuntimeLockTests.test_frozen_dependency_constraints \
+            CallRuntimeLockTests.test_reported_old_pin_violates_published_constraint
+          "$runtime/bin/python" scripts/verify-calls.py --hermetic \
+            --report-json "$runtime/reports/calls.json" \
+            --report-junit "$runtime/reports/calls.xml"
+      - name: Upload call verification reports
+        if: always()
+        uses: https://code.forgejo.org/forgejo/upload-artifact@16871d9e8cfcf27ff31822cac382bbb5450f1e1e
+        with:
+          name: call-verification
+          path: ${{ runner.temp }}/call-verification.*/reports/*
+          if-no-files-found: error
+          retention-days: 30
       - name: Test
         # Plain `bun test` under a stall watchdog: a wedged test process fails the step
         # naming the file it hung in, instead of idling silently until the job is killed.

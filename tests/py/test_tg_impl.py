@@ -1,9 +1,15 @@
 """Black-box switch transactions; services and CLI runtimes are hermetic fakes."""
 
+import fcntl
 import json
+import os
+import pathlib
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import unittest
 
 from test_switch import Sandbox
 
@@ -56,6 +62,38 @@ sys.exit(s.get('version_fail',0) if args and args[0] in ('--version','--help') e
 """
 
 
+FLOCK_WORKER = """import fcntl, os, pathlib, sys, time
+lock, control, ready, slot = map(pathlib.Path, sys.argv[1:])
+gates = os.environ.get('FLOCK_WORKER_GATES')
+def gate(name):
+ if gates:
+  pathlib.Path(gates, name + '.reached.' + str(slot)).write_text('1')
+  while pathlib.Path(gates, name).exists(): time.sleep(.005)
+with lock.open('rb') as stream:
+ held=False
+ while True:
+  selected=control.read_text()==str(slot)
+  if selected and not held:
+   try: fcntl.flock(stream,fcntl.LOCK_EX|fcntl.LOCK_NB); held=True; ready.write_text(str(slot))
+   except BlockingIOError: pass
+  if held and not selected:
+   ready.write_text('-1')
+   gate('release')
+   fcntl.flock(stream,fcntl.LOCK_UN); held=False
+  time.sleep(.005)
+"""
+
+
+def flock_held(path):
+    with path.open("rb") as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(stream, fcntl.LOCK_UN)
+        return False
+
+
 class ImplTests(Sandbox):
     def setUp(self):
         super().setUp()
@@ -66,18 +104,7 @@ class ImplTests(Sandbox):
         (self.lock.parent / ".env").write_text("TG_BOT_TOKEN=123:fake\n")
         (self.repo / "desired").write_text("0")
         (self.repo / "ready").write_text("")
-        worker = """import fcntl, pathlib, sys, time
-lock, control, ready, slot = map(pathlib.Path, sys.argv[1:])
-with lock.open('rb') as stream:
- held=False
- while True:
-  selected=control.read_text()==str(slot)
-  if selected and not held:
-   try: fcntl.flock(stream,fcntl.LOCK_EX|fcntl.LOCK_NB); held=True; ready.write_text(str(slot))
-   except BlockingIOError: pass
-  if held and not selected: fcntl.flock(stream,fcntl.LOCK_UN); held=False; ready.write_text('-1')
-  time.sleep(.005)
-"""
+        worker = FLOCK_WORKER
         self.workers = [
             subprocess.Popen(
                 [
@@ -120,8 +147,12 @@ with lock.open('rb') as stream:
             process.wait(timeout=3)
 
     def wait_slot(self, slot):
+        # -1 is published while the old owner still holds the lock; it only means
+        # "no owner" once the lock is actually free.
         deadline = time.monotonic() + 3
-        while (self.repo / "ready").read_text() != str(slot):
+        while (self.repo / "ready").read_text() != str(slot) or (
+            slot == -1 and flock_held(self.lock)
+        ):
             self.assertLess(time.monotonic(), deadline, "flock fixture did not become ready")
             time.sleep(0.01)
 
@@ -535,3 +566,66 @@ with lock.open('rb') as stream:
         )
         self.assert_ok(self.impl("use", "py", "tg-ctl"))
         self.assertTrue(any("kickstart" in call[1] for call in self.calls()))
+
+
+class FlockWorkerHandoffTests(unittest.TestCase):
+    """A releasing owner must publish -1 while it still holds the lock.
+
+    Publishing after unlocking lets the next owner's ready=<slot> be overwritten
+    with -1, so a restart fake polling for the new slot never sees it (CI run 8785).
+    The worker's `release` gate pins the interleaving between the two release steps.
+    """
+
+    def start(self, slot, gates):
+        return subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                FLOCK_WORKER,
+                str(self.lock),
+                str(self.control),
+                str(self.ready),
+                str(slot),
+            ],
+            env={**os.environ, "FLOCK_WORKER_GATES": str(gates)},
+        )
+
+    def wait_for(self, condition, what):
+        deadline = time.monotonic() + 5
+        while not condition():
+            self.assertLess(time.monotonic(), deadline, what)
+            time.sleep(0.005)
+
+    def test_release_publishes_before_unlock_so_next_owner_ready_survives(self):
+        root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        self.lock, self.control, self.ready = root / "lock", root / "desired", root / "ready"
+        gates = root / "gates"
+        gates.mkdir()
+        self.lock.touch()
+        self.control.write_text("0")
+        self.ready.write_text("")
+        (gates / "release").touch()
+        workers = [self.start(slot, gates) for slot in (0, 1)]
+
+        def stop():
+            for worker in workers:
+                worker.terminate()
+            for worker in workers:
+                worker.wait(timeout=5)
+
+        self.addCleanup(stop)
+        self.wait_for(lambda: self.ready.read_text() == "0", "owner 0 never became ready")
+
+        self.control.write_text("1")
+        self.wait_for((gates / "release.reached.0").exists, "owner 0 never reached release")
+
+        # Owner 0 is parked between its two release steps: the successor must not
+        # be able to own the lock yet, and -1 must already be published.
+        self.assertTrue(flock_held(self.lock), "lock released before -1 was published")
+        self.assertEqual(self.ready.read_text(), "-1")
+
+        (gates / "release").unlink()
+        self.wait_for(lambda: self.ready.read_text() == "1", "successor never published ready")
+        self.wait_for(lambda: flock_held(self.lock), "successor does not hold the lock")
+        self.assertEqual(self.ready.read_text(), "1")

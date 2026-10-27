@@ -1,12 +1,14 @@
 {
   "name": "tg-cli",
   "engines": { "bun": ">=1.2.21" },
-  "version": "1.72.0",
+  "version": "1.72.1",
   "type": "module",
   "scripts": {
     "schema:gen": "bun scripts/generate-config-schema.ts",
     "schema:check": "bun scripts/generate-config-schema.ts --check",
-    "test": "bun test"
+    "test": "bun test",
+    "test:calls": "python3 scripts/verify-calls.py",
+    "test:calls:deployed": "python3 scripts/verify-calls.py --deployed"
   },
   "devDependencies": {
     "bun-types": "^1.2.0"

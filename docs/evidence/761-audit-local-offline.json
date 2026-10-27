@@ -1,0 +1,83 @@
+{
+  "schema": 1,
+  "run": {
+    "utc": "2026-10-27T07:33:46Z",
+    "tested": {
+      "repo": "/home/ultra/xp/tg-cli/.worktrees/call-integration-complete-761",
+      "sha": "218a7a45b1b265fc56094ea92ce69e0a6e58eb49",
+      "version": "1.71.1",
+      "dirty": true,
+      "code_sha256": "7cc77c6a2b29928ee01b5b0008fb5ef6def4b3ba1d61d24a043c047e17750b2b",
+      "verification_sha256": "6e28476b1eef1093b50319a34afffdf7380029d98fc4d31dd33ec26031782274"
+    },
+    "deployed": {
+      "inspected": false,
+      "repo": null,
+      "sha": null,
+      "version": null,
+      "code_sha256": null
+    },
+    "interpreter": {
+      "executable": "/usr/bin/python3",
+      "version": "3.14.4",
+      "implementation": "CPython"
+    },
+    "runtimes": {
+      "python": "3.14.4",
+      "bun": "1.4.2"
+    },
+    "levels": [
+      "hermetic"
+    ],
+    "run_id": "verify-20261027t073345z-9e178953",
+    "blocked_capabilities": {},
+    "interrupted": false,
+    "scope_note": "fixture = fakes at external boundaries; real = installed tools / live Telegram or Fish"
+  },
+  "checks": [
+    {
+      "id": "hermetic.integration.integration",
+      "title": "integration suite tests/telegram-761-call-integration.test.py",
+      "capability": "hermetic",
+      "scope": "fixture",
+      "status": "blocked",
+      "detail": "prerequisite_missing",
+      "evidence": {
+        "tools": [
+          "ffmpeg"
+        ],
+        "path": "tests/telegram-761-call-integration.test.py"
+      },
+      "depends_on": []
+    },
+    {
+      "id": "hermetic.regression.mutation-controls",
+      "title": "regression suite tests/support/call_mutation_controls.py",
+      "capability": "hermetic",
+      "scope": "fixture",
+      "status": "blocked",
+      "detail": "prerequisite_missing",
+      "evidence": {
+        "tools": [
+          "ffmpeg"
+        ],
+        "path": "tests/support/call_mutation_controls.py"
+      },
+      "depends_on": []
+    }
+  ],
+  "unsupported_capabilities": [
+    "live_two_way_conversation"
+  ],
+  "summary": {
+    "overall": "incomplete_blocked",
+    "exit_code": 2,
+    "counts": {
+      "pass": 0,
+      "fail": 0,
+      "blocked": 2,
+      "not_run": 0
+    },
+    "total": 2
+  }
+}

@@ -1,0 +1,199 @@
+{
+  "schema": 1,
+  "run": {
+    "utc": "2026-10-27T07:05:01Z",
+    "tested": {
+      "repo": "/home/ultra/xp/tg-cli/.worktrees/call-integration-complete-761",
+      "sha": "218a7a45b1b265fc56094ea92ce69e0a6e58eb49",
+      "version": "1.71.0",
+      "dirty": true,
+      "code_sha256": "370da0af2ac4a6890992ff6bfe1654297ce500233f98d4f0e123828eee3d6da8",
+      "verification_sha256": "9612a549b7b81c6f0154fce9a1a77ca6175cdd2e89e0935203029438d001fc6f"
+    },
+    "deployed": {
+      "inspected": false,
+      "repo": null,
+      "sha": null,
+      "version": null,
+      "code_sha256": null
+    },
+    "interpreter": {
+      "executable": "/usr/bin/python3",
+      "version": "3.14.4",
+      "implementation": "CPython"
+    },
+    "runtimes": {
+      "python": "3.14.4",
+      "bun": null
+    },
+    "levels": [
+      "deployed",
+      "telegram",
+      "tts",
+      "call",
+      "two_way"
+    ],
+    "run_id": "blocked-761-20261027",
+    "blocked_capabilities": {
+      "deployed": "local-scope",
+      "telegram": "not-authorized",
+      "tts": "tool-denied"
+    },
+    "interrupted": false,
+    "scope_note": "fixture = fakes at external boundaries; real = installed tools / live Telegram or Fish"
+  },
+  "checks": [
+    {
+      "id": "deployed.alias_realpath",
+      "title": "installed aliases resolve to one checkout",
+      "capability": "deployed",
+      "scope": "real",
+      "status": "blocked",
+      "detail": "blocked:local-scope",
+      "evidence": {},
+      "depends_on": []
+    },
+    {
+      "id": "deployed.installed_version",
+      "title": "installed version and SHA equal the tested source",
+      "capability": "deployed",
+      "scope": "real",
+      "status": "blocked",
+      "detail": "blocked:local-scope",
+      "evidence": {},
+      "depends_on": [
+        "deployed.alias_realpath"
+      ]
+    },
+    {
+      "id": "deployed.credential_metadata",
+      "title": "private credential files (metadata only)",
+      "capability": "deployed",
+      "scope": "real",
+      "status": "blocked",
+      "detail": "blocked:local-scope",
+      "evidence": {},
+      "depends_on": []
+    },
+    {
+      "id": "deployed.tg_ctl",
+      "title": "tg-ctl daemon code current and autostart enabled",
+      "capability": "deployed",
+      "scope": "real",
+      "status": "blocked",
+      "detail": "blocked:local-scope",
+      "evidence": {},
+      "depends_on": []
+    },
+    {
+      "id": "deployed.frontdoor_dry_run",
+      "title": "installed tg/call-cli dry-runs are identical",
+      "capability": "deployed",
+      "scope": "real",
+      "status": "blocked",
+      "detail": "blocked:local-scope",
+      "evidence": {},
+      "depends_on": [
+        "deployed.alias_realpath"
+      ]
+    },
+    {
+      "id": "deployed.history_read",
+      "title": "history is a nonmutating read through both frontdoors",
+      "capability": "deployed",
+      "scope": "real",
+      "status": "blocked",
+      "detail": "blocked:local-scope",
+      "evidence": {},
+      "depends_on": [
+        "deployed.alias_realpath"
+      ]
+    },
+    {
+      "id": "deployed.voice_profile",
+      "title": "configured neural profile",
+      "capability": "deployed",
+      "scope": "real",
+      "status": "blocked",
+      "detail": "blocked:local-scope",
+      "evidence": {},
+      "depends_on": [
+        "deployed.alias_realpath"
+      ]
+    },
+    {
+      "id": "telegram.sessions_online",
+      "title": "both sessions online with verified identity",
+      "capability": "telegram",
+      "scope": "real",
+      "status": "blocked",
+      "detail": "blocked:not-authorized",
+      "evidence": {},
+      "depends_on": []
+    },
+    {
+      "id": "telegram.mirror_roundtrip",
+      "title": "exact-self mirror send/edit/readback (INTEGRATION TEST—NO CALL)",
+      "capability": "telegram",
+      "scope": "real",
+      "status": "blocked",
+      "detail": "blocked:not-authorized",
+      "evidence": {},
+      "depends_on": [
+        "telegram.sessions_online"
+      ]
+    },
+    {
+      "id": "tts.synthesis",
+      "title": "fresh neural synthesis through Effects().synthesize",
+      "capability": "tts",
+      "scope": "real",
+      "status": "blocked",
+      "detail": "blocked:tool-denied",
+      "evidence": {},
+      "depends_on": []
+    },
+    {
+      "id": "call.dial",
+      "title": "one audited call through run_call",
+      "capability": "call",
+      "scope": "real",
+      "status": "blocked",
+      "detail": "dependency_blocked:deployed.alias_realpath",
+      "evidence": {},
+      "depends_on": [
+        "deployed.alias_realpath",
+        "deployed.installed_version",
+        "telegram.sessions_online",
+        "telegram.mirror_roundtrip",
+        "tts.synthesis"
+      ]
+    },
+    {
+      "id": "call.two_way",
+      "title": "live two-way conversation",
+      "capability": "call",
+      "scope": "real",
+      "status": "blocked",
+      "detail": "unsupported:CONVERSATION_REQUIRES_IDENTIFIED_SERVICE",
+      "evidence": {
+        "reason": "live two-way conversation is NOT_READY: the audited intro/transcript path is missing"
+      },
+      "depends_on": []
+    }
+  ],
+  "unsupported_capabilities": [
+    "live_two_way_conversation"
+  ],
+  "summary": {
+    "overall": "incomplete_blocked",
+    "exit_code": 2,
+    "counts": {
+      "pass": 0,
+      "fail": 0,
+      "blocked": 12,
+      "not_run": 0
+    },
+    "total": 12
+  }
+}
