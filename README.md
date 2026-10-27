@@ -990,7 +990,9 @@ Telegram/provider audio verification.
 ### Shared call-lib and conversational start
 
 The `tg-call-lib` wheel packages this same `telegram_client` source; there is no
-second implementation. `tg-call library-info` and `tg-call-json`'s `describe`
+second implementation. Its distribution metadata lives in `features/pyproject.toml`
+(a uv workspace member of the root `tg-cli` project), so a git install adds
+`#subdirectory=features`. `tg-call library-info` and `tg-call-json`'s `describe`
 request report distribution version and module path. The prepared Bun consumer
 is in `adapters/calbot/`; it has not been deployed into the running application.
 
