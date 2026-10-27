@@ -102,3 +102,13 @@ def test_apply_feature_missing_value(args):
 )
 def test_features_ecmascript_whitespace_and_comment_boundaries(text, expected):
     assert parse_feature_config(text) == expected
+
+
+def test_feature_primitive_proto_assignments_like_ts():
+    assert parse_feature_config("features:\n  __proto__: true\n  hooks: false") == {"hooks": False}
+    assert "__proto__" not in resolve_features({}, FeatureOverrides(["__proto__"], []))
+    assert "__proto__" not in resolve_features({}, FeatureOverrides([], ["__proto__"]))
+    assert (
+        resolve_features({"__proto__": False}, FeatureOverrides(["__proto__"], []))["__proto__"]
+        is True
+    )

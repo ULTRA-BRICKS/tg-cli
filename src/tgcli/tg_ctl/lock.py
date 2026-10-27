@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TypedDict
 
+from tgcli.common.js_number import js_integer, js_number
 from tgcli.common.js_string import JS_WHITESPACE_PATTERN, js_trim
 from tgcli.tg_ctl.config import ControlConfig
 
@@ -90,10 +91,10 @@ def bot_id_from_token(token: str) -> str:
     return bot_id if colon and re.fullmatch(r"[0-9]+", bot_id) else ""
 
 
-def read_pid_file(content: str | None) -> int | None:
+def read_pid_file(content: str | None) -> float | None:
     if content is None or not re.fullmatch(r"[0-9]+", js_trim(content)):
         return None
-    pid = int(js_trim(content))
+    pid = js_number(js_trim(content))
     return pid if pid > 0 else None
 
 
@@ -125,10 +126,7 @@ def flock_pids_for_inode(proc_locks: str, ino: str) -> list[int]:
         inode = fields[5].split(":")
         if len(inode) < 3 or inode[2] != ino:
             continue
-        try:
-            pid = int(fields[4])
-        except ValueError:
-            continue
-        if pid >= 0:
-            pids[pid] = None
+        pid = js_integer(js_number(fields[4]))
+        if pid is not None and pid >= 0:
+            pids[int(pid)] = None
     return list(pids)

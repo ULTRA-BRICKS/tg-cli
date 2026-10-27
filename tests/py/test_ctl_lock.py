@@ -154,3 +154,32 @@ def test_flock_ecmascript_whitespace_separator():
         "\ufeff2:\ufeffFLOCK\ufeffADVISORY\ufeffWRITE\ufeff4242\ufeff103:02:42 0 EOF", "42"
     ) == [4242]
     assert flock_pids_for_inode("2:\x85FLOCK  ADVISORY WRITE 4242 103:02:42 0 EOF", "42") == []
+
+
+def test_pid_numbers_use_js_double():
+    import math
+
+    assert read_pid_file("9007199254740993") == 9007199254740992
+    assert math.isinf(read_pid_file("9" * 309))
+    assert math.isinf(read_pid_file("9" * 5000))
+
+
+@pytest.mark.parametrize(
+    ("pid", "expected"),
+    [
+        ("1e3", [1000]),
+        ("0x10", [16]),
+        ("12.0", [12]),
+        ("1_000", []),
+        ("١٢", []),
+        ("0b11", [3]),
+        ("0o10", [8]),
+        ("+12", [12]),
+        ("Infinity", []),
+        ("9007199254740993", [9007199254740992]),
+    ],
+)
+def test_flock_js_number_syntax(pid, expected):
+    assert (
+        flock_pids_for_inode("1: FLOCK ADVISORY WRITE " + pid + " 00:00:42 0 EOF", "42") == expected
+    )

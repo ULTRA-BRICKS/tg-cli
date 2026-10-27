@@ -61,3 +61,7 @@ def test_env_bom_and_python_only_whitespace():
         "\x85KEEP": "1\x85",
         "\x1cKEY": "2\x1f",
     }
+
+
+def test_env_ignores_primitive_proto_assignment_like_ts():
+    assert parse_env_content("__proto__=v\nA=x") == {"A": "x"}

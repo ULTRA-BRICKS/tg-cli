@@ -16,7 +16,7 @@ def parse_env_content(text: str) -> dict[str, str]:
             continue
         key, value = trimmed.split("=", 1)
         key = js_trim(key)
-        if key:
+        if key and key != "__proto__":
             env[key] = js_trim(value)
     return env
 

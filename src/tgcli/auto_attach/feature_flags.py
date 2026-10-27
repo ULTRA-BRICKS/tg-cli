@@ -55,7 +55,7 @@ def parse_feature_config(text: str) -> dict[str, bool]:
         name, value = js_trim(line).split(":", 1)
         name = re.sub(r"""^["']|["']$""", "", js_trim(name))
         value = js_trim(value).lower()
-        if name and value in _TRUE_TOKENS | _FALSE_TOKENS:
+        if name and name != "__proto__" and value in _TRUE_TOKENS | _FALSE_TOKENS:
             out[name] = value in _TRUE_TOKENS
     return out
 
@@ -63,9 +63,11 @@ def parse_feature_config(text: str) -> dict[str, bool]:
 def resolve_features(config: dict[str, bool], overrides: FeatureOverrides) -> dict[str, bool]:
     merged = {**DEFAULT_FEATURES, **config}
     for name in overrides.enable:
-        merged[name] = True
+        if name != "__proto__" or name in merged:
+            merged[name] = True
     for name in overrides.disable:
-        merged[name] = False
+        if name != "__proto__" or name in merged:
+            merged[name] = False
     return merged
 
 

@@ -30,3 +30,16 @@ def test_format_send_output(ids, expected):
 )
 def test_decode_text_escapes(text, expected):
     assert decode_text_escapes(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("ids", "expected"),
+    [
+        ([10**21], "OK tg#1e+21"),
+        ([1e21], "OK tg#1e+21"),
+        ([9007199254740993], "OK tg#9007199254740992"),
+        ([10**5000], "OK"),
+    ],
+)
+def test_send_receipt_formats_js_numbers(ids, expected):
+    assert format_send_output(ids) == expected

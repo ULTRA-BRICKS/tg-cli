@@ -150,3 +150,71 @@ def test_control_parse_resolve_roundtrip():
 )
 def test_control_ecmascript_whitespace_and_comment_boundaries(text, expected):
     assert parse_control_config(text) == expected
+
+
+def test_control_numbers_round_to_js_double_before_resolving():
+    raw = parse_control_config(
+        "control:\n  allowed_senders: 9007199254740993\n  staleness_sec: 9007199254740993\n"
+    )
+    assert raw["allowed_senders"] == [9007199254740992]
+    assert raw["staleness_sec"] == 9007199254740992
+    assert resolve_control_config(raw).staleness_sec == 9007199254740992
+
+
+@pytest.mark.parametrize("digits", [309, 5000])
+def test_control_very_long_numbers_do_not_crash_and_resolve_nonfinite(digits):
+    import math
+
+    raw = parse_control_config(
+        "control:\n  staleness_sec: "
+        + "9" * digits
+        + "\n  idle_exit_min: "
+        + "9" * digits
+        + "\n  allowed_senders: "
+        + "9" * digits
+        + "\n"
+    )
+    assert math.isinf(raw["staleness_sec"])
+    assert math.isinf(raw["allowed_senders"][0])
+    cfg = resolve_control_config(raw)
+    assert (cfg.staleness_sec, cfg.idle_exit_min) == (300, 30)
+
+
+def test_resolve_control_nullish_healing_and_session_passthrough():
+    cfg = resolve_control_config(
+        dict.fromkeys(
+            [
+                "enabled",
+                "inject_wrap",
+                "allowed_senders",
+                "topics",
+                "private_topics",
+                "git_state_banner",
+                "session",
+            ]
+        )
+    )
+    assert cfg.enabled is True
+    assert cfg.inject_wrap == "[TG from {name} {id}] {msg}"
+    assert cfg.allowed_senders == []
+    assert (cfg.topics, cfg.private_topics, cfg.git_state_banner) == (False, False, True)
+    assert cfg.session is None
+    assert resolve_control_config({"session": ""}).session == ""
+    assert (
+        resolve_control_config({"enabled": False, "inject_wrap": "", "allowed_senders": []}).enabled
+        is False
+    )
+    assert resolve_control_config({"inject_wrap": ""}).inject_wrap == ""
+
+
+@pytest.mark.parametrize("transport", [[], {}, None, 42, True])
+def test_resolve_control_invalid_transport_heals_without_throwing(transport):
+    assert resolve_control_config({"transport": transport}).transport == "auto"
+
+
+def test_resolve_control_programmatic_number_uses_js_double():
+    assert (
+        resolve_control_config({"staleness_sec": 9007199254740993}).staleness_sec
+        == 9007199254740992
+    )
+    assert resolve_control_config({"staleness_sec": 10**5000}).staleness_sec == 300

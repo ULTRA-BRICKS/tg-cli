@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal, TypedDict, cast
 
+from tgcli.common.js_number import js_integer, js_number
 from tgcli.common.js_string import JS_WHITESPACE_PATTERN, js_trim, js_trim_start
 
 
@@ -13,9 +14,9 @@ class ControlConfigRaw(TypedDict, total=False):
     transport: str
     session: str
     inject_wrap: str
-    staleness_sec: int
-    idle_exit_min: int
-    allowed_senders: list[int]
+    staleness_sec: float
+    idle_exit_min: float
+    allowed_senders: list[float]
     topics: bool
     private_topics: bool
     git_state_banner: bool
@@ -29,7 +30,7 @@ class ControlConfig:
     inject_wrap: str = "[TG from {name} {id}] {msg}"
     staleness_sec: int = 300
     idle_exit_min: int = 30
-    allowed_senders: list[int] = field(default_factory=list)
+    allowed_senders: list[float] = field(default_factory=list)
     topics: bool = False
     private_topics: bool = False
     git_state_banner: bool = True
@@ -80,43 +81,44 @@ def parse_control_config(text: str) -> ControlConfigRaw:
         elif key == "inject_wrap":
             out["inject_wrap"] = _unquote(value)
         elif key == "staleness_sec" and _INT_RE.fullmatch(value):
-            out["staleness_sec"] = int(value)
+            out["staleness_sec"] = js_number(value)
         elif key == "idle_exit_min" and _INT_RE.fullmatch(value):
-            out["idle_exit_min"] = int(value)
+            out["idle_exit_min"] = js_number(value)
         elif key == "allowed_senders":
             out["allowed_senders"] = [
-                int(js_trim(s)) for s in _unquote(value).split(",") if _INT_RE.fullmatch(js_trim(s))
+                js_number(js_trim(s))
+                for s in _unquote(value).split(",")
+                if _INT_RE.fullmatch(js_trim(s))
             ]
     return out
 
 
 def resolve_control_config(
-    raw: ControlConfigRaw, env: Mapping[str, str] | None = None
+    raw: Mapping[str, object], env: Mapping[str, str] | None = None
 ) -> ControlConfig:
-    """Heal invalid durations/transports; there are no environment overrides in TS."""
+    """Heal programmatic values just as the TS nullish/default and integer checks do."""
 
     def positive_int(value: object, default: int) -> int:
-        return (
-            int(value)
-            if type(value) in (int, float)
-            and isinstance(value, (int, float))
-            and value > 0
-            and value % 1 == 0
-            else default
-        )
+        integer = js_integer(value)
+        return int(integer) if integer is not None and integer > 0 else default
 
-    transport = raw.get("transport", "auto")
+    def nullish[T](key: str, default: T) -> T:
+        value = raw.get(key)
+        return default if value is None else cast(T, value)
+
+    transport = raw.get("transport")
     return ControlConfig(
-        enabled=raw.get("enabled", DEFAULT_CONTROL.enabled),
+        enabled=nullish("enabled", DEFAULT_CONTROL.enabled),
         transport=cast(Literal["auto", "tmux", "channel"], transport)
-        if transport in {"auto", "tmux", "channel"}
+        if isinstance(transport, str) and transport in {"auto", "tmux", "channel"}
         else "auto",
-        session=raw.get("session"),
-        inject_wrap=raw.get("inject_wrap", DEFAULT_CONTROL.inject_wrap),
+        # Unlike the nullish-default fields, an explicitly null session is retained.
+        session=cast(str | None, raw.get("session")),
+        inject_wrap=nullish("inject_wrap", DEFAULT_CONTROL.inject_wrap),
         staleness_sec=positive_int(raw.get("staleness_sec"), DEFAULT_CONTROL.staleness_sec),
         idle_exit_min=positive_int(raw.get("idle_exit_min"), DEFAULT_CONTROL.idle_exit_min),
-        allowed_senders=list(raw.get("allowed_senders", DEFAULT_CONTROL.allowed_senders)),
-        topics=raw.get("topics", DEFAULT_CONTROL.topics),
-        private_topics=raw.get("private_topics", DEFAULT_CONTROL.private_topics),
-        git_state_banner=raw.get("git_state_banner", DEFAULT_CONTROL.git_state_banner),
+        allowed_senders=list(nullish("allowed_senders", DEFAULT_CONTROL.allowed_senders)),
+        topics=nullish("topics", DEFAULT_CONTROL.topics),
+        private_topics=nullish("private_topics", DEFAULT_CONTROL.private_topics),
+        git_state_banner=nullish("git_state_banner", DEFAULT_CONTROL.git_state_banner),
     )
