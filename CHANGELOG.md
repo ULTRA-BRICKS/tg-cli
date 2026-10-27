@@ -3,6 +3,22 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.71.3
+
+- **Python render layer (#768).** Added HTML and emoji-entity helpers, rich-message validation,
+  table rendering, tag badges, branded prefixes and terminal help coloring for the Python port.
+  Preserved UTF-16 entity offsets, JavaScript number diagnostics and the formatting reference;
+  prefix fallbacks use the canonical Bun Unicode letter set across supported Python versions.
+  These pure modules prepare the sender migration; existing entrypoints continue using TypeScript.
+
+## 1.71.2
+
+- **Python shared config primitives (#768).** Ported environment/config parsing, bot-scoped
+  state paths, feature flags, send receipts and shared text helpers for the Python migration.
+  Preserved JavaScript Unicode whitespace, binary64 number conversion and nullish defaults,
+  with focused parity tests and a TypeScript-captured path fixture. These modules prepare
+  later Python send/daemon tasks; the active command entrypoints continue using TypeScript.
+
 ## 1.71.1
 
 - **Python port skeleton (#768).** Added the `tg-cli` Python package and facade with
@@ -10,6 +26,9 @@ semantic versioning.
   Moved the unchanged `tg-call-lib` distribution metadata into the `features` uv workspace
   member, and added locked dependencies and Python CI checks. Existing entrypoints keep
   running TypeScript until a later migration task installs and selects the switch shims.
+
+- **Dependency security refresh.** Lock certifi 2026.10.19, filelock 4.2.1 and setuptools
+  84.1.0; refresh the matching hashed sender and voice requirements.
 
 ## 1.71.0
 
