@@ -55,6 +55,11 @@ jobs:
         run: |
           uv run ruff check
           uv run ruff format --check
+      - name: Standalone switch compatibility (Python 3.9)
+        run: |
+          uv run ruff check --target-version py39 scripts/tg-impl
+          uv run --no-project --python 3.9 python scripts/tg-impl status --json
+          uv run --no-project --python 3.9 --with pytest==8.4.2 python -m pytest tests/py/test_switch.py tests/py/test_tg_impl.py -q
       - name: Types
         run: uv run mypy --strict src/tgcli
       - name: Test
