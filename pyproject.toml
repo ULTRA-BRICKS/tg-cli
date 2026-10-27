@@ -3,27 +3,42 @@ requires = ["setuptools>=75,<85"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tg-call-lib"
-dynamic = ["version"]
-description = "Independent Telegram call lifecycle and provider adapters"
+name = "tg-cli"
+version = "1.67.1"
+description = "Telegram CLI for agents: Python port of tg, tg-ctl and call-cli"
 requires-python = ">=3.12"
-
-[project.optional-dependencies]
-call = ["pyrofork>=2.3,<3", "py-tgcalls>=2.2,<3", "aiohttp>=3.14,<4", "qrcode>=8.2,<9"]
-voice = ["torch>=2.14,<3", "numpy>=2.4,<3"]
+dependencies = ["httpx>=0.28,<1", "tg-call-lib"]
 
 [project.scripts]
-tg-call = "telegram_client.cli:caller_main"
-tg-mtproto = "telegram_client.cli:personal_main"
-tg-call-json = "telegram_client.bridge:main"
-call-agent-mock = "telegram_client.mock_agent:main"
+tg = "tgcli.entry:tg"
+tg-ctl = "tgcli.entry:tg_ctl"
+call-cli = "tgcli.entry:call_cli"
 
-[tool.setuptools]
-package-dir = {"" = "features"}
-packages = ["telegram_client"]
+[dependency-groups]
+dev = ["pytest>=8,<9", "ruff>=0.7", "mypy>=1.13,<2"]
 
-[tool.setuptools.package-data]
-telegram_client = ["NOTICE", "*.json", "*.lock", "requirements.txt"]
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tgcli*"]
 
-[tool.setuptools.dynamic]
-version = {attr = "telegram_client.call_lib.VERSION"}
+[tool.uv.workspace]
+members = ["features"]
+
+[tool.uv.sources]
+tg-call-lib = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests/py"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+include = ["src/**/*.py", "tests/py/**/*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/tgcli"]

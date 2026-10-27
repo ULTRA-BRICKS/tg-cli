@@ -3,6 +3,14 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.67.1
+
+- **Python port skeleton (#768).** The root `pyproject.toml` is now the `tg-cli` project
+  (`src/tgcli`: facade with TypeScript fall-through, JS-compatible JSON, atomic file
+  writes, UTF-16-safe slicing) and a uv workspace root; `tg-call-lib` moved to
+  `features/pyproject.toml` unchanged. Nothing is ported yet, so `tg`, `tg-ctl` and
+  `call-cli` behave as before.
+
 ## 1.67.0
 
 - **Identified calls and private history (#761).** `tg call`, `call-cli`, and

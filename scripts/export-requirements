@@ -1,0 +1,10 @@
+#!/bin/sh
+# Writes requirements-tg.txt (third-party runtime dependencies of tg-cli, hashed) from uv.lock,
+# so ci/dependency-review/dep-audit.sh can pip-audit them as data. First-party git sources
+# (agent-tools libraries, hyper-text-lint) are not PyPI artifacts: add one
+# `--no-emit-package <name>` per such source below as they join pyproject.toml.
+# CI runs this and fails when the committed file differs.
+set -eu
+cd "$(dirname "$0")/.."
+uv export --frozen --no-dev --no-emit-workspace --format requirements-txt \
+  --no-header --output-file requirements-tg.txt >/dev/null
