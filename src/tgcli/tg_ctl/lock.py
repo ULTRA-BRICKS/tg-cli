@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TypedDict
 
+from tgcli.common.js_string import JS_WHITESPACE_PATTERN, js_trim
 from tgcli.tg_ctl.config import ControlConfig
 
 
@@ -90,9 +91,9 @@ def bot_id_from_token(token: str) -> str:
 
 
 def read_pid_file(content: str | None) -> int | None:
-    if content is None or not re.fullmatch(r"[0-9]+", content.strip()):
+    if content is None or not re.fullmatch(r"[0-9]+", js_trim(content)):
         return None
-    pid = int(content.strip())
+    pid = int(js_trim(content))
     return pid if pid > 0 else None
 
 
@@ -118,7 +119,7 @@ def plan_legacy_last_user_target_migration(
 def flock_pids_for_inode(proc_locks: str, ino: str) -> list[int]:
     pids: dict[int, None] = {}
     for line in proc_locks.split("\n"):
-        fields = line.split()
+        fields = re.split(JS_WHITESPACE_PATTERN + "+", js_trim(line))
         if len(fields) < 6 or fields[1] != "FLOCK":
             continue
         inode = fields[5].split(":")

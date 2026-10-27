@@ -4,19 +4,20 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from tgcli.common.fsio import read_text_lossy
+from tgcli.common.js_string import js_trim
 
 
 def parse_env_content(text: str) -> dict[str, str]:
     """Keep values literal; only the first equals sign separates a key."""
     env: dict[str, str] = {}
     for line in text.split("\n"):
-        trimmed = line.strip()
+        trimmed = js_trim(line)
         if not trimmed or trimmed.startswith("#") or "=" not in trimmed:
             continue
         key, value = trimmed.split("=", 1)
-        key = key.strip()
+        key = js_trim(key)
         if key:
-            env[key] = value.strip()
+            env[key] = js_trim(value)
     return env
 
 

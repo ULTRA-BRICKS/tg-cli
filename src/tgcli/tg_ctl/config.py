@@ -5,6 +5,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal, TypedDict, cast
 
+from tgcli.common.js_string import JS_WHITESPACE_PATTERN, js_trim, js_trim_start
+
 
 class ControlConfigRaw(TypedDict, total=False):
     enabled: bool
@@ -47,16 +49,16 @@ def parse_control_config(text: str) -> ControlConfigRaw:
     out: ControlConfigRaw = {}
     in_control = False
     for raw_line in text.split("\n"):
-        line = re.sub(r"\s+#.*$", "", raw_line)
-        if not line.strip() or line.strip().startswith("#"):
+        line = re.sub(JS_WHITESPACE_PATTERN + r"+#[^\r\n\u2028\u2029]*\Z", "", raw_line)
+        if not js_trim(line) or js_trim(line).startswith("#"):
             continue
-        if len(line) == len(line.lstrip()):
-            in_control = re.sub(r":.*$", "", line.strip()) == "control"
+        if len(line) == len(js_trim_start(line)):
+            in_control = re.sub(r":[^\r\n\u2028\u2029]*\Z", "", js_trim(line)) == "control"
             continue
         if not in_control or ":" not in line:
             continue
-        key, value = line.strip().split(":", 1)
-        key, value = _unquote(key.strip()), value.strip()
+        key, value = js_trim(line).split(":", 1)
+        key, value = _unquote(js_trim(key)), js_trim(value)
         if not value:
             continue
         if key in {"enabled", "topics", "private_topics", "git_state_banner"}:
@@ -83,7 +85,7 @@ def parse_control_config(text: str) -> ControlConfigRaw:
             out["idle_exit_min"] = int(value)
         elif key == "allowed_senders":
             out["allowed_senders"] = [
-                int(s.strip()) for s in _unquote(value).split(",") if _INT_RE.fullmatch(s.strip())
+                int(js_trim(s)) for s in _unquote(value).split(",") if _INT_RE.fullmatch(js_trim(s))
             ]
     return out
 

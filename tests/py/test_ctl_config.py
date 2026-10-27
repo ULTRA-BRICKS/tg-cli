@@ -133,3 +133,20 @@ def test_control_parse_resolve_roundtrip():
         300,
         45,
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("control:\n\ufeffenabled:\ufeffyes\n", {"enabled": True}),
+        ("control:\n  enabled: yes\ufeff#comment\n", {"enabled": True}),
+        ("control:\n  enabled: yes\x85#comment\n", {}),
+        ("control:\n  enabled: yes #comment\r\n", {}),
+        ("control:\n  session: abc # c\u2028z\n", {"session": "abc # c\u2028z"}),
+        ("control:\u2028metadata\n  enabled: true\n", {}),
+        ("control:\n  allowed_senders: \ufeff1\ufeff,2,\x853\n", {"allowed_senders": [1, 2]}),
+        ("control:\n\x85enabled: true\n", {}),
+    ],
+)
+def test_control_ecmascript_whitespace_and_comment_boundaries(text, expected):
+    assert parse_control_config(text) == expected

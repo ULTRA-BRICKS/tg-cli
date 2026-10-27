@@ -140,3 +140,17 @@ PROC_LOCKS = "\n".join(
 )
 def test_flock_pids_for_inode(text, inode, expected):
     assert flock_pids_for_inode(text, inode) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"), [("\ufeff4242\ufeff", 4242), ("\x854242", None), ("\x1c4242\x1f", None)]
+)
+def test_pid_ecmascript_whitespace(text, expected):
+    assert read_pid_file(text) == expected
+
+
+def test_flock_ecmascript_whitespace_separator():
+    assert flock_pids_for_inode(
+        "\ufeff2:\ufeffFLOCK\ufeffADVISORY\ufeffWRITE\ufeff4242\ufeff103:02:42 0 EOF", "42"
+    ) == [4242]
+    assert flock_pids_for_inode("2:\x85FLOCK  ADVISORY WRITE 4242 103:02:42 0 EOF", "42") == []

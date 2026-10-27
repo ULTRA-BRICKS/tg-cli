@@ -87,3 +87,18 @@ def test_apply_feature_flags():
 )
 def test_apply_feature_missing_value(args):
     assert apply_feature_flags(args).error == args[0] + " requires a feature name"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("features:\n\ufeffhooks:\ufeffyes\n", {"hooks": True}),
+        ("features:\n  hooks: yes\ufeff#comment\n", {"hooks": True}),
+        ("features:\n  hooks: yes\x85#comment\n", {}),
+        ("features:\n  hooks: yes #comment\r\n", {}),
+        ("features:\u2028metadata\n  hooks: true\n", {}),
+        ("features:\n\x85hooks: true\n", {}),
+    ],
+)
+def test_features_ecmascript_whitespace_and_comment_boundaries(text, expected):
+    assert parse_feature_config(text) == expected

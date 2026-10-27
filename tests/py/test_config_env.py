@@ -36,3 +36,28 @@ def test_load_env_lossy_without_newline_translation(tmp_path: Path):
 )
 def test_config_dir(env, expected):
     assert config_dir(env, Path("/home/u")) == Path(expected)
+
+
+@pytest.mark.parametrize(
+    ("text", "trimmed", "trimmed_start"),
+    [
+        ("\ufeff \ttext\xa0\u3000", "text", "text\xa0\u3000"),
+        ("\u2028x\u2029", "x", "x\u2029"),
+        ("\x85text\x85", "\x85text\x85", "\x85text\x85"),
+        ("\x1ctext\x1f", "\x1ctext\x1f", "\x1ctext\x1f"),
+        ("\u180etext\u180e", "\u180etext\u180e", "\u180etext\u180e"),
+    ],
+)
+def test_ecmascript_trim_whitespace(text, trimmed, trimmed_start):
+    from tgcli.common.js_string import js_trim, js_trim_start
+
+    assert js_trim(text) == trimmed
+    assert js_trim_start(text) == trimmed_start
+
+
+def test_env_bom_and_python_only_whitespace():
+    assert parse_env_content("\ufeffTOKEN= abc\ufeff\n\x85KEEP=1\x85\n\x1cKEY=2\x1f") == {
+        "TOKEN": "abc",
+        "\x85KEEP": "1\x85",
+        "\x1cKEY": "2\x1f",
+    }
