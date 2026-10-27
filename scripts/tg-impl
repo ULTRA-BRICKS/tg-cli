@@ -193,6 +193,11 @@ def service_definition(env, running=False):
                     definition.get("ProgramArguments", []),
                     "rig apply" if label == LABELS[0] else "tg-ctl enable",
                 )
+                if "Program" in definition:
+                    validate_command(
+                        [definition["Program"], "run"],
+                        "rig apply" if label == LABELS[0] else "tg-ctl enable",
+                    )
             except (ValueError, TypeError, plistlib.InvalidFileException) as error:
                 raise VerificationError("invalid launchd plist " + str(path)) from error
             return "launchd", label

@@ -12,7 +12,9 @@ import json, os, pathlib, sys, time
 r=pathlib.Path(os.environ['TEST_REPO']); args=sys.argv[1:]; name=pathlib.Path(sys.argv[0]).name
 statepath=r/'service.json'; s=json.loads(statepath.read_text())
 with open(os.environ['TEST_LOG'],'a') as log:
- log.write(json.dumps([name,args,{k:v for k,v in os.environ.items() if k.startswith('TG_IMPL')}])+'\\n')
+ log.write(json.dumps(
+  [name,args,{k:v for k,v in os.environ.items() if k.startswith('TG_IMPL')}]
+ )+'\\n')
 def restart():
  s['restarted']=True; s['restarts']=s.get('restarts',0)+1; s['polls']=0
  statepath.write_text(json.dumps(s))
@@ -28,8 +30,11 @@ if name in ('systemctl','launchctl'):
  if 'restart' in args or 'kickstart' in args:
   restart()
  if '--property=ExecStart' in args:
-  print(s.get('effective_exec', '{ path='+str(r/'bin/tg-ctl')+' ; argv[]='+str(r/'bin/tg-ctl')+' run ; ignore_errors=no ; }'))
- elif 'show' in args: print((s['pids'][2] if s.get('restarts',0)>1 else s.get('main',s['pids'][1])) if s.get('restarted') else s.get('oldmain',s['pids'][0]))
+  print(s.get('effective_exec', '{ path='+str(r/'bin/tg-ctl')+
+   ' ; argv[]='+str(r/'bin/tg-ctl')+' run ; ignore_errors=no ; }'))
+ elif 'show' in args:
+  print((s['pids'][2] if s.get('restarts',0)>1 else s.get('main',s['pids'][1]))
+   if s.get('restarted') else s.get('oldmain',s['pids'][0]))
  if 'list' in args: sys.exit(0 if s.get('launchd') else 1)
  sys.exit(0)
 if name=='python': sys.exit(s.get('selfcheck_fail',0))
@@ -37,10 +42,13 @@ if args and args[0]=='status':
  if not s.get('running',True): print('tg-ctl: not running'); sys.exit(1)
  if s.get('status_fail') and s.get('restarted'): sys.exit(1)
  if s.get('restarted') and s.get('polls',0)<s.get('gap_polls',0):
-  s['polls']=s.get('polls',0)+1; statepath.write_text(json.dumps(s)); print('tg-ctl: not running'); sys.exit(1)
+  s['polls']=s.get('polls',0)+1
+  statepath.write_text(json.dumps(s))
+  print('tg-ctl: not running'); sys.exit(1)
  old=not s.get('restarted') or s.get('polls',0)<s.get('old_polls',0)
  s['polls']=s.get('polls',0)+1; statepath.write_text(json.dumps(s))
- print('tg-ctl: running (pid %s)' % (s.get('oldpid',s['pids'][0]) if old else (s['pids'][2] if s.get('restarts',0)>1 else s.get('newpid',s['pids'][1]))))
+ print('tg-ctl: running (pid %s)' % (s.get('oldpid',s['pids'][0]) if old else
+  (s['pids'][2] if s.get('restarts',0)>1 else s.get('newpid',s['pids'][1]))))
  print('impl: '+s.get('impl','ts')+' 1.0.0'); sys.exit(0)
 if args and args[0]=='restart':
  restart()
@@ -92,9 +100,7 @@ with lock.open('rb') as stream:
             self.executable("fakebin/" + name, FAKE)
         for name in ("tg", "tg-ctl", "call-cli", "python"):
             self.executable(".venv/bin/" + name, FAKE)
-        (self.repo / "tests/parity/gated.txt").write_text(
-            "tg\ncall\ntg-ctl-a\ntg-ctl\n"
-        )
+        (self.repo / "tests/parity/gated.txt").write_text("tg\ncall\ntg-ctl-a\ntg-ctl\n")
 
     def unrelated_process(self):
         process = subprocess.Popen(["/bin/sleep", "60"])
@@ -116,9 +122,7 @@ with lock.open('rb') as stream:
     def wait_slot(self, slot):
         deadline = time.monotonic() + 3
         while (self.repo / "ready").read_text() != str(slot):
-            self.assertLess(
-                time.monotonic(), deadline, "flock fixture did not become ready"
-            )
+            self.assertLess(time.monotonic(), deadline, "flock fixture did not become ready")
             time.sleep(0.01)
 
     def configure(self, **values):
@@ -136,18 +140,12 @@ with lock.open('rb') as stream:
 
     def calls(self):
         log = self.home / "log"
-        return (
-            [json.loads(line) for line in log.read_text().splitlines()]
-            if log.exists()
-            else []
-        )
+        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
 
     def unit(self, shim=True):
         path = self.home / ".config/systemd/user/agenttools-tg-ctl-tg-ctl.service"
         path.parent.mkdir(parents=True)
-        command = (
-            '"%s" run' % (self.repo / "bin/tg-ctl") if shim else "bun /old/tg-ctl run"
-        )
+        command = '"%s" run' % (self.repo / "bin/tg-ctl") if shim else "bun /old/tg-ctl run"
         path.write_text("[Service]\nExecStart=" + command + "\n")
         if not shim:
             self.configure(
@@ -172,9 +170,7 @@ with lock.open('rb') as stream:
             },
         )
         self.assertEqual(rows["call-cli"]["source"], "state")
-        self.assertEqual(
-            rows["call-cli"]["target"], str(self.repo / ".venv/bin/call-cli")
-        )
+        self.assertEqual(rows["call-cli"]["target"], str(self.repo / ".venv/bin/call-cli"))
 
     def test_impl_status_warns_env_override(self):
         self.env["TG_IMPL_TG"] = "py"
@@ -186,9 +182,7 @@ with lock.open('rb') as stream:
     def test_impl_use_tg_writes_and_verifies(self):
         self.assert_ok(self.impl("use", "py", "tg"))
         self.assertEqual(self.selected("tg"), "py")
-        self.assertIn(
-            ["python", ["-m", "tgcli.entry", "--self-check", "tg"], {}], self.calls()
-        )
+        self.assertIn(["python", ["-m", "tgcli.entry", "--self-check", "tg"], {}], self.calls())
 
     def test_impl_use_tg_failed_verify_restores(self):
         self.configure(version_fail=1)
@@ -211,9 +205,7 @@ with lock.open('rb') as stream:
         path.parent.mkdir(parents=True)
         import plistlib
 
-        path.write_bytes(
-            plistlib.dumps({"ProgramArguments": ["bun", "/old/tg-ctl", "run"]})
-        )
+        path.write_bytes(plistlib.dumps({"ProgramArguments": ["bun", "/old/tg-ctl", "run"]}))
         result = self.impl("use", "py", "tg-ctl")
         self.assertEqual(result.returncode, 1)
         self.assertIn("rig apply", result.stderr)
@@ -259,12 +251,8 @@ with lock.open('rb') as stream:
         self.unit()
         self.configure(oldmain=0)
         self.assert_ok(self.impl("use", "py", "tg-ctl"))
-        self.assertTrue(
-            any(c[0] == "systemctl" and "restart" in c[1] for c in self.calls())
-        )
-        self.assertFalse(
-            any(c[0] == "tg-ctl" and c[1] == ["restart"] for c in self.calls())
-        )
+        self.assertTrue(any(c[0] == "systemctl" and "restart" in c[1] for c in self.calls()))
+        self.assertFalse(any(c[0] == "tg-ctl" and c[1] == ["restart"] for c in self.calls()))
 
     def test_impl_stops_stray_before_unit_restart(self):
         process = self.workers[0]
@@ -331,23 +319,17 @@ with lock.open('rb') as stream:
         ):
             (self.repo / "fakebin" / name).symlink_to(target)
         self.assert_ok(self.impl("use", "py", "tg-ctl"))
-        self.assertTrue(
-            any(c[0] == "tg-ctl" and c[1] == ["restart"] for c in self.calls())
-        )
+        self.assertTrue(any(c[0] == "tg-ctl" and c[1] == ["restart"] for c in self.calls()))
 
     def test_broken_venv_does_not_block_daemon_rollback(self):
         self.state("tg-ctl", "py")
         (self.repo / ".venv/bin/python").unlink()
         self.assert_ok(self.impl("use", "ts", "tg-ctl"))
         self.assertEqual(self.selected("tg-ctl"), "ts")
-        self.assertTrue(
-            any(c[0] == "bun" and c[1][-1:] == ["restart"] for c in self.calls())
-        )
+        self.assertTrue(any(c[0] == "bun" and c[1][-1:] == ["restart"] for c in self.calls()))
 
     def test_unknown_status_is_not_treated_as_stopped(self):
-        self.executable(
-            "fakebin/bun", "#!/bin/sh\necho status-unavailable >&2\nexit 1\n"
-        )
+        self.executable("fakebin/bun", "#!/bin/sh\necho status-unavailable >&2\nexit 1\n")
         result = self.impl("use", "py", "tg-ctl")
         self.assertEqual(result.returncode, 1)
         self.assertFalse((self.home / ".local/state/tg-cli/impl/tg-ctl").exists())
@@ -359,9 +341,7 @@ with lock.open('rb') as stream:
 
     def test_daemon_python_requires_python_facade(self):
         self.assertEqual(self.impl("use", "py", "tg-ctl-daemon").returncode, 1)
-        self.assertFalse(
-            (self.home / ".local/state/tg-cli/impl/tg-ctl-daemon").exists()
-        )
+        self.assertFalse((self.home / ".local/state/tg-cli/impl/tg-ctl-daemon").exists())
 
     def test_service_definition_must_launch_run(self):
         self.unit()
@@ -412,10 +392,7 @@ with lock.open('rb') as stream:
         self.configure(running=False)
         (self.repo / "desired").write_text("-1")
         self.wait_slot(-1)
-        path = (
-            self.home
-            / ".config/systemd/user/agenttools-tg-ctl-tg-ctl.service.d/override.conf"
-        )
+        path = self.home / ".config/systemd/user/agenttools-tg-ctl-tg-ctl.service.d/override.conf"
         path.parent.mkdir()
         path.write_text("[Service]\nExecStart=\nExecStart=/frozen/tg-ctl run\n")
         result = self.impl("use", "py", "tg-ctl")
@@ -426,7 +403,9 @@ with lock.open('rb') as stream:
     def test_loaded_wrong_execstart_is_refused(self):
         self.unit()
         self.configure(
-            effective_exec="{ path=/frozen/tg-ctl ; argv[]=/frozen/tg-ctl run ; ignore_errors=no ; }"
+            effective_exec=(
+                "{ path=/frozen/tg-ctl ; argv[]=/frozen/tg-ctl run ; ignore_errors=no ; }"
+            )
         )
         result = self.impl("use", "py", "tg-ctl")
         self.assertEqual(result.returncode, 1)
@@ -441,21 +420,15 @@ with lock.open('rb') as stream:
             "fakebin/lsof",
             "#!/usr/bin/env python3\nprint(" + repr(records) + ', end="")\n',
         )
-        return scope, lambda: scope["lsof_lock_owner"](
-            self.lock, self.lock.stat(), self.env
-        )
+        return scope, lambda: scope["lsof_lock_owner"](self.lock, self.lock.stat(), self.env)
 
     def test_macos_lock_field_proves_owner_without_taking_flock(self):
         from unittest.mock import patch
 
         stat = self.lock.stat()
-        records = (
-            f"p{self.workers[0].pid}\nf3\nD0x{stat.st_dev:x}\ni{stat.st_ino}\nlW\n"
-        )
+        records = f"p{self.workers[0].pid}\nf3\nD0x{stat.st_dev:x}\ni{stat.st_ino}\nlW\n"
         _, probe = self.lsof_probe(records)
-        with patch(
-            "fcntl.flock", side_effect=AssertionError("status must not acquire a lock")
-        ):
+        with patch("fcntl.flock", side_effect=AssertionError("status must not acquire a lock")):
             self.assertEqual(probe(), self.workers[0].pid)
 
     def test_macos_plain_opener_is_not_a_lock_owner(self):
@@ -467,9 +440,7 @@ with lock.open('rb') as stream:
 
     def test_macos_wrong_file_write_lock_is_not_accepted(self):
         stat = self.lock.stat()
-        records = (
-            f"p{self.workers[0].pid}\nf3\nD0x{stat.st_dev:x}\ni{stat.st_ino + 1}\nlW\n"
-        )
+        records = f"p{self.workers[0].pid}\nf3\nD0x{stat.st_dev:x}\ni{stat.st_ino + 1}\nlW\n"
         scope, probe = self.lsof_probe(records)
         with self.assertRaises(scope["VerificationError"]):
             probe()
@@ -506,10 +477,7 @@ with lock.open('rb') as stream:
 
     def test_running_unit_uses_loaded_config_instead_of_unloaded_disk_change(self):
         self.unit()
-        path = (
-            self.home
-            / ".config/systemd/user/agenttools-tg-ctl-tg-ctl.service.d/unloaded.conf"
-        )
+        path = self.home / ".config/systemd/user/agenttools-tg-ctl-tg-ctl.service.d/unloaded.conf"
         path.parent.mkdir()
         path.write_text("[Service]\nExecStart=\nExecStart=/unloaded/other run\n")
         self.assert_ok(self.impl("use", "py", "tg-ctl"))
@@ -524,13 +492,46 @@ with lock.open('rb') as stream:
     def test_stopped_daemon_rejects_spaced_execstart_dropin_without_manager_calls(self):
         self.unit()
         self.configure(running=False)
-        path = (
-            self.home
-            / ".config/systemd/user/agenttools-tg-ctl-tg-ctl.service.d/override.conf"
-        )
+        path = self.home / ".config/systemd/user/agenttools-tg-ctl-tg-ctl.service.d/override.conf"
         path.parent.mkdir()
         path.write_text("[Service]\nExecStart =\nExecStart = /frozen/tg-ctl run\n")
         result = self.impl("use", "py", "tg-ctl")
         self.assertEqual(result.returncode, 1)
         self.assertIn("tg-ctl enable", result.stderr)
         self.assertFalse(any(c[0] in ("systemctl", "launchctl") for c in self.calls()))
+
+    def test_launchd_explicit_program_cannot_override_shim_arguments(self):
+        import plistlib
+
+        path = self.home / "Library/LaunchAgents/ai.hyperide.tg-ctl.plist"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(
+            plistlib.dumps(
+                {
+                    "Program": "/frozen/bun",
+                    "ProgramArguments": [str(self.repo / "bin/tg-ctl"), "run"],
+                }
+            )
+        )
+        result = self.impl("use", "py", "tg-ctl")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("rig apply", result.stderr)
+        self.assertFalse(any("kickstart" in call[1] for call in self.calls()))
+        self.assertFalse((self.home / ".local/state/tg-cli/impl/tg-ctl").exists())
+
+    def test_launchd_matching_explicit_program_accepts_shim(self):
+        import plistlib
+
+        path = self.home / "Library/LaunchAgents/ai.hyperide.tg-ctl.plist"
+        path.parent.mkdir(parents=True)
+        shim = str(self.repo / "bin/tg-ctl")
+        path.write_bytes(
+            plistlib.dumps(
+                {
+                    "Program": shim,
+                    "ProgramArguments": [shim, "run"],
+                }
+            )
+        )
+        self.assert_ok(self.impl("use", "py", "tg-ctl"))
+        self.assertTrue(any("kickstart" in call[1] for call in self.calls()))

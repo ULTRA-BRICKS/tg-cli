@@ -31,8 +31,7 @@ class Sandbox(unittest.TestCase):
             key: value
             for key, value in os.environ.items()
             if not key.startswith("TG_IMPL")
-            and key
-            not in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "TG_BUN", "TG_CTL_CONFIG_DIR")
+            and key not in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "TG_BUN", "TG_CTL_CONFIG_DIR")
         }
         self.env.update(
             HOME=str(self.home),
@@ -84,9 +83,7 @@ class SwitchTests(Sandbox):
     def test_shim_default_is_ts(self):
         result = self.shim("hello", "я😀", "")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            json.loads(result.stdout), [str(self.repo / "tg"), "hello", "я😀", ""]
-        )
+        self.assertEqual(json.loads(result.stdout), [str(self.repo / "tg"), "hello", "я😀", ""])
 
     def test_shim_state_file_py(self):
         self.state("tg", "  py  \nts")
@@ -106,9 +103,7 @@ class SwitchTests(Sandbox):
 
     def test_shim_per_entry_env_beats_global(self):
         self.env.update(TG_IMPL="ts", TG_IMPL_CALL_CLI="py")
-        self.assertEqual(
-            json.loads(self.shim("peer", name="call-cli").stdout), ["py", "peer"]
-        )
+        self.assertEqual(json.loads(self.shim("peer", name="call-cli").stdout), ["py", "peer"])
 
     def test_shim_unknown_selection_exit_64(self):
         self.env["TG_IMPL_TG"] = "wat"
