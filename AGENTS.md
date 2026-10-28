@@ -639,6 +639,13 @@ after Telegram took it is sent again by the retry or the replay.
     a SIGKILL orphan); breaking it on sight let two live writers in at once under CPU load
     (#519). Rare residual double-holder paths (a writer frozen >5 s mid-acquire, a clock jump,
     two breakers of one stale lock) are tracked in #680.
+  - **History archive (`scripts/history-archive-import.py`, Refs #815/#813):** the cap above drops
+    old rows on every write (the file is trimmed by position), so history older than the live window
+    lives in a SIBLING file `tg-ctl.<botid>.history-archive.jsonl` in the same row shape (0600, never
+    trimmed; `tg replies` does not read it yet). The importer merges the owner's MTProto chat dump,
+    harness-transcript `tg` calls and other hosts' history files into it: idempotent (`importKey`),
+    chronological, secret-scrubbed, and it never writes the live file. The anonymised corpus derived
+    from it is `tests/fixtures/render-corpus/` (README there).
 
 - **Durable forwarded-question state (`tg-ctl.<botid>.questions.json`, v1.20.0):** the daemon held
   all question state ONLY in memory (`pendingButtons`/`activeButtonKeys`/`answeredButtons`), so a
