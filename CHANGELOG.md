@@ -3,6 +3,37 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.73.0
+
+- **Problem reports state actual actions and results (tg-cli#800, subset).** Every explicit
+  `tg --tag problem` body — including `--automated`, stdin and the Python facade, which runs this
+  sender — must describe a concrete action already performed with its observed result and the
+  recovery step being attempted now (or an exact hard dependency plus the check to run when it
+  clears). Headings alone, passive monitoring, future-only promises and quoted examples are
+  rejected before the Bot API; a request to the human is no longer required. The warm local Laya
+  classifier (existing `TG_LAYA*` settings) is asked separately for completed action and current
+  recovery: a confident negative blocks, middling or positive scores never clear a deterministic
+  failure, and an unavailable classifier is reported while the deterministic check still decides.
+  `--dry-run` never contacts Laya. `tg-ctl alert send` routes raw warning/critical signals without
+  that evidence to the exclusive source holder (or subscribers) as internal incidents with durable,
+  uncertainty-aware receipts instead of posting them to Telegram. Untagged bodies (apart from
+  the shared problem layout check, which now requires these facts instead of an explicit
+  request to the human), per-item classification, metrics and the justified override of #800
+  are not part of this change; see `docs/problem-reports.md`.
+  The offline check treats a line break or `<br>` inside one sentence as a wrap (so "I am not
+  <br>checking" is still a negation, while independent lines never share one), ignores result
+  words inside code literals and file names (`output.log`, `result.json`) when locating the
+  observed result, and accepts the Russian recovery verbs «чиню/чиним».
+  A short report is enough: one named object plus an observed result («Перезапустил браузер;
+  результат: вкладка не появилась», "Restarted Chrome; result: the tab is still missing", `exit 1`,
+  `unknown host`) satisfies the action requirement, while filler targets and deferred results
+  ("unknown.", "will know later") still do not. Validation time is now linear in the body size (a
+  24 KiB body of repeated actions took 83 s before; it takes milliseconds). `classifyIntent`, the evidence
+  extractor and the `tg`/`tg-ctl` entrypoints are split into small modules (`features/cli/
+  outbound-runtime/`, `features/cli/args-*.ts`, `features/tg-ctl/alert-remediation/`; older
+  changelog sections moved verbatim to `docs/changelog/`) so the changed runtime modules meet
+  the strict complexity and file-size limits.
+
 ## 1.72.1
 
 - Add complete call integration, regression and mutation verification with JSON/JUnit evidence (#761).

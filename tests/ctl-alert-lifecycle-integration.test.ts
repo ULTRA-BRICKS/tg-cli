@@ -7,6 +7,7 @@ import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Subprocess } from 'bun';
 import { tempDir, trackChild } from './helpers/test-temp';
+import { COMPLETE_PROBLEM } from './fixtures/intent-gate/problem-remediation';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const SESSION = '01a0d2d7-6202-702d-b9e8-006b656b0799';
@@ -80,14 +81,14 @@ test('subscribe → send (footer + session copy) → throttle → unbind on clos
   expect(subscribed.out).toContain(`subscribed (bound): Supervisor · pid ${first.pid} · session ${SESSION} · sources: sysmon,supervisor · ttl 1 h 0 min`);
   expect((await ctl('list')).out).toContain(`  - bound · Supervisor · pid ${first.pid} · session ${SESSION} · sources: sysmon,supervisor · expires in `);
 
-  const sendArgs = ['send', '--source', 'sysmon', '--severity', 'critical', '--key', 'load', '--text', 'load 38 > 24; swap 10 GB'];
+  const sendArgs = ['send', '--source', 'sysmon', '--severity', 'critical', '--key', 'load', '--text', COMPLETE_PROBLEM];
   const posted = await ctl(...sendArgs);
   expect(posted.err).toBe('');
   expect(posted.code).toBe(0);
   expect(posted.out).toBe(`OK tg#500 sessions=1 (Supervisor (pid ${first.pid}))\n`);
   expect(sent).toHaveLength(1);
-  expect(String(sent[0].text)).toEndWith(`load 38 &gt; 24; swap 10 GB\n\n<i>↳ также адресовано агенту: Supervisor (pid ${first.pid})</i>`);
-  expect(received()).toEqual([{ pid: first.pid, text: '[alert tg#500 · sysmon · critical] load 38 > 24; swap 10 GB\n— when fixed, follow up on this alert: tg --reply-to 500 "<status>"' }]);
+  expect(String(sent[0].text)).toEndWith(`${COMPLETE_PROBLEM}\n\n<i>↳ также адресовано агенту: Supervisor (pid ${first.pid})</i>`);
+  expect(received()).toEqual([{ pid: first.pid, text: `[alert tg#500 · sysmon · critical] ${COMPLETE_PROBLEM}\n— when fixed, follow up on this alert: tg --reply-to 500 "<status>"` }]);
 
   // The same (source,key,severity) inside the window: nothing posted, nothing delivered.
   const repeat = await ctl(...sendArgs);
@@ -95,9 +96,9 @@ test('subscribe → send (footer + session copy) → throttle → unbind on clos
   expect(repeat.out).toStartWith('throttled tg#500 ');
   expect(sent).toHaveLength(1);
   // An escalation (different severity) and a source nobody subscribed to.
-  const warning = await ctl('send', '--source', 'sysmon', '--severity', 'warning', '--key', 'load', '--text', 'w');
+  const warning = await ctl('send', '--source', 'sysmon', '--severity', 'warning', '--key', 'load', '--text', COMPLETE_PROBLEM);
   expect(warning.out).toBe(`OK tg#501 sessions=1 (Supervisor (pid ${first.pid}))\n`);
-  const other = await ctl('send', '--source', 'other', '--severity', 'warning', '--key', 'x', '--text', 'x');
+  const other = await ctl('send', '--source', 'other', '--severity', 'warning', '--key', 'x', '--text', COMPLETE_PROBLEM);
   expect(other.out).toBe('OK tg#502 sessions=0\n');
   expect(String(sent[2].text)).not.toContain('адресовано');
   expect(received()).toHaveLength(2);
@@ -106,7 +107,7 @@ test('subscribe → send (footer + session copy) → throttle → unbind on clos
   first.kill('SIGTERM');
   await first.exited;
   expect((await ctl('list')).out).toContain(`  - suspended (no live omp-live endpoint) · Supervisor · pid ${first.pid} · session ${SESSION}`);
-  const unbound = await ctl('send', '--source', 'sysmon', '--severity', 'critical', '--key', 'mem', '--text', 'm');
+  const unbound = await ctl('send', '--source', 'sysmon', '--severity', 'critical', '--key', 'mem', '--text', COMPLETE_PROBLEM);
   expect(unbound.out).toBe('OK tg#503 sessions=0\n');
   expect(received()).toHaveLength(2);
 
@@ -114,9 +115,9 @@ test('subscribe → send (footer + session copy) → throttle → unbind on clos
   const second = await startHost('Supervisor (resumed)');
   expect(second.pid).not.toBe(first.pid);
   expect((await ctl('list')).out).toContain(`  - bound · Supervisor (resumed) · pid ${second.pid} · session ${SESSION}`);
-  const rebound = await ctl('send', '--source', 'supervisor', '--severity', 'critical', '--key', 'OVERLOAD', '--text', 'load1=40');
+  const rebound = await ctl('send', '--source', 'supervisor', '--severity', 'critical', '--key', 'OVERLOAD', '--text', COMPLETE_PROBLEM);
   expect(rebound.out).toBe(`OK tg#504 sessions=1 (Supervisor (resumed) (pid ${second.pid}))\n`);
-  expect(received().at(-1)).toEqual({ pid: second.pid, text: '[alert tg#504 · supervisor · critical] load1=40\n— when fixed, follow up on this alert: tg --reply-to 504 "<status>"' });
+  expect(received().at(-1)).toEqual({ pid: second.pid, text: `[alert tg#504 · supervisor · critical] ${COMPLETE_PROBLEM}\n— when fixed, follow up on this alert: tg --reply-to 504 "<status>"` });
 
   // Unsubscribe by the recorded pid; list is empty again.
   expect((await ctl('unsubscribe', '--pid', String(second.pid))).out).toBe(`unsubscribed session ${SESSION}\n`);

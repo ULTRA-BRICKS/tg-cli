@@ -1,0 +1,386 @@
+{
+  "plain text": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "",
+    "wire": [
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "📁\nhello there"
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "html with tag and title": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "",
+    "wire": [
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "📁 <tg-emoji emoji-id=\"5294525981007062296\">🟢</tg-emoji><tg-emoji emoji-id=\"5294382683718200108\">▫️</tg-emoji><tg-emoji emoji-id=\"5294436190420770975\">▫️</tg-emoji> — 𝑺𝒕𝒂𝒕𝒖𝒔\n<b>Done</b> shipped",
+          "parse_mode": "HTML"
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "subagent label": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "",
+    "wire": [
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "📁 [𝗳𝗶𝘅𝗲𝗿]\nhi from the subagent"
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "agent env branding": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "",
+    "wire": [
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "<tg-emoji emoji-id=\"5274170649227600531\">✳️</tg-emoji>\nhello from an agent",
+          "parse_mode": "HTML"
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "answer reply-to marks done": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "",
+    "wire": [
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "📁 <tg-emoji emoji-id=\"5294303944082762041\">🔵</tg-emoji><tg-emoji emoji-id=\"5294414440706382789\">▫️</tg-emoji><tg-emoji emoji-id=\"5294185480294808567\">▫️</tg-emoji>\nthe answer",
+          "parse_mode": "HTML",
+          "reply_to_message_id": 41
+        }
+      },
+      {
+        "method": "setMessageReaction",
+        "fields": {
+          "chat_id": "-100123",
+          "message_id": 41,
+          "reaction": [
+            {
+              "type": "emoji",
+              "emoji": "👌"
+            }
+          ]
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "topic flag": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "",
+    "wire": [
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "📁\ninto a topic",
+          "message_thread_id": 7
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "topic env": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "",
+    "wire": [
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "📁\ninto the env topic",
+          "message_thread_id": 9
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "table send": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "",
+    "wire": [
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "📁\nHeading\n<pre>┌──────┬────────┐\n│ task │ status │\n├──────┼────────┤\n│ ship │ done   │\n└──────┴────────┘</pre>",
+          "parse_mode": "HTML"
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "document attachment": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "",
+    "wire": [
+      {
+        "method": "sendDocument",
+        "fields": {
+          "chat_id": "-100123",
+          "document": {
+            "file": "notes.txt",
+            "size": 12
+          },
+          "caption": "📁\r\nsee attached"
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "photo attachment": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "",
+    "wire": [
+      {
+        "method": "sendPhoto",
+        "fields": {
+          "chat_id": "-100123",
+          "photo": {
+            "file": "p.png",
+            "size": 16
+          },
+          "caption": "📁\r\na picture"
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "missing attachment is skipped": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "tg: skipping attachment <HOME>/gone.txt: file not found\n",
+    "wire": [
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "📁\ntext still goes"
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "line spec quote": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "",
+    "wire": [
+      {
+        "method": "sendDocument",
+        "fields": {
+          "chat_id": "-100123",
+          "document": {
+            "file": "code.ts",
+            "size": 48
+          },
+          "caption": "📁\r\nlook at code.ts:2-3"
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "markdown attachment without pandoc": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "Warning: md-as-pdf: <HOME>/doc.md: pandoc not found (brew install pandoc) — attaching the original .md\n",
+    "wire": [
+      {
+        "method": "sendDocument",
+        "fields": {
+          "chat_id": "-100123",
+          "document": {
+            "file": "doc.md",
+            "size": 14
+          },
+          "caption": "📁\r\ndoc"
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "long message is split": {
+    "code": 0,
+    "out": "OK tg#101 tg#102\n",
+    "err": "tg: warning: long plain message has little visible structure. Use headings, blank-line paragraphs, lists/tables, or --format html / tg --table for readable Telegram reports. This warning does not block the send.\n",
+    "wire": [
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "📁\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      },
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "flood cap refuses": {
+    "code": 1,
+    "out": "",
+    "err": "tg: warning: long plain message has little visible structure. Use headings, blank-line paragraphs, lists/tables, or --format html / tg --table for readable Telegram reports. This warning does not block the send.\ntg: refusing 30003-character message: it would send as 8 messages; use allowFlood: true or --no-feature flood-cap to allow it\n",
+    "wire": [],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "ticket and pr refs stay plain without cli": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "Warning: autolink-tasks: not logged in: authentication required — sending without links\nautolink-prs: the gh CLI is not authenticated. Run: gh auth login (shown once)\n",
+    "wire": [
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "📁\nsee HYP-576 and #12 and <a href=\"https://t.me/c/123/5\">tg#5</a>",
+          "parse_mode": "HTML"
+        }
+      }
+    ],
+    "files": {
+      "autolink-tasks.json": "{\"gh-login\":true}",
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  },
+  "agent report with a question records follow-up": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "autolink-prs: the gh CLI is not authenticated. Run: gh auth login (shown once)\ntg: intent gate: FOLLOW-UP REQUIRED — this message asks a question that is not a decision request.\nSend it as a REPLY to this message, one message per item, in its format:\n  1. [decision] «Кстати, что делать с #566 — включать private_topics по умолчанию или нет?»\n     tg --reply-to 101 --tag decision --format html '<h3>Context</h3><p>…</p><hr><h3>Glossary</h3><ul><li>…</li></ul><hr><h3>Options</h3><table><tr><th>Option</th><th>Pros</th><th>Cons</th></tr>…</table><hr><h3>Recommendation</h3><ul><li>…</li></ul><hr><h3>Where to look</h3><ul><li>file.ts:42</li></ul>'\ntg: recorded — `tg obligations` lists it until a reply to tg#101 settles it.\n",
+    "wire": [
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "<tg-emoji emoji-id=\"5274170649227600531\">✳️</tg-emoji> <tg-emoji emoji-id=\"5294525981007062296\">🟢</tg-emoji><tg-emoji emoji-id=\"5294382683718200108\">▫️</tg-emoji><tg-emoji emoji-id=\"5294436190420770975\">▫️</tg-emoji>\nГотово: смержил #690, тесты зелёные, задеплоил на прод. Кстати, что делать с #566 — включать private_topics по умолчанию или нет?",
+          "parse_mode": "HTML"
+        }
+      }
+    ],
+    "files": {
+      "autolink-tasks.json": "{\"gh-login\":true}",
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n",
+      "intent-obligations.jsonl": "{\"event\":\"owed\",\"id\":\"101.1\",\"chatId\":\"-100123\",\"originalId\":101,\"kind\":\"decision\",\"quote\":\"Кстати, что делать с #566 — включать private_topics по умолчанию или нет?\",\"at\":0,\"sender\":\"[]\"}\n"
+    }
+  },
+  "pane origin records route and history": {
+    "code": 0,
+    "out": "OK tg#101\n",
+    "err": "",
+    "wire": [
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "📁 [𝘄𝗼𝗿𝗸]\nrouted message"
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n",
+      "tg-ctl.123.history.jsonl": "{\"ts\":0,\"message_id\":101,\"chat_id\":-100123,\"direction\":\"agent\",\"from\":\"agent\",\"text\":\"routed message\",\"pane\":\"%7\",\"threadId\":null}\n",
+      "tg-ctl.123.routes.json": "[{\"id\":101,\"cwd\":\"<HOME>/work\",\"ts\":0,\"paneId\":\"%7\"}]"
+    }
+  },
+  "telegram 500 queues to the outbox": {
+    "code": 75,
+    "out": "",
+    "err": "tg: Telegram did not answer (HTTP 500 fake failure) — queued 1 part(s); the tg-ctl daemon delivers them, marked as delayed, when Telegram answers again\n",
+    "wire": [
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "📁\nqueued message"
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n",
+      "tg-ctl.123.log": "[<TIME>] outbox: queued <OUTBOX-ID> (1 request(s), HTTP 500 fake failure)\n",
+      "tg-ctl.123.outbox/<OUTBOX-ID>.json": "{\"version\":1,\"id\":\"<OUTBOX-ID>\",\"createdAt\":0,\"ops\":[{\"method\":\"sendMessage\",\"body\":{\"chat_id\":\"-100123\",\"text\":\"📁\\nqueued message\"}}],\"delivered\":[]}"
+    }
+  },
+  "telegram 400 fails": {
+    "code": 1,
+    "out": "",
+    "err": "Telegram API error (sendMessage): 400 {\"ok\":false,\"description\":\"fake failure\"}\n",
+    "wire": [
+      {
+        "method": "sendMessage",
+        "fields": {
+          "chat_id": "-100123",
+          "text": "📁\nbad request message"
+        }
+      }
+    ],
+    "files": {
+      "config.yaml": "# yaml-language-server: $schema=./config.schema.json\n"
+    }
+  }
+}

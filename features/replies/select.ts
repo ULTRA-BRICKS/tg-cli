@@ -114,6 +114,10 @@ export function filterByPanes(records: HistoryRecord[], panes: string[] | null):
 // entrypoint turns that into a clean stderr error + exit 1).
 export function searchHistory(records: HistoryRecord[], query: string, regex: boolean): HistoryRecord[] {
   if (regex) {
+    // codeql[js/regex-injection] Intentional: `tg replies find --regex <pattern>` is the documented contract
+    // (README: --regex for a regular expression); the operator supplies the pattern about their own local
+    // history, the match runs in the operator's own CLI process, and an invalid pattern throws to a clean
+    // stderr error. See tests/replies-select.test.ts.
     const re = new RegExp(query, 'i'); // may throw — caller catches
     return records.filter((r) => re.test(r.text));
   }

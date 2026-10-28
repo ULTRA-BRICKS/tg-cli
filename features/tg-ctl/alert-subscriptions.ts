@@ -5,9 +5,10 @@
 //
 // Why: a monitoring alert (rig sysmon, the omp-supervisor watcher) used to reach Telegram
 // only, so the agent responsible for the machine never saw it in its own chat. A live omp
-// session binds a TEMPORARY subscription; every alert is then posted to Telegram with a
-// footer naming that session and delivered into the session with the Telegram message id
-// (`tg#<id>`), so the agent can follow up on the very message once the issue is fixed.
+// session binds a TEMPORARY subscription. Owner-ready reports are posted to Telegram and
+// delivered with the Telegram message id (`tg#<id>`). Incomplete problem reports reach the
+// exclusive source holder (or subscribers when vacant) as internal incidents only, so an
+// agent can investigate and report actual remediation without inventing work in the alert.
 //
 // Lifecycle without events: the omp-live extension never calls the daemon — it publishes
 // `<cfg>/omp-live/<pid>-<instanceId>.json` on session_start/session_switch and withdraws it
@@ -27,12 +28,14 @@
 // instead of posting again. A claim its owner never settled expires after CLAIM_MAX_MS.
 
 import { escapeHtml, decodeHtmlEntities, stripHtmlTags } from '../render/html';
+import { createHash } from 'node:crypto';
+import { DEFAULT_ALERT_TTL_MS, isMs, isPositiveInt, parseEnvelope, SOURCE_RE, STORE_VERSION, THROTTLE_RETAIN_MS, validSessionId } from './alert-remediation/alert-primitives';
+import { unresolvedInternalReceipt } from './alert-remediation/throttle-records';
 import { isRecord } from './guards';
 import type { OriginalOmpEndpoint } from './omp-live-routing';
 import { formatAge } from './text-util';
 
 export type AlertSeverity = 'info' | 'warning' | 'critical';
-const SEVERITIES: readonly AlertSeverity[] = ['info', 'warning', 'critical'];
 
 export interface AlertSubscription {
   sessionId: string; // omp session id — the persistent identity across resume
@@ -77,9 +80,14 @@ export interface AlertSubscriptionStore {
 export interface AlertThrottleEntry {
   key: string; // throttleKey(source, key, severity)
   at: number; // ms epoch of the claim
-  messageId: number | null; // the Telegram message id once posted; null = claim in flight
-  pending: string[]; // session ids the posted alert has not reached yet
+  messageId: number | null; // positive = Telegram id, 0 = internal/holder only, null = post in flight
+  pending: string[]; // session ids whose acceptance has not been confirmed
+  internalText?: string; // immutable internal incident snapshot, persisted BEFORE delivery
+  internalRecipients?: string[]; // current assignments + accepted identity history across subscription changes
+  internalAttempts?: InternalAlertAttempt[]; // generations whose send frame may have reached a host
 }
+
+export interface InternalAlertAttempt { sessionId: string; pid: number; instanceId: string }
 
 export interface AlertThrottleStore {
   sent: AlertThrottleEntry[];
@@ -100,44 +108,16 @@ export interface AlertBinding {
   state: 'bound' | 'suspended';
 }
 
-const STORE_VERSION = 1;
+export { DEFAULT_ALERT_TTL_MS, DEFAULT_ALERT_WINDOW_MS, HOLDER_TEXT_MAX_BYTES, KEY_MAX, TEXT_MAX, TITLE_MAX } from './alert-remediation/alert-primitives';
 // A holder whose endpoint vanished (or whose deliveries keep failing) loses the slot after this.
 export const HOLDER_GRACE_MS = 10 * 60_000;
 // An unanswered handoff request lets the requester take the slot after this.
 export const HANDOFF_ANSWER_MS = 10 * 60_000;
-export const DEFAULT_ALERT_TTL_MS = 12 * 60 * 60_000;
-export const DEFAULT_ALERT_WINDOW_MS = 10 * 60_000;
 // A claim nobody settled (the sender died mid-post) stops blocking after this long.
 export const CLAIM_MAX_MS = 2 * 60_000;
-// Throttle entries older than this can never match a window a caller would pass.
-const THROTTLE_RETAIN_MS = 24 * 60 * 60_000;
 const MAX_THROTTLE_ENTRIES = 200;
+const MAX_UNRESOLVED_INTERNAL_RECEIPTS = MAX_THROTTLE_ENTRIES;
 const MAX_SUBSCRIPTIONS = 64;
-const SOURCE_RE = /^[A-Za-z0-9._-]{1,64}$/;
-export const KEY_MAX = 256;
-export const TITLE_MAX = 256;
-// Telegram splits a long post; the omp-live transport refuses a body over 64 000 bytes, so
-// the session copy (head + tail lines + the text) must stay well below that.
-export const TEXT_MAX = 32_000;
-
-// Type guards (narrowing is what makes them worth a name): a positive pid-like integer and
-// a non-negative ms-epoch.
-const isPositiveInt = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v > 0;
-const isMs = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
-
-// The envelope every store shares: a parse of a different version is an empty store (the
-// caller logs it), never a silent reinterpretation.
-function parseEnvelope(blob: string | null, listField: string): Record<string, unknown> | null {
-  if (blob === null) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(blob);
-  } catch {
-    return null;
-  }
-  if (!isRecord(parsed) || parsed.version !== STORE_VERSION || !Array.isArray(parsed[listField])) return null;
-  return parsed;
-}
 
 // --- subscription store ---
 
@@ -162,7 +142,6 @@ function validSubscription(v: unknown): AlertSubscription | null {
 }
 
 const nullableString = (v: unknown): v is string | null => v === null || typeof v === 'string';
-const validSessionId = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= 512;
 
 function validRequest(v: unknown): HandoffRequest | null {
   if (!isRecord(v) || !validSessionId(v.sessionId) || !isMs(v.at)) return null;
@@ -417,10 +396,22 @@ export type ThrottleVerdict =
   | { kind: 'in-flight'; entry: AlertThrottleEntry } // another sender holds a fresh claim
   | { kind: 'throttled'; entry: AlertThrottleEntry }; // posted inside the window; only re-deliver its pending sessions
 
+
+export class InternalReceiptCapacityError extends Error {
+  readonly code = 'internal_receipt_capacity';
+  constructor() {
+    super(`internal receipt capacity (${MAX_UNRESOLVED_INTERNAL_RECEIPTS}) reached; reconcile unresolved incidents before creating another internal claim`);
+    this.name = 'InternalReceiptCapacityError';
+  }
+}
+
 export function throttleVerdict(store: AlertThrottleStore, key: string, now: number, windowMs: number): ThrottleVerdict {
   const entry = store.sent.find((e) => e.key === key);
   if (!entry) return { kind: 'send' };
   const elapsed = now - entry.at;
+  // An unresolved internal incident retains its original text/receipt identity across
+  // retries, even when the normal repeat window elapsed. Pending never means delivered.
+  if (unresolvedInternalReceipt(entry)) return { kind: 'throttled', entry };
   if (elapsed < 0) return { kind: 'send' }; // a clock stepped back: the entry is from the future, never a block
   if (entry.messageId === null) return elapsed < CLAIM_MAX_MS ? { kind: 'in-flight', entry } : { kind: 'send' };
   return elapsed < windowMs ? { kind: 'throttled', entry } : { kind: 'send' };
@@ -456,22 +447,93 @@ export function markAlertDelivered(store: AlertThrottleStore, key: string, sessi
   return { sent: store.sent.map((e) => (e.key === key ? { ...e, pending: e.pending.filter((s) => !sessionIds.includes(s)) } : e)) };
 }
 
+// Internal receipts have a separate namespace, so observing a raw incident never
+// throttles a later complete owner report. A new holder has its own delivery window.
+export function internalThrottleKey(msg: AlertMessage, holderSessionId: string | null): string {
+  return `internal:${JSON.stringify([holderSessionId, msg.source, msg.key, msg.severity])}`;
+}
+
+// Persist ALL pending recipients before I/O. Concurrent retries use the same request id
+// and text. omp-live deduplicates only within one endpoint generation; pin it before send.
+export function claimInternalAlert(store: AlertThrottleStore, key: string, now: number, text: string, pending: readonly string[]): AlertThrottleStore {
+  // Admission happens under the caller's store lock, before delivery. Never make
+  // room for a new incident by forgetting a possibly accepted earlier one.
+  if (store.sent.filter((entry) => entry.key !== key && unresolvedInternalReceipt(entry)).length >= MAX_UNRESOLVED_INTERNAL_RECEIPTS) {
+    throw new InternalReceiptCapacityError();
+  }
+  const prior = store.sent.find((entry) => entry.key === key);
+  const at = Math.max(now, (prior?.at ?? -1) + 1);
+  const recipients = [...new Set(pending)];
+  return { sent: [...store.sent.filter((entry) => entry.key !== key), { key, at, messageId: 0, pending: recipients, internalText: text, internalRecipients: recipients, internalAttempts: [] }] };
+}
+
+// `pinned`: THIS call recorded the generation. `ready`: it was already recorded by an earlier
+// attempt, which may have written a frame — only the caller that got `pinned` may release it.
+export type InternalAttemptVerdict = 'pinned' | 'ready' | 'internal_delivery_uncertain' | 'internal_receipt_changed' | 'internal_receipt_acknowledged';
+
+// Called under the store lock, after the socket connects but BEFORE its send frame.
+// A lost ACK or failed acknowledgement write can be reconciled only by that generation's
+// receipt cache. A restarted endpoint has no cache; automatic replay could duplicate work.
+export function pinInternalAlertAttempt(store: AlertThrottleStore, key: string, claimAt: number, target: InternalAlertAttempt): { store: AlertThrottleStore; result: InternalAttemptVerdict } {
+  const entry = store.sent.find((item) => item.key === key && item.at === claimAt && item.internalText !== undefined);
+  if (!entry) return { store, result: 'internal_receipt_changed' };
+  if (!entry.pending.includes(target.sessionId)) return { store,
+    result: entry.internalRecipients?.includes(target.sessionId) ? 'internal_receipt_acknowledged' : 'internal_receipt_changed' };
+  // Older/corrupt receipts cannot prove whether a frame was already written.
+  if (entry.internalAttempts === undefined) return { store, result: 'internal_delivery_uncertain' };
+  const prior = entry.internalAttempts.find((attempt) => attempt.sessionId === target.sessionId);
+  if (prior) return { store, result: prior.pid === target.pid && prior.instanceId === target.instanceId ? 'ready' : 'internal_delivery_uncertain' };
+  const attempt = { sessionId: target.sessionId, pid: target.pid, instanceId: target.instanceId };
+  return { store: { sent: store.sent.map((item) => item === entry ? { ...item, internalAttempts: [...entry.internalAttempts!, attempt] } : item) }, result: 'pinned' };
+}
+
+// The host answered `stale_identity` before reading the frame, so nothing was accepted: drop
+// exactly that generation's pin (fenced on the claim) and let the re-resolved endpoint be tried.
+// A frame the host DID read (any other outcome) keeps its pin; that is the uncertainty rule.
+export function releaseInternalAlertAttempt(store: AlertThrottleStore, key: string, claimAt: number, target: InternalAlertAttempt): AlertThrottleStore {
+  return { sent: store.sent.map((entry) => entry.key === key && entry.at === claimAt && entry.internalText !== undefined && entry.internalAttempts !== undefined
+    ? { ...entry, internalAttempts: entry.internalAttempts.filter((attempt) => !(attempt.sessionId === target.sessionId && attempt.pid === target.pid && attempt.instanceId === target.instanceId)) }
+    : entry) };
+}
+
+// A withdrawn/expired subscription is no longer responsible for the incident. Assign
+// its replacement the same snapshot without replaying sessions already acknowledged.
+export function reconcileInternalAlertRecipients(store: AlertThrottleStore, key: string, claimAt: number, sessionIds: readonly string[]): AlertThrottleStore {
+  const recipients = [...new Set(sessionIds)];
+  return { sent: store.sent.map((entry) => {
+    if (entry.key !== key || entry.at !== claimAt || entry.internalText === undefined) return entry;
+    const prior = entry.internalRecipients ?? entry.pending;
+    const accepted = prior.filter((session) => !entry.pending.includes(session));
+    return { ...entry, internalRecipients: [...new Set([...accepted, ...recipients])], pending: recipients.filter((session) => !accepted.includes(session)) };
+  }) };
+}
+
+// Remove only acknowledged recipients from this receipt; a concurrent forced send's
+// replacement or another sender's progress must not be overwritten by a stale result.
+export function markInternalAlertDelivered(store: AlertThrottleStore, key: string, claimAt: number, sessionIds: readonly string[]): AlertThrottleStore {
+  return { sent: store.sent.map((entry) => entry.key === key && entry.at === claimAt && entry.internalText !== undefined
+    ? { ...entry, pending: entry.pending.filter((session) => !sessionIds.includes(session)),
+      internalRecipients: [...new Set([...(entry.internalRecipients ?? entry.pending), ...sessionIds])] } : entry) };
+}
+
+export function internalAlertRequestId(key: string, claimAt: number, sessionId: string): string {
+  // Hash metadata only, never message content. No truncation/sanitization collisions.
+  return `alert-internal-${createHash('sha256').update(JSON.stringify([key, claimAt, sessionId])).digest('hex')}`;
+}
+
 export function serializeAlertThrottle(store: AlertThrottleStore, now: number): string {
-  const sent = store.sent.filter((e) => now - e.at < THROTTLE_RETAIN_MS).slice(-MAX_THROTTLE_ENTRIES);
+  const unresolved = store.sent.filter(unresolvedInternalReceipt);
+  // An already over-capacity/corrupt store must also fail without truncating it.
+  if (unresolved.length > MAX_UNRESOLVED_INTERNAL_RECEIPTS) throw new InternalReceiptCapacityError();
+  // A just-acknowledged row was stored among the protected rows. Its prior array
+  // position must not evict it behind older ordinary history when protection ends.
+  const ordinary = store.sent.filter((entry) => !unresolvedInternalReceipt(entry) && now - entry.at < THROTTLE_RETAIN_MS)
+    .sort((a, b) => a.at - b.at).slice(-MAX_THROTTLE_ENTRIES);
+  const sent = [...unresolved, ...ordinary];
   return JSON.stringify({ version: STORE_VERSION, sent });
 }
 
-export function parseAlertThrottle(blob: string | null, now: number): AlertThrottleStore {
-  const sent: AlertThrottleEntry[] = [];
-  for (const raw of (parseEnvelope(blob, 'sent')?.sent as unknown[] | undefined) ?? []) {
-    if (!isRecord(raw) || typeof raw.key !== 'string' || !isMs(raw.at) || now - raw.at >= THROTTLE_RETAIN_MS) continue;
-    const holderSent = raw.messageId === 0 && raw.key.startsWith('holder:');
-    if (raw.messageId !== null && !holderSent && !isPositiveInt(raw.messageId)) continue;
-    const pending = Array.isArray(raw.pending) ? raw.pending.filter((s): s is string => typeof s === 'string') : [];
-    sent.push({ key: raw.key, at: raw.at, messageId: raw.messageId as number | null, pending });
-  }
-  return { sent };
-}
+export { parseAlertThrottle } from './alert-remediation/throttle-records';
 
 // --- rendering ---
 
@@ -594,13 +656,20 @@ export function holderTakenNote(source: string, taker: AlertHolder): string {
   return `[alert-holder ${source}] the ${source} alert slot was taken by ${who(taker)}; you no longer receive its alerts`;
 }
 
-// The omp-live transport refuses a body over 64 000 BYTES (TEXT_MAX counts characters).
-export const HOLDER_TEXT_MAX_BYTES = 64_000;
 
 // The copy a `send --to-holder` delivers: no Telegram id exists, so no `tg#` reference.
 export function holderAlertText(msg: AlertMessage): string {
   const text = msg.html ? decodeHtmlEntities(stripHtmlTags(msg.text)) : msg.text;
   return `[alert ${msg.source} · ${msg.severity} · ${msg.key}] ${text}`;
+}
+
+export type InternalAlertOwnerStatus = 'withheld' | 'unconfirmed';
+
+export function internalAlertText(msg: AlertMessage, owner: InternalAlertOwnerStatus): string {
+  const status = owner === 'withheld'
+    ? 'Owner problem report withheld: the incident does not yet describe actual attempts/results and current remediation.'
+    : 'Owner delivery is unconfirmed: the owner post failed or returned no usable receipt.';
+  return `${holderAlertText(msg)}\n\n${status}\nInvestigate within your authority. A problem report must describe actual actions already taken and observed results, plus the concrete remediation being attempted now. If blocked, state the exact dependency and the verification to run when it clears. Receipt of this incident does not mean remediation has started.`;
 }
 
 export function formatAlertList(bindings: readonly AlertBinding[], now: number): string {
@@ -616,173 +685,6 @@ export function formatAlertList(bindings: readonly AlertBinding[], now: number):
 }
 
 // --- argv ---
-
-export type AlertCommand =
-  | { cmd: 'send'; message: AlertMessage; windowMs: number; force: boolean; toHolder: boolean }
-  | { cmd: 'subscribe'; pid: number | null; sessionId: string | null; sources: string[] | null; ttlMs: number | null; exclusive: boolean; source: string | null }
-  | { cmd: 'unsubscribe'; pid: number | null; sessionId: string | null; all: boolean }
-  | { cmd: 'list'; json: boolean }
-  | { cmd: 'handoff-request'; source: string; reason: string | null; pid: number | null; sessionId: string | null }
-  | { cmd: 'handoff'; source: string; to: string | null; deny: boolean; reason: string | null; pid: number | null; sessionId: string | null }
-  | { cmd: 'take'; source: string; pid: number | null; sessionId: string | null; ttlMs: number | null }
-  | { cmd: 'release'; source: string; pid: number | null; sessionId: string | null }
-  | { cmd: 'holder'; source: string; json: boolean }
-  | { cmd: 'error'; error: string };
-
-const UNITS = { '': 60_000, s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 } as const;
-
-// `10m`, `90s`, `2h`, `1d`; a bare number is minutes. null = not a duration.
-export function parseDurationMs(raw: string): number | null {
-  const m = /^(\d+)([smhd]?)$/.exec(raw.trim());
-  if (!m) return null;
-  const ms = Number(m[1]) * UNITS[m[2] as keyof typeof UNITS];
-  return Number.isSafeInteger(ms) ? ms : null;
-}
-
-const USAGE = 'usage: tg-ctl alert send|subscribe|unsubscribe|list|handoff-request|handoff|take|release|holder';
-
-type Flags = Record<string, string | true>;
-type FlagsResult = { ok: true; flags: Flags } | { ok: false; error: string };
-
-// Flags are `--name value` (or bare boolean flags); values are taken verbatim so a text
-// that starts with a dash still works after its flag.
-function readFlags(argv: readonly string[], booleans: readonly string[]): FlagsResult {
-  const flags: Flags = {};
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (!a.startsWith('--')) return { ok: false, error: `unexpected argument: ${a}` };
-    const name = a.slice(2);
-    if (booleans.includes(name)) {
-      flags[name] = true;
-      continue;
-    }
-    if (i + 1 >= argv.length) return { ok: false, error: `missing value for --${name}` };
-    flags[name] = argv[++i];
-  }
-  return { ok: true, flags };
-}
-
-const KNOWN: Record<string, readonly string[]> = {
-  send: ['source', 'severity', 'key', 'text', 'title', 'html', 'window', 'force', 'to-holder'],
-  subscribe: ['pid', 'session', 'sources', 'ttl', 'exclusive', 'source'],
-  unsubscribe: ['pid', 'session', 'all'],
-  list: ['json'],
-  'handoff-request': ['source', 'reason', 'pid', 'session'],
-  handoff: ['source', 'to', 'deny', 'reason', 'pid', 'session'],
-  take: ['source', 'pid', 'session', 'ttl'],
-  release: ['source', 'pid', 'session'],
-  holder: ['source', 'json'],
-};
-const BOOLEANS = ['html', 'force', 'all', 'json', 'exclusive', 'deny', 'to-holder'];
-type AlertCmdName = Exclude<AlertCommand['cmd'], 'error'>;
-const isAlertCmd = (cmd: string | undefined): cmd is AlertCmdName => cmd !== undefined && Object.hasOwn(KNOWN, cmd);
-const badSource = (source: string): string => `invalid --source: ${source} (letters, digits, - _ . only)`;
-
-type PidResult = { ok: true; pid: number | null } | { ok: false; error: string };
-type TtlResult = { ok: true; ttlMs: number | null } | { ok: false; error: string };
-
-export function parseAlertArgv(argv: readonly string[]): AlertCommand {
-  const [cmd, ...rest] = argv;
-  if (!isAlertCmd(cmd)) return { cmd: 'error', error: USAGE };
-  const read = readFlags(rest, BOOLEANS);
-  if (!read.ok) return { cmd: 'error', error: read.error };
-  const flags = read.flags;
-  for (const name of Object.keys(flags)) if (!KNOWN[cmd].includes(name)) return { cmd: 'error', error: `unknown flag: --${name}` };
-  const str = (name: string): string | null => (typeof flags[name] === 'string' ? (flags[name] as string) : null);
-  const pidFlag = (): PidResult => {
-    const raw = str('pid');
-    if (raw === null) return { ok: true, pid: null };
-    const pid = Number(raw);
-    return isPositiveInt(pid) ? { ok: true, pid } : { ok: false, error: `invalid --pid: ${raw}` };
-  };
-
-  const ttlFlag = (): TtlResult => {
-    const raw = str('ttl');
-    if (raw === null) return { ok: true, ttlMs: DEFAULT_ALERT_TTL_MS };
-    const ms = parseDurationMs(raw);
-    if (ms === null) return { ok: false, error: `invalid --ttl: ${raw} (e.g. 12h, 30m, 0 = no expiry)` };
-    return { ok: true, ttlMs: ms === 0 ? null : ms };
-  };
-
-  if (cmd === 'list') return { cmd, json: flags.json === true };
-
-  // The holder commands (tg-cli#747): each names a --source; the caller's session is --pid,
-  // --session or the nearest live omp ancestor, as for subscribe.
-  if (cmd === 'holder' || cmd === 'handoff-request' || cmd === 'handoff' || cmd === 'take' || cmd === 'release') {
-    const source = str('source');
-    if (source === null) return { cmd: 'error', error: `${cmd} requires --source` };
-    if (!SOURCE_RE.test(source)) return { cmd: 'error', error: badSource(source) };
-    if (cmd === 'holder') return { cmd, source, json: flags.json === true };
-    const pid = pidFlag();
-    if (!pid.ok) return { cmd: 'error', error: pid.error };
-    const sessionId = str('session');
-    if (pid.pid !== null && sessionId !== null) return { cmd: 'error', error: '--pid and --session are exclusive' };
-    if (cmd === 'release') return { cmd, source, pid: pid.pid, sessionId };
-    if (cmd === 'take') {
-      const ttl = ttlFlag();
-      return ttl.ok ? { cmd, source, pid: pid.pid, sessionId, ttlMs: ttl.ttlMs } : { cmd: 'error', error: ttl.error };
-    }
-    const reason = str('reason');
-    if (cmd === 'handoff-request') return { cmd, source, reason, pid: pid.pid, sessionId };
-    const to = str('to');
-    const deny = flags.deny === true;
-    if (to !== null && deny) return { cmd: 'error', error: '--to and --deny are exclusive' };
-    if (to === null && !deny) return { cmd: 'error', error: 'handoff requires --to <session id> or --deny' };
-    return { cmd, source, to, deny, reason, pid: pid.pid, sessionId };
-  }
-
-  if (cmd === 'unsubscribe' || cmd === 'subscribe') {
-    const pid = pidFlag();
-    if (!pid.ok) return { cmd: 'error', error: pid.error };
-    const sessionId = str('session');
-    if (pid.pid !== null && sessionId !== null) return { cmd: 'error', error: '--pid and --session are exclusive' };
-    if (cmd === 'unsubscribe') return { cmd, pid: pid.pid, sessionId, all: flags.all === true };
-    const ttl = ttlFlag();
-    if (!ttl.ok) return { cmd: 'error', error: ttl.error };
-    const exclusive = flags.exclusive === true;
-    const source = str('source');
-    const sourcesRaw = str('sources');
-    if (exclusive) {
-      if (source === null) return { cmd: 'error', error: '--exclusive requires --source' };
-      if (sourcesRaw !== null) return { cmd: 'error', error: '--exclusive and --sources are exclusive' };
-      if (!SOURCE_RE.test(source)) return { cmd: 'error', error: badSource(source) };
-      return { cmd, pid: pid.pid, sessionId, sources: null, ttlMs: ttl.ttlMs, exclusive, source };
-    }
-    if (source !== null) return { cmd: 'error', error: '--source requires --exclusive (use --sources for a non-exclusive subscription)' };
-    let sources: string[] | null = null;
-    if (sourcesRaw !== null) {
-      sources = sourcesRaw.split(',').map((s) => s.trim()).filter(Boolean);
-      if (sources.length === 0 || sources.some((s) => !SOURCE_RE.test(s))) return { cmd: 'error', error: `invalid --sources: ${sourcesRaw}` };
-    }
-    return { cmd, pid: pid.pid, sessionId, sources, ttlMs: ttl.ttlMs, exclusive, source: null };
-  }
-
-  const source = str('source');
-  const severity = str('severity');
-  const key = str('key');
-  const text = str('text');
-  const title = str('title');
-  if (source === null || severity === null || key === null || text === null) {
-    return { cmd: 'error', error: 'send requires --source, --severity, --key and --text' };
-  }
-  if (!SOURCE_RE.test(source)) return { cmd: 'error', error: badSource(source) };
-  if (!(SEVERITIES as readonly string[]).includes(severity)) return { cmd: 'error', error: `invalid --severity: ${severity} (info|warning|critical)` };
-  if (!text.trim()) return { cmd: 'error', error: 'empty --text' };
-  if (text.length > TEXT_MAX) return { cmd: 'error', error: `--text longer than ${TEXT_MAX} chars` };
-  if (key.length > KEY_MAX) return { cmd: 'error', error: `--key longer than ${KEY_MAX} chars` };
-  if (title !== null && title.length > TITLE_MAX) return { cmd: 'error', error: `--title longer than ${TITLE_MAX} chars` };
-  let windowMs = DEFAULT_ALERT_WINDOW_MS;
-  const windowRaw = str('window');
-  if (windowRaw !== null) {
-    const ms = parseDurationMs(windowRaw);
-    if (ms === null) return { cmd: 'error', error: `invalid --window: ${windowRaw}` };
-    windowMs = ms;
-  }
-  return {
-    cmd,
-    message: { source, severity: severity as AlertSeverity, key: key.trim() || '-', text, html: flags.html === true, title },
-    windowMs,
-    force: flags.force === true,
-    toHolder: flags['to-holder'] === true,
-  };
-}
+// The `tg-ctl alert …` grammar lives in alert-remediation/alert-argv.ts.
+export { parseAlertArgv, parseDurationMs } from './alert-remediation/alert-argv';
+export type { AlertCommand } from './alert-remediation/alert-argv';

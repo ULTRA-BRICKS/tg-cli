@@ -613,73 +613,78 @@ export function buildClaudeQuestionAnswerOutput(
   };
 }
 
+type AnsweredButton = Extract<ButtonAnswer, { status: 'answered' }>;
+
+function claudeQuestionHookOutput(req: ButtonRequest, answer: AnsweredButton): unknown {
+  // Prefer echoing the ORIGINAL tool_input; rebuild from the request fields
+  // only for manual/back-compat callers that never carried it.
+  const input = req.toolInput ?? {
+    questions: [
+      {
+        header: req.title,
+        question: req.question,
+        options: req.options ?? [],
+      },
+    ],
+  };
+  // codeql[js/remote-property-injection] False positive: a computed key in an object LITERAL defines an own
+  // data property; it never assigns the prototype, so a question text of '__proto__' or 'constructor'
+  // cannot pollute anything (tests/codeql-hardening.test.ts proves the prototype stays Object.prototype).
+  // The map is only JSON-serialized into the hook reply.
+  return buildClaudeQuestionAnswerOutput(input, { [req.question]: answer.value });
+}
+
+function claudePermissionHookOutput(req: ButtonRequest, answer: AnsweredButton): unknown {
+  const behavior = answer.decision ?? decisionFromValue(answer.value);
+  // On a RELABELED deny (plan-approval → "Keep planning"), convey the tapped
+  // label as the reason so the model gets the INTENT, not an unexplained block
+  // (a bare deny on ExitPlanMode can leave it re-prompting or looping). A plain
+  // Approve/Reject deny carries no extra reason (the default "Reject" is noise).
+  const denyReason = behavior === 'deny' ? (answer.reason ?? (req.decisionLabels ? answer.label : undefined)) : undefined;
+
+  // PreToolUse output (hookEventName REQUIRED): permissionDecision, with the deny
+  // reason in the event's own `permissionDecisionReason`. For an ALLOW the live
+  // hooks docs require `updatedInput` ALONGSIDE allow for the user-interactive
+  // tools (ExitPlanMode / AskUserQuestion): "Returning allow alone is not
+  // sufficient for these tools." Echo the unchanged `tool_input` back so the tool
+  // runs without falling through to the local permission prompt.
+  if (req.permissionEvent === 'PreToolUse') {
+    const out: Record<string, unknown> = { hookEventName: 'PreToolUse', permissionDecision: behavior };
+    if (behavior === 'allow' && req.toolInput) out.updatedInput = req.toolInput;
+    if (denyReason) out.permissionDecisionReason = denyReason;
+    return { hookSpecificOutput: out };
+  }
+  // PermissionRequest output (hookEventName REQUIRED). The `decision` object has a
+  // `message` field documented "for deny only: tells Claude why the permission was
+  // denied" (live hooks reference, PermissionRequest decision control). That is the
+  // MODEL-facing reason channel — distinct from top-level `systemMessage`, which is
+  // "shown to the user" only. On a RELABELED deny (plan-approval → "Keep planning")
+  // the intent must reach Claude so it resumes planning rather than re-prompting on
+  // an unexplained block, so the tapped label rides `decision.message`. A bare allow
+  // needs no `updatedInput` echo (it is optional for a permission we never modify).
+  const decision: Record<string, unknown> = { behavior };
+  if (denyReason) decision.message = denyReason;
+  return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } };
+}
+
+function codexPermissionHookOutput(answer: AnsweredButton): unknown {
+  const behavior = answer.decision ?? decisionFromValue(answer.value);
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'PermissionRequest',
+      decision: behavior === 'deny'
+        ? { behavior, message: answer.reason ?? 'Rejected from Telegram' }
+        : { behavior },
+    },
+  };
+}
+
 export function formatAgentHookOutput(req: ButtonRequest, answer: ButtonAnswer): unknown | null {
   if (answer.status !== 'answered') return null;
-
-  if (req.agent === 'claude' && req.kind === 'question') {
-    // Prefer echoing the ORIGINAL tool_input; rebuild from the request fields
-    // only for manual/back-compat callers that never carried it.
-    const input = req.toolInput ?? {
-      questions: [
-        {
-          header: req.title,
-          question: req.question,
-          options: req.options ?? [],
-        },
-      ],
-    };
-    return buildClaudeQuestionAnswerOutput(input, { [req.question]: answer.value });
-  }
-
-  if (req.agent === 'claude' && req.kind === 'permission') {
-    const behavior = answer.decision ?? decisionFromValue(answer.value);
-    // On a RELABELED deny (plan-approval → "Keep planning"), convey the tapped
-    // label as the reason so the model gets the INTENT, not an unexplained block
-    // (a bare deny on ExitPlanMode can leave it re-prompting or looping). A plain
-    // Approve/Reject deny carries no extra reason (the default "Reject" is noise).
-    const denyReason = behavior === 'deny' ? (answer.reason ?? (req.decisionLabels ? answer.label : undefined)) : undefined;
-
-    // PreToolUse output (hookEventName REQUIRED): permissionDecision, with the deny
-    // reason in the event's own `permissionDecisionReason`. For an ALLOW the live
-    // hooks docs require `updatedInput` ALONGSIDE allow for the user-interactive
-    // tools (ExitPlanMode / AskUserQuestion): "Returning allow alone is not
-    // sufficient for these tools." Echo the unchanged `tool_input` back so the tool
-    // runs without falling through to the local permission prompt.
-    if (req.permissionEvent === 'PreToolUse') {
-      const out: Record<string, unknown> = { hookEventName: 'PreToolUse', permissionDecision: behavior };
-      if (behavior === 'allow' && req.toolInput) out.updatedInput = req.toolInput;
-      if (denyReason) out.permissionDecisionReason = denyReason;
-      return { hookSpecificOutput: out };
-    }
-    // PermissionRequest output (hookEventName REQUIRED). The `decision` object has a
-    // `message` field documented "for deny only: tells Claude why the permission was
-    // denied" (live hooks reference, PermissionRequest decision control). That is the
-    // MODEL-facing reason channel — distinct from top-level `systemMessage`, which is
-    // "shown to the user" only. On a RELABELED deny (plan-approval → "Keep planning")
-    // the intent must reach Claude so it resumes planning rather than re-prompting on
-    // an unexplained block, so the tapped label rides `decision.message`. A bare allow
-    // needs no `updatedInput` echo (it is optional for a permission we never modify).
-    const decision: Record<string, unknown> = { behavior };
-    if (denyReason) decision.message = denyReason;
-    return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } };
-  }
-
-  if (req.agent === 'codex' && req.kind === 'permission') {
-    const behavior = answer.decision ?? decisionFromValue(answer.value);
-    return {
-      hookSpecificOutput: {
-        hookEventName: 'PermissionRequest',
-        decision: behavior === 'deny'
-          ? { behavior, message: answer.reason ?? 'Rejected from Telegram' }
-          : { behavior },
-      },
-    };
-  }
-
-  if (req.agent === 'opencode') {
-    return { answer: answer.value };
-  }
-
+  if (req.agent === 'claude' && req.kind === 'question') return claudeQuestionHookOutput(req, answer);
+  if (req.agent === 'claude' && req.kind === 'permission') return claudePermissionHookOutput(req, answer);
+  if (req.agent === 'codex' && req.kind === 'permission') return codexPermissionHookOutput(answer);
+  if (req.agent === 'opencode') return { answer: answer.value };
   return null;
 }
 

@@ -9,6 +9,14 @@ import {
   alertTag,
   alertTitle,
   claimAlert,
+  claimInternalAlert,
+  internalThrottleKey,
+  internalAlertRequestId,
+  internalAlertText,
+  markInternalAlertDelivered,
+  reconcileInternalAlertRecipients,
+  pinInternalAlertAttempt,
+  releaseInternalAlertAttempt,
   formatAlertList,
   markAlertDelivered,
   nearestLiveAncestor,
@@ -87,6 +95,201 @@ const msg = (over: Partial<AlertMessage> = {}): AlertMessage => ({
   html: false,
   title: null,
   ...over,
+});
+
+describe('internal incident receipts', () => {
+  test('snapshot is durable before acceptance and pending recipients keep original identity past the repeat window', () => {
+    const key = internalThrottleKey(msg(), null);
+    const text = internalAlertText(msg(), 'withheld');
+    const claimed = claimInternalAlert({ sent: [] }, key, NOW, text, ['a', 'b', 'a']);
+    const restored = parseAlertThrottle(serializeAlertThrottle(claimed, NOW), NOW);
+    expect(restored.sent).toEqual([{ key, at: NOW, messageId: 0, pending: ['a', 'b'], internalText: text, internalRecipients: ['a', 'b'], internalAttempts: [] }]);
+    expect(throttleVerdict(restored, key, NOW + 2 * DEFAULT_ALERT_WINDOW_MS, DEFAULT_ALERT_WINDOW_MS).kind).toBe('throttled');
+    const done = markInternalAlertDelivered(restored, key, NOW, ['a', 'b']);
+    expect(throttleVerdict(done, key, NOW + 2 * DEFAULT_ALERT_WINDOW_MS, DEFAULT_ALERT_WINDOW_MS).kind).toBe('send');
+    expect(throttleVerdict(restored, throttleKey(msg().source, msg().key, msg().severity), NOW, DEFAULT_ALERT_WINDOW_MS).kind).toBe('send');
+  });
+
+  test('stable bounded request id includes incident, claim and session identity without truncation collisions', () => {
+    const key = internalThrottleKey(msg({ key: 'x'.repeat(255) + 'A' }), null);
+    const id = internalAlertRequestId(key, NOW, 'a'.repeat(511) + 'A');
+    expect(id.length).toBeLessThanOrEqual(256);
+    expect(id).toBe(internalAlertRequestId(key, NOW, 'a'.repeat(511) + 'A'));
+    for (const other of [
+      internalAlertRequestId(internalThrottleKey(msg({ key: 'x'.repeat(255) + 'B' }), null), NOW, 'a'.repeat(511) + 'A'),
+      internalAlertRequestId(key, NOW + 1, 'a'.repeat(511) + 'A'),
+      internalAlertRequestId(key, NOW, 'a'.repeat(511) + 'B'),
+    ]) expect(other).not.toBe(id);
+    expect(internalThrottleKey(msg(), 'holder-a')).not.toBe(internalThrottleKey(msg(), 'holder-b'));
+    expect(internalThrottleKey(msg(), null)).not.toBe(internalThrottleKey(msg(), 'holder-a'));
+  });
+
+  test('concurrent acknowledgements merge, and stale acknowledgement cannot clear a forced replacement', () => {
+    const key = internalThrottleKey(msg(), null);
+    const first = claimInternalAlert({ sent: [] }, key, NOW, 'first snapshot', ['a', 'b']);
+    const once = markInternalAlertDelivered(first, key, NOW, ['a']);
+    expect(markInternalAlertDelivered(once, key, NOW, ['b']).sent[0].pending).toEqual([]);
+    const forced = claimInternalAlert(once, key, NOW, 'forced snapshot', ['a', 'b']);
+    expect(forced.sent[0].at).toBeGreaterThan(NOW);
+    expect(markInternalAlertDelivered(forced, key, NOW, ['b'])).toEqual(forced);
+    expect(reconcileInternalAlertRecipients(forced, key, NOW, ['replacement'])).toEqual(forced);
+  });
+
+  test('assignment changes keep only responsible pending recipients while preserving the snapshot and acknowledgements', () => {
+    const key = internalThrottleKey(msg(), null);
+    const initial = claimInternalAlert({ sent: [] }, key, NOW, 'incident', ['accepted', 'withdrawn']);
+    const partial = markInternalAlertDelivered(initial, key, NOW, ['accepted']);
+    const reassigned = reconcileInternalAlertRecipients(partial, key, NOW, ['accepted', 'replacement']);
+    expect(reassigned.sent[0]).toEqual({ key, at: NOW, messageId: 0, pending: ['replacement'], internalText: 'incident', internalRecipients: ['accepted', 'replacement'], internalAttempts: [] });
+    const renewed = reconcileInternalAlertRecipients(reassigned, key, NOW, ['accepted', 'withdrawn']);
+    expect(renewed.sent[0].pending).toEqual(['withdrawn']);
+  });
+
+  test('accepted identity survives unsubscribe and resubscribe without replaying the same incident', () => {
+    const key = internalThrottleKey(msg(), null);
+    const initial = claimInternalAlert({ sent: [] }, key, NOW, 'incident', ['accepted', 'pending']);
+    const partial = markInternalAlertDelivered(initial, key, NOW, ['accepted']);
+    const removed = reconcileInternalAlertRecipients(partial, key, NOW, ['pending']);
+    const restored = reconcileInternalAlertRecipients(parseAlertThrottle(serializeAlertThrottle(removed, NOW), NOW), key, NOW, ['accepted', 'pending']);
+    expect(restored.sent[0].pending).toEqual(['pending']);
+  });
+
+  test('a late acceptance after subscription withdrawal is retained for a later resubscription', () => {
+    const key = internalThrottleKey(msg(), null);
+    const initial = claimInternalAlert({ sent: [] }, key, NOW, 'incident', ['in-flight']);
+    const reassigned = reconcileInternalAlertRecipients(initial, key, NOW, ['replacement']);
+    const acknowledged = markInternalAlertDelivered(reassigned, key, NOW, ['in-flight']);
+    const resumed = reconcileInternalAlertRecipients(acknowledged, key, NOW, ['in-flight', 'replacement']);
+    expect(resumed.sent[0].pending).toEqual(['replacement']);
+  });
+
+  test('an unresolved attempt is durably pinned to its endpoint generation, with claim fencing', () => {
+    const key = internalThrottleKey(msg(), null);
+    const target = { sessionId: 'pending', pid: 7, instanceId: 'a'.repeat(32) };
+    const initial = claimInternalAlert({ sent: [] }, key, NOW, 'incident', ['pending']);
+    const pinned = pinInternalAlertAttempt(initial, key, NOW, target);
+    expect(pinned.result).toBe('pinned');
+    const restored = parseAlertThrottle(serializeAlertThrottle(pinned.store, NOW), NOW);
+    expect(pinInternalAlertAttempt(restored, key, NOW, target).result).toBe('ready');
+    for (const resumed of [{ ...target, pid: 8 }, { ...target, instanceId: 'b'.repeat(32) }]) {
+      const refused = pinInternalAlertAttempt(restored, key, NOW, resumed);
+      expect(refused.result).toBe('internal_delivery_uncertain');
+      expect(refused.store).toEqual(restored);
+    }
+    const forced = claimInternalAlert(restored, key, NOW + 1, 'reconciled incident', ['pending']);
+    expect(pinInternalAlertAttempt(forced, key, NOW, target).result).toBe('internal_receipt_changed');
+    expect(pinInternalAlertAttempt(forced, key, NOW + 1, { ...target, pid: 8 }).result).toBe('pinned');
+  });
+
+  test('a pin the host rejected as stale_identity is released so the fresh endpoint generation can be tried once', () => {
+    const key = internalThrottleKey(msg(), null);
+    const target = { sessionId: 'pending', pid: 7, instanceId: 'a'.repeat(32) };
+    const fresh = { ...target, pid: 8, instanceId: 'b'.repeat(32) };
+    const pinned = pinInternalAlertAttempt(claimInternalAlert({ sent: [] }, key, NOW, 'incident', ['pending']), key, NOW, target).store;
+    expect(pinInternalAlertAttempt(pinned, key, NOW, fresh).result).toBe('internal_delivery_uncertain');
+    const released = releaseInternalAlertAttempt(pinned, key, NOW, target);
+    expect(pinInternalAlertAttempt(released, key, NOW, fresh).result).toBe('pinned');
+    // Only the rejected generation of this claim is released.
+    expect(releaseInternalAlertAttempt(pinned, key, NOW, fresh)).toEqual(pinned);
+    expect(releaseInternalAlertAttempt(pinned, key, NOW + 1, target)).toEqual(pinned);
+  });
+
+  test('unresolved receipt survives ordinary history eviction and the 24-hour retention boundary', () => {
+    const key = internalThrottleKey(msg(), null);
+    const target = { sessionId: 'pending', pid: 7, instanceId: 'a'.repeat(32) };
+    const initial = pinInternalAlertAttempt(claimInternalAlert({ sent: [] }, key, NOW, 'incident', ['pending']), key, NOW, target).store;
+    let crowded = initial;
+    for (let i = 0; i < 200; i++) crowded = settleAlert(claimAlert(crowded, `ordinary-${i}`, NOW + 1), `ordinary-${i}`, i + 1, []);
+    const underPressure = parseAlertThrottle(serializeAlertThrottle(crowded, NOW + 2), NOW + 2);
+    expect(underPressure.sent.find(entry => entry.key === key)).toEqual(initial.sent[0]);
+    for (const age of [24 * HOUR, 25 * HOUR, 30 * 24 * HOUR]) {
+      const raw = JSON.stringify({ version: 1, sent: initial.sent });
+      const parsed = parseAlertThrottle(raw, NOW + age);
+      expect(parsed.sent).toEqual(initial.sent);
+      const restored = parseAlertThrottle(serializeAlertThrottle(parsed, NOW + age), NOW + age);
+      expect(throttleVerdict(restored, key, NOW + age, DEFAULT_ALERT_WINDOW_MS).kind).toBe('throttled');
+      expect(pinInternalAlertAttempt(restored, key, NOW, { ...target, pid: 8 }).result).toBe('internal_delivery_uncertain');
+      expect(internalAlertRequestId(key, restored.sent[0].at, target.sessionId)).toBe(internalAlertRequestId(key, NOW, target.sessionId));
+    }
+  });
+
+  test('withdrawal and corrupt attempt history do not expire unresolved delivery identity', () => {
+    const key = internalThrottleKey(msg(), null);
+    const target = { sessionId: 'pending', pid: 7, instanceId: 'a'.repeat(32) };
+    const initial = pinInternalAlertAttempt(claimInternalAlert({ sent: [] }, key, NOW, 'incident', ['pending']), key, NOW, target).store;
+    const withdrawn = reconcileInternalAlertRecipients(initial, key, NOW, []);
+    expect(withdrawn.sent[0].pending).toEqual([]);
+    const restored = parseAlertThrottle(serializeAlertThrottle(withdrawn, NOW + 25 * HOUR), NOW + 25 * HOUR);
+    expect(throttleVerdict(restored, key, NOW + 25 * HOUR, DEFAULT_ALERT_WINDOW_MS).kind).toBe('throttled');
+    const assigned = reconcileInternalAlertRecipients(restored, key, NOW, ['pending']);
+    expect(pinInternalAlertAttempt(assigned, key, NOW, { ...target, pid: 8 }).result).toBe('internal_delivery_uncertain');
+    const corrupt = parseAlertThrottle(JSON.stringify({ version: 1, sent: [{ ...initial.sent[0], internalAttempts: 'invalid' }] }), NOW + 25 * HOUR);
+    expect(corrupt.sent).toHaveLength(1);
+    expect(pinInternalAlertAttempt(corrupt, key, NOW, target).result).toBe('internal_delivery_uncertain');
+  });
+
+  test('a newly acknowledged receipt keeps its ordinary throttle slot ahead of older history', () => {
+    const key = internalThrottleKey(msg(), null);
+    let store = claimInternalAlert({ sent: [] }, key, NOW, 'incident', ['pending']);
+    for (let i = 0; i < 200; i++) store = settleAlert(claimAlert(store, `older-${i}`, NOW - 1), `older-${i}`, i + 1, []);
+    const protectedFirst = parseAlertThrottle(serializeAlertThrottle(store, NOW), NOW);
+    const acknowledged = markInternalAlertDelivered(protectedFirst, key, NOW, ['pending']);
+    const restored = parseAlertThrottle(serializeAlertThrottle(acknowledged, NOW + 1), NOW + 1);
+    expect(restored.sent.some(entry => entry.key === key)).toBe(true);
+    expect(restored.sent).toHaveLength(200);
+    expect(throttleVerdict(restored, key, NOW + 1, DEFAULT_ALERT_WINDOW_MS).kind).toBe('throttled');
+  });
+
+  test('unresolved receipt capacity fails closed without blocking ordinary owner history or dropping old attempts', () => {
+    let full = { sent: [] as AlertThrottleEntry[] };
+    for (let i = 0; i < 200; i++) full = claimInternalAlert(full, internalThrottleKey(msg({ key: `pending-${i}` }), null), NOW, 'incident', ['pending']);
+    const newKey = internalThrottleKey(msg({ key: 'overflow' }), null);
+    expect(() => claimInternalAlert(full, newKey, NOW, 'new incident', ['pending'])).toThrow('internal receipt capacity');
+    expect(parseAlertThrottle(serializeAlertThrottle(full, NOW + 25 * HOUR), NOW + 25 * HOUR).sent).toHaveLength(200);
+    let withOrdinary = full;
+    for (let i = 0; i < 250; i++) withOrdinary = settleAlert(claimAlert(withOrdinary, `owner-${i}`, NOW), `owner-${i}`, i + 1, []);
+    const restored = parseAlertThrottle(serializeAlertThrottle(withOrdinary, NOW), NOW);
+    expect(restored.sent.filter(entry => entry.internalText !== undefined)).toHaveLength(200);
+    expect(restored.sent.filter(entry => entry.internalText === undefined)).toHaveLength(200);
+    expect(restored.sent.some(entry => entry.key === 'owner-249')).toBe(true);
+    const released = markInternalAlertDelivered(full, full.sent[0].key, NOW, ['pending']);
+    expect(() => claimInternalAlert(released, newKey, NOW + 1, 'new incident', ['pending'])).not.toThrow();
+    expect(() => claimInternalAlert(full, full.sent[0].key, NOW + 1, 'explicit replacement', ['pending'])).not.toThrow();
+    const overflow = { sent: [...full.sent, { ...full.sent[0], key: newKey }] };
+    expect(() => serializeAlertThrottle(overflow, NOW)).toThrow('internal receipt capacity');
+  });
+
+  test('missing or corrupt attempt history is uncertain, while unattempted suspended recipients remain eligible', () => {
+    const key = internalThrottleKey(msg(), null);
+    const target = { sessionId: 'pending', pid: 7, instanceId: 'a'.repeat(32) };
+    const initial = claimInternalAlert({ sent: [] }, key, NOW, 'incident', ['pending']);
+    expect(pinInternalAlertAttempt(initial, key, NOW, target).result).toBe('pinned');
+    for (const internalAttempts of [undefined, 'invalid', [{ ...target, instanceId: 'bad' }], [target, { ...target, pid: 8 }]]) {
+      const restored = parseAlertThrottle(JSON.stringify({ version: 1, sent: [{ ...initial.sent[0], internalAttempts }] }), NOW);
+      expect(pinInternalAlertAttempt(restored, key, NOW, target).result).toBe('internal_delivery_uncertain');
+    }
+    const accepted = markInternalAlertDelivered(initial, key, NOW, ['pending']);
+    expect(pinInternalAlertAttempt(accepted, key, NOW, { ...target, pid: 8 }).result).toBe('internal_receipt_acknowledged');
+  });
+
+  test('internal zero id needs an intact bounded snapshot; it never masquerades as a Telegram id', () => {
+    const entry = { key: internalThrottleKey(msg(), null), at: NOW, messageId: 0, pending: ['a'] };
+    const parse = (over: Record<string, unknown>) => parseAlertThrottle(JSON.stringify({ version: 1, sent: [{ ...entry, ...over }] }), NOW).sent;
+    expect(parse({})).toEqual([]);
+    expect(parse({ internalText: '' })).toEqual([]);
+    expect(parse({ internalText: 'я'.repeat(HOLDER_TEXT_MAX_BYTES) })).toEqual([]);
+    expect(parse({ internalText: 'snapshot', key: throttleKey('sysmon', 'load', 'critical') })).toEqual([]);
+    expect(parse({ internalText: 'snapshot' })).toHaveLength(1);
+  });
+
+  test('internal status distinguishes withheld from unknown owner delivery and never invents remediation', () => {
+    const text = internalAlertText(msg({ html: true, text: '<b>Memory</b> &gt; 97%' }), 'withheld');
+    expect(text).toContain('Memory > 97%');
+    expect(text).toContain('Owner problem report withheld');
+    expect(text).toContain('Receipt of this incident does not mean remediation has started');
+    expect(text).not.toMatch(/tg#|--reply-to/u);
+    expect(internalAlertText(msg(), 'unconfirmed')).toContain('Owner delivery is unconfirmed');
+  });
 });
 
 describe('subscription store', () => {

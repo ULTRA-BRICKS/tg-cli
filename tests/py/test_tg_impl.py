@@ -402,6 +402,16 @@ class ImplTests(Sandbox):
         self.assertFalse(any(c[0] in ("systemctl", "launchctl") for c in self.calls()))
         self.assertIn("next start", result.stdout)
 
+    def test_stop_survives_control_truncation_pause(self):
+        import fcntl
+
+        with (self.repo / "desired").open("w") as control:
+            time.sleep(0.15)
+            control.write("-1")
+        self.wait_slot(-1)
+        with self.lock.open("rb") as probe:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     def test_status_and_mainpid_agreeing_without_lock_cannot_verify(self):
         self.unit()
         self.configure(successor_lock=False)

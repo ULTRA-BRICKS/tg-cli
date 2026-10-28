@@ -11,11 +11,14 @@ import { tempDir } from "./helpers/test-temp"
 // Import the emoji map from the CLI
 const TG_PATH = new URL("../tg", import.meta.url).pathname
 // The maps were extracted out of `tg` into the branding module (decomposition
-// Stage 0); the source-parse tests read the COMBINED source so a regex finds the
-// maps (now in the module) and the help text / comments (still in `tg`) alike.
+// Stage 0) and the help text into the outbound runtime's usage module (tg-cli#817); the
+// source-parse tests read the COMBINED source so a regex finds the maps, the help text and
+// the comments wherever they live now.
 const EMOJI_MODULE_PATH = new URL("../features/branding/emoji.ts", import.meta.url).pathname
+const USAGE_MODULE_PATH = new URL("../features/cli/outbound-runtime/usage.ts", import.meta.url).pathname
 async function combinedSource(): Promise<string> {
-  return (await Bun.file(TG_PATH).text()) + "\n" + (await Bun.file(EMOJI_MODULE_PATH).text())
+  const parts = await Promise.all([TG_PATH, EMOJI_MODULE_PATH, USAGE_MODULE_PATH].map((path) => Bun.file(path).text()))
+  return parts.join("\n")
 }
 
 // Create a temp dir with a fake `pgrep` that reports `ollama` as running.

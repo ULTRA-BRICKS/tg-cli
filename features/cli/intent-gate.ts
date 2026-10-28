@@ -1,6 +1,6 @@
 /**
  * @file The pre-send intent gate (tg-cli#706): what an outgoing message IS — a decision
- * ask, a problem (a blocker for the human), a report — whether or not it carries a
+ * ask, a problem, a report — whether or not it carries a
  * `--tag`, and whether each part follows its format.
  *
  * Accessed via: the `tg` entrypoint, on the final assembled body, after the content
@@ -27,8 +27,9 @@
  * sender's prose. A narrow set of self-answered questions ("Почему упало? Флейк в …")
  * is not an ask. Problem and report kinds need explicit markers (a blocker phrase; a
  * completed-work verb), because a decision's own Context routinely mentions failures
- * and finished work. The optional laya probability (laya-socket.ts) is advisory only:
- * it can add a hint, never block or pass a message on its own.
+ * and finished work. Laya ask probability is advisory. Explicit problem reports also
+ * require performed actions/results and current recovery: an available negative Laya
+ * assessment can block, a positive cannot override deterministic missing evidence.
  *
  * PURE — no I/O.
  */
@@ -41,6 +42,7 @@ import {
   splitSections,
   validateEscalationFormat,
 } from './escalation-format';
+import { validateProblemRemediation, withoutRemediationLabel, type ProblemLayaAssessment } from './problem-remediation';
 
 export type IntentKind = 'decision' | 'problem' | 'report';
 
@@ -51,7 +53,7 @@ export interface FollowUp {
   quote: string;
 }
 
-export type BlockReason = 'malformed-decision' | 'malformed-problem' | 'malformed-report' | 'mixed';
+export type BlockReason = 'malformed-decision' | 'malformed-problem' | 'malformed-report' | 'mixed' | 'incomplete-problem-remediation';
 
 export type IntentVerdict =
   // `valid`: the body is a decision request / a problem in its format — what a reply
@@ -65,10 +67,11 @@ export interface IntentInput {
   // The validated lowercase `--tag`, if any.
   tag?: string;
   // `--automated`: a program-generated notification (a monitor alert, a scheduled
-  // digest). The problem/report FORMAT checks are skipped; asks are still detected.
+  // digest). Layout checks are skipped; required problem actions/results are not.
   automated?: boolean;
   // laya's P(the message asks the reader something), when the warm server answered.
   layaAskProbability?: number | null;
+  layaProblemAssessment?: ProblemLayaAssessment;
 }
 
 export interface IntentSignals {
@@ -80,6 +83,10 @@ export interface IntentSignals {
 // laya at or above this probability adds an advisory hint when the heuristic found no
 // ask. Measured on the shipped checkpoints (tg-cli#706): non-asks stay well below it.
 export const LAYA_ASK_THRESHOLD = 0.9;
+// Symmetric high-confidence negative. Live warm-model probes assign middling scores to
+// valid RU/EN recovery prose, so p<0.5 is not evidence of a missing action. The broad
+// uncertainty band leaves deterministic content checks authoritative.
+export const LAYA_PROBLEM_MISSING_THRESHOLD = 0.1;
 
 // --- Prose extraction --------------------------------------------------------------
 
@@ -96,8 +103,10 @@ const ENTITY_RE = /&(#\d+|#x[\da-f]+|[a-z]+);/giu;
 
 function decodeEntities(text: string): string {
   return text.replace(ENTITY_RE, (m, name: string) => {
-    if (name.startsWith('#x') || name.startsWith('#X')) return String.fromCodePoint(Number.parseInt(name.slice(2), 16));
-    if (name.startsWith('#')) return String.fromCodePoint(Number(name.slice(1)));
+    if (name.startsWith('#')) {
+      const cp = /^#x/iu.test(name) ? Number.parseInt(name.slice(2), 16) : Number(name.slice(1));
+      return cp > 0 && cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff) ? String.fromCodePoint(cp) : m;
+    }
     return NAMED_ENTITIES[name.toLowerCase()] ?? m;
   });
 }
@@ -233,7 +242,7 @@ export function detectSignals(body: string): IntentSignals {
       }
       previousWasAsk = false;
       if (PROBLEM_RE.test(own) && !NO_BLOCKER_RE.test(own)) problems.push(clip(sentence));
-      else if (own.split(CLAUSE_SPLIT_RE).some((clause) => REPORT_RE.test(clause) && !NEGATED_RE.test(clause))) {
+      else if (withoutRemediationLabel(own).split(CLAUSE_SPLIT_RE).some((clause) => REPORT_RE.test(clause) && !NEGATED_RE.test(clause))) {
         reports.push(clip(sentence));
       }
     });
@@ -258,10 +267,9 @@ const NEED_RE = new RegExp(
 );
 
 /**
- * The problem format: a problem is an escalation to unblock the sender
- * (decision-request-discipline: "A blocker that needs the human to unblock you goes out as
- * `tg --tag problem` — the same structure applies to it"). Context, evidence, the ask, and
- * the same Rich Message structure as a decision. A choice inside a problem is a decision.
+ * Context, evidence, actual recovery actions/results, and readable Rich Message structure.
+ * A human dependency is optional: an agent may still be recovering autonomously.
+ * A choice inside a problem is a decision.
  */
 export function validateProblemFormat(body: string): FormatCheck {
   const text = body ?? '';
@@ -270,11 +278,7 @@ export function validateProblemFormat(body: string): FormatCheck {
   if (!hasFileRef(text) && !LINK_OR_LOG_RE.test(text)) {
     missing.push('Evidence / where to look — a file:line, a link, a log path, or the failing command/output in <code>/<pre>');
   }
-  // Matched only, never rendered as HTML.
-  // codeql[js/incomplete-multi-character-sanitization]
-  if (!NEED_RE.test(text.replace(TAG_RE, ' '))) {
-    missing.push('The ask — what exactly you need from the human to get unblocked ("нужен доступ к …", "please grant …")');
-  }
+  missing.push(...validateProblemRemediation(text).missing);
   if ((text.match(HEADING_RE) ?? []).length < 2) {
     missing.push('Structure — each section under its own <h3>/<h4> heading (needs --format html; ≥2 headings)');
   }
@@ -339,7 +343,16 @@ export function layaWorthAsking(input: IntentInput): boolean {
   return detectSignals(input.body).asks.length === 0;
 }
 
-export function classifyIntent(input: IntentInput): IntentVerdict {
+/** What every stage of the classification shares. `kinds` and `hints` are filled as stages learn more. */
+interface Classification {
+  input: IntentInput;
+  body: string;
+  sig: IntentSignals;
+  kinds: IntentKind[];
+  hints: string[];
+}
+
+function startClassification(input: IntentInput): Classification {
   const body = input.body ?? '';
   const { tag } = input;
   const sig = detectSignals(body);
@@ -356,101 +369,145 @@ export function classifyIntent(input: IntentInput): IntentVerdict {
         'If it does ask, send that question as its own --tag decision message.',
     );
   }
+  return { input, body, sig, kinds, hints };
+}
 
-  // A decision request already in its format — asked in so many words or not: the rest
-  // of the body is its context (a decision's Context routinely names failures and done work).
-  // A question under a heading that is not part of the decision (Where to look, Glossary,
-  // an unrelated heading) — or before the first heading, outside every section the format
-  // defines — is a second ask riding along, owed as its own message.
-  const decision = validateEscalationFormat(body);
-  if (decision.ok) {
-    if (!kinds.includes('decision')) kinds.unshift('decision');
-    const labels = decisionLabels(body);
-    const extraAsks = splitSections(body)
-      .filter((s) => s.heading === '' || (!OPTIONS_HEADING_RE.test(s.heading) && !DECISION_PART_NAME_RE.test(s.heading)))
-      .flatMap((s) => detectSignals(s.body).asks);
-    if (labels.length > 1 || extraAsks.length > 0) {
-      return {
-        action: 'follow-up',
-        kinds,
-        reason: [
-          labels.length > 1 ? `this message carries ${labels.length} separate decisions — each one needs its own message` : '',
-          extraAsks.length > 0 ? 'it also asks a question outside its decision request' : '',
-        ]
-          .filter(Boolean)
-          .join('; '),
-        followUps: [
-          ...(labels.length > 1 ? labels.map((quote): FollowUp => ({ kind: 'decision', quote })) : []),
-          ...extraAsks.map((quote): FollowUp => ({ kind: 'decision', quote })),
-        ],
-        hints,
-      };
-    }
-    if (tag !== 'decision') hints.push('This is a decision request: send it with --tag decision.');
-    // A program's message (--automated) never settles an agent's owed follow-up.
-    return input.automated ? { action: 'pass', kinds, hints } : { action: 'pass', kinds, hints, valid: 'decision' };
+/** A warm Laya score for both parts of a problem: what it adds as missing items and as hints. */
+function layaScoreFindings(assessment: { done: number; current: number }): { missing: string[]; hints: string[] } {
+  const { done, current } = assessment;
+  const missing: string[] = [];
+  const hints: string[] = [];
+  if (done <= LAYA_PROBLEM_MISSING_THRESHOLD) missing.push(`Already tried — Laya did not find a concrete completed action with its observed result (p=${done.toFixed(2)}).`);
+  if (current <= LAYA_PROBLEM_MISSING_THRESHOLD) missing.push(`Doing now — Laya did not find current recovery work or an exact hard dependency with its verification step (p=${current.toFixed(2)}).`);
+  if ([done, current].some((p) => p > LAYA_PROBLEM_MISSING_THRESHOLD && p < LAYA_ASK_THRESHOLD)) {
+    hints.push(`Laya problem check inconclusive (done=${done.toFixed(2)}, current=${current.toFixed(2)}); deterministic evidence decides.`);
   }
+  return { missing, hints };
+}
 
-  if (kinds.length === 3) {
-    return {
-      action: 'block',
-      kinds,
-      reason: 'mixed',
-      detail: [
-        `decision: «${sig.asks[0] ?? '(tagged)'}»`,
-        `problem: «${sig.problems[0] ?? '(tagged)'}»`,
-        `report: «${sig.reports[0] ?? '(tagged)'}»`,
-      ],
-      hints,
-    };
+/** Unavailable/skipped inference is a distinct hint; the deterministic contract stays enforceable offline. */
+function layaProblemFindings(assessment: ProblemLayaAssessment | undefined): { missing: string[]; hints: string[] } {
+  if (assessment?.status === 'ok') return layaScoreFindings(assessment);
+  if (assessment?.status === 'unavailable') {
+    return { missing: [], hints: [`Laya problem check unavailable (${assessment.reason}); deterministic action/result and current-step checks still apply.`] };
   }
+  if (assessment?.status === 'skipped') {
+    return { missing: [], hints: ['Laya problem check skipped for offline --dry-run; deterministic action/result and current-step checks still apply.'] };
+  }
+  return { missing: [], hints: [] };
+}
 
-  // Untagged: a report is the sendable carrier; a blocker whose only questions are its
-  // own requests ("дашь доступ?") is a problem; any other question makes it a decision.
-  const requestsOnly = sig.asks.every((q) => NEED_RE.test(q));
-  const primary: IntentKind | 'answer' | null =
-    (tag !== undefined ? PRIMARY_TAGS[tag] : undefined) ??
-    (tag === 'answer'
-      ? 'answer'
-      : kinds.includes('report')
-        ? 'report'
-        : kinds.includes('problem') && requestsOnly
-          ? 'problem'
-          : kinds.includes('decision')
-            ? 'decision'
-            : null);
-  if (primary === null) return { action: 'pass', kinds, hints };
+// Every explicit problem report, including automation and decision-shaped bodies.
+// A semantic positive can never clear the deterministic requirements (Laya can mistake
+// future promises for performed work).
+function incompleteProblemBlock(c: Classification): IntentVerdict | null {
+  const laya = layaProblemFindings(c.input.layaProblemAssessment);
+  c.hints.push(...laya.hints);
+  const missing = [...validateProblemRemediation(c.body).missing, ...laya.missing];
+  return missing.length > 0 ? { action: 'block', kinds: c.kinds, reason: 'incomplete-problem-remediation', detail: missing, hints: c.hints } : null;
+}
 
-  const asks: FollowUp[] = sig.asks.map((quote) => ({ kind: 'decision', quote }));
-  if (primary === 'answer' && asks.length === 0) return { action: 'pass', kinds, hints };
+/** A decision request carrying several decisions, or a question outside its own sections. */
+function decisionFollowUp(c: Classification, labels: string[], extraAsks: string[]): IntentVerdict {
+  return {
+    action: 'follow-up',
+    kinds: c.kinds,
+    reason: [
+      labels.length > 1 ? `this message carries ${labels.length} separate decisions — each one needs its own message` : '',
+      extraAsks.length > 0 ? 'it also asks a question outside its decision request' : '',
+    ]
+      .filter(Boolean)
+      .join('; '),
+    followUps: [
+      ...(labels.length > 1 ? labels.map((quote): FollowUp => ({ kind: 'decision', quote })) : []),
+      ...extraAsks.map((quote): FollowUp => ({ kind: 'decision', quote })),
+    ],
+    hints: c.hints,
+  };
+}
 
-  // An answer that is nothing but a question back is a bare decision ask; an answer
-  // with real content of its own is sendable and owes the question as a follow-up.
+// A decision request already in its format — asked in so many words or not: the rest
+// of the body is its context (a decision's Context routinely names failures and done work).
+// A question under a heading that is not part of the decision (Where to look, Glossary,
+// an unrelated heading) — or before the first heading, outside every section the format
+// defines — is a second ask riding along, owed as its own message.
+function decisionRequestVerdict(c: Classification): IntentVerdict {
+  const { input, body, kinds, hints } = c;
+  if (!kinds.includes('decision')) kinds.unshift('decision');
+  const labels = decisionLabels(body);
+  const extraAsks = splitSections(body)
+    .filter((s) => s.heading === '' || (!OPTIONS_HEADING_RE.test(s.heading) && !DECISION_PART_NAME_RE.test(s.heading)))
+    .flatMap((s) => detectSignals(s.body).asks);
+  if (labels.length > 1 || extraAsks.length > 0) return decisionFollowUp(c, labels, extraAsks);
+  if (input.tag !== 'decision') hints.push('This is a decision request: send it with --tag decision.');
+  // A program's message (--automated) never settles an agent's owed follow-up.
+  return input.automated ? { action: 'pass', kinds, hints } : { action: 'pass', kinds, hints, valid: 'decision' };
+}
+
+// An explicit problem's completed recovery attempts are part of its evidence;
+// a choice alongside them is handled as a decision follow-up.
+function mixedBlock(c: Classification): IntentVerdict | null {
+  const { sig, kinds, hints } = c;
+  if (kinds.length !== 3 || c.input.tag === 'problem') return null;
+  return {
+    action: 'block',
+    kinds,
+    reason: 'mixed',
+    detail: [
+      `decision: «${sig.asks[0] ?? '(tagged)'}»`,
+      `problem: «${sig.problems[0] ?? '(tagged)'}»`,
+      `report: «${sig.reports[0] ?? '(tagged)'}»`,
+    ],
+    hints,
+  };
+}
+
+// Untagged: a report is the sendable carrier; a blocker whose only questions are its
+// own requests ("дашь доступ?") is a problem; any other question makes it a decision.
+function primaryIntent({ input, sig, kinds }: Classification): IntentKind | 'answer' | null {
+  const tagged = input.tag !== undefined ? PRIMARY_TAGS[input.tag] : undefined;
+  if (tagged !== undefined) return tagged;
+  if (input.tag === 'answer') return 'answer';
+  if (kinds.includes('report')) return 'report';
+  if (kinds.includes('problem') && sig.asks.every((q) => NEED_RE.test(q))) return 'problem';
+  return kinds.includes('decision') ? 'decision' : null;
+}
+
+// An answer that is nothing but a question back is a bare decision ask; an answer
+// with real content of its own is sendable and owes the question as a follow-up.
+function isBareQuestion({ body, sig }: Classification): boolean {
   const answerProse = proseLines(body)
     .flat()
     .filter((s) => !sig.asks.some((q) => q.includes(clip(s)) || clip(s).includes(q)))
     .join(' ');
-  const bareQuestion = primary === 'answer' && (answerProse.match(/[\p{L}\p{N}]/gu) ?? []).length < 20;
-  if (primary === 'decision' || bareQuestion) {
-    return {
-      action: 'block',
-      kinds,
-      reason: 'malformed-decision',
-      detail: [
-        ...sig.asks.map((q) => `ask: «${q}»`),
-        ...(asks.length > 1 ? [`It asks ${asks.length} separate questions — each one is its own decision message.`] : []),
-        ...decision.missing,
-      ],
-      hints,
-    };
-  }
+  return (answerProse.match(/[\p{L}\p{N}]/gu) ?? []).length < 20;
+}
 
-  const check =
-    input.automated || primary === 'answer'
-      ? { ok: true, missing: [] }
-      : primary === 'problem'
-        ? validateProblemFormat(body)
-        : validateReportFormat(body);
+function malformedDecisionBlock(c: Classification, asks: FollowUp[], decisionMissing: string[]): IntentVerdict {
+  return {
+    action: 'block',
+    kinds: c.kinds,
+    reason: 'malformed-decision',
+    detail: [
+      ...c.sig.asks.map((q) => `ask: «${q}»`),
+      ...(asks.length > 1 ? [`It asks ${asks.length} separate questions — each one is its own decision message.`] : []),
+      ...decisionMissing,
+    ],
+    hints: c.hints,
+  };
+}
+
+function followUpReason(primary: IntentKind | 'answer', choiceAsks: number): string {
+  if (choiceAsks === 0) return `this ${primary} also reports a blocker — the blocker is its own --tag problem message`;
+  return choiceAsks === 1 ? 'this message asks a question that is not a decision request' : `this message asks ${choiceAsks} questions that are not decision requests`;
+}
+
+/** A problem or report (or an answer with content) that may be sent: block on its layout, else owe follow-ups. */
+function sendableVerdict(c: Classification, primary: IntentKind | 'answer', asks: FollowUp[]): IntentVerdict {
+  const { input, body, sig, kinds, hints } = c;
+  const check: FormatCheck = input.automated || primary === 'answer'
+    ? { ok: true, missing: [] }
+    : (primary === 'problem' ? validateProblemFormat(body) : validateReportFormat(body));
   // A problem's own request ("дашь доступ к staging?") is its ask, not a separate decision.
   const choiceAsks = primary === 'problem' ? asks.filter((a) => !NEED_RE.test(a.quote)) : asks;
   if (!check.ok) {
@@ -458,10 +515,7 @@ export function classifyIntent(input: IntentInput): IntentVerdict {
       action: 'block',
       kinds,
       reason: primary === 'problem' ? 'malformed-problem' : 'malformed-report',
-      detail: [
-        ...check.missing,
-        ...choiceAsks.map((a) => `and the question «${a.quote}» goes out as its own --tag decision message`),
-      ],
+      detail: [...check.missing, ...choiceAsks.map((a) => `and the question «${a.quote}» goes out as its own --tag decision message`)],
       hints,
     };
   }
@@ -470,21 +524,27 @@ export function classifyIntent(input: IntentInput): IntentVerdict {
     ...choiceAsks,
     ...(primary === 'report' ? sig.problems.map((quote): FollowUp => ({ kind: 'problem', quote })) : []),
   ];
-  if (followUps.length === 0) {
-    return primary === 'problem' && !input.automated ? { action: 'pass', kinds, hints, valid: 'problem' } : { action: 'pass', kinds, hints };
-  }
-  return {
-    action: 'follow-up',
-    kinds,
-    reason:
-      choiceAsks.length === 0
-        ? `this ${primary} also reports a blocker — the blocker is its own --tag problem message`
-        : choiceAsks.length === 1
-          ? 'this message asks a question that is not a decision request'
-          : `this message asks ${choiceAsks.length} questions that are not decision requests`,
-    followUps,
-    hints,
-  };
+  if (followUps.length > 0) return { action: 'follow-up', kinds, reason: followUpReason(primary, choiceAsks.length), followUps, hints };
+  return primary === 'problem' && !input.automated ? { action: 'pass', kinds, hints, valid: 'problem' } : { action: 'pass', kinds, hints };
+}
+
+function classifyByPrimary(c: Classification, decisionMissing: string[]): IntentVerdict {
+  const { kinds, hints } = c;
+  const primary = primaryIntent(c);
+  if (primary === null) return { action: 'pass', kinds, hints };
+  const asks = c.sig.asks.map((quote): FollowUp => ({ kind: 'decision', quote }));
+  if (primary === 'answer' && asks.length === 0) return { action: 'pass', kinds, hints };
+  if (primary === 'decision' || (primary === 'answer' && isBareQuestion(c))) return malformedDecisionBlock(c, asks, decisionMissing);
+  return sendableVerdict(c, primary, asks);
+}
+
+export function classifyIntent(input: IntentInput): IntentVerdict {
+  const c = startClassification(input);
+  const incomplete = input.tag === 'problem' ? incompleteProblemBlock(c) : null;
+  if (incomplete !== null) return incomplete;
+  const decision = validateEscalationFormat(c.body);
+  if (decision.ok) return decisionRequestVerdict(c);
+  return mixedBlock(c) ?? classifyByPrimary(c, decision.missing);
 }
 
 // --- Rendering --------------------------------------------------------------------
@@ -495,13 +555,17 @@ const DECISION_SKELETON =
   "<h3>Recommendation</h3><ul><li>…</li></ul><hr><h3>Where to look</h3><ul><li>file.ts:42</li></ul>'";
 const PROBLEM_SKELETON =
   "'<h3>Context</h3><p>…</p><hr><h3>What is blocked</h3><ul><li>…</li></ul><hr>" +
-  "<h3>What I need from you</h3><ul><li>…</li></ul><hr><h3>Where to look</h3><ul><li>file.ts:42 / log / link</li></ul>'";
+  '<h3>Already tried</h3><p>Actual action and observed result</p><hr>' +
+  '<h3>Doing now</h3><p>Current recovery action, or exact hard dependency and verification when it clears</p><hr>' +
+  "<h3>Where to look</h3><ul><li>file.ts:42 / log / link</li></ul>'";
 
 const REASON_HEADLINE: Record<BlockReason, string> = {
   'malformed-decision':
     'this message asks the reader to decide, but it is not in the decision-request format (skill: decision-request-discipline)',
   'malformed-problem':
-    'this problem (a blocker for the human) is not in the problem format (skill: decision-request-discipline)',
+    'this problem is not in the problem format',
+  'incomplete-problem-remediation':
+    'this problem does not explain both actual attempts/results and current recovery; nothing was sent',
   'malformed-report': 'this report is not in the report format (tg help report)',
   mixed: 'this message mixes a decision, a problem and a report — send them as separate messages',
 };
@@ -523,7 +587,7 @@ export function formatIntentVerdict(verdict: IntentVerdict, originalId?: number)
       `tg: intent gate: BLOCKED — ${REASON_HEADLINE[verdict.reason]}.`,
       'Fix:',
       ...verdict.detail.map((d) => `  • ${d}`),
-      verdict.reason === 'malformed-problem'
+      verdict.reason === 'malformed-problem' || verdict.reason === 'incomplete-problem-remediation'
         ? `Shape: tg --tag problem --format html ${PROBLEM_SKELETON}`
         : verdict.reason === 'malformed-report'
           ? 'Shape: tg report --title … --ticket … --impact … --verify-cmd … --verify-result …  (tg help report)'

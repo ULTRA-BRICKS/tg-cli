@@ -23,6 +23,8 @@ const WELL_FORMED = fixture('well-formed-decision.html');
 const PROBLEM_OK = [
   '<h3>Контекст</h3><p>Деплой tg-cli на прод застрял: CI падает на шаге setup-bun из-за rate limit GitHub API.</p><hr>',
   '<h3>Что заблокировано</h3><ul><li>мерж #692 и всех PR после него</li></ul><hr>',
+  '<h3>Уже сделал</h3><p>Повторил сборку на резервном раннере; получил HTTP 403 от GitHub API.</p><hr>',
+  '<h3>Сейчас делаю</h3><p>Проверяю доступность пакета Bun через резервное зеркало.</p><hr>',
   '<h3>Что нужно от тебя</h3><ul><li>нужен токен GitHub с правом read:packages для раннера</li></ul><hr>',
   '<h3>Где смотреть</h3><ul><li>.github/workflows/ci.yml:20</li></ul>',
 ].join('\n');
@@ -121,10 +123,10 @@ test('a report with a malformed question and no proof is BLOCKED and names the q
   }
 });
 
-test('--tag problem: a blocker needs context, evidence, the ask and structure; its own request is not a decision', () => {
+test('--tag problem needs context, evidence, attempted/current actions and structure; its optional request is not a decision', () => {
   const bare = classifyIntent({ body: 'Блокер: CI падает, без токена не починить.', tag: 'problem' });
   expect(bare.action).toBe('block');
-  if (bare.action === 'block') expect(bare.reason).toBe('malformed-problem');
+  if (bare.action === 'block') expect(bare.reason).toBe('incomplete-problem-remediation');
   expect(validateProblemFormat(PROBLEM_OK)).toEqual({ ok: true, missing: [] });
   expect(classifyIntent({ body: PROBLEM_OK, tag: 'problem' }).action).toBe('pass');
   const withRequest = PROBLEM_OK.replace('нужен токен GitHub', 'дашь токен GitHub?');
@@ -151,10 +153,10 @@ test('--tag answer: a real answer with a question back owes it; a bare question 
   expect(classifyIntent({ tag: 'answer', body: 'Готово.' }).action).toBe('pass');
 });
 
-test('--automated skips the problem/report formats but still refuses a prose question', () => {
-  expect(classifyIntent({ body: 'Память 95%, своп 80%.', tag: 'problem', automated: true }).action).toBe('pass');
+test('--automated skips layouts but requires problem remediation and still detects a prose question', () => {
+  expect(classifyIntent({ body: 'Память 95%, своп 80%.', tag: 'problem', automated: true }).action).toBe('block');
   expect(classifyIntent({ body: 'Готово, задеплоил.', automated: true }).action).toBe('pass');
-  expect(classifyIntent({ body: 'Перезапустить демон?', tag: 'problem', automated: true }).action).toBe('follow-up');
+  expect(classifyIntent({ body: `${PROBLEM_OK}<p>Перезапустить демон?</p>`, tag: 'problem', automated: true }).action).toBe('follow-up');
 });
 
 test('chatter with no ask, blocker or finished work passes untouched', () => {

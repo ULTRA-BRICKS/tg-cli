@@ -168,6 +168,26 @@ function writeAtomic(path: string, content: string | Uint8Array): void {
   fsyncPath(join(path, '..'), 'r');
 }
 
+// One queued send → its outbox request; uploads are copied into <id>.files/ first.
+async function toOutboxOp(send: QueuedSend, i: number, filesDir: string): Promise<OutboxOp> {
+  const advisory = send.threadAdvisory ? { threadAdvisory: true } : {};
+  if (!(send.body instanceof FormData)) return { method: send.method, body: send.body, ...advisory };
+  const body: Record<string, unknown> = {};
+  const files: OutboxFile[] = [];
+  for (const [field, value] of send.body.entries()) {
+    if (typeof value === 'string') {
+      body[field] = value;
+      continue;
+    }
+    mkdirSync(filesDir, { recursive: true, mode: 0o700 });
+    const file = `${i}-${field}`;
+    writeAtomic(join(filesDir, file), new Uint8Array(await value.arrayBuffer()));
+    // A Bun.file part is named by its whole path; Telegram gets the base name.
+    files.push({ field, file, name: value.name ? basename(value.name) : field });
+  }
+  return { method: send.method, body, files, ...advisory };
+}
+
 export async function writeOutboxEntry(
   dir: string,
   // `delivered`: the parts of this send that went out before the outage. Their routes are
@@ -185,27 +205,7 @@ export async function writeOutboxEntry(
   const id = `${String(input.createdAt).padStart(15, '0')}-${process.pid}-${crypto.randomUUID().slice(0, 8)}`;
   const filesDir = join(dir, `${id}.files`);
   const ops: OutboxOp[] = [];
-  for (const [i, send] of input.sends.entries()) {
-    const advisory = send.threadAdvisory ? { threadAdvisory: true } : {};
-    if (!(send.body instanceof FormData)) {
-      ops.push({ method: send.method, body: send.body, ...advisory });
-      continue;
-    }
-    const body: Record<string, unknown> = {};
-    const files: OutboxFile[] = [];
-    for (const [field, value] of send.body.entries()) {
-      if (typeof value === 'string') {
-        body[field] = value;
-        continue;
-      }
-      mkdirSync(filesDir, { recursive: true, mode: 0o700 });
-      const file = `${i}-${field}`;
-      writeAtomic(join(filesDir, file), new Uint8Array(await value.arrayBuffer()));
-      // A Bun.file part is named by its whole path; Telegram gets the base name.
-      files.push({ field, file, name: value.name ? basename(value.name) : field });
-    }
-    ops.push({ method: send.method, body, files, ...advisory });
-  }
+  for (const [i, send] of input.sends.entries()) ops.push(await toOutboxOp(send, i, filesDir));
   const entry: OutboxEntry = {
     version: 1,
     id,
@@ -220,6 +220,9 @@ export async function writeOutboxEntry(
   writeAtomic(path, JSON.stringify(entry));
   return { id, path };
 }
+
+// The method becomes a URL path segment on replay, so only a bare Bot API name is accepted.
+const BOT_METHOD = /^[A-Za-z]+$/;
 
 function parseEntry(raw: string): OutboxEntry | null {
   let parsed: unknown;
@@ -237,7 +240,7 @@ function parseEntry(raw: string): OutboxEntry | null {
     !Array.isArray(parsed.ops) ||
     !parsed.ops.every(
       (op: unknown) =>
-        op && typeof op === 'object' && 'method' in op && typeof op.method === 'string' && 'body' in op && op.body && typeof op.body === 'object',
+        op && typeof op === 'object' && 'method' in op && typeof op.method === 'string' && BOT_METHOD.test(op.method) && 'body' in op && op.body && typeof op.body === 'object',
     ) ||
     !('createdAt' in parsed) ||
     typeof parsed.createdAt !== 'number' ||
@@ -305,36 +308,59 @@ function prefixed(text: string | undefined, parseMode: unknown, mark: string, li
 // The request(s) that replay `op` with the delay mark: the mark rides the text or
 // caption when it fits, else it goes out as its own message just before.
 export function markOp(op: OutboxOp, mark: string): OutboxOp[] {
-  const body = op.body;
-  let marked: Record<string, unknown> | null = null;
-  if (op.method === 'sendMessage' && typeof body.text === 'string' && body.entities === undefined) {
-    const text = prefixed(body.text, body.parse_mode, mark, MESSAGE_LIMIT);
-    if (text !== null) marked = { ...body, text };
-  } else if (op.method === 'sendRichMessage') {
-    const rich = body.rich_message;
-    if (rich && typeof rich === 'object' && 'html' in rich && typeof rich.html === 'string') {
-      const html = `<p>${escapeHtml(mark)}</p>${rich.html}`;
-      // The extra paragraph is one more block and more text: past a rich limit Telegram
-      // would refuse the whole report.
-      if (validateRichHtml(html).ok) marked = { ...body, rich_message: { html } };
-    }
-  } else if (op.method === 'sendPhoto' || op.method === 'sendDocument') {
-    const caption = prefixed(typeof body.caption === 'string' ? body.caption : undefined, body.parse_mode, mark, CAPTION_LIMIT);
-    if (caption !== null) marked = { ...body, caption };
-  } else if (op.method === 'sendMediaGroup' && typeof body.media === 'string') {
-    let media: unknown = null;
-    try {
-      media = JSON.parse(body.media);
-    } catch {
-      // not ours to fix: the mark goes separately and Telegram judges the album
-    }
-    if (Array.isArray(media) && media[0] && typeof media[0] === 'object') {
-      const [first, ...rest] = media;
-      const caption = prefixed(typeof first.caption === 'string' ? first.caption : undefined, first.parse_mode, mark, CAPTION_LIMIT);
-      if (caption !== null) marked = { ...body, media: JSON.stringify([{ ...first, caption }, ...rest]) };
-    }
-  }
+  const marked = markedBody(op, mark);
   return marked ? [{ ...op, body: marked }] : [markMessage(op, mark), op];
+}
+
+// The request body with the mark folded in, or null when it does not fit / not foldable.
+function markedBody(op: OutboxOp, mark: string): Record<string, unknown> | null {
+  switch (op.method) {
+    case 'sendMessage':
+      return markedText(op.body, mark);
+    case 'sendRichMessage':
+      return markedRich(op.body, mark);
+    case 'sendPhoto':
+    case 'sendDocument':
+      return markedCaption(op.body, mark);
+    case 'sendMediaGroup':
+      return markedAlbum(op.body, mark);
+    default:
+      return null;
+  }
+}
+
+function markedText(body: Record<string, unknown>, mark: string): Record<string, unknown> | null {
+  if (typeof body.text !== 'string' || body.entities !== undefined) return null;
+  const text = prefixed(body.text, body.parse_mode, mark, MESSAGE_LIMIT);
+  return text === null ? null : { ...body, text };
+}
+
+function markedRich(body: Record<string, unknown>, mark: string): Record<string, unknown> | null {
+  const rich = body.rich_message;
+  if (!rich || typeof rich !== 'object' || !('html' in rich) || typeof rich.html !== 'string') return null;
+  const html = `<p>${escapeHtml(mark)}</p>${rich.html}`;
+  // The extra paragraph is one more block and more text: past a rich limit Telegram
+  // would refuse the whole report.
+  return validateRichHtml(html).ok ? { ...body, rich_message: { html } } : null;
+}
+
+function markedCaption(body: Record<string, unknown>, mark: string): Record<string, unknown> | null {
+  const caption = prefixed(typeof body.caption === 'string' ? body.caption : undefined, body.parse_mode, mark, CAPTION_LIMIT);
+  return caption === null ? null : { ...body, caption };
+}
+
+function markedAlbum(body: Record<string, unknown>, mark: string): Record<string, unknown> | null {
+  if (typeof body.media !== 'string') return null;
+  let media: unknown = null;
+  try {
+    media = JSON.parse(body.media);
+  } catch {
+    // not ours to fix: the mark goes separately and Telegram judges the album
+  }
+  if (!Array.isArray(media) || !media[0] || typeof media[0] !== 'object') return null;
+  const [first, ...rest] = media;
+  const caption = prefixed(typeof first.caption === 'string' ? first.caption : undefined, first.parse_mode, mark, CAPTION_LIMIT);
+  return caption === null ? null : { ...body, media: JSON.stringify([{ ...first, caption }, ...rest]) };
 }
 
 type ReplayOutcome =
@@ -366,39 +392,59 @@ export interface FlushDeps {
   appendHistory: (records: HistoryRecord[]) => void;
 }
 
+type PostResult = { outcome: ReplayOutcome } | { resp: Response };
+
+async function postRequest(op: OutboxOp, body: Record<string, unknown>, filesDir: string, deps: FlushDeps): Promise<PostResult> {
+  let init: RequestInit;
+  try {
+    init = requestInit(op, body, filesDir);
+  } catch (err) {
+    // The copied upload is gone or unreadable: no later flush can send it either.
+    return { outcome: { kind: 'permanent', reason: `outbox file unreadable: ${describeFetchError(err)}` } };
+  }
+  try {
+    return { resp: await deps.post(op.method, init) };
+  } catch (err) {
+    return { outcome: { kind: 'transient', reason: describeFetchError(err) } };
+  }
+}
+
+// Bot API answer → outcome; `rejected` = Telegram refused the request (the caller may fall back).
+async function interpretResponse(
+  resp: Response,
+  body: Record<string, unknown>,
+): Promise<ReplayOutcome | { kind: 'rejected'; status: number; description: string }> {
+  if (isTransientStatus(resp.status)) return { kind: 'transient', ...(await readTransientAnswer(resp)) };
+  const description = await readErrorDescription(resp.clone());
+  if (description !== null) return { kind: 'rejected', status: resp.status, description };
+  const json: unknown = await resp.json().catch(() => null);
+  // A 2xx that is not a Telegram answer (a proxy page) proves nothing was sent.
+  if (!json || typeof json !== 'object' || !('ok' in json) || json.ok !== true || !('result' in json)) {
+    return { kind: 'transient', reason: `HTTP ${resp.status} without a Bot API answer` };
+  }
+  const threadId = body.message_thread_id === undefined ? null : Number(body.message_thread_id);
+  return { kind: 'ok', ids: sentIds(json.result, threadId) };
+}
+
+// The advisory-thread fallback a live send has: a stale topic lands in General, once.
+function canFallBackToGeneral(op: OutboxOp, body: Record<string, unknown>, description: string, fellBack: boolean): boolean {
+  if (fellBack || !op.threadAdvisory || body.message_thread_id === undefined) return false;
+  return isThreadRejection(description) || isTopicDeletedError(description);
+}
+
 async function replayOp(op: OutboxOp, filesDir: string, deps: FlushDeps): Promise<ReplayOutcome> {
   let body = op.body;
   let fellBack = false;
   for (;;) {
-    let init: RequestInit;
-    try {
-      init = requestInit(op, body, filesDir);
-    } catch (err) {
-      // The copied upload is gone or unreadable: no later flush can send it either.
-      return { kind: 'permanent', reason: `outbox file unreadable: ${describeFetchError(err)}` };
-    }
-    let resp: Response;
-    try {
-      resp = await deps.post(op.method, init);
-    } catch (err) {
-      return { kind: 'transient', reason: describeFetchError(err) };
-    }
-    if (isTransientStatus(resp.status)) return { kind: 'transient', ...(await readTransientAnswer(resp)) };
-    const description = await readErrorDescription(resp.clone());
-    if (description === null) {
-      const json: unknown = await resp.json().catch(() => null);
-      // A 2xx that is not a Telegram answer (a proxy page) proves nothing was sent.
-      if (!json || typeof json !== 'object' || !('ok' in json) || json.ok !== true || !('result' in json)) {
-        return { kind: 'transient', reason: `HTTP ${resp.status} without a Bot API answer` };
-      }
-      const threadId = body.message_thread_id === undefined ? null : Number(body.message_thread_id);
-      return { kind: 'ok', ids: sentIds(json.result, threadId) };
-    }
+    const posted = await postRequest(op, body, filesDir, deps);
+    if ('outcome' in posted) return posted.outcome;
+    const answer = await interpretResponse(posted.resp, body);
+    if (answer.kind !== 'rejected') return answer;
     // The same advisory-thread fallback a live send has: a stale topic lands in General,
     // without the anchor (it lives in that topic).
-    if (fellBack || !op.threadAdvisory || body.message_thread_id === undefined || !(isThreadRejection(description) || isTopicDeletedError(description))) {
+    if (!canFallBackToGeneral(op, body, answer.description, fellBack)) {
       // Server text goes to the daemon log: printable characters only, capped.
-      return { kind: 'permanent', reason: `HTTP ${resp.status} ${description.replace(/[\x00-\x1f\x7f]/g, '?')}`.slice(0, 200) };
+      return { kind: 'permanent', reason: `HTTP ${answer.status} ${answer.description.replace(/[\x00-\x1f\x7f]/g, '?')}`.slice(0, 200) };
     }
     const general = { ...body };
     delete general.message_thread_id;
@@ -420,6 +466,69 @@ function writeHistory(entry: OutboxEntry, deps: Pick<FlushDeps, 'appendHistory'>
   deps.appendHistory(buildOutboundHistoryRecords(ids, h.text, h.ts, h.pane, h.groupToken, h.chatId, h.targetAgent, h.sessionKey, threads));
 }
 
+// Move every unreadable entry to failed/ (never retried, kept for a human).
+function quarantineBroken(dir: string, broken: string[], deps: FlushDeps, result: { dropped: number }): void {
+  for (const base of broken) {
+    moveTo(dir, 'failed', base);
+    result.dropped++;
+    deps.log(`outbox: dropped ${base}: unreadable entry (moved to failed/)`);
+  }
+}
+
+// Replay the entry's head request: the delay mark (own message or folded in), then the request.
+// Progress is persisted after every request that went out. Returns the failure that stopped it.
+async function replayHeadOp(
+  entry: OutboxEntry,
+  mark: string,
+  path: string,
+  filesDir: string,
+  deps: FlushDeps,
+): Promise<Exclude<ReplayOutcome, { kind: 'ok' }> | null> {
+  const op = entry.ops[0];
+  const parts = op.marked ? [op] : markOp(op, mark);
+  for (const [i, part] of parts.entries()) {
+    const out = await replayOp(part, filesDir, deps);
+    if (out.kind !== 'ok') return out;
+    const isMark = i < parts.length - 1;
+    entry.delivered.push(...out.ids.map((d) => (isMark ? { ...d, mark: true } : d)));
+    const route = entry.route;
+    if (route) {
+      const ts = Math.floor(deps.now() / 1000);
+      deps.recordRoutes(out.ids.map(({ id }) => ({ id, ts, ...route })));
+    }
+    // A separate mark went out: remember it, so a retry sends only the message itself.
+    if (isMark) entry.ops[0] = { ...op, marked: true };
+    else entry.ops.shift();
+    // Persist progress after every request, so a crash never replays a delivered part.
+    writeAtomic(path, JSON.stringify(entry));
+  }
+  return null;
+}
+
+// Best-effort, like the live send: the answer is out either way.
+async function postDoneReaction(reaction: NonNullable<OutboxEntry['reaction']>, deps: FlushDeps): Promise<void> {
+  const { chatId, messageId, emoji } = reaction;
+  try {
+    await deps.post('setMessageReaction', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId, reaction: [{ type: 'emoji', emoji }] }),
+    });
+  } catch (err) {
+    deps.log(`outbox: done reaction on ${messageId} failed: ${describeFetchError(err)}`);
+  }
+}
+
+// Every request of the entry went out: history, done reaction, then remove it from the queue.
+async function completeEntry(base: string, entry: OutboxEntry, path: string, filesDir: string, deps: FlushDeps): Promise<void> {
+  writeHistory(entry, deps);
+  if (entry.reaction) await postDoneReaction(entry.reaction, deps);
+  rmSync(path, { force: true });
+  rmSync(filesDir, { recursive: true, force: true });
+  const ids = entry.delivered.map((d) => d.id);
+  deps.log(`outbox: delivered ${base} (queued ${new Date(entry.createdAt).toISOString()}; message ids ${ids.join(', ') || 'none'})`);
+}
+
 // Replay the queue, oldest first. `delivered`/`dropped` count entries; `stopped` = a
 // transient failure ended the flush with entries still queued (`retryAfterMs`: the wait
 // Telegram asked for with a 429).
@@ -430,39 +539,13 @@ export async function flushOutbox(
   const result: { delivered: number; dropped: number; stopped: boolean; retryAfterMs?: number } = { delivered: 0, dropped: 0, stopped: false };
   pruneOutbox(dir, deps);
   const { entries, broken } = readOutbox(dir);
-  for (const base of broken) {
-    moveTo(dir, 'failed', base);
-    result.dropped++;
-    deps.log(`outbox: dropped ${base}: unreadable entry (moved to failed/)`);
-  }
+  quarantineBroken(dir, broken, deps, result);
   for (const { base, entry } of entries) {
     const path = join(dir, `${base}.json`);
     const filesDir = join(dir, `${base}.files`);
     const mark = formatDelayMark(entry.createdAt, deps.now());
     let failure: Exclude<ReplayOutcome, { kind: 'ok' }> | null = null;
-    while (entry.ops.length > 0 && failure === null) {
-      const op = entry.ops[0];
-      const parts = op.marked ? [op] : markOp(op, mark);
-      for (const [i, part] of parts.entries()) {
-        const out = await replayOp(part, filesDir, deps);
-        if (out.kind !== 'ok') {
-          failure = out;
-          break;
-        }
-        const isMark = i < parts.length - 1;
-        entry.delivered.push(...out.ids.map((d) => (isMark ? { ...d, mark: true } : d)));
-        const route = entry.route;
-        if (route) {
-          const ts = Math.floor(deps.now() / 1000);
-          deps.recordRoutes(out.ids.map(({ id }) => ({ id, ts, ...route })));
-        }
-        // A separate mark went out: remember it, so a retry sends only the message itself.
-        if (isMark) entry.ops[0] = { ...op, marked: true };
-        else entry.ops.shift();
-        // Persist progress after every request, so a crash never replays a delivered part.
-        writeAtomic(path, JSON.stringify(entry));
-      }
-    }
+    while (entry.ops.length > 0 && failure === null) failure = await replayHeadOp(entry, mark, path, filesDir, deps);
     if (failure?.kind === 'transient') {
       deps.log(`outbox: Telegram still unavailable (${failure.reason}); ${base} stays queued`);
       result.stopped = true;
@@ -476,25 +559,8 @@ export async function flushOutbox(
       deps.log(`outbox: dropped ${base} (moved to failed/): ${failure.reason}`);
       continue;
     }
-    writeHistory(entry, deps);
-    if (entry.reaction) {
-      // Best-effort, like the live send: the answer is out either way.
-      const { chatId, messageId, emoji } = entry.reaction;
-      try {
-        await deps.post('setMessageReaction', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: chatId, message_id: messageId, reaction: [{ type: 'emoji', emoji }] }),
-        });
-      } catch (err) {
-        deps.log(`outbox: done reaction on ${messageId} failed: ${describeFetchError(err)}`);
-      }
-    }
-    rmSync(path, { force: true });
-    rmSync(filesDir, { recursive: true, force: true });
+    await completeEntry(base, entry, path, filesDir, deps);
     result.delivered++;
-    const ids = entry.delivered.map((d) => d.id);
-    deps.log(`outbox: delivered ${base} (queued ${new Date(entry.createdAt).toISOString()}; message ids ${ids.join(', ') || 'none'})`);
   }
   return result;
 }

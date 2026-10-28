@@ -5,7 +5,7 @@
 import { afterAll, expect, test } from 'bun:test';
 import { chmodSync, mkdirSync } from 'fs';
 import { join } from 'path';
-import { layaAskProbability, layaSocketPath, parseLayaReply } from '../features/cli/laya-socket';
+import { layaAskProbability, layaProblemAssessment, layaSocketPath, parseLayaReply } from '../features/cli/laya-socket';
 import { tempDir } from './helpers/test-temp';
 
 const dir = tempDir('tg-laya-', { short: true });
@@ -75,4 +75,55 @@ test('a reply that is not ok, or carries no probability, is null', () => {
   expect(parseLayaReply('{"ok":true,"result":{"answers":{}}}')).toBeNull();
   expect(parseLayaReply('not json')).toBeNull();
   expect(parseLayaReply('{"ok":true,"result":{"answers":{"asks_reader":{"noul":0.2}}}}')).toBe(0.2);
+});
+
+const problemReply = (): void => {
+  reply = () => JSON.stringify({ ok: true, result: { answers: { has_done: { type: 'noul', noul: 0.8 }, has_current: { type: 'noul', noul: 0.7 } } } });
+};
+const occurrences = (text: string, part: string): number => text.split(part).length - 1;
+
+test('problem assessment sends an inline labelled report once, not done + whole body', async () => {
+  problemReply();
+  requests = [];
+  const body = 'Already tried: Restarted Chrome; result: the tab is still missing. Doing now: Checking browser permissions.';
+  expect(await layaProblemAssessment(body, env())).toEqual({ status: 'ok', done: 0.8, current: 0.7 });
+  expect(requests).toHaveLength(1);
+  expect(requests[0].message).toBe(body);
+});
+
+test('problem assessment keeps genuinely distinct sections, each once', async () => {
+  problemReply();
+  requests = [];
+  const body = 'Problem: build fails.\nAlready tried: cleared the cache; it still fails.\nDoing now: bisecting the lockfile change.';
+  await layaProblemAssessment(body, env());
+  expect(requests).toHaveLength(1);
+  expect(occurrences(requests[0].message, 'cleared the cache; it still fails.')).toBe(1);
+  expect(occurrences(requests[0].message, 'bisecting the lockfile change.')).toBe(1);
+});
+
+test('problem assessment keeps labelled sections when one is a substring of the other', async () => {
+  problemReply();
+  requests = [];
+  await layaProblemAssessment('Already tried: restart\nDoing now: restart the worker after the config fix', env());
+  expect(requests[0].message).toBe('restart\nrestart the worker after the config fix');
+});
+
+test('problem assessment keeps a Result heading when the current action is unlabelled', async () => {
+  problemReply();
+  requests = [];
+  await layaProblemAssessment('## Already tried\nrestarted the worker\n## Result\nthe queue is still stuck\nI am bisecting the config change.', env());
+  expect(requests[0].message).toContain('Result: the queue is still stuck');
+  expect(requests[0].message).toContain('bisecting the config change');
+});
+
+test('problem assessment with identical or empty sections sends them once', async () => {
+  problemReply();
+  requests = [];
+  await layaProblemAssessment('Build fails.', env());
+  expect(requests).toHaveLength(1);
+  expect(occurrences(requests[0].message, 'Build fails.')).toBe(1);
+  requests = [];
+  await layaProblemAssessment('', env());
+  expect(requests).toHaveLength(1);
+  expect(requests[0].message).toBe('');
 });

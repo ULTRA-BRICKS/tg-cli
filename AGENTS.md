@@ -6,7 +6,7 @@ Agent-facing documentation. English only.
 
 ## What This Repo Is
 
-`tg` is a single-file Bun/TypeScript CLI (`#!/usr/bin/env bun`, entrypoint: `tg` at repo root,
+`tg` is a modular Bun/TypeScript CLI (`#!/usr/bin/env bun`, thin entrypoint: `tg` at repo root,
 no build step) that sends curated agent reports to Telegram via the Bot API.
 
 Credentials: `~/.config/tg-cli/.env` — must contain `TG_BOT_TOKEN` and `TG_CHAT_ID`, written by
@@ -221,13 +221,25 @@ and instanceId are per process) and stored in `CtlPaths.alertSubscriptions`. The
 register/unregister event: the omp-live extension only publishes/withdraws its metadata file,
 so bound state is resolved against `listLiveEndpoints()` at send/list time (`resolveAlertBindings`)
 — no endpoint for the session id = suspended (nothing delivered), an endpoint again = bound under
-its new pid. Do not add an extension-side hook for this. `alert send` posts through `tg`
+its new pid. Do not add an extension-side hook for this. Complete problem reports and
+informational `alert send` messages post through `tg`
 (`--format html --tag problem|report --subagent <source> --title …`, the footer names each bound
 session), parses `OK tg#<id>`, delivers `[alert tg#<id> · <source> · <severity>] <text>` through
 `sendLiveMessage` (never a tmux/ACP fallback), and throttles repeats of (source, key, severity)
 in `CtlPaths.alertThrottle` (`--window`, default 10 min; `--force` bypasses). Sources: rig sysmon
 (`riglib/sysmon_daemon/alert.py`) and `~/.cache/omp-supervisor/watch.sh`. Lifecycle proof:
 `tests/ctl-alert-lifecycle-integration.test.ts`.
+
+Raw warning/critical signals without actual attempts/results and current remediation
+route internally through `runInternalAlertSend`: exclusive source holder first, including
+suspended/unreachable holds (exit 5); subscribers only when the slot is vacant. No recipient
+is an explicit local failure (exit 3). A failed/unconfirmed owner post also routes internally
+and retains exit 1. Internal acceptance never claims recovery started. The local throttle
+store persists immutable incident text and pending/acknowledged recipient identities before
+I/O; claim-fenced retries preserve text and skip acknowledged sessions, including after
+resubscription. Internal throttle keys do not suppress a later complete owner report.
+The classifier adapter itself persists no body/hash. See `docs/problem-reports.md` and
+`tests/ctl-alert-remediation-integration.test.ts`.
 
 Exclusive holder (tg-cli#747): the same store carries `holders` (at most one per source,
 additive — an old store parses as `holders: []`, `STORE_VERSION` stays 1). The rules
@@ -393,8 +405,16 @@ after Telegram took it is sent again by the retry or the replay.
   append-only `<config>/intent-obligations.jsonl` store and `tg obligations`; `laya-socket.ts`
   is the gate's one impure module: it asks task-cli's ALREADY-WARM laya classify server over
   its unix socket (never spawns it, never loads a model in `tg`, bounded by
-  `TG_LAYA_TIMEOUT_MS`) and laya only ever adds a hint. Scope = agent ancestry or an agent env
-  marker; programs spawned from agent sessions pass `--automated` (tg-ctl's alert and usage
+  `TG_LAYA_TIMEOUT_MS`). Ask scores remain advisory. Every explicit `--tag problem`,
+  including `--automated` and a sender without agent markers, additionally passes
+  `problem-remediation.ts`: actual attempted action plus observed result, and current
+  recovery work (or a precise hard dependency and verification trigger). Laya checks both;
+  a confident negative (p<=0.1) blocks, middling scores are inconclusive, and a positive
+  cannot clear deterministic missing evidence. Unavailable
+  inference is diagnosed separately and deterministic valid reports still pass. Dry-run is
+  offline and explicitly skips Laya. The generic escalation override cannot skip the
+  remediation requirement. Human intervention is optional. See `docs/problem-reports.md`.
+  Other intent scope = agent ancestry or an agent env marker; programs spawned from agent sessions pass `--automated` (tg-ctl's alert and usage
   sends do). `tests/hermetic-env.ts` scrubs the agent markers and sets `TG_LAYA=0`, so the
   suite sees the same (non-agent) sender locally and in CI; a test that wants the gate sets
   `TG_AI_MODEL` in the env it spawns `tg` with.

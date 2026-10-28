@@ -142,10 +142,12 @@ INTENT GATE (every agent-written message, tagged or NOT — tg-cli#706):
   tg reads the body itself, so a missing --tag no longer skips the format:
     • a question to the reader ("…?", "решай", "выбери", "let me know") is a
       decision request and needs the decision format above;
-    • a problem (a blocker you need the human to clear: "блокер", "нет
-      доступа", "blocked on") needs: Context prose; evidence / where to look
-      (file:line, link, log, or the failing output in <code>/<pre>); the ask
-      ("нужен доступ к …", "please grant …"); ≥2 <h3>/<h4> headings and <hr>;
+    • a problem needs: Context prose; evidence / where to look (file:line,
+      link, log, or failing output); Already tried / Уже сделал — concrete
+      action AND observed result; Doing now / Сейчас делаю — current recovery
+      work. A hard blocker states why action cannot proceed, the exact external
+      dependency, and the verification/retry when it clears. A human request is
+      optional. Use ≥2 <h3>/<h4> headings and <hr> for agent-authored reports;
     • a report of finished work ("готово", "смержил", "merged", "deployed")
       needs a reference (#123, ABC-123 or a URL) and verification (tests / CI /
       a live check); over 500 characters, headings or a list (or use
@@ -161,13 +163,23 @@ INTENT GATE (every agent-written message, tagged or NOT — tg-cli#706):
         tg --reply-to <id> --tag decision --format html '…'
       A reply that passes the gate settles it; \`tg obligations\` lists what is
       still owed (--check exits 1 while any is open; dismiss <id> --reason …).
-  Not gated: a sender with no agent identity (no agent process above it, no
-  agent env marker — a cron job). --automated (a program-generated alert or
-  digest) skips the problem/report formats; a prose question is still refused.
-  laya (task-cli's local classifier) is consulted only through its already
-  warm server (never loaded per message; TG_LAYA=0 off, TG_LAYA_TIMEOUT_MS,
-  default 1200) and only adds a hint. ESCALATION_GATE_ENFORCE=0 downgrades a
-  block to a warning. Iterate with --dry-run.
+  Every --tag problem is checked, including --automated and senders without
+  agent markers. --automated skips layout requirements, never actions/results.
+  Headings alone, "under observation", and future promises do not count. Report
+  only work actually performed; never invent an attempt to satisfy the gate.
+  Other tags keep the agent/automation scope above.
+  Laya uses task-cli's already-warm local socket (TG_LAYA_SOCKET or discovery;
+  never loads/spawns a model). For problems it checks both required facts; a
+  confident negative (p<=0.1) blocks; middling scores are inconclusive. A positive
+  cannot clear deterministic missing evidence.
+  TG_LAYA_TIMEOUT_MS overrides the bound (problem default 3000 ms; ask hint
+  1200 ms). TG_LAYA=0, no server, timeout, invalid reply or an over-16-KB request
+  prints an unavailable reason and uses the deterministic check. Full action
+  sections are classified; long evidence is never silently cut to the head.
+  --dry-run stays offline: no Laya/socket/network call, no credentials; it checks
+  the same deterministic requirements and reports the semantic check skipped.
+  ESCALATION_GATE_ENFORCE=0 cannot bypass required problem actions/results.
+  Examples and scope: docs/problem-reports.md.
 
 DICTIONARY GATE (banned wording, ALWAYS on, NO bypass flag):
   Every outgoing message — the --title, the body, and the caption of a

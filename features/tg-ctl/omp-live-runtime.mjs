@@ -96,6 +96,22 @@ function authenticated(expected, supplied) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+// Admission order is part of the wire contract: protocol, credential, then the exact process
+// generation. Nothing about the hosted session is read before a request passes all three.
+function assertTrustedRequest(request, { token, pid, instanceId }) {
+  if (!request || request.v !== VERSION) throw failure('unsupported_protocol');
+  if (!authenticated(token, request.token)) throw failure('authentication_failed');
+  if (request.pid !== pid || request.instanceId !== instanceId) throw failure('stale_identity');
+}
+
+// A send must name the live session, carry a bounded request id and a non-empty bounded body.
+function assertSendableRequest(request, current) {
+  if (request.sessionId !== current.sessionId) throw failure('stale_session');
+  if (!safeString(request.requestId, 256)) throw failure('invalid_request_id');
+  if (typeof request.text !== 'string' || request.text.trim().length === 0) throw failure('invalid_message');
+  if (Buffer.byteLength(request.text) > TEXT_MAX) throw failure('message_too_large');
+}
+
 /** @param {{root?:string, snapshot:()=>object, send:(text:string)=>void|Promise<void>}} options */
 export async function startLiveEndpoint({ root = defaultRegistryRoot(), snapshot, send }) {
   if (process.platform === 'win32') throw failure('posix_required');
@@ -136,16 +152,11 @@ export async function startLiveEndpoint({ root = defaultRegistryRoot(), snapshot
   }
   async function dispatch(request) {
     if (closed) throw failure('endpoint_closed');
-    if (!request || request.v !== VERSION) throw failure('unsupported_protocol');
-    if (!authenticated(token, request.token)) throw failure('authentication_failed');
-    if (request.pid !== pid || request.instanceId !== instanceId) throw failure('stale_identity');
+    assertTrustedRequest(request, { token, pid, instanceId });
     const current = state();
     if (request.op === 'status') return { ok: true, v: VERSION, ...current };
     if (request.op !== 'send') throw failure('invalid_operation');
-    if (request.sessionId !== current.sessionId) throw failure('stale_session');
-    if (!safeString(request.requestId, 256)) throw failure('invalid_request_id');
-    if (typeof request.text !== 'string' || request.text.trim().length === 0) throw failure('invalid_message');
-    if (Buffer.byteLength(request.text) > TEXT_MAX) throw failure('message_too_large');
+    assertSendableRequest(request, current);
     const hash = createHash('sha256').update(request.text).digest('hex');
     const key = `${current.sessionId}\0${request.requestId}`;
     const prior = receipts.get(key);
@@ -220,8 +231,11 @@ export async function startLiveEndpoint({ root = defaultRegistryRoot(), snapshot
   return { metadataPath, instanceId, pid, refresh, published, close };
 }
 
-/** One request per connection, bounded and authenticated. Does not spawn any processes. */
-export async function requestEndpoint(meta, payload, timeoutMs = TIMEOUT_MS) {
+/** One request per connection, bounded and authenticated. Does not spawn any processes.
+ * `beforeWrite` is synchronous and may refuse the request. It runs only after connect,
+ * before any frame bytes, so callers can durably pin an uncertain delivery generation.
+ */
+export async function requestEndpoint(meta, payload, timeoutMs = TIMEOUT_MS, beforeWrite) {
   const request = { ...payload, v: VERSION, pid: meta.pid, instanceId: meta.instanceId, token: meta.token };
   const wire = Buffer.from(`${JSON.stringify(request)}\n`);
   if (wire.length > FRAME_MAX) throw failure('frame_too_large');
@@ -234,7 +248,12 @@ export async function requestEndpoint(meta, payload, timeoutMs = TIMEOUT_MS) {
     // treat `endpoint_unavailable` as "no endpoint", so never report it after connect.
     socket.on('error', () => finish(failure(connected ? 'endpoint_connection_lost' : 'endpoint_unavailable')));
     socket.on('end', () => { if (!settled) finish(failure('incomplete_reply')); });
-    socket.on('connect', () => { connected = true; socket.write(wire); });
+    socket.on('connect', () => {
+      connected = true;
+      if (settled) return;
+      try { beforeWrite?.(); if (!settled) socket.write(wire); }
+      catch (err) { finish(err); }
+    });
     socket.on('data', chunk => {
       buffer = Buffer.concat([buffer, chunk]);
       if (buffer.length > FRAME_MAX) { finish(failure('response_too_large')); return; }
@@ -308,7 +327,7 @@ export async function listLiveEndpoints(root = defaultRegistryRoot()) {
   return (await probed(root)).map(r => r.status);
 }
 
-export async function sendLiveMessage({ root = defaultRegistryRoot(), pid, instanceId, sessionId, requestId, text }) {
+export async function sendLiveMessage({ root = defaultRegistryRoot(), pid, instanceId, sessionId, requestId, text, beforeSend }) {
   if (!Number.isSafeInteger(pid) || pid <= 0) throw failure('exact_pid_required');
   if (typeof text !== 'string' || !text.trim()) throw failure('invalid_message');
   if (Buffer.byteLength(text) > TEXT_MAX) throw failure('message_too_large');
@@ -319,7 +338,8 @@ export async function sendLiveMessage({ root = defaultRegistryRoot(), pid, insta
   const { meta, status } = matches[0];
   if (instanceId !== undefined && instanceId !== status.instanceId) throw failure('stale_identity');
   if (sessionId !== undefined && sessionId !== status.sessionId) throw failure('stale_session');
-  const reply = await requestEndpoint(meta, { op: 'send', sessionId: status.sessionId, requestId, text });
+  const reply = await requestEndpoint(meta, { op: 'send', sessionId: status.sessionId, requestId, text }, TIMEOUT_MS,
+    beforeSend ? () => beforeSend(status) : undefined);
   if (reply.accepted !== true || reply.sessionId !== status.sessionId || reply.requestId !== requestId) throw failure('invalid_acceptance');
   return reply;
 }

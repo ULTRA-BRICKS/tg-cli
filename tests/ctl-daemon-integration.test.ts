@@ -178,19 +178,19 @@ test('daemon round-trip: old owner message still delivered, guard replies, /stat
     await Bun.sleep(50);
   }
 
-  // (a) prompt from allowed sender → inject attempted → no panes → guard reply.
-  expect(sent[0]?.text).toBe(NO_AGENT_REPLY);
-  // (b) /status → composed status names THIS daemon as running.
-  expect(sent[1]?.text).toContain(`tg-ctl: running (pid ${daemon.pid})`);
-  expect(sent[1]?.text).toContain('offset: 105');
-  expect(sent[1]?.text).toContain('usage telemetry: shadowed by');
-  expect(sent[1]?.text).toContain(join(statusProject, '.claude', 'settings.json'));
-  // (c) OLD owner message (#183) is NOT dropped by age — it is delivered like any
-  // other, degrading to the no-agent guard here (no "skipped N stale" notice).
-  expect(sent[2]?.text).toBe(NO_AGENT_REPLY);
-  // (e) photo → downloaded, then the inject for it degrades to the guard too.
-  expect(sent[3]?.text).toBe(NO_AGENT_REPLY);
+  // Concurrency contract (concurrent-dispatch.ts): replies to independent
+  // targets and the /status reply may interleave freely, so no fixed
+  // cross-response index. Exact cardinality instead: (a) the allowed-sender
+  // prompt, (c) the OLD owner message (#183 — delivered like any other, never
+  // "skipped" by age) and (e) the photo inject all degrade to the no-agent
+  // guard; (b) exactly one /status reply naming THIS daemon.
+  const statusReply = sent.filter((m) => m.text.includes(`tg-ctl: running (pid ${daemon.pid})`));
   expect(sent).toHaveLength(4);
+  expect(sent.filter((m) => m.text === NO_AGENT_REPLY)).toHaveLength(3);
+  expect(statusReply).toHaveLength(1);
+  expect(statusReply[0]?.text).toContain('offset: 105');
+  expect(statusReply[0]?.text).toContain('usage telemetry: shadowed by');
+  expect(statusReply[0]?.text).toContain(join(statusProject, '.claude', 'settings.json'));
   expect(sent.some((m) => m.text.includes('skipped'))).toBe(false);
   for (const m of sent) expect(m.chat_id).toBe(1);
 
