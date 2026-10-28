@@ -52,6 +52,10 @@ export interface HistoryRecord {
   // answers — Telegram does not infer the topic from the reply anchor in a private chat with
   // topics, so a reply that names no thread lands in General.
   threadId?: number | null;
+  // The remote machine that sent this message (docs/specs/2026-10-28-remote-ctl-server.md §5): set
+  // ONLY by the daemon when it records a message another machine sent. Such a row's `pane` and
+  // `sessionKey` are `<machine>/…`, so a remote `%3` never equals a local one. Absent = this machine.
+  machine?: string;
 }
 
 // Keep the tail only — recency is what `replies` shows, and the file must not
@@ -60,6 +64,48 @@ export const MAX_HISTORY = 5000;
 
 function isDirection(v: unknown): v is Direction {
   return v === 'user' || v === 'agent';
+}
+
+function nonEmptyString(v: unknown): string | undefined {
+  return typeof v === 'string' && v !== '' ? v : undefined;
+}
+
+// A line whose required fields are all present and well-typed.
+function hasRequiredFields(r: Record<string, unknown>): r is Record<string, unknown> & Pick<HistoryRecord, 'ts' | 'message_id' | 'direction' | 'from' | 'text' | 'pane'> {
+  return (
+    typeof r.ts === 'number' &&
+    (typeof r.message_id === 'number' || r.message_id === null) &&
+    isDirection(r.direction) &&
+    typeof r.from === 'string' &&
+    typeof r.text === 'string' &&
+    (typeof r.pane === 'string' || r.pane === null)
+  );
+}
+
+// The optional, informational fields. An absent or malformed one just means "unknown", never an
+// invalid record.
+function optionalFields(r: Record<string, unknown>): Partial<HistoryRecord> {
+  // groupId: an empty string is treated the same as absent: groupMultiPartSends' adjacency check is
+  // `r.groupId !== undefined && prev?.groupId === r.groupId`, and two DIFFERENT records both carrying
+  // `groupId: ''` (a hand-edited or corrupted line — the write path only ever emits
+  // crypto.randomUUID(), never '') would otherwise satisfy that check and wrongly merge.
+  const groupId = nonEmptyString(r.groupId);
+  // targetAgent, symmetric with groupId: an absent or empty value is "untagged / unknown" (a legacy
+  // row, or a send with no resolvable target).
+  const targetAgent = nonEmptyString(r.targetAgent);
+  const sessionKey = nonEmptyString(r.sessionKey);
+  // Same shape as MACHINE_RE in tg-ctl/remote-routes.ts (this module stays free of tg-ctl imports).
+  const machine = typeof r.machine === 'string' && /^[a-z][a-z0-9-]{0,31}$/.test(r.machine) ? r.machine : undefined;
+  // A topic id is a positive integer; null is General. Anything else is "unknown", never trusted.
+  const threadId = r.threadId === null || (typeof r.threadId === 'number' && Number.isInteger(r.threadId) && r.threadId > 0) ? (r.threadId as number | null) : undefined;
+  return {
+    ...(typeof r.chat_id === 'number' ? { chat_id: r.chat_id } : {}),
+    ...(groupId !== undefined ? { groupId } : {}),
+    ...(targetAgent !== undefined ? { targetAgent } : {}),
+    ...(sessionKey !== undefined ? { sessionKey } : {}),
+    ...(machine !== undefined ? { machine } : {}),
+    ...(threadId !== undefined ? { threadId } : {}),
+  };
 }
 
 // One JSONL line → a record, or null when the line is blank/garbage/incomplete.
@@ -74,40 +120,8 @@ function parseLine(line: string): HistoryRecord | null {
   }
   if (!parsed || typeof parsed !== 'object') return null;
   const r = parsed as Record<string, unknown>;
-  if (typeof r.ts !== 'number') return null;
-  if (!(typeof r.message_id === 'number' || r.message_id === null)) return null;
-  if (!isDirection(r.direction)) return null;
-  if (typeof r.from !== 'string') return null;
-  if (typeof r.text !== 'string') return null;
-  if (!(typeof r.pane === 'string' || r.pane === null)) return null;
-  // groupId is optional/informational — an absent or malformed value just
-  // means "not part of a known multi-part group", never an invalid record.
-  // An empty string is treated the same as absent: groupMultiPartSends'
-  // adjacency check is `r.groupId !== undefined && prev?.groupId === r.groupId`,
-  // and two DIFFERENT records both carrying `groupId: ''` (a hand-edited or
-  // corrupted line — the write path only ever emits crypto.randomUUID(),
-  // never '') would otherwise satisfy that check and wrongly merge.
-  const groupId = typeof r.groupId === 'string' && r.groupId !== '' ? r.groupId : undefined;
-  // targetAgent is optional/informational, symmetric with groupId: an absent or
-  // empty value is "untagged / unknown" (a legacy row, or a send with no
-  // resolvable target), never an invalid record.
-  const targetAgent = typeof r.targetAgent === 'string' && r.targetAgent !== '' ? r.targetAgent : undefined;
-  const sessionKey = typeof r.sessionKey === 'string' && r.sessionKey !== '' ? r.sessionKey : undefined;
-  // A topic id is a positive integer; null is General. Anything else is "unknown", never trusted.
-  const threadId = r.threadId === null || (typeof r.threadId === 'number' && Number.isInteger(r.threadId) && r.threadId > 0) ? (r.threadId as number | null) : undefined;
-  return {
-    ts: r.ts,
-    message_id: r.message_id,
-    ...(typeof r.chat_id === 'number' ? { chat_id: r.chat_id } : {}),
-    direction: r.direction,
-    from: r.from,
-    text: r.text,
-    pane: r.pane,
-    ...(groupId !== undefined ? { groupId } : {}),
-    ...(targetAgent !== undefined ? { targetAgent } : {}),
-    ...(sessionKey !== undefined ? { sessionKey } : {}),
-    ...(threadId !== undefined ? { threadId } : {}),
-  };
+  if (!hasRequiredFields(r)) return null;
+  return { ts: r.ts, message_id: r.message_id, direction: r.direction, from: r.from, text: r.text, pane: r.pane, ...optionalFields(r) };
 }
 
 // Where message `messageId` of `chatId` sits (tg-cli#551): its topic id, `null` for General,

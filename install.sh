@@ -109,7 +109,7 @@ ln -sfn "$ENTRY_PATH" "$BIN/$TOOL"
 echo "tg: symlinked $BIN/$TOOL -> $ENTRY_PATH"
 
 # Independent optional clients: no auth or dependency installation during setup.
-for client in tg-mtproto tg-call call-cli; do
+for client in tg-mtproto tg-call call-cli tg-remote; do
   if [[ -f "$SRC/$client" ]]; then
     chmod +x "$SRC/$client"
     ln -sfn "$SRC/$client" "$BIN/$client"

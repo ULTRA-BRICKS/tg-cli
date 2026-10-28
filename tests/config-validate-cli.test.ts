@@ -83,6 +83,42 @@ test('invalid settings exit 1 with file:line diagnostics on stderr', () => {
   expect(readFileSync(path, 'utf8')).toBe(yaml);
 });
 
+test('a valid laya block passes and an invalid one is reported by the Python caller with its line', () => {
+  const good = fixture('control:\n  enabled: true\nlaya:\n  autostart: false\n  warm_timeout_ms: 2000\n  task_bin: /usr/bin/task\n');
+  const ok = run(['config', 'validate'], good.home, good.configDir);
+  expect(ok.code).toBe(0);
+  expect(ok.out).toBe(`${join(good.configDir, 'config.yaml')}: valid\n`);
+
+  const yaml = 'laya:\n  enabled: false\n  required: true\n  warm_timeout_ms: soon\n  bogus: 1\n  task_bin: task\n';
+  const bad = fixture(yaml);
+  const path = join(bad.configDir, 'config.yaml');
+  const result = run(['config', 'validate'], bad.home, bad.configDir);
+  expect(result.code).toBe(1);
+  expect(result.err).toContain(`${path}:3: error: laya.required: true conflicts with laya.enabled: false`);
+  expect(result.err).toContain(`${path}:4: error: laya.warm_timeout_ms must be a positive integer (got 'soon')`);
+  expect(result.err).toContain(`${path}:5: error: laya.bogus is not a known setting`);
+  expect(result.err).toContain(`${path}:6: error: laya.task_bin must be an absolute path (got 'task')`);
+  expect(readFileSync(path, 'utf8')).toBe(yaml);
+});
+
+test('laya.socket must be an absolute path without .. and a valid one passes', () => {
+  const good = fixture('laya:\n  socket: /home/u/.local/state/tg-cli/laya-ubuntu.sock\n');
+  expect(run(['config', 'validate'], good.home, good.configDir).code).toBe(0);
+  const bad = fixture('laya:\n  socket: laya.sock\n');
+  const relative = run(['config', 'validate'], bad.home, bad.configDir);
+  expect(relative.code).toBe(1);
+  expect(relative.err).toContain(`${join(bad.configDir, 'config.yaml')}:2: error: laya.socket must be an absolute path (got 'laya.sock')`);
+  const dotdot = fixture('laya:\n  socket: /a/../b.sock\n');
+  expect(run(['config', 'validate'], dotdot.home, dotdot.configDir).err).toContain('laya.socket must not contain ..');
+});
+
+test('an inline laya value is reported once, by the structural check', () => {
+  const { home, configDir } = fixture('laya: true\n');
+  const result = run(['config', 'validate'], home, configDir);
+  expect(result.code).toBe(1);
+  expect(result.err.match(/:1: error:/g)).toHaveLength(1);
+});
+
 test('legacy forms warn but still exit 0', () => {
   const { home, configDir } = fixture('control:\n  topics: yes\n');
   const result = run(['config', 'validate'], home, configDir);

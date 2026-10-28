@@ -234,7 +234,7 @@ Agents skipped `--tag decision`, so the decision-format gate never ran and bare 
 
 Scope: an agent process above `tg` or an agent's env marker (`TG_AI_MODEL`, `CLAUDECODE`, `RIG_AGENT_ID`, …). A cron job is not gated; a program spawned from an agent session passes `--automated` (tg-ctl's alerts and usage digests do), which skips the problem/report formats but still refuses a prose question. `ESCALATION_GATE_ENFORCE=0` downgrades a block to a warning, as for `--tag decision`.
 
-**laya** (task-cli's local classifier, the PyPI `laya` package) is asked only when the heuristic found no question, only through task-cli's **already-warm** classify server (a unix socket under `~/.local/state/task-cli/classify/`; `tg` never starts it and never loads a model), within `TG_LAYA_TIMEOUT_MS` (default 1200). A high P(asks the reader) adds a hint; it never blocks or passes a message on its own — measured on Russian agent messages, both laya checkpoints missed questions the regex detector catches. `TG_LAYA=0` turns the lookup off.
+**laya** (task-cli's local classifier, the PyPI `laya` package) is asked only when the heuristic found no question, through task-cli's classify server (a unix socket under `~/.local/state/task-cli/classify/`). When no server answers, `tg` runs `task classify-server start` once (bounded by `laya.cold_timeout_sec`, default 75 s; a failed start is not retried for 300 s; start it by hand with `task classify-server start`), then asks within `laya.warm_timeout_ms` (default 3000 ms, `TG_LAYA_TIMEOUT_MS`). To use a Laya served elsewhere (for example a private proxy socket to another machine), pin it durably with `laya.socket: /absolute/path/laya.sock` (or `TG_LAYA_SOCKET`, which wins): a pinned socket must sit in a private directory you own, is never replaced, and `tg` never starts `task` or a model for it. `tg` never loads a model itself and `--dry-run` never starts or contacts Laya. A high P(asks the reader) adds a hint; it never blocks or passes a message on its own — measured on Russian agent messages, both laya checkpoints missed questions the regex detector catches. If Laya is unavailable for any reason the hint names the reason, what was tried and the next step; `laya.required: true` makes that a failure instead (exit 1, nothing sent). `TG_LAYA=0` or `laya.enabled: false` turns the lookup off; the `laya:` settings are in `tg help config`.
 
 ### Autolinks
 
@@ -484,6 +484,32 @@ or explicit daemon starts. Use `tg-ctl stop` to stop the daemon now, or
 other control settings.
 
 > **One bot token per machine.** Telegram allows a single `getUpdates` consumer per token. Outbound `tg` is unaffected.
+
+### Agents on a second machine — one `tg-ctl` server (v1.74.0)
+
+One bot token has exactly one `getUpdates` poller. When agents also run on another machine, name the server that
+runs `tg-ctl` in that machine's config instead of starting a second daemon:
+
+```yaml
+# second machine (client): ~/.config/tg-cli/config.yaml
+control:
+  server: ssh://tg-ctl-ubuntu     # an alias from ~/.ssh/config: host, port, key and pinned host key live there
+  machine: clvm                   # this machine's name in routes and history ([clvm/<window>] in the header)
+
+# the machine that runs tg-ctl
+control:
+  remote_machines: "clvm=ultra@65.21.40.51"   # peers it serves and delivers replies to
+```
+
+The client still posts to Telegram itself (attachments come from its own disk); each send is then recorded on the
+server, so a Telegram reply to it is typed into that exact session on that machine. A client never starts a poller
+(`tg-ctl run|start|restart|enable` exit 78); a bad `control.server` / `control.machine` / `control.remote_machines`
+value stops `tg`, `tg-ctl` and `tg config validate` with exit 78 and a diagnostic. `tg-ctl status` prints the
+server, the transport and a real round trip. `tg-remote doctor [--no-network]` checks config, link and journal.
+If the link is down at send time the message is out, a stderr warning names the journal entry and `tg-remote client
+flush` replays it. Not supported on a client (refused with an explicit message): forum topics, question/permission
+cards, `tg-ctl ask|withdraw|alert|inbox`, inbound photos/documents, outbox replay. Spec:
+`docs/specs/2026-10-28-remote-ctl-server.md`.
 
 ### Forum topics — one topic per agent (opt-in, experimental)
 

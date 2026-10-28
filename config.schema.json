@@ -102,6 +102,27 @@
             true
           ],
           "default": true
+        },
+        "server": {
+          "type": "string",
+          "description": "Client machine only: the ssh_config alias of the host that runs tg-ctl, as ssh://<alias> (alias or host name only: no user, port, path or leading dash; key, port, jump host and host-key pinning belong in ~/.ssh/config). Setting it makes this machine a ctl client: tg-ctl run/start/restart/enable exit 78 and tg never autostarts a daemon. Requires control.machine; a machine is a client or the daemon host, never both.",
+          "examples": [
+            "ssh://tg-ctl-ubuntu"
+          ]
+        },
+        "machine": {
+          "type": "string",
+          "description": "Client machine only: this machine's name in the server's routes and history, 1-32 characters of a-z, 0-9 and -, starting with a letter. Required with control.server.",
+          "examples": [
+            "clvm"
+          ]
+        },
+        "remote_machines": {
+          "type": "string",
+          "description": "Daemon host only: comma-separated name=ssh-target list of the client machines this tg-ctl serves (at most 8, unique names; target is [user@]host). It is both the allowlist of peers and the address replies are delivered to. Not allowed together with control.server or control.machine.",
+          "examples": [
+            "clvm=ultra@clvm.example.com"
+          ]
         }
       }
     },
@@ -266,6 +287,73 @@
           "default": true,
           "examples": [
             true
+          ]
+        }
+      }
+    },
+    "laya": {
+      "type": "object",
+      "description": "Laya, the local model tg asks about reports. tg starts it when it is not running. Read and validated by the Python caller (src/tgcli/laya): an invalid block exits 78 where Laya is consulted.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Ask Laya about reports at all. false (or TG_LAYA=0) switches the model off: the deterministic checks decide alone and no hint is printed on the ask path. Incompatible with required: true.",
+          "examples": [
+            true
+          ],
+          "default": true
+        },
+        "autostart": {
+          "type": "boolean",
+          "description": "When no live Laya server answers, start one with `task classify-server start` (bounded by cold_timeout_sec). A failed start is not retried for 300 seconds. TG_LAYA_AUTOSTART overrides. --dry-run never starts anything.",
+          "examples": [
+            true
+          ],
+          "default": true
+        },
+        "required": {
+          "type": "boolean",
+          "description": "Fail a send (exit 1, before any Telegram request) when Laya was consulted and is unavailable for any reason, instead of falling back to the deterministic checks with a hint. TG_LAYA_REQUIRED overrides. Cannot be combined with enabled: false or TG_LAYA=0 (exit 78).",
+          "examples": [
+            false
+          ],
+          "default": false
+        },
+        "cold_timeout_sec": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Seconds allowed for the autostart (spawn plus model load). Measured cold start: 6.4 s on a CPU host; task classify-server start itself waits up to 60 s, so the default leaves room for its own diagnostic. TG_LAYA_COLD_TIMEOUT_SEC overrides.",
+          "examples": [
+            75,
+            120
+          ],
+          "default": 75
+        },
+        "warm_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Milliseconds allowed for one request to a running server. Measured warm calls: 31-64 ms (GPU/fast host), 267-1395 ms (CPU host, the first call being the slowest). TG_LAYA_TIMEOUT_MS overrides.",
+          "examples": [
+            3000,
+            2000
+          ],
+          "default": 3000
+        },
+        "task_bin": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path of the task executable used for autostart. Without it tg searches PATH entries that are absolute, not world-writable and owned by you or root, never the current directory. A path that is relative, missing or not executable is an error, not a fallback.",
+          "examples": [
+            "/usr/local/bin/task"
+          ]
+        },
+        "socket": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path of a private Unix socket served by an external Laya (for example a proxy to another machine). Pins it durably: tg uses exactly this socket, never starts `task` or any model for it, and an unreachable pinned socket is an unavailable Laya (with laya.required: true the send fails). The parent directory must be owned by you with no group/other access and the socket must be yours. Relative, empty or `..`-containing values are an error (exit 78). TG_LAYA_SOCKET overrides.",
+          "examples": [
+            "/run/user/1000/tg-cli/laya.sock"
           ]
         }
       }

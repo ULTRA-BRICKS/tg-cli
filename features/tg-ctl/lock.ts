@@ -43,6 +43,9 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     alertThrottle: join(configDir, `${base}.alert-throttle.json`),
     outbox: join(configDir, `${base}.outbox`),
     chatgptRefs: join(configDir, `${base}.chatgpt-refs.json`),
+    remoteDir: join(configDir, 'remote'),
+    remoteRoutes: join(configDir, `${base}.remote-routes.json`),
+    remoteStatus: join(configDir, `${base}.remote-status.json`),
   };
 }
 
@@ -205,6 +208,8 @@ export function flockPidsForInode(procLocks: string, ino: string): number[] {
 // NO TTY check — agents call tg through a piped Bash tool, so isatty is false
 // in exactly the scenario that must fire; the TMUX check alone excludes
 // CI/cron. Fire-and-forget: the daemon's flock makes double-starts a no-op.
+// A ctl client (control.server set) NEVER auto-starts: its daemon runs elsewhere, and a second
+// getUpdates poller on one bot token is exactly what the remote-ctl design rules out.
 export function shouldAutoStart(env: { TMUX?: string }, cfg: ControlConfig): boolean {
-  return Boolean(env.TMUX) && cfg.enabled;
+  return Boolean(env.TMUX) && cfg.enabled && cfg.server === undefined;
 }

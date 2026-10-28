@@ -1,0 +1,16 @@
+#!/usr/bin/env -S python3 -I
+"""Remote ctl endpoint and client tool: stdlib only, no venv.
+
+Always run isolated (`python3 -I tg-remote …`, which the shebang also does): no cwd or script
+directory on sys.path, PYTHON* ignored. The only import root added is this checkout's own
+`src`, so a `tgcli/` planted in the caller's cwd can never execute.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "src"))
+
+from tgcli.remote.cli import run  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(run())

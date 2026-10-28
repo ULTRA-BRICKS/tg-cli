@@ -4,6 +4,7 @@ import { writeStdoutLine } from "../stdout-line"
 import { accessSync, constants as fsConstants, statSync } from "fs"
 import { checkAttachmentFile, type FileCheckDeps } from "../../auto-attach/file-check"
 import { formatIntentVerdict } from "../intent-gate"
+import type { RemoteMode } from "../../tg-ctl/remote-config"
 import type { PreparedMessage, SendAction } from "./types"
 
 // Real fs wiring for the pure checkAttachmentFile (tg-cli#207) — the
@@ -72,9 +73,16 @@ function reportAttachments(items: SendAction["items"], fileCheckDeps: FileCheckD
 // scaffold/placeholder drafts (an agent testing whether its markup satisfies the strict
 // gate) reached the live chat. --dry-run stops here: no credential check, no
 // autolink/network lookups, no transport, no send.
-export function reportDryRunAndExit(send: SendAction, prepared: PreparedMessage, fileCheckDeps: FileCheckDeps): never {
+export function reportDryRunAndExit(
+  send: SendAction,
+  prepared: PreparedMessage,
+  fileCheckDeps: FileCheckDeps,
+  remote: RemoteMode = { mode: "local" },
+): never {
   writeStdoutLine(dryRunHeadline(send, prepared))
   if (prepared.intent.action === "follow-up") writeStdoutLine(formatIntentVerdict(prepared.intent))
+  // The role this machine would send as. Nothing is contacted: no tg-remote, no ssh, no journal.
+  if (remote.mode === "client") writeStdoutLine(`remote: client of ${remote.server} as ${remote.machine} (not contacted)`)
   // NOTE: this is the body as assembled so far (post table/pipe-table
   // conversion, pre-autolink) — autolink-tasks/autolink-msgrefs run AFTER
   // this point and can still rewrite it before a real send. It is the exact

@@ -54,12 +54,27 @@ async function writeEntry(
   }
 }
 
+// A ctl client has no daemon to replay an outbox (spec §3): queueing would strand the message
+// forever behind a "queued" promise nobody keeps. Refuse, write nothing, and let the agent retry.
+// The ids that DID go out before Telegram stopped answering are still recorded on the server, so
+// a reply to one of them reaches its session.
+async function refuseOutboxOnClient(run: OutboundRun, removePdfTempDirs: () => void): Promise<never> {
+  removePdfTempDirs()
+  if (run.recorder.outboundIds.length > 0) {
+    run.recorder.recordOutboundHistory(run.prepared.caption)
+    await run.recorder.publishRemote?.()
+  }
+  console.error("tg: Telegram unreachable; client machines have no outbox replay — nothing queued, retry the send")
+  process.exit(1)
+}
+
 export async function persistQueuedSends(
   run: OutboundRun,
   queuedSends: QueuedSend[],
   sendStartedAt: number,
   removePdfTempDirs: () => void,
 ): Promise<never> {
+  if (run.remote.mode === "client") await refuseOutboxOnClient(run, removePdfTempDirs)
   const ctl = ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(run.paths.home, ".config", "tg-cli"), botIdFromToken(run.sender.botToken))
   const reason = queuedSends.find((s) => s.reason !== undefined)?.reason ?? "Telegram unavailable"
   const { id, writeError } = await writeEntry(run, ctl.outbox, queuedSends, sendStartedAt)

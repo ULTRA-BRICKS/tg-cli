@@ -1,7 +1,7 @@
 """Pure control-block parsing and resolution, without a YAML dependency."""
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Literal, TypedDict, cast
 
@@ -20,6 +20,9 @@ class ControlConfigRaw(TypedDict, total=False):
     topics: bool
     private_topics: bool
     git_state_banner: bool
+    server: str
+    machine: str
+    remote_machines: str
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,10 @@ class ControlConfig:
     topics: bool = False
     private_topics: bool = False
     git_state_banner: bool = True
+    # Raw, unvalidated scalars: `tgcli.remote.config.check` is the one place that judges them.
+    server: str | None = None
+    machine: str | None = None
+    remote_machines: str | None = None
 
 
 DEFAULT_CONTROL = ControlConfig()
@@ -46,8 +53,15 @@ def _unquote(s: str) -> str:
     return re.sub(r"""^["']|["']$""", "", s)
 
 
-def parse_control_config(text: str) -> ControlConfigRaw:
-    out: ControlConfigRaw = {}
+_BOOLEAN_KEYS = frozenset({"enabled", "topics", "private_topics", "git_state_banner"})
+_STRING_KEYS = frozenset(
+    {"transport", "session", "inject_wrap", "server", "machine", "remote_machines"}
+)
+_INTEGER_KEYS = frozenset({"staleness_sec", "idle_exit_min"})
+
+
+def _control_pairs(text: str) -> Iterator[tuple[str, str]]:
+    """Yield the non-empty `key: value` scalars of the top-level `control:` block."""
     in_control = False
     for raw_line in text.split("\n"):
         line = re.sub(JS_WHITESPACE_PATTERN + r"+#[^\r\n\u2028\u2029]*\Z", "", raw_line)
@@ -60,37 +74,33 @@ def parse_control_config(text: str) -> ControlConfigRaw:
             continue
         key, value = js_trim(line).split(":", 1)
         key, value = _unquote(js_trim(key)), js_trim(value)
-        if not value:
-            continue
-        if key in {"enabled", "topics", "private_topics", "git_state_banner"}:
-            token = value.lower()
-            if token in _TRUE_TOKENS or token in _FALSE_TOKENS:
-                boolean = token in _TRUE_TOKENS
-                if key == "enabled":
-                    out["enabled"] = boolean
-                elif key == "topics":
-                    out["topics"] = boolean
-                elif key == "private_topics":
-                    out["private_topics"] = boolean
-                else:
-                    out["git_state_banner"] = boolean
-        elif key == "transport":
-            out["transport"] = _unquote(value)
-        elif key == "session":
-            out["session"] = _unquote(value)
-        elif key == "inject_wrap":
-            out["inject_wrap"] = _unquote(value)
-        elif key == "staleness_sec" and _INT_RE.fullmatch(value):
-            out["staleness_sec"] = js_number(value)
-        elif key == "idle_exit_min" and _INT_RE.fullmatch(value):
-            out["idle_exit_min"] = js_number(value)
-        elif key == "allowed_senders":
-            out["allowed_senders"] = [
-                js_number(js_trim(s))
-                for s in _unquote(value).split(",")
-                if _INT_RE.fullmatch(js_trim(s))
-            ]
-    return out
+        if value:
+            yield key, value
+
+
+def _apply_control_pair(out: dict[str, object], key: str, value: str) -> None:
+    if key in _BOOLEAN_KEYS:
+        token = value.lower()
+        if token in _TRUE_TOKENS or token in _FALSE_TOKENS:
+            out[key] = token in _TRUE_TOKENS
+    elif key in _STRING_KEYS:
+        out[key] = _unquote(value)
+    elif key in _INTEGER_KEYS:
+        if _INT_RE.fullmatch(value):
+            out[key] = js_number(value)
+    elif key == "allowed_senders":
+        out[key] = [
+            js_number(js_trim(s))
+            for s in _unquote(value).split(",")
+            if _INT_RE.fullmatch(js_trim(s))
+        ]
+
+
+def parse_control_config(text: str) -> ControlConfigRaw:
+    out: dict[str, object] = {}
+    for key, value in _control_pairs(text):
+        _apply_control_pair(out, key, value)
+    return cast(ControlConfigRaw, out)
 
 
 def resolve_control_config(
@@ -121,4 +131,7 @@ def resolve_control_config(
         topics=nullish("topics", DEFAULT_CONTROL.topics),
         private_topics=nullish("private_topics", DEFAULT_CONTROL.private_topics),
         git_state_banner=nullish("git_state_banner", DEFAULT_CONTROL.git_state_banner),
+        server=cast(str | None, raw.get("server")),
+        machine=cast(str | None, raw.get("machine")),
+        remote_machines=cast(str | None, raw.get("remote_machines")),
     )

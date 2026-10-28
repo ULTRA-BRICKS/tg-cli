@@ -42,7 +42,7 @@ import {
   splitSections,
   validateEscalationFormat,
 } from './escalation-format';
-import { validateProblemRemediation, withoutRemediationLabel, type ProblemLayaAssessment } from './problem-remediation';
+import { validateProblemRemediation, withoutRemediationLabel, type LayaUnavailable, type ProblemLayaAssessment } from './problem-remediation';
 
 export type IntentKind = 'decision' | 'problem' | 'report';
 
@@ -72,6 +72,8 @@ export interface IntentInput {
   // laya's P(the message asks the reader something), when the warm server answered.
   layaAskProbability?: number | null;
   layaProblemAssessment?: ProblemLayaAssessment;
+  // Why the ask check got no answer (set when it was consulted and Laya was unavailable).
+  layaAskUnavailable?: LayaUnavailable;
 }
 
 export interface IntentSignals {
@@ -369,7 +371,20 @@ function startClassification(input: IntentInput): Classification {
         'If it does ask, send that question as its own --tag decision message.',
     );
   }
+  // The ask check was due and Laya gave no answer: say why instead of falling back silently.
+  // A switch the owner turned off themselves (`disabled`) stays quiet.
+  const missed = input.layaAskUnavailable;
+  if (missed !== undefined && missed.reason !== 'disabled') {
+    hints.push(`${layaUnavailableText('ask', missed)}; the deterministic detector decided alone.`);
+  }
   return { input, body, sig, kinds, hints };
+}
+
+/** `Laya <check> check unavailable (<reason>): tried <attempt>. Next: <remedy>` — each part when known. */
+function layaUnavailableText(check: 'ask' | 'problem', missed: LayaUnavailable): string {
+  const tried = missed.attempt ? `: tried ${missed.attempt}` : '';
+  const next = missed.remedy ? `. Next: ${missed.remedy}` : '';
+  return `Laya ${check} check unavailable (${missed.reason})${tried}${next}`;
 }
 
 /** A warm Laya score for both parts of a problem: what it adds as missing items and as hints. */
@@ -389,7 +404,7 @@ function layaScoreFindings(assessment: { done: number; current: number }): { mis
 function layaProblemFindings(assessment: ProblemLayaAssessment | undefined): { missing: string[]; hints: string[] } {
   if (assessment?.status === 'ok') return layaScoreFindings(assessment);
   if (assessment?.status === 'unavailable') {
-    return { missing: [], hints: [`Laya problem check unavailable (${assessment.reason}); deterministic action/result and current-step checks still apply.`] };
+    return { missing: [], hints: [`${layaUnavailableText('problem', assessment)}; deterministic action/result and current-step checks still apply.`] };
   }
   if (assessment?.status === 'skipped') {
     return { missing: [], hints: ['Laya problem check skipped for offline --dry-run; deterministic action/result and current-step checks still apply.'] };

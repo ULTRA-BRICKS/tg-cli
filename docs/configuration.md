@@ -58,8 +58,19 @@ control.enabled scope
   Explicit tg-ctl run and tg-ctl start still work. Use tg-ctl stop to stop the
   daemon now, or tg-ctl disable to remove OS autostart and stop it.
 
+Remote ctl server (control.server, control.machine, control.remote_machines)
+  One bot has one tg-ctl poller. A second machine runs agents against it instead of its own:
+    client machine:       control: server: "ssh://tg-ctl-ubuntu" and machine: "clvm"
+    daemon host (server): control: remote_machines: "clvm=ultra@clvm.example.com"
+  A machine is a client or the daemon host, never both. With none of the three keys
+  behaviour is unchanged. Any of them present but invalid makes every tg send
+  (--dry-run included), tg-ctl run/start/restart/enable and tg config validate fail
+  with the diagnostic (exit 78 / 1); there is no silent fallback to local behavior.
+  An empty value ("") counts as unset.
+  The rules live in tg-remote config check, which runs offline (no network, no ssh).
+
 File syntax and compatibility
-  Use top-level control:, voice:, and features: blocks with one-level scalar
+  Use top-level control:, voice:, features:, and laya: blocks with one-level scalar
   entries. The editor schema recommends unquoted true/false and plain decimal
   integers. The runtime also accepts unquoted yes/no, on/off, and 1/0 booleans.
   Only voice.enabled accepts quoted booleans; control and features do not.
@@ -69,7 +80,23 @@ File syntax and compatibility
   by the feature parser but do not add a feature. The schema flags unknown
   keys to catch mistakes. Full YAML constructs and YAML arrays are unsupported.
   Omit unused blocks; use control.enabled: false or voice.enabled: false
-  for their respective opt-outs.
+  for their respective opt-outs. The laya: block is stricter: an unknown key, a
+  non-boolean value, a non-positive timeout, a relative task_bin or socket, or required: true
+  together with enabled: false (or TG_LAYA=0) is an error (exit 78 where Laya is
+  consulted), never healed into a default.
+
+Laya (the local model behind the report checks)
+  tg asks Laya about explicit problem reports and about bodies in which the
+  deterministic detector found no question. When no server answers, tg runs
+  `task classify-server start` once (a failed start is not retried for 300 s), then
+  asks with the warm timeout. To start it yourself: task classify-server start
+  Environment overrides config.yaml: TG_LAYA (0/false/no/off disables),
+  TG_LAYA_AUTOSTART, TG_LAYA_REQUIRED, TG_LAYA_TIMEOUT_MS (warm_timeout_ms),
+  TG_LAYA_COLD_TIMEOUT_SEC (cold_timeout_sec) and TG_LAYA_SOCKET (laya.socket: use exactly
+  this socket; it is never autostarted, no model is started for it). TG_PYTHON picks the interpreter that runs the caller.
+  Unavailable Laya, for any reason, prints a hint naming the reason, what was tried
+  and the next step. With laya.required: true the send fails instead (exit 1, before
+  any Telegram request). --dry-run never starts, connects to or loads Laya.
 
 Validation
   tg config validate checks config.yaml read-only: no credentials, network, or
@@ -82,6 +109,11 @@ Validation
   with a warning) and rejects text the line checks did not model.
   Warnings (exit 0) are legacy forms the runtime accepts but the editor schema
   flags: yes/no, on/off, 1/0 booleans and quoted voice.enabled/voice.threads.
+  control.server, control.machine and control.remote_machines are checked by the offline
+  tg-remote config check (python3, no network, no ssh); a bad value, or a checker that
+  cannot run while any of them is set, is an error (exit 1).
+  The laya: block is checked by the Python caller (python3 -I <repo>/tg-laya
+  check-config) with the same rules the send path applies; it needs python3 3.12+.
 
 Example config.yaml (credentials stay in .env):
 # yaml-language-server: $schema=./config.schema.json
@@ -147,6 +179,21 @@ control:
     Default: true
     Prepend a warning when a fresh non-reply message is automatically routed into a pane whose repository has uncommitted changes or a non-main branch.
     Example: git_state_banner: true
+
+  control.server (string)
+    Default: unset (this machine is not a ctl client)
+    Client machine only: the ssh_config alias of the host that runs tg-ctl, as ssh://<alias> (alias or host name only: no user, port, path or leading dash; key, port, jump host and host-key pinning belong in ~/.ssh/config). Setting it makes this machine a ctl client: tg-ctl run/start/restart/enable exit 78 and tg never autostarts a daemon. Requires control.machine; a machine is a client or the daemon host, never both.
+    Example: server: "ssh://tg-ctl-ubuntu"
+
+  control.machine (string)
+    Default: unset (required when control.server is set)
+    Client machine only: this machine's name in the server's routes and history, 1-32 characters of a-z, 0-9 and -, starting with a letter. Required with control.server.
+    Example: machine: "clvm"
+
+  control.remote_machines (string)
+    Default: unset (no client machines)
+    Daemon host only: comma-separated name=ssh-target list of the client machines this tg-ctl serves (at most 8, unique names; target is [user@]host). It is both the allowlist of peers and the address replies are delivered to. Not allowed together with control.server or control.machine.
+    Example: remote_machines: "clvm=ultra@clvm.example.com"
 
 voice:
   Local transcription of inbound voice notes.
@@ -246,6 +293,46 @@ features:
     Default: true
     Run pre-send-photo hooks when hook descriptors are installed. AGENTS_HOOKS=0 bypasses these hooks.
     Example: hooks: true
+
+laya:
+  Laya, the local model tg asks about reports. tg starts it when it is not running. Read and validated by the Python caller (src/tgcli/laya): an invalid block exits 78 where Laya is consulted.
+
+  laya.enabled (boolean)
+    Default: true
+    Ask Laya about reports at all. false (or TG_LAYA=0) switches the model off: the deterministic checks decide alone and no hint is printed on the ask path. Incompatible with required: true.
+    Example: enabled: true
+
+  laya.autostart (boolean)
+    Default: true
+    When no live Laya server answers, start one with `task classify-server start` (bounded by cold_timeout_sec). A failed start is not retried for 300 seconds. TG_LAYA_AUTOSTART overrides. --dry-run never starts anything.
+    Example: autostart: true
+
+  laya.required (boolean)
+    Default: false
+    Fail a send (exit 1, before any Telegram request) when Laya was consulted and is unavailable for any reason, instead of falling back to the deterministic checks with a hint. TG_LAYA_REQUIRED overrides. Cannot be combined with enabled: false or TG_LAYA=0 (exit 78).
+    Example: required: false
+
+  laya.cold_timeout_sec (integer; minimum 1)
+    Default: 75
+    Seconds allowed for the autostart (spawn plus model load). Measured cold start: 6.4 s on a CPU host; task classify-server start itself waits up to 60 s, so the default leaves room for its own diagnostic. TG_LAYA_COLD_TIMEOUT_SEC overrides.
+    Example: cold_timeout_sec: 75
+    Example: cold_timeout_sec: 120
+
+  laya.warm_timeout_ms (integer; minimum 1)
+    Default: 3000
+    Milliseconds allowed for one request to a running server. Measured warm calls: 31-64 ms (GPU/fast host), 267-1395 ms (CPU host, the first call being the slowest). TG_LAYA_TIMEOUT_MS overrides.
+    Example: warm_timeout_ms: 3000
+    Example: warm_timeout_ms: 2000
+
+  laya.task_bin (string)
+    Default: unset (task is searched on trusted PATH entries)
+    Absolute path of the task executable used for autostart. Without it tg searches PATH entries that are absolute, not world-writable and owned by you or root, never the current directory. A path that is relative, missing or not executable is an error, not a fallback.
+    Example: task_bin: "/usr/local/bin/task"
+
+  laya.socket (string)
+    Default: unset (tg discovers laya-*.sock under task-cli's classify directory)
+    Absolute path of a private Unix socket served by an external Laya (for example a proxy to another machine). Pins it durably: tg uses exactly this socket, never starts `task` or any model for it, and an unreachable pinned socket is an unavailable Laya (with laya.required: true the send fails). The parent directory must be owned by you with no group/other access and the socket must be yours. Relative, empty or `..`-containing values are an error (exit 78). TG_LAYA_SOCKET overrides.
+    Example: socket: "/run/user/1000/tg-cli/laya.sock"
 ```
 
 ## Maintaining the generated files

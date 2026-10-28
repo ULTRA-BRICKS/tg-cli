@@ -129,6 +129,7 @@ export function createMedia(d: MediaDeps) {
         injectText,
         from: action.from,
         messageId: action.messageId,
+        media: true,
       })
     }
     if (state.selectedAgentRoute) {

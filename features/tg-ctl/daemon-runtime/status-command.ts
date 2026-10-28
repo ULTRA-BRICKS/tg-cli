@@ -173,7 +173,8 @@ function hookStatusLines(ctx: Ctx, statusScopeCwd: string): string[] {
 }
 
 // `topicSettings`: the resolved topicSettingsLine, awaited by the async caller.
-export function composeStatus(ctx: Ctx, statusCwd: string | null, topicSettings: string | null): string {
+// `extraLines`: a block the async caller resolved up front (the hub's remote machines; [] elsewhere).
+export function composeStatus(ctx: Ctx, statusCwd: string | null, topicSettings: string | null, extraLines: string[] = []): string {
   const env = autostartEnv(ctx)
   const runState = probeDaemonRunState(ctx, false)
   const lines: string[] = daemonStateLines(ctx, runState)
@@ -204,5 +205,6 @@ export function composeStatus(ctx: Ctx, statusCwd: string | null, topicSettings:
   // otherwise status lies while launchd keeps the daemon alive across reboots (tg-cli#88).
   const kind = autostartKind(env)
   lines.push(composeAutostartLine(env, kind))
+  lines.push(...extraLines)
   return lines.join("\n")
 }

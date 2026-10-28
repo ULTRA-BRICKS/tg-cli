@@ -12,7 +12,10 @@ import { runChatgptCli } from "../../chatgpt/cli"
 import { spawnPmRunner } from "../../chatgpt/pm-runner"
 import { loadEnv } from "../../config/env"
 import { renderConfigHelp } from "../../config/schema"
-import { CONFIG_VALIDATE_USAGE, renderValidation, validateConfigText } from "../../config/validate"
+import { remoteModeDiagnostics } from "../../config/remote-diagnostics"
+import { layaConfigDiagnostics } from "../laya-socket"
+import { CONFIG_VALIDATE_USAGE, renderValidation } from "../../config/validate"
+import { validateConfigWithLaya } from "../../config/validate-laya"
 import { runHooksCli } from "../../hooks/cli"
 import { installSkill } from "../../install-skill/install"
 import { formatHelp } from "../../render/format-help"
@@ -22,6 +25,8 @@ import { runUserAccount } from "../../user-account/cli"
 import { userAccountDeps } from "../../user-account/sidecar-fs"
 import { OBLIGATIONS_USAGE } from "../obligations"
 import { buildReportSend, isReportError, isReportHelp, REPORT_USAGE } from "../report"
+import { parseControlConfig, resolveControlConfig } from "../../tg-ctl/config"
+import { resolveRemoteMode } from "../../tg-ctl/remote-config"
 import { authDeps } from "./auth-deps"
 import { runObligationsSubcommand } from "./subcommands-obligations"
 import { applyUserShorthand, runRepliesSubcommand } from "./subcommands-replies"
@@ -88,7 +93,15 @@ function runConfigValidate(rawArgs: string[], paths: RuntimePaths): void {
   if (rawArgs.length === 2 && rawArgs[0] === "config" && rawArgs[1] === "validate") {
     const configPath = join(paths.configDir, "config.yaml")
     const raw = readConfigYamlOrExit(configPath)
-    const verdict = renderValidation(configPath, validateConfigText(raw))
+    // Remote-ctl keys are validated once, by the offline `tg-remote config check`; a missing or
+    // broken checker is itself an error here, never a silent pass.
+    const remote = resolveRemoteMode(resolveControlConfig(parseControlConfig(raw)), process.env, { configDir: paths.configDir })
+    const diagnostics = validateConfigWithLaya(raw, layaConfigDiagnostics(configPath, process.env))
+    if (remote.mode === "invalid") {
+      diagnostics.push(...remoteModeDiagnostics(raw, remote))
+      diagnostics.sort((a, b) => a.line - b.line)
+    }
+    const verdict = renderValidation(configPath, diagnostics)
     process.stderr.write(verdict.stderr)
     process.stdout.write(verdict.stdout)
     process.exit(verdict.code)

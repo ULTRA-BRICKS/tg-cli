@@ -201,6 +201,15 @@ test('laya is asked only when the heuristic found no ask, and only adds a hint',
   expect(classifyIntent({ body: 'Готово: #690 смержен, CI зелёный, деплой прошёл.', layaAskProbability: 0.6 }).hints).toEqual([]);
 });
 
+test('an unavailable Laya on the ask check is a hint with reason, attempt and remedy — except an explicit disabled', () => {
+  const body = 'Готово: #690 смержен, CI зелёный, деплой прошёл.';
+  const missed = { status: 'unavailable' as const, reason: 'cold-timeout' as const, attempt: 'ran task classify-server start (cold budget 75 s)', remedy: 'run: task classify-server start' };
+  const v = classifyIntent({ body, layaAskProbability: null, layaAskUnavailable: missed });
+  expect(v.action).toBe('pass');
+  expect(v.hints).toEqual(['Laya ask check unavailable (cold-timeout): tried ran task classify-server start (cold budget 75 s). Next: run: task classify-server start; the deterministic detector decided alone.']);
+  expect(classifyIntent({ body, layaAskUnavailable: { ...missed, reason: 'disabled' } }).hints).toEqual([]);
+});
+
 // --- rendering ----------------------------------------------------------------------
 
 test('the follow-up text names each item and the exact reply command with the sent id', () => {

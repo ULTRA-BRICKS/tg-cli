@@ -91,8 +91,8 @@ copies only.
   and a successor holds the lock.
 - **Linux daemon supervision:** the live `tg-ctl run` is a plain detached process (parent pid 1)
   started by `tg-ctl start`/`restart`. The systemd user unit
-  `agenttools-tg-ctl-tg-ctl.service` (`ExecStart` = the clone's `tg-ctl`) may be installed but
-  disabled. A `…service.d/*.conf` drop-in pinning `ExecStart` to a
+  `agenttools-tg-ctl-tg-ctl.service` (`ExecStart` = the clone's `tg-ctl`) may be enabled on a host.
+  A `…service.d/*.conf` drop-in pinning `ExecStart` to a
   `tg-cli-releases/<ver>-<hash>/tg-ctl` path would make an enabled unit run that frozen
   snapshot instead of the clone — do not leave one behind. Run `tg-ctl enable` by absolute path
   from the clone (`~/.local/share/tg-cli/tg-ctl enable`), never from a worktree or a snapshot:
@@ -296,6 +296,28 @@ failed send releases its own claim. `markHolderDelivery` is fenced on the tenure
 `since`). Known limits: docs/alert-holder.md.
 `unsubscribe --all` never touches holders.
 
+### Remote ctl server: one daemon, clients on other machines (tg-cli#831, docs/specs/2026-10-28-remote-ctl-server.md)
+
+`control.server: ssh://<ssh_config alias>` + `control.machine: <name>` make a machine a ctl CLIENT; `control.remote_machines:
+"name=user@host"` makes the machine that runs `tg-ctl` the HUB. All three are validated once, in Python
+(`tg-remote config check --json`, `src/tgcli/remote/config.py`); TypeScript only reads the raw strings
+(`features/tg-ctl/remote-config.ts`, `resolveRemoteMode`) and treats any checker failure, or a report that
+contradicts the observed keys, as `invalid` (exit 78) — never as local, because a client that fell back to local
+could start a second getUpdates poller. A client never polls: `tg-ctl run|start|restart|enable` exit 78,
+`shouldAutoStart` is false. The wire is one JSON line in/out over SSH stdio, always `python3 -I <launcher>`
+(`src/tgcli/remote/{protocol,ssh,client,server,satellite,hub,journal}.py`, launcher `tg-remote`): client → server
+`ssh … -- <alias> tg-remote server --peer <machine>` (the key's forced command pins the endpoint and the peer; the
+explicit command exists so protocol JSON can never reach a login shell); hub → client `ssh … <target> tg-remote
+satellite serve`. The client sends `record` (route + history of each send, idempotent on `(chat,id)`; journal on
+failure, send is never repeated), the hub stores it in `tg-ctl.<bot>.remote-routes.json` (`features/tg-ctl/
+remote-routes.ts`, namespaced `<machine>/…`, never merged into `routes.json`/`sessions.json`) and delivers a
+reply through `tg-remote hub deliver` → satellite ledger (`claimed → delivered|uncertain|failed`, a replay reports the
+ORIGINAL outcome) → `tg-ctl satellite-deliver` (existing sinks, no ledger). Delivery is at-most-once; after the
+request was written an ssh drop is `uncertain` and is never re-sent. Unsupported on a client and refused with an
+explicit line: session topics/cards, `tg-ctl ask|withdraw|alert|inbox|audit-delivery|harness-event`, inbound media,
+outbox replay. Tests: `tests/remote-*.test.ts`, `tests/py/test_remote_*.py`; the real-SSH acceptance run is
+recorded in the PR, not in the suite.
+
 ### Harness-agnostic control: tmux panes and rig-wrapper hosts (docs/specs/2026-09-30-harness-agnostic-control.md)
 
 A harness session (omp, Claude Code, Codex, opencode) is reached through the terminal that
@@ -443,16 +465,20 @@ after Telegram took it is sent again by the retry or the replay.
   which also gained the Glossary requirement and `decisionLabels`), and the verdict — pass,
   follow-up (sent; one reply per item owed) or block. `obligations.ts` (PURE) is the
   append-only `<config>/intent-obligations.jsonl` store and `tg obligations`; `laya-socket.ts`
-  is the gate's one impure module: it asks task-cli's ALREADY-WARM laya classify server over
-  its unix socket (never spawns it, never loads a model in `tg`, bounded by
-  `TG_LAYA_TIMEOUT_MS`). Ask scores remain advisory. Every explicit `--tag problem`,
+  is the gate's thin glue to the Python Laya caller (`src/tgcli/laya`, run as
+  `python3 -I <repo>/tg-laya`, stdlib only: it owns the `laya:` config, socket trust, autostart
+  of task-cli's classify server via `task classify-server start`, and the timeouts; never loads a
+  model in `tg`). Ask scores remain advisory. Every explicit `--tag problem`,
   including `--automated` and a sender without agent markers, additionally passes
   `problem-remediation.ts`: actual attempted action plus observed result, and current
   recovery work (or a precise hard dependency and verification trigger). Laya checks both;
   a confident negative (p<=0.1) blocks, middling scores are inconclusive, and a positive
   cannot clear deterministic missing evidence. Unavailable
-  inference is diagnosed separately and deterministic valid reports still pass. Dry-run is
-  offline and explicitly skips Laya. The generic escalation override cannot skip the
+  inference is diagnosed separately (typed reason, attempt, remedy; also on the ask path) and
+  deterministic valid reports still pass unless `laya.required: true`, which fails the send
+  before any Bot API request (exit 1; an invalid `laya:` config exits 78); `laya.socket` (env `TG_LAYA_SOCKET` wins) pins an external classifier socket that is never autostarted. Dry-run is
+  offline and never starts or contacts Laya (`tests/hermetic-env.ts` sets `TG_LAYA=0` for every
+  child, so a stray consult can never autostart a model on a dev host). The generic escalation override cannot skip the
   remediation requirement. Human intervention is optional. See `docs/problem-reports.md`.
   Other intent scope = agent ancestry or an agent env marker; programs spawned from agent sessions pass `--automated` (tg-ctl's alert and usage
   sends do). `tests/hermetic-env.ts` scrubs the agent markers and sets `TG_LAYA=0`, so the

@@ -52,7 +52,7 @@ export async function prepareMessage(send: SendAction, sender: SenderContext, in
   const agentAuthored = isAgentAuthored(sender)
   const gatedSender = agentAuthored && send.automated !== true
   if (inv.features["file-mention-guard"] !== false && gatedSender) guardUnattachedFiles(send, dictFields, paths.home)
-  const intent = await runIntentGate(send, caption, env, agentAuthored)
+  const intent = await runIntentGate(send, caption, env, paths.configDir, agentAuthored)
   if (gatedSender) runDimensionGate(send, dictFields, env, paths)
 
   return { caption, effectiveFormat, dictFields, title, sessionNamePrimary: sessionName.primary, agentLabel, intent, agentAuthored, thread }

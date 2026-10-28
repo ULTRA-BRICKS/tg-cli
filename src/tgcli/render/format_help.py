@@ -153,13 +153,17 @@ INTENT GATE (every agent-written message, tagged or NOT — tg-cli#706):
   Headings alone, "under observation", and future promises do not count. Report
   only work actually performed; never invent an attempt to satisfy the gate.
   Other tags keep the agent/automation scope above.
-  Laya uses task-cli's already-warm local socket (TG_LAYA_SOCKET or discovery;
-  never loads/spawns a model). For problems it checks both required facts; a
+  Laya (the local model, run through src/tgcli/laya) is asked via task-cli's classify
+  server; when none answers, tg runs `task classify-server start` once (settings:
+  the laya: block, tg help config). For problems it checks both required facts; a
   confident negative (p<=0.1) blocks; middling scores are inconclusive. A positive
   cannot clear deterministic missing evidence.
-  TG_LAYA_TIMEOUT_MS overrides the bound (problem default 3000 ms; ask hint
-  1200 ms). TG_LAYA=0, no server, timeout, invalid reply or an over-16-KB request
-  prints an unavailable reason and uses the deterministic check. Full action
+  Unavailable Laya, for any reason (disabled, no socket, autostart failed, cold-timeout,
+  timeout, invalid reply, over-16-KB request), prints a hint with the reason, what was
+  tried and the next step; the deterministic check decides. With laya.required: true
+  the send fails instead (exit 1, before any Telegram request); an invalid laya: config
+  exits 78. TG_LAYA_TIMEOUT_MS (3000 ms), TG_LAYA_COLD_TIMEOUT_SEC (75 s), TG_LAYA=0,
+  TG_LAYA_AUTOSTART and TG_LAYA_REQUIRED override the config. Full action
   sections are classified; long evidence is never silently cut to the head.
   --dry-run stays offline: no Laya/socket/network call, no credentials; it checks
   the same deterministic requirements and reports the semantic check skipped.

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from tgcli.common.fsio import append_lines, atomic_write, read_text_lossy
+from tgcli.common.fsio import append_lines, atomic_create, atomic_write, read_text_lossy
 
 
 def test_read_text_lossy_keeps_crlf(tmp_path: Path) -> None:
@@ -131,4 +131,29 @@ def test_atomic_write_zero_write_fails_without_replacing_target(
     with pytest.raises(OSError, match="write"):
         atomic_write(path, "new")
     assert path.read_bytes() == b"old"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["f"]
+
+
+def test_atomic_create_publishes_whole_file_once_and_never_replaces(tmp_path: Path) -> None:
+    path = tmp_path / "f"
+    assert atomic_create(path, "first") is True
+    assert atomic_create(path, "second") is False
+    assert path.read_bytes() == b"first"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["f"]
+
+
+def test_atomic_create_has_exactly_one_winner_among_concurrent_creators(tmp_path: Path) -> None:
+    path = tmp_path / "f"
+    wins: list[bool] = []
+    threads = [
+        threading.Thread(target=lambda n=n: wins.append(atomic_create(path, f"w{n}")))
+        for n in range(12)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert wins.count(True) == 1
+    assert path.read_bytes() in {f"w{n}".encode() for n in range(12)}
     assert sorted(p.name for p in tmp_path.iterdir()) == ["f"]

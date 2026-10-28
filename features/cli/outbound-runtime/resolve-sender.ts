@@ -16,6 +16,7 @@ import { enforceEscalationGate } from "./escalation-gate"
 import { detectAiEmoji, detectAiModel, listEmojiHelpers } from "./model-detect"
 import { ownSessionKey, readSessionRegistry } from "./session-helpers"
 import { resolveSessionIdentity, type SessionIdentity } from "./session-identity"
+import type { RemoteMode } from "../../tg-ctl/remote-config"
 import type { Invocation, MergedEnv, RuntimePaths, SendAction, SenderContext } from "./types"
 
 // Info-only flags inspect local state and send nothing, so they must work
@@ -80,11 +81,14 @@ async function handleSessionTopic(
   botToken: string | undefined,
   inv: Invocation,
   paths: RuntimePaths,
+  remote: RemoteMode,
 ): Promise<void> {
   if (parsed.action !== "sessionTopic") return
   const { pinned, ancestor, hasSessionIdentity, sessionless } = identity
   const ctl = resolveControlConfig(parseControlConfig(inv.configYamlRaw))
-  if (hasSessionIdentity && !sessionless && (ctl.topics || ctl.privateTopics) && botToken) {
+  // A ctl client has no session topics (spec §3): the daemon lives on the server and is never asked.
+  const topicsOn = remote.mode !== "client" && (ctl.topics || ctl.privateTopics)
+  if (hasSessionIdentity && !sessionless && topicsOn && botToken) {
     const answer = parseResolvedSession(
       await askDaemon(ctlPaths(paths.configDir, botIdFromToken(botToken)).socket, {
         kind: "resolve-session",
@@ -133,7 +137,11 @@ function asSendAction(parsed: ParseResult): SendAction {
   process.exit(1)
 }
 
-export async function resolveSender(inv: Invocation, paths: RuntimePaths): Promise<{ send: SendAction; sender: SenderContext }> {
+export async function resolveSender(
+  inv: Invocation,
+  paths: RuntimePaths,
+  remote: RemoteMode = { mode: "local" },
+): Promise<{ send: SendAction; sender: SenderContext }> {
   const { parsed } = inv
   // Help/version/error exits above are pure. Refresh editor metadata only for
   // an actionable invocation; every dry-run leaves config and schema untouched.
@@ -149,7 +157,7 @@ export async function resolveSender(inv: Invocation, paths: RuntimePaths): Promi
   const aiEmoji = detectAiEmoji(env, model)
   handleModelInfoActions(parsed, model, aiEmoji)
 
-  const identity = resolveSessionIdentity(parsed, env, paths.configDir)
+  const identity = resolveSessionIdentity(parsed, env, paths.configDir, remote.mode === "client" ? remote.machine : undefined)
   handleDetectAgent(parsed, identity, env)
   enforceParseTimeEscalationGate(parsed, env)
 
@@ -158,7 +166,7 @@ export async function resolveSender(inv: Invocation, paths: RuntimePaths): Promi
   const chatIdNumber = Number(chatId)
   const currentChatId = Number.isFinite(chatIdNumber) ? chatIdNumber : undefined
 
-  await handleSessionTopic(parsed, identity, botToken, inv, paths)
+  await handleSessionTopic(parsed, identity, botToken, inv, paths, remote)
   handleSessionId(parsed, identity)
 
   const send = asSendAction(parsed)

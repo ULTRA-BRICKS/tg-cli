@@ -5,7 +5,10 @@ import { parseControlConfig, resolveControlConfig } from "../config"
 import { readConfigFile } from "../../config/config-file"
 import { runOmpLiveCommand } from "../../../tools/omp-live-cli.mjs"
 import { botIdFromToken, ctlPaths } from "../lock"
+import { resolveRemoteMode, type RemoteMode } from "../remote-config"
+import { clientRefusalLine, EXIT_SERVER_UNREACHABLE, reportClientStatus } from "./remote-client-status"
 import { CAPABILITIES, CAPABILITIES_SCHEMA_VERSION, OWNER_ONLY_FLAG, parseGenericAskArgv } from "../generic-ask"
+import { SATELLITE_CAPABILITY } from "../remote-satellite"
 import { parseVoiceConfig, resolveVoiceConfig } from "../voice"
 import { USAGE } from "./constants"
 import { installHooks } from "./hooks-setup"
@@ -20,6 +23,8 @@ import { askDaemon, runGenericAsk, runWithdrawCommand, signalExit, verifyGrantAr
 import { runAlertCommand } from "./alert-commands"
 import { runAuditDelivery } from "./delivery"
 import { runAutoContinueOnce, runCodexUsageHook, runHarnessEvent } from "./harness-event"
+import { hubStatusLines } from "./remote-hub"
+import { runSatelliteDeliver } from "./satellite-deliver"
 import { runDaemon } from "./run-daemon"
 
 type GenericAsk = NonNullable<ReturnType<typeof parseGenericAskArgv>>
@@ -32,6 +37,8 @@ const OWNER_ONLY_USAGE = "usage: tg-ctl ask --owner-only <question> [--timeout S
 // Exits that need no config, env, network or daemon access; order matters (first match wins).
 async function exitEarlyWithoutConfig(cmd: string | undefined): Promise<void> {
   if (cmd === "omp-live") process.exit(await runOmpLiveCommand(process.argv.slice(3)))
+  // One-shot run on the CLIENT machine by `tg-remote satellite serve`: needs no config or credentials.
+  if (cmd === "satellite-deliver") process.exit(await runSatelliteDeliver())
   // Bare invocation (no subcommand) prints HELP on stdout and exits 0 — it NEVER launches the
   // daemon (the shared service-management contract: a bare `<tool> <service>` is help, not run).
   if (!cmd || cmd === "-h" || cmd === "--help") {
@@ -60,7 +67,7 @@ async function exitEarlyWithoutConfig(cmd: string | undefined): Promise<void> {
 // `capabilities --json`: static feature markers, no config, env, network or daemon access.
 function exitCapabilities(): never {
   if (process.argv.length === 4 && process.argv[3] === "--json") {
-    writeStdoutLine(JSON.stringify({ schema_version: CAPABILITIES_SCHEMA_VERSION, capabilities: [...CAPABILITIES] }))
+    writeStdoutLine(JSON.stringify({ schema_version: CAPABILITIES_SCHEMA_VERSION, capabilities: [...CAPABILITIES, SATELLITE_CAPABILITY] }))
     process.exit(0)
   }
   console.error("usage: tg-ctl capabilities --json")
@@ -112,6 +119,54 @@ function runVoiceSetupCommand(configDir: string, home: string): never {
   // also refresh editor metadata, while failures and dry-runs skip this refresh.
   if (ok && !setupArgs.includes("--dry-run")) readConfigFile(configDir)
   process.exit(ok ? 0 : 1)
+}
+
+// A ctl client (control.server set) must never run, start, restart or enable a poller: its daemon
+// lives on the server, and a second getUpdates loop on one bot token steals the other's updates.
+// An invalid remote config stops here too — never a silent fall-back to a local daemon. Runs before
+// the credential gate so a client without a .env still gets the real reason.
+const POLLER_COMMANDS = ["run", "start", "restart", "enable"]
+
+function exitIfNotDaemonHost(cmd: string, configDir: string, env: CliEnv): void {
+  if (!POLLER_COMMANDS.includes(cmd)) return
+  const cfg = resolveControlConfig(parseControlConfig(readConfigFile(configDir, { readOnly: true })))
+  const mode = resolveRemoteMode(cfg, env, { configDir })
+  if (mode.mode === "client") {
+    console.error(`tg-ctl: this machine is a ctl client of ${mode.server}; it must not poll Telegram (control.server is set)`)
+    process.exit(78)
+  }
+  if (mode.mode === "invalid") {
+    for (const error of mode.errors) console.error(`tg-ctl: invalid remote config: ${error}`)
+    process.exit(78)
+  }
+}
+
+// `tg-ctl status` and the daemon-bound operations on a ctl client (spec §6). `status` on a client
+// reports the SERVER's health (a real round trip through tg-remote), on a misconfigured machine it
+// stops with the diagnostics, elsewhere it falls through to the local status. The operations below
+// need a daemon this machine does not run: a typed refusal, exit 69 — except `ask`, a harness hook:
+// it keeps its no-daemon behaviour (a hook must never turn into a deny) and only gains the line.
+const CLIENT_REFUSED_OPS = ["ask", "withdraw", "alert", "inbox", "audit-delivery", "harness-event"]
+
+async function exitWithServerStatus(mode: RemoteMode, configDir: string): Promise<void> {
+  if (mode.mode === "invalid") {
+    for (const error of mode.errors) console.error(`tg-ctl: invalid remote config: ${error}`)
+    process.exit(78)
+  }
+  if (mode.mode !== "client") return
+  const report = await reportClientStatus(mode, configDir)
+  for (const line of report.lines) writeStdoutLine(line)
+  process.exit(report.exitCode)
+}
+
+async function handleRemoteClientRole(cmd: string, configDir: string, env: CliEnv): Promise<void> {
+  if (cmd !== "status" && !CLIENT_REFUSED_OPS.includes(cmd)) return
+  const cfg = resolveControlConfig(parseControlConfig(readConfigFile(configDir, { readOnly: true })))
+  const mode = resolveRemoteMode(cfg, env, { configDir })
+  if (cmd === "status") return await exitWithServerStatus(mode, configDir)
+  if (mode.mode !== "client") return
+  console.error(clientRefusalLine(mode.server, cmd))
+  if (cmd !== "ask") process.exit(EXIT_SERVER_UNREACHABLE)
 }
 
 function exitUnlessBotCredentials(cmd: string, configDir: string, env: CliEnv, genericAsk: GenericAsk | null): { token: string; botId: string } {
@@ -187,7 +242,7 @@ function runUsageScheduleCommand(ctx: Ctx): never {
 
 async function runStatusCommand(ctx: Ctx): Promise<never> {
   await refreshOriginalHosts()
-  writeStdoutLine(composeStatus(ctx, null, await topicSettingsLine(ctx)))
+  writeStdoutLine(composeStatus(ctx, null, await topicSettingsLine(ctx), await hubStatusLines(ctx)))
   process.exit(0)
 }
 
@@ -288,6 +343,8 @@ export async function runCli(): Promise<void> {
   if (cmd === "usage-schedule-check") await runUsageScheduleCheckCommand(configDir, env)
   if (cmd === "voice-setup") runVoiceSetupCommand(configDir, home)
 
+  exitIfNotDaemonHost(cmd, configDir, env)
+  await handleRemoteClientRole(cmd, configDir, env)
   const ctx = buildCtx(configDir, home, env, exitUnlessBotCredentials(cmd, configDir, env, genericAsk))
   if (cmd === "ask") await runAskCommand(ctx, genericAsk)
   const run = CTX_COMMANDS[cmd]

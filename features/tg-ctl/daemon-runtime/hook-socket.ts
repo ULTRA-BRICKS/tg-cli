@@ -1,5 +1,6 @@
 // daemon-runtime/hook-socket: extracted verbatim from tg-ctl (guardian-817 modular refactor).
 import { chmodSync, unlinkSync } from "fs"
+import { isRecord } from "../guards"
 import { createServer, type Server, type Socket } from "net"
 import { hookSessionKey } from "../harness-sessions"
 import { pinnedSession } from "../session-registry-store"
@@ -10,6 +11,7 @@ import { CLOSE_STATUS, hatchSiblingKeys, parseWithdrawLine, type WithdrawRequest
 import { grantDenyReasonText, pullGrant, type GrantRecord, type VerifyGrantOutcome, routeForRequest, verifyGrant } from "../grants"
 import { isGenericAskRequest, isPrivateOwnerChatId } from "../generic-ask"
 import { log, type Ctx } from "./ctx-io"
+import { applyRemoteRecordLine, remoteStatusReply } from "./remote-hub"
 import { ANSWERED_REPLAY_MS, MAX_HOOK_REQUEST_BYTES, canForwardButtonRequest, decideQueuedPermissionReconnect, describeAskRequest, describeHookLine, describeRegistration, dropAsk, hookMatchesRegistration, normalizeButtonRequest, type AbandonedButton, type PendingButton, type QuestionRuntime, writeAskStatus } from "./button-requests"
 import { clearSessionTopicMisses, currentSessionRegistry, handleResolveSession, liveEntry, noteSessionTopicMiss, recordHookSession } from "./session-registry"
 import { armPendingSocketClose, forwardAndPostQuestion, withdrawCards } from "./question-cards"
@@ -30,7 +32,7 @@ export function startHookServer(ctx: Ctx, rt: QuestionRuntime): Server | null {
         if (newline === -1) {
           // A hook request is a single small JSON line; anything bigger is a
           // misbehaving client trying to grow the buffer forever.
-          if (raw.length > MAX_HOOK_REQUEST_BYTES) socket.destroy()
+          if (raw.length > hookLineCap(raw)) socket.destroy()
           return
         }
         const line = raw.slice(0, newline).trim()
@@ -55,6 +57,29 @@ export function startHookServer(ctx: Ctx, rt: QuestionRuntime): Server | null {
   }
 }
 
+// A hook request is one small line, but `tg-remote server` relays a whole message record. The wire
+// contract caps a request at 1 MiB (spec §4: 256 KiB of history text, which JSON escaping can inflate
+// several times over), and the relay adds a short `{kind, peer}` wrapper: only a line that announces
+// itself as a remote record, in its first bytes, may be that long.
+const MAX_REMOTE_LINE_BYTES = 1024 * 1024 + 8 * 1024
+const REMOTE_RECORD_PREFIX = /^\{\s*"kind"\s*:\s*"remote-record"/
+
+function hookLineCap(raw: string): number {
+  return REMOTE_RECORD_PREFIX.test(raw.slice(0, 64)) ? MAX_REMOTE_LINE_BYTES : MAX_HOOK_REQUEST_BYTES
+}
+
+// `tg-remote server` (the forced SSH command of a client machine) asks the daemon to record one
+// message sent from that machine, or for its status (spec §4.1). The peer is checked against this
+// host's own control.remote_machines inside, never trusted from the line. Dispatched before
+// normalization like the other control lines; a host that serves no machine answers PEER_UNKNOWN.
+function answerRemoteLine(ctx: Ctx, socket: Socket, parsedLine: unknown): boolean {
+  if (!isRecord(parsedLine)) return false
+  if (parsedLine.kind !== "remote-record" && parsedLine.kind !== "remote-status") return false
+  const reply = parsedLine.kind === "remote-record" ? applyRemoteRecordLine(ctx, parsedLine) : remoteStatusReply(ctx, parsedLine)
+  socket.end(`${JSON.stringify(reply)}\n`)
+  return true
+}
+
 function parseHookLine(line: string): unknown {
   try {
     return JSON.parse(line)
@@ -67,6 +92,7 @@ function parseHookLine(line: string): unknown {
 // old/normalized-looking payload can never be confused with a question forward. Resolves true
 // when the line was one of them (and answered).
 async function dispatchControlLine(ctx: Ctx, rt: QuestionRuntime, socket: Socket, parsedLine: unknown): Promise<boolean> {
+  if (answerRemoteLine(ctx, socket, parsedLine)) return true
   // The verify-grant exchange (grant protocol v1.1, tg-cli#398).
   // Cross-repo compatibility: an OLD daemon (no marker handling)
   // receives this line, fails normalizeButtonRequest, and drops it as

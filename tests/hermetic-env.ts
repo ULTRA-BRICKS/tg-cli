@@ -51,6 +51,10 @@ process.env.TG_SEND_RETRY_BUDGET_MS ??= '0';
 for (const key of ['TG_AI_MODEL', 'CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'OPENCODE', 'CODEX', 'RIG_AGENT_ID', 'RIG_DETACHED_AGENT', 'TG_AGENT', 'RIG_SESSION']) {
   delete process.env[key];
 }
+// Laya is never reached from the suite: a developer's warm task-cli classify server is off
+// limits, and since tg autostarts it (docs/specs/2026-10-28-laya-autostart.md) a stray consult
+// would START one. TG_LAYA=0 reaches every child (hermeticEnv below); a test that wants the
+// gate points TG_LAYA_SOCKET at a fake or TG_PYTHON at a fake caller and sets TG_LAYA itself.
 process.env.TG_LAYA = '0';
 
 // Bun gives a child spawned with NO `env` the environment bun STARTED with — the PATH,
@@ -58,13 +62,13 @@ process.env.TG_LAYA = '0';
 // a built-in default (/usr/bin:/bin). Either way the child ran the real `ps` and then lsof'd every
 // live omp on the host: a `tg-ctl harness-event --pane %3` took ~500 ms unloaded and over 5 s
 // under suite load (tg-cli#550). A hook always runs with a PATH in production, so such a child
-// gets the suite's PATH and private tmux dir; a value the test sets itself still wins.
+// gets the suite's PATH and private tmux dir (and TG_LAYA=0); a value the test sets itself still wins.
 type SpawnEnv = Record<string, string | undefined>;
 
 function hermeticEnv(env: SpawnEnv | undefined): SpawnEnv {
   if (env === undefined) return { ...process.env };
   const out = { ...env };
-  for (const key of ['PATH', 'TMUX_TMPDIR', 'TG_SEND_RETRY_BUDGET_MS']) out[key] ??= process.env[key];
+  for (const key of ['PATH', 'TMUX_TMPDIR', 'TG_SEND_RETRY_BUDGET_MS', 'TG_LAYA']) out[key] ??= process.env[key];
   return out;
 }
 

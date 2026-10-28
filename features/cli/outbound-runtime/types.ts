@@ -17,6 +17,7 @@ import type { AgentAncestor } from "../../tg-ctl/discover"
 import type { HostRecord } from "../../tg-ctl/host-registry"
 import type { SessionEntry } from "../../tg-ctl/session-registry"
 import type { ControlConfig, CtlPaths } from "../../tg-ctl/types"
+import type { RemoteMode } from "../../tg-ctl/remote-config"
 import type { OutboxRoute } from "../../transport/outbox"
 import type { Format, ParseResult } from "../args"
 import type { DictionaryField } from "../dict-gate"
@@ -52,6 +53,8 @@ export interface Invocation {
 export interface SessionNameParts {
   primary: string
   secondary: string | null
+  /** Ctl client only: `primary` without the `<machine>/` namespace (the record carries both). */
+  bare?: string
 }
 
 /** Who is sending: model/emoji brand, credentials and the session identity (`sender-*.ts`). */
@@ -85,6 +88,8 @@ export interface SenderContext {
   harnessTitle: string
   /** `sessionNameFor` of the original: resolves the `[window]` name from a (possibly dropped) title. */
   sessionNameFor: (title: string) => SessionNameParts
+  /** The `control.machine` namespace on a ctl client (names read `<machine>/<name>`); absent elsewhere. */
+  remoteMachine?: string
 }
 
 /** The `TG_TOPIC` env / `--topic` selection that the thread stage may later adjust. */
@@ -142,6 +147,8 @@ export interface OutboundRecorder {
   recordOutboundHistory: (body: string, write?: (recs: HistoryRecord[]) => void) => void
   /** The route a queued send replays (undefined when this send has no origin). */
   outboxRoute: () => OutboxRoute | undefined
+  /** Client machines only: after the local history write, hand this send's route + history to the ctl server. Never throws. */
+  publishRemote?: () => Promise<void>
 }
 
 /** Where the send posts (`topic-resolution.ts`). */
@@ -165,4 +172,6 @@ export interface OutboundRun {
   recorder: OutboundRecorder
   thread: ThreadResolution
   fileCheckDeps: FileCheckDeps
+  /** Machine role from control.server/machine/remote_machines; read via `remoteModeOf` (./remote-mode). */
+  remote: RemoteMode
 }

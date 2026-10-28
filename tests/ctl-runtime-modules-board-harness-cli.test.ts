@@ -33,7 +33,7 @@ describe("tg-ctl CLI pre-config exits", () => {
     expect(r.err).toBe(run([]).out)
   })
   test("capabilities", () => {
-    expect(run(["capabilities", "--json"])).toEqual({ code: 0, out: '{"schema_version":1,"capabilities":["ask-owner-only-v1"]}\n', err: "" })
+    expect(run(["capabilities", "--json"])).toEqual({ code: 0, out: '{"schema_version":1,"capabilities":["ask-owner-only-v1","remote-satellite-v1"]}\n', err: "" })
     expect(run(["capabilities"])).toEqual({ code: 2, out: "", err: "usage: tg-ctl capabilities --json\n" })
   })
   test("ask --owner-only usage errors", () => {

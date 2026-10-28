@@ -8,9 +8,28 @@
  */
 import { splitSections } from './escalation-format';
 
+/** Why Laya gave no answer. src/tgcli/laya names all of them except the two `helper-*` ones (the glue's own). */
+export const LAYA_REASONS = [
+  'disabled', 'invalid-config', 'no-socket', 'no-task', 'untrusted-socket', 'autostart-failed',
+  'autostart-skipped', 'cold-timeout', 'timeout', 'connection-error', 'invalid-response',
+  'payload-too-large', 'helper-failed', 'helper-timeout',
+] as const;
+export type LayaReason = (typeof LAYA_REASONS)[number];
+
+/** No answer from Laya: what happened, what was tried and what to do next. */
+export interface LayaUnavailable {
+  status: 'unavailable';
+  reason: LayaReason;
+  detail?: string;
+  attempt?: string;
+  remedy?: string;
+  // `required`: the send must fail instead of falling back (laya.required).
+  policy?: 'required' | 'fallback';
+}
+
 export type ProblemLayaAssessment =
   | { status: 'ok'; done: number; current: number }
-  | { status: 'unavailable'; reason: 'disabled' | 'no-socket' | 'timeout' | 'connection-error' | 'invalid-response' | 'payload-too-large' }
+  | LayaUnavailable
   | { status: 'skipped'; reason: 'dry-run' };
 
 const DONE_LABEL = /^(?:(?:what (?:i|we) (?:already )?(?:did|tried))|already (?:done|tried)|actions taken|tried|уже (?:сделал[аи]?|сделано|проверил[аи]?)|что (?:уже )?(?:сделал[аи]?|сделано|предпринято)|предпринято|попытки)$/iu;

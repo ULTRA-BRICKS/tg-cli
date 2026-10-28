@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Launcher of the Laya caller (src/tgcli/laya), run by `tg` as `python3 -I <repo>/tg-laya ...`.
+
+`-I` (isolated mode) drops the current directory, PYTHONPATH and the user site from sys.path, so
+nothing planted in the cwd or the environment can shadow `tgcli`. The only import root added here
+is `src/` next to this file, resolved from this file's own real path.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "src"))
+
+from tgcli.laya.cli import main  # noqa: E402
+
+sys.exit(main(sys.argv[1:]))

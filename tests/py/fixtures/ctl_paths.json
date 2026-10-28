@@ -29,5 +29,8 @@
   "alertSubscriptions": "/home/u/.config/tg-cli/tg-ctl.8574086668.alert-subscriptions.json",
   "alertThrottle": "/home/u/.config/tg-cli/tg-ctl.8574086668.alert-throttle.json",
   "outbox": "/home/u/.config/tg-cli/tg-ctl.8574086668.outbox",
-  "chatgptRefs": "/home/u/.config/tg-cli/tg-ctl.8574086668.chatgpt-refs.json"
+  "chatgptRefs": "/home/u/.config/tg-cli/tg-ctl.8574086668.chatgpt-refs.json",
+  "remoteDir": "/home/u/.config/tg-cli/remote",
+  "remoteRoutes": "/home/u/.config/tg-cli/tg-ctl.8574086668.remote-routes.json",
+  "remoteStatus": "/home/u/.config/tg-cli/tg-ctl.8574086668.remote-status.json"
 }

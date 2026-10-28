@@ -1,28 +1,35 @@
 /**
- * @file laya's verdict for the intent gate, from task-cli's warm classify server — never
- * by loading the model in this process.
+ * @file laya's verdict for the intent gate: glue to the Python caller `tgcli.laya`
+ * (src/tgcli/laya, stdlib only), which owns the `laya:` config, socket discovery and trust,
+ * autostart of task-cli's classify server, the unix-socket client and every timeout. This module
+ * only spawns it, reads its JSON lines and keeps the parts that are TS-only because the intent
+ * gate is TS: the question texts, the problem-evidence message and reply-probability parsing.
  *
  * Accessed via: the `tg` entrypoint for explicit problem reports, or when the deterministic
- * detector found no ask in another body (intent-gate.ts `layaWorthAsking`). Never on dry-run.
+ * detector found no ask in another body (intent-gate.ts `layaWorthAsking`). Never on dry-run
+ * (agent-gates.ts decides before calling in here).
  *
- * WHAT: laya (PyPI `laya`, Convai Innovations' local classifier) answers typed questions
- * about a text with calibrated probabilities. task-cli keeps one loaded model resident in
- * a machine-wide server (task-cli `tasklib/classify_server.py`: a unix socket under
- * `$XDG_STATE_HOME/task-cli/classify/laya-<version>.sock`, one JSON request line
- * `{"op":"predict","message":…,"questions":…}` → one reply line `{"ok":true,"result":…}`),
- * spawned by `task classify` and idle-exiting after 15 minutes. tg only connects to a
- * server that is already listening: it never spawns one and never imports the model, so a
- * send costs one socket round-trip at most, bounded by `TG_LAYA_TIMEOUT_MS`.
+ * WIRE: `python3 -I <repo>/tg-laya ask --config-dir <dir>` (`TG_PYTHON` replaces `python3`; `-I` plus
+ * the launcher's own `sys.path.insert(<repo>/src)` mean nothing in the cwd or PYTHON* can shadow
+ * the package), stdin one JSON `{message, questions}`. stdout: a first `{"status":"budget",
+ * "total_ms"}` line (how long the call may take: the kill timer is armed from it, so no config is
+ * parsed here), then `{"status":"ok","line","policy"}` or `{"status":"unavailable","reason",
+ * "detail","attempt","remedy","policy"}`. stderr is inherited: a cold start says so while it waits.
  *
- * Ask hints fail open (null). Problem checks return a typed unavailable reason and fall
- * back to mandatory deterministic action/result checks. An available negative problem
- * classification blocks; a positive never overrides deterministic missing evidence.
- *
- * The one impure module of the intent gate (socket + directory reads).
+ * Every failure is a typed unavailable reply; whether the send may go on without the model is the
+ * policy the gate applies (laya.required), not decided here.
  */
-import { lstatSync, readdirSync } from 'fs';
-import { dirname, join } from 'path';
-import { problemRemediationEvidence, type ProblemLayaAssessment } from './problem-remediation';
+import { readFileSync } from 'fs';
+import type { Subprocess } from 'bun';
+import type { ConfigDiagnostic } from '../config/validate';
+import { join } from 'path';
+import {
+  problemRemediationEvidence,
+  LAYA_REASONS,
+  type LayaReason,
+  type LayaUnavailable,
+  type ProblemLayaAssessment,
+} from './problem-remediation';
 
 // The one question asked. `noul` = a calibrated P(true) in `answers.<name>.noul`.
 export const LAYA_QUESTIONS = {
@@ -32,11 +39,13 @@ export const LAYA_QUESTIONS = {
   },
 } as const;
 
-const DEFAULT_TIMEOUT_MS = 1200;
-const DEFAULT_PROBLEM_TIMEOUT_MS = 3000;
 // laya reads a few hundred tokens per state; the head of a long body is what it sees anyway.
 const MAX_MESSAGE_CHARS = 2000;
-const MAX_REQUEST_BYTES = 16 * 1024;
+// Interpreter start plus config parse; the budget line arrives right after.
+const HELPER_STARTUP_MS = 15_000;
+// On top of the helper's own budget: it enforces every deadline itself, this only reaps a hang.
+const HELPER_KILL_MARGIN_MS = 5_000;
+const REPO_ROOT = join(import.meta.dir, '..', '..');
 
 export const LAYA_PROBLEM_QUESTIONS = {
   has_done: {
@@ -62,52 +71,169 @@ export function parseLayaReply(line: string): number | null {
   return probability(line, 'asks_reader');
 }
 
-// Only a directory this user owns and nobody else can enter: another account must not be
-// able to plant a listener that receives the message text (task-cli's `_private_dir` rule).
-function privateDir(dir: string): boolean {
-  try {
-    const st = lstatSync(dir);
-    return st.isDirectory() && st.uid === process.getuid?.() && (st.mode & 0o077) === 0;
-  } catch {
-    return false;
-  }
+export type LayaReply = { status: 'ok'; line: string; policy: 'required' | 'fallback' } | Required<LayaUnavailable>;
+export type LayaAskResult = { status: 'ok'; probability: number } | Required<LayaUnavailable>;
+
+export interface LayaHelperOptions {
+  /** Test seam: the kill margin after the helper's announced budget. */
+  killMarginMs?: number;
+  startupMs?: number;
 }
 
-/** The socket to try: `TG_LAYA_SOCKET`, else the newest `laya-*.sock` task-cli left listening. */
-export function layaSocketPath(env: NodeJS.ProcessEnv): string | null {
-  if (env.TG_LAYA_SOCKET) return privateDir(dirname(env.TG_LAYA_SOCKET)) ? env.TG_LAYA_SOCKET : null;
-  const state = env.XDG_STATE_HOME || join(env.HOME ?? '', '.local', 'state');
-  const dir = join(state, 'task-cli', 'classify');
-  if (!privateDir(dir)) return null;
-  try {
-    const sockets = readdirSync(dir)
-      .filter((name) => /^laya-.*\.sock$/u.test(name))
-      .map((name) => {
-        const path = join(dir, name);
-        const st = lstatSync(path);
-        return { path, mtime: st.mtimeMs, ok: st.isSocket() && st.uid === process.getuid?.() };
-      })
-      .filter((s) => s.ok)
-      .sort((a, b) => b.mtime - a.mtime);
-    return sockets[0]?.path ?? null;
-  } catch {
-    return null;
+// The helper gets what it needs and nothing else: no bot token, no agent variables and no PYTHON*
+// (isolated mode ignores them anyway; this keeps them out of its children too).
+const FORWARDED = /^(?:PATH|HOME|USER|LOGNAME|LANG|TMPDIR|XDG_.*|TASK_.*|LC_.*|TG_LAYA(?:_.*)?)$/u;
+
+function helperEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) if (value !== undefined && FORWARDED.test(key)) out[key] = value;
+  return out;
+}
+
+/** `python3 -I <repo>/tg-laya <args>`: isolated interpreter, trusted import root added by the launcher. */
+export function layaCommand(env: NodeJS.ProcessEnv, ...args: string[]): string[] {
+  return [env.TG_PYTHON || 'python3', '-I', join(REPO_ROOT, 'tg-laya'), ...args];
+}
+
+type Policy = 'required' | 'fallback';
+
+// The documented runtime boolean tokens (docs/configuration.md), case-insensitive. Python
+// (src/tgcli/laya/config.py `_TRUE`) is the source; tests/laya-socket.test.ts pins this copy.
+export const LAYA_TRUE_TOKENS = ['true', '1', 'yes', 'on'] as const;
+
+/**
+ * `laya.required` as far as this glue can tell WITHOUT the Python caller (which owns the real parse
+ * and validation): consulted only when that caller itself failed, so a broken interpreter can never
+ * silently turn a required Laya into a fallback. It errs towards `required`: the environment first,
+ * then the first `required:` of the `laya:` block, however the rest of the file reads.
+ */
+function policyWithoutHelper(env: NodeJS.ProcessEnv, configDir: string): Policy {
+  const isTrue = (value: string): boolean => (LAYA_TRUE_TOKENS as readonly string[]).includes(value.trim().toLowerCase());
+  const forced = (env.TG_LAYA_REQUIRED ?? '').trim();
+  if (forced !== '') return isTrue(forced) ? 'required' : 'fallback';
+  let text = '';
+  try { text = readFileSync(join(configDir, 'config.yaml'), 'utf8'); } catch { return 'fallback'; }
+  let inBlock = false;
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/\s+#.*$/u, '');
+    if (/^\s*(?:#|$)/u.test(line)) continue;
+    if (/^\S/u.test(line)) inBlock = /^laya:\s*$/u.test(line);
+    else if (inBlock && isTrue(/^\s+required:\s*(.*)$/u.exec(line)?.[1] ?? '')) return 'required';
   }
+  return 'fallback';
+}
+
+function helperFailure(reason: 'helper-failed' | 'helper-timeout', detail: string, attempt: string, remedy: string, policy: Policy): Required<LayaUnavailable> {
+  return { status: 'unavailable', reason, detail, attempt, remedy, policy };
+}
+
+const HELPER_REMEDY = 'install python3 (3.12+) or point TG_PYTHON at one, then retry; `python3 -I <checkout>/tg-laya` must run';
+
+type HelperLine = { status?: unknown; total_ms?: unknown } & Partial<Required<LayaUnavailable>> & { line?: unknown };
+
+function parseLine(text: string): HelperLine | null {
+  try {
+    const value = JSON.parse(text) as unknown;
+    return typeof value === 'object' && value !== null ? (value as HelperLine) : null;
+  } catch { return null; }
+}
+
+function toReply(line: HelperLine): LayaReply | null {
+  const policy = line.policy === 'required' ? 'required' : 'fallback';
+  if (line.status === 'ok' && typeof line.line === 'string') return { status: 'ok', line: line.line, policy };
+  if (line.status !== 'unavailable' || typeof line.reason !== 'string') return null;
+  const text = (v: unknown): string => (typeof v === 'string' ? v : '');
+  const known = (LAYA_REASONS as readonly string[]).includes(line.reason);
+  // A reason this glue does not know is a contract break: never forward it as if typed.
+  if (!known) return invalidResponse(policy, `the Python caller reported an unknown reason ${JSON.stringify(line.reason).slice(0, 60)}`);
+  return { status: 'unavailable', reason: line.reason as LayaReason, detail: text(line.detail), attempt: text(line.attempt), remedy: text(line.remedy), policy };
+}
+
+/** One predict request through the Python caller. Never throws. */
+export async function askLaya(
+  message: string,
+  questions: Record<string, unknown>,
+  env: NodeJS.ProcessEnv,
+  configDir: string,
+  options: LayaHelperOptions = {},
+): Promise<LayaReply> {
+  const command = layaCommand(env, 'ask', '--config-dir', configDir);
+  const attempt = `ran \`${command.join(' ')}\``;
+  let proc: Subprocess;
+  try {
+    proc = Bun.spawn(command, { env: helperEnv(env), stdin: 'pipe', stdout: 'pipe', stderr: 'inherit' });
+  } catch (error) {
+    return helperFailure('helper-failed', error instanceof Error ? error.message : String(error), attempt, HELPER_REMEDY, policyWithoutHelper(env, configDir));
+  }
+  // A killed helper's own children may keep its stdout pipe open: the kill, not EOF, ends the wait.
+  const kill = { timedOut: false, timer: undefined as NodeJS.Timeout | undefined, onKilled: () => {} };
+  const killed = new Promise<null>((resolve) => { kill.onKilled = () => resolve(null); });
+  const arm = (ms: number): void => {
+    clearTimeout(kill.timer);
+    kill.timer = setTimeout(() => { kill.timedOut = true; proc.kill('SIGKILL'); kill.onKilled(); }, ms);
+  };
+  arm(options.startupMs ?? HELPER_STARTUP_MS);
+  try {
+    const stdin = proc.stdin as { write(data: string): unknown; end(): unknown };
+    stdin.write(JSON.stringify({ message, questions }));
+    stdin.end();
+  } catch { /* the helper died before reading; its exit is reported below */ }
+  const reply = await Promise.race([readHelperReply(proc, (budgetMs) => arm(budgetMs + (options.killMarginMs ?? HELPER_KILL_MARGIN_MS))), killed]);
+  const code = await proc.exited;
+  clearTimeout(kill.timer);
+  if (kill.timedOut) {
+    return helperFailure('helper-timeout', 'the Python caller did not finish within its own announced budget', attempt, 'retry; if it repeats run `task classify-server start` by hand and check `python3 -I <checkout>/tg-laya` runs', policyWithoutHelper(env, configDir));
+  }
+  // The caller reporting its own failure (unreadable config, bad state dir) could not read `required`.
+  if (reply?.status === 'unavailable' && reply.reason === 'helper-failed') return { ...reply, policy: policyWithoutHelper(env, configDir) };
+  if (reply !== null) return reply;
+  return helperFailure('helper-failed', `the Python caller exited ${code} without a reply (see its stderr above)`, attempt, HELPER_REMEDY, policyWithoutHelper(env, configDir));
+}
+
+/** The helper's stdout lines: its budget announcement re-arms the kill timer, the last reply wins. */
+async function readHelperReply(proc: Subprocess, onBudget: (totalMs: number) => void): Promise<LayaReply | null> {
+  const state: { reply: LayaReply | null } = { reply: null };
+  const consume = (text: string): void => {
+    const parsed = parseLine(text);
+    if (parsed === null) return;
+    if (parsed.status === 'budget' && typeof parsed.total_ms === 'number') onBudget(parsed.total_ms);
+    else state.reply = toReply(parsed) ?? state.reply;
+  };
+  const decoder = new TextDecoder();
+  let pending = '';
+  for await (const chunk of proc.stdout as ReadableStream<Uint8Array>) {
+    pending += decoder.decode(chunk, { stream: true });
+    for (let newline = pending.indexOf('\n'); newline >= 0; newline = pending.indexOf('\n')) {
+      consume(pending.slice(0, newline));
+      pending = pending.slice(newline + 1);
+    }
+  }
+  if (pending.trim()) consume(pending);
+  return state.reply;
+}
+
+function invalidResponse(policy: 'required' | 'fallback', detail: string): Required<LayaUnavailable> {
+  return {
+    status: 'unavailable', reason: 'invalid-response', detail, policy,
+    attempt: 'asked the classify server; its reply could not be used',
+    remedy: 'run: task classify-server start (restart it); if it repeats, read the server log in ~/.local/state/task-cli/classify/',
+  };
 }
 
 /**
- * laya's P(the body asks the reader something), or null when no warm server answered in
- * time. `TG_LAYA=0` turns it off.
+ * laya's P(the body asks the reader something), or a typed unavailable reply.
  */
-export async function layaAskProbability(body: string, env: NodeJS.ProcessEnv): Promise<number | null> {
-  const reply = await requestLaya(body.slice(0, MAX_MESSAGE_CHARS), LAYA_QUESTIONS, env, DEFAULT_TIMEOUT_MS);
-  return reply.status === 'ok' ? parseLayaReply(reply.line) : null;
+export async function layaAskProbability(body: string, env: NodeJS.ProcessEnv, configDir: string, options?: LayaHelperOptions): Promise<LayaAskResult> {
+  const reply = await askLaya(body.slice(0, MAX_MESSAGE_CHARS), LAYA_QUESTIONS, env, configDir, options);
+  if (reply.status !== 'ok') return reply;
+  const p = parseLayaReply(reply.line);
+  return p === null ? invalidResponse(reply.policy, 'the reply carried no asks_reader probability') : { status: 'ok', probability: p };
 }
 
 /** Full action sections, not the body's head; too large is unavailable, never a negative
- * inferred from truncated evidence. Uses the same socket discovery and TG_LAYA settings.
+ * inferred from truncated evidence.
  */
-export async function layaProblemAssessment(body: string, env: NodeJS.ProcessEnv): Promise<ProblemLayaAssessment> {
+export async function layaProblemAssessment(body: string, env: NodeJS.ProcessEnv, configDir: string, options?: LayaHelperOptions): Promise<ProblemLayaAssessment> {
   const evidence = problemRemediationEvidence(body);
   // Only the author's words. Synthetic "attempts/results" headings around a bare
   // symptom can bias the classifier into claiming those facts exist.
@@ -118,65 +244,38 @@ export async function layaProblemAssessment(body: string, env: NodeJS.ProcessEnv
     : !evidence.doneLabel ? evidence.done
     : evidence.current.includes(evidence.done) ? evidence.current
     : `${evidence.done}\n${evidence.current}`;
-  const reply = await requestLaya(message, LAYA_PROBLEM_QUESTIONS, env, DEFAULT_PROBLEM_TIMEOUT_MS);
+  const reply = await askLaya(message, LAYA_PROBLEM_QUESTIONS, env, configDir, options);
   if (reply.status !== 'ok') return reply;
   const done = probability(reply.line, 'has_done');
   const current = probability(reply.line, 'has_current');
   return done === null || current === null
-    ? { status: 'unavailable', reason: 'invalid-response' }
+    ? invalidResponse(reply.policy, 'the reply carried no has_done/has_current probabilities')
     : { status: 'ok', done, current };
 }
 
-type LayaResponse = { status: 'ok'; line: string } | Extract<ProblemLayaAssessment, { status: 'unavailable' }>;
+/** The refusal printed when `laya.required` is on and Laya did not answer. */
+export function formatRequiredFailure(outcome: LayaUnavailable): string {
+  const lines = [`tg: Laya is required (laya.required: true) but unavailable: ${outcome.reason}. Tried: ${outcome.attempt || 'nothing'}. Next: ${outcome.remedy || 'run: task classify-server start'}.`];
+  if (outcome.detail) lines.push(`  Detail: ${outcome.detail}`);
+  return lines.join('\n');
+}
 
-async function requestLaya(body: string, questions: Record<string, unknown>, env: NodeJS.ProcessEnv, defaultTimeoutMs: number): Promise<LayaResponse> {
-  if (/^(?:0|false|no|off)$/iu.test((env.TG_LAYA ?? '').trim())) return { status: 'unavailable', reason: 'disabled' };
-  const path = layaSocketPath(env);
-  if (path === null) return { status: 'unavailable', reason: 'no-socket' };
-  const parsedTimeout = Number(env.TG_LAYA_TIMEOUT_MS);
-  const timeoutMs = Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : defaultTimeoutMs;
-  const request = `${JSON.stringify({ op: 'predict', message: body, questions })}\n`;
-  if (Buffer.byteLength(request, 'utf8') > MAX_REQUEST_BYTES) return { status: 'unavailable', reason: 'payload-too-large' };
-  return new Promise<LayaResponse>((resolve) => {
-    let settled = false;
-    let buffer = '';
-    let connection: { end(): void } | undefined;
-    const decoder = new TextDecoder();
-    const timer = setTimeout(() => finish({ status: 'unavailable', reason: 'timeout' }, connection), timeoutMs);
-    const finish = (value: LayaResponse, socket?: { end(): void }): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      socket?.end();
-      resolve(value);
-    };
-    Bun.connect({
-      unix: path,
-      socket: {
-        open(socket) {
-          connection = socket;
-          if (settled) { socket.end(); return; }
-          socket.write(request);
-        },
-        data(socket, chunk) {
-          buffer += decoder.decode(chunk, { stream: true });
-          if (Buffer.byteLength(buffer, 'utf8') > MAX_REQUEST_BYTES) {
-            finish({ status: 'unavailable', reason: 'invalid-response' }, socket);
-            return;
-          }
-          const newline = buffer.indexOf('\n');
-          if (newline >= 0) finish({ status: 'ok', line: buffer.slice(0, newline) }, socket);
-        },
-        close() {
-          finish({ status: 'unavailable', reason: 'connection-error' });
-        },
-        error() {
-          finish({ status: 'unavailable', reason: 'connection-error' }, connection);
-        },
-        connectError() {
-          finish({ status: 'unavailable', reason: 'connection-error' }, connection);
-        },
-      },
-    }).catch(() => finish({ status: 'unavailable', reason: 'connection-error' }, connection));
-  });
+/** The refusal printed (exit 78) when the `laya:` config or its environment is invalid. */
+export function formatConfigFailure(outcome: LayaUnavailable): string {
+  return `tg: Laya configuration is invalid: ${outcome.detail}. Next: ${outcome.remedy}.`;
+}
+
+/**
+ * `tg config validate`: the `laya:` block of this file, checked by the Python caller with the rules
+ * the send path applies. A caller that cannot run is an error, not a pass: the block stays unchecked.
+ */
+export function layaConfigDiagnostics(configPath: string, env: NodeJS.ProcessEnv): ConfigDiagnostic[] {
+  const unchecked = (why: string): ConfigDiagnostic[] => [{ line: 1, severity: 'error', message: `the laya: block could not be checked: ${why} (${HELPER_REMEDY})` }];
+  try {
+    const run = Bun.spawnSync(layaCommand(env, 'check-config', '--file', configPath), { env: helperEnv(env), stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: HELPER_STARTUP_MS });
+    const parsed = JSON.parse(run.stdout.toString()) as { diagnostics?: ConfigDiagnostic[] };
+    return Array.isArray(parsed.diagnostics) ? parsed.diagnostics : unchecked(`exit ${run.exitCode}, ${run.stderr.toString().trim().slice(0, 200)}`);
+  } catch (error) {
+    return unchecked(error instanceof Error ? error.message : String(error));
+  }
 }

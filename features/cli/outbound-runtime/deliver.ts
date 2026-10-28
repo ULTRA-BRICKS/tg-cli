@@ -140,6 +140,8 @@ export async function deliver(run: OutboundRun): Promise<void> {
   // agent meant to say, not the branded envelope. Best-effort; never blocks
   // the (already-sent) send.
   recorder.recordOutboundHistory(prepared.caption)
+  // Ctl client: route + history to the server, bounded, warnings on stderr, never an exit code.
+  await recorder.publishRemote?.()
 
   autoStartDaemon(run)
 

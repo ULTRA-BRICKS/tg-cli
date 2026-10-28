@@ -183,3 +183,19 @@ def test_flock_js_number_syntax(pid, expected):
     assert (
         flock_pids_for_inode("1: FLOCK ADVISORY WRITE " + pid + " 00:00:42 0 EOF", "42") == expected
     )
+
+
+def test_ctl_paths_remote_state_names():
+    paths = ctl_paths(Path("/cfg"), "42")
+    assert paths["remoteDir"] == "/cfg/remote"
+    assert paths["remoteRoutes"] == "/cfg/tg-ctl.42.remote-routes.json"
+    assert paths["remoteStatus"] == "/cfg/tg-ctl.42.remote-status.json"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [({}, True), ({"server": "ssh://tg-ctl-ubuntu"}, False), ({"machine": "clvm"}, True)],
+)
+def test_should_auto_start_is_false_for_a_ctl_client(raw, expected):
+    # A client machine must never start a second getUpdates poller (spec §1.3).
+    assert should_auto_start({"TMUX": "sock"}, resolve_control_config(raw)) is expected

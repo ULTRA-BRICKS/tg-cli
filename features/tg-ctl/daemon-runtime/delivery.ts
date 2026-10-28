@@ -523,8 +523,8 @@ export function paneLockIo(paneId: string): RoutesLockIo {
   return fsRoutesLockIo(join(dir, `${paneId.replace(/[^A-Za-z0-9]/g, "_")}.lock`))
 }
 
-export async function runInjectStepsLocked(steps: InjectStep[]): Promise<{ ok: true } | InjectFailure> {
-  const paneId = (steps.find((step) => step.kind === "verify-pane") as Extract<InjectStep, { kind: "verify-pane" }>).paneId
+// Runs `body` holding `paneId`'s typing lock (acquire/break-dead/typing-through rules above).
+export async function withPaneTypingLock<T>(paneId: string, body: () => Promise<T>): Promise<T> {
   const io = paneLockIo(paneId)
   let held = false
   for (let i = 0; i < PANE_LOCK_ATTEMPTS && !held; i++) {
@@ -535,10 +535,15 @@ export async function runInjectStepsLocked(steps: InjectStep[]): Promise<{ ok: t
   }
   if (!held) log(`pane ${paneId} typing lock still held after ${PANE_LOCK_ATTEMPTS * PANE_LOCK_DELAY_MS}ms — typing through`)
   try {
-    return await runInjectSteps(steps)
+    return await body()
   } finally {
     if (held) io.release()
   }
+}
+
+export async function runInjectStepsLocked(steps: InjectStep[]): Promise<{ ok: true } | InjectFailure> {
+  const paneId = (steps.find((step) => step.kind === "verify-pane") as Extract<InjectStep, { kind: "verify-pane" }>).paneId
+  return withPaneTypingLock(paneId, () => runInjectSteps(steps))
 }
 
 // tg-cli#309: the verify-permission-menu step found a different menu (or none) where

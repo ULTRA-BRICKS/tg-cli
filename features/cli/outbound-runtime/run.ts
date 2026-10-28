@@ -12,6 +12,8 @@ import { recordFollowUps } from "./follow-ups"
 import { parseInvocation } from "./parse-invocation"
 import { prepareMessage } from "./prepare-message"
 import { resolveSender } from "./resolve-sender"
+import { enforceRemoteMode } from "./remote-mode"
+import { createRemoteRecorder } from "./remote-recorder"
 import { resolveThread } from "./topic-resolution"
 import { runSubcommands } from "./subcommands"
 import type { OutboundRun, RuntimePaths } from "./types"
@@ -29,15 +31,17 @@ export async function runOutbound(rootDir: string): Promise<void> {
   const paths = runtimePaths(rootDir)
   await runSubcommands(rawArgs, paths)
   const inv = await parseInvocation(rawArgs, paths)
-  const { send, sender } = await resolveSender(inv, paths)
+  const remote = enforceRemoteMode(inv, paths)
+  const { send, sender } = await resolveSender(inv, paths, remote)
   const prepared = await prepareMessage(send, sender, inv, paths)
   const fileCheckDeps = makeFileCheckDeps()
-  if (send.dryRun) reportDryRunAndExit(send, prepared, fileCheckDeps)
+  if (send.dryRun) reportDryRunAndExit(send, prepared, fileCheckDeps, remote)
   const autolinks = resolveAutolinks(prepared.caption, inv.features, paths, sender.botToken)
   const built = buildPlan(send, prepared, sender, autolinks, inv.features, fileCheckDeps)
-  const recorder = createOutboundRecorder({ paths, sender, plan: built.plan })
-  const thread = await resolveThread(send, prepared, sender, inv.configYamlRaw, paths)
-  const run: OutboundRun = { paths, send, features: inv.features, sender, prepared, built, recorder, thread, fileCheckDeps }
+  const recorderCtx = { paths, sender, plan: built.plan }
+  const recorder = remote.mode === "client" ? createRemoteRecorder({ ...recorderCtx, target: remote }) : createOutboundRecorder(recorderCtx)
+  const thread = await resolveThread(send, prepared, sender, inv.configYamlRaw, paths, remote)
+  const run: OutboundRun = { paths, send, features: inv.features, sender, prepared, built, recorder, thread, fileCheckDeps, remote }
   await deliver(run)
   recordFollowUps(run)
 }

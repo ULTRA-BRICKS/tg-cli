@@ -12,12 +12,15 @@ import { aggregateUsage, orderByLruMru, parseRoutes, recognizeRoute, routeMatche
 import type { Registry } from "../session-registry"
 import type { Action } from "../types"
 import { log, readFileOrNull } from "./ctx-io"
-import { deliverHostPane, deliverOriginalOmp, injectInbound, listLiveHosts } from "./delivery"
+import { deliverHostPane, deliverInboundOnce, deliverOriginalOmp, injectInbound, listLiveHosts } from "./delivery"
 import { sendMessage } from "./telegram-api"
 import { listLiveOmpAgents, refreshOriginalHosts, refreshSessionRegistry } from "./session-registry"
 import { listAgentCandidates, noAgentReplyNow } from "./pane-discovery"
 import { snapshot } from "./tmux-probe"
 import type { AgentRouteEnv } from "./agent-routes-env"
+import { anchorMachine, linkMaybeDownLine, remoteMediaRefusedNotice, routeNotRecordedNotice } from "../remote-hub-model"
+import { parseRemoteRoutes, recognizeRemoteRoute } from "../remote-routes"
+import { hubMachines, sendRemoteDeliver } from "./remote-hub"
 
 type ReplyRouteAction = Extract<Action, { kind: "reply-route" }>
 type LiveOmp = NonNullable<ReturnType<typeof matchLiveOmpOrigin>>
@@ -71,8 +74,42 @@ export async function handleReplyRouteWith(
   if (recognized) {
     const routed = await routeRecognizedReply(env, call, recognized)
     if (routed !== null) return routed
+  } else {
+    const remote = await routeRemoteReply(env, call)
+    if (remote !== null) return remote
   }
   return routeToLiveCandidates(env, call)
+}
+
+// A reply to a message ANOTHER machine sent (hub mode, spec §5 "Reply"): the session that sent it
+// is reached through `tg-remote hub deliver`, never through a local pane — pane ids and pids are
+// machine-local, so the same `%3` here is a different agent. A failed or uncertain delivery is
+// reported and ends here: no local picker, no last-user anchor (the owner did not address a local agent).
+// null: not a reply to a remote message (or this host serves no machine) — the local path continues.
+async function routeRemoteReply(env: AgentRouteEnv, call: ReplyCall): Promise<boolean | null> {
+  const machines = hubMachines(env.ctx).map((m) => m.name)
+  if (machines.length === 0) return null
+  const { action } = call
+  const hit = recognizeRemoteRoute(parseRemoteRoutes(readFileOrNull(env.ctx.paths.remoteRoutes)), env.ctx.chatId, action.replyToMessageId)
+  if (hit === null) {
+    // A client machine brackets its header `[<machine>/<window>]`: the quote anchor shows it. Naming
+    // a known machine with no recorded route must never end in a local delivery.
+    const named = anchorMachine(action.injectText, machines)
+    if (named === null) return null
+    log(`reply-route: replyTo=${action.replyToMessageId} → anchor names ${named} but no route was recorded`)
+    await sendMessage(env.ctx, routeNotRecordedNotice(named), call.out)
+    return false
+  }
+  if (action.media) {
+    log(`reply-route: replyTo=${action.replyToMessageId} → ${hit.machine}: media reply refused (local paths)`)
+    await sendMessage(env.ctx, remoteMediaRefusedNotice(hit.machine), call.out)
+    return false
+  }
+  const where = hit.route.sessionKey ?? hit.route.paneId ?? "?"
+  log(`reply-route: replyTo=${action.replyToMessageId} → ${hit.machine} session ${where} msg="${call.msgPreview}"`)
+  const target = `machine:${hit.machine}/${where}`
+  const res = await deliverInboundOnce(action.messageId, target, () => sendRemoteDeliver(env.ctx, hit, action.injectText, action.messageId))
+  return settleReplyDelivery(env, call, res)
 }
 
 // A reply whose origin is known: deliver to wherever that origin lives now. null: it could not be
@@ -223,7 +260,10 @@ async function routeToLiveCandidates(env: AgentRouteEnv, call: ReplyCall): Promi
   // An UNRECOGNIZED reply (no origin known) with a single agent is unambiguous —
   // inject there. The recognized-but-unconfirmed case above never reaches here. A reply
   // from a gone session's topic is not: its session is gone, so the human picks (tg-cli#709).
-  if (!recognized && candidates.length === 1 && action.threadId === undefined) {
+  // A host that serves other machines cannot tell whether an unrecognised reply was meant for one
+  // of THEIR agents (the route may simply have been lost): never auto-inject it into the one local agent.
+  const machines = hubMachines(env.ctx).map((m) => m.name)
+  if (!recognized && candidates.length === 1 && action.threadId === undefined && machines.length === 0) {
     log(`reply-route: replyTo=${action.replyToMessageId} → unrecognized, single candidate ${candidates[0].paneId}/${candidates[0].windowName} → inject msg="${msgPreview}"`)
     const delivered = await injectReplyVerbatim(env, call, candidates[0].paneId)
     // Still a confirmed CTO-explicit delivery — record it as the tg-cli#78
@@ -239,7 +279,8 @@ async function routeToLiveCandidates(env: AgentRouteEnv, call: ReplyCall): Promi
   // was reused by a different project), so it carries the gone notice; an
   // unrecognized reply never knew an origin, so no notice.
   log(`reply-route: replyTo=${action.replyToMessageId} → ${candidates.length} candidates recognized=${!!recognized} → picker`)
-  return postReplyPicker(env, call, candidates, recognized ? goneNotice(goneOriginLabel(recognized)) : undefined)
+  const notice = recognized ? goneNotice(goneOriginLabel(recognized)) : machines.length > 0 ? linkMaybeDownLine(machines) : undefined
+  return postReplyPicker(env, call, candidates, notice)
 }
 
 // A reply whose origin is gone. It goes to the origin's recorded process-lineage

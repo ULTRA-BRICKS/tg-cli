@@ -43,6 +43,9 @@ class CtlPaths(TypedDict):
     alertThrottle: str
     outbox: str
     chatgptRefs: str
+    remoteDir: str
+    remoteRoutes: str
+    remoteStatus: str
 
 
 def ctl_paths(config_dir: Path, bot_id: str) -> CtlPaths:
@@ -83,6 +86,9 @@ def ctl_paths(config_dir: Path, bot_id: str) -> CtlPaths:
         "alertThrottle": path("alert-throttle.json"),
         "outbox": path("outbox"),
         "chatgptRefs": path("chatgpt-refs.json"),
+        "remoteDir": posixpath.normpath(posixpath.join(str(config_dir), "remote")),
+        "remoteRoutes": path("remote-routes.json"),
+        "remoteStatus": path("remote-status.json"),
     }
 
 
@@ -103,7 +109,9 @@ def owns_pid_file(content: str | None, own_pid: int) -> bool:
 
 
 def should_auto_start(env: Mapping[str, str], cfg: ControlConfig) -> bool:
-    return bool(env.get("TMUX")) and cfg.enabled
+    # Any control.server value (even an invalid one) marks a ctl client, which must never start a
+    # second getUpdates poller; `machine` alone is rejected by `tgcli.remote.config.check` instead.
+    return bool(env.get("TMUX")) and cfg.enabled and cfg.server is None
 
 
 def plan_legacy_last_user_target_migration(

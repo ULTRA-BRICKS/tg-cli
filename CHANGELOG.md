@@ -3,6 +3,48 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.74.0
+
+- **Laya can be pinned in config (#830).** `laya.socket: /abs/path.sock` (env `TG_LAYA_SOCKET` wins) durably pins a private external classify socket; it is never autostarted, and an unreachable one is a typed unavailable reason naming the pinned path.
+- **A configurable ctl server for a second machine (#831).** `control.server: ssh://<ssh_config alias>` +
+  `control.machine: <name>` (client) and `control.remote_machines: "name=user@host"` (the machine that runs
+  `tg-ctl`). A client keeps its local pipeline (local attachments, direct Bot API post) and records every send
+  (machine-qualified route and history) on the server over a fixed SSH stdio RPC; a Telegram reply to such a
+  message is typed by the daemon into that exact session on that machine (never into a local process with the
+  same pane id or pid), at most once: a lost link after the request was written is recorded `uncertain` and
+  never re-sent. The RPC is the new stdlib-only Python package `tgcli.remote`, launcher `tg-remote` (`config
+  check`, `client record|hello|status|flush`, `doctor`, `server --peer`, `satellite serve`, `hub hello|deliver`),
+  always run as `python3 -I`. A client never polls Telegram: `tg-ctl run|start|restart|enable` exit 78 and the
+  lazy autostart is off; an invalid remote key exits 78 for `tg` (also `--dry-run`), `tg-ctl` and `tg config
+  validate`, never a silent local fallback. While `remote_machines` is set an unrecognised reply is never
+  auto-injected into the single local agent. `tg-ctl status` shows server, transport and real link health on
+  both sides. Not supported in this version (refused explicitly): session topics and question/permission
+  cards for client sessions, `tg-ctl ask|withdraw|alert|inbox|audit-delivery|harness-event` on a client, inbound
+  media to a client session, outbox replay on a client. Design: `docs/specs/2026-10-28-remote-ctl-server.md`.
+- **Laya starts itself and never goes missing silently (#830).** When no classify server answers, `tg` runs
+  `task classify-server start` once (own process group, sanitized env, bounded by `laya.cold_timeout_sec`,
+  default 75 s; measured cold start 6.4 s on a CPU host), checks that the printed socket sits in a private
+  directory you own, and asks with `laya.warm_timeout_ms` (default 3000 ms, was 1200 ms for the ask check;
+  measured warm calls 31-64 ms fast host, 267-1395 ms CPU host). A failed start is remembered in
+  `~/.local/state/tg-cli/laya-autostart.json` and not retried for 300 s; concurrent senders start one server.
+  `--dry-run` never spawns, connects or loads anything. To start Laya by hand: `task classify-server start`.
+- **Every "no answer" has a typed reason, also on the ask path.** `disabled`, `invalid-config`, `no-socket`,
+  `no-task`, `untrusted-socket`, `autostart-failed`, `autostart-skipped`, `cold-timeout`, `timeout`,
+  `connection-error`, `invalid-response`, `payload-too-large`, `helper-failed`, `helper-timeout`; the hint names
+  the reason, what was tried and the next step. The ask check used to return nothing without a word.
+- **`laya.required: true` (or `TG_LAYA_REQUIRED=1`) fails the send before any Bot API request** (exit 1) when Laya
+  was consulted and is unavailable for any reason: `tg: Laya is required (laya.required: true) but unavailable:
+  <reason>. Tried: <attempt>. Next: <remedy>.` It is also enforced when the Python caller itself cannot run.
+- **New `laya:` config block** (`enabled`, `autostart`, `required`, `cold_timeout_sec`, `warm_timeout_ms`,
+  `task_bin`) with env overrides `TG_LAYA`, `TG_LAYA_AUTOSTART`, `TG_LAYA_REQUIRED`, `TG_LAYA_TIMEOUT_MS`,
+  `TG_LAYA_COLD_TIMEOUT_SEC`, `TG_LAYA_SOCKET` (still wins and is never autostarted). Validation is strict: an
+  unknown key, non-boolean, non-positive timeout, relative `task_bin`, or `required: true` with Laya disabled
+  exits 78 where Laya is consulted and is listed by `tg config validate`. `config.schema.json`,
+  `docs/configuration.md` and `tg help config` describe it.
+- **The Laya caller is Python** (`src/tgcli/laya`, stdlib only, started as `python3 -I <repo>/tg-laya` with a
+  sanitized environment so nothing in the cwd or `PYTHON*` can shadow it); the TypeScript socket client is gone.
+  The test suite sets `TG_LAYA=0` for every child process so a stray consult can never autostart a model.
+
 ## 1.73.1
 
 - **/chatgpt, /spend and /daily find `pm` / `rig` from the daemon environment (#804).** The daemon looks for the

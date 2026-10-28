@@ -7,6 +7,7 @@ import { type Registry } from "../session-registry"
 import { resolveLocatorToSession } from "../session-registry-store"
 import { paneLocatorOf } from "../session-topics"
 import { parseRoutes, recognizeRoute, routeMatchesPane, type Route } from "../routes"
+import { parseRemoteRoutes, recognizeRemoteRoute, remotePaneLabel, type RemoteRouteEntry } from "../remote-routes"
 import { inboundHistoryRecords, type TopicSession } from "../../replies/inbound"
 import { findTopic } from "../topics"
 import type { PaneInfo, TgMessage, TgUpdate } from "../types"
@@ -15,6 +16,7 @@ import { sessionRegistry } from "./session-registry"
 import { snapshot } from "./tmux-probe"
 import type { Ctx } from "./ctx-io"
 import type { TopicRoutingApi } from "./topic-routing"
+import { hubMachines } from "./remote-hub"
 import type { TargetRoutingApi } from "./target-routing"
 
 export type InboundHistoryDeps = {
@@ -113,6 +115,41 @@ function resolveTopicOf(scope: HistoryScope, threadId: number): TopicSession | n
   return { pane: binding.paneId, agent: resolveAgentOf(scope, binding.paneId), sessionKey: key }
 }
 
+// How the replies of THIS batch that answer a message another machine sent are attributed (hub mode
+// only; null otherwise, so a plain machine reads nothing extra). The row names the remote session —
+// `<machine>/<pane>`, `<machine>/<name>`, `<machine>/<key>` — and never a local pane, which a
+// same-numbered local `%3` would otherwise collide with (spec §5).
+interface RemoteReplyScope {
+  paneOf: (m: TgMessage) => string | null
+  agentOf: (pane: string | null) => string | null
+  sessionOf: (pane: string | null) => string | null
+}
+
+function remoteReplyScope(ctx: Ctx): RemoteReplyScope | null {
+  if (hubMachines(ctx).length === 0) return null
+  const store = parseRemoteRoutes(readFileOrNull(ctx.paths.remoteRoutes))
+  const byPane = new Map<string, RemoteRouteEntry>()
+  return {
+    paneOf: (m) => {
+      const replyId = m.reply_to_message?.message_id
+      if (replyId === undefined || !isRoutedReply(m)) return null
+      const hit = recognizeRemoteRoute(store, ctx.chatId, replyId)
+      if (!hit) return null
+      const pane = remotePaneLabel(hit.machine, hit.route)
+      byPane.set(pane, hit)
+      return pane
+    },
+    agentOf: (pane) => {
+      const hit = pane === null ? undefined : byPane.get(pane)
+      return hit ? `${hit.machine}/${hit.name.primary}` : null
+    },
+    sessionOf: (pane) => {
+      const hit = pane === null ? undefined : byPane.get(pane)
+      return hit?.route.sessionKey ? `${hit.machine}/${hit.route.sessionKey}` : null
+    },
+  }
+}
+
 // Persist inbound history for `tg replies` recall — every message the CTO
 // sent in this batch. Best-effort, off the inject path: a read/write error
 // here never blocks delivery. Stale + rejected senders are filtered the
@@ -123,6 +160,7 @@ export function recordInboundHistory(d: InboundHistoryDeps, updates: TgUpdate[])
   const found = d.targetRouting.discover()
   const targetPane = found.ok ? found.target.pane.paneId : null
   const histRoutes = parseRoutes(readFileOrNull(ctx.paths.routes))
+  const remote = remoteReplyScope(ctx)
   // One snapshot for the whole batch (the resolveSessionName primary over the live panes — the
   // SAME derivation the reader uses for its own pane); a pane that's gone (or none) → null →
   // untagged. The registry session the pane (or `omp:<pid>` origin) hosts is stamped
@@ -137,9 +175,9 @@ export function recordInboundHistory(d: InboundHistoryDeps, updates: TgUpdate[])
       pane: targetPane,
       nowSec: Math.floor(Date.now() / 1000),
       stalenessSec: ctx.cfg.stalenessSec,
-      resolvePane: (m) => resolveReplyPane(histRoutes, m),
-      resolveAgent: (pane) => resolveAgentOf(scope, pane),
-      resolveSession: (pane) => resolveSessionOf(scope, pane),
+      resolvePane: (m) => resolveReplyPane(histRoutes, m) ?? remote?.paneOf(m) ?? null,
+      resolveAgent: (pane) => remote?.agentOf(pane) ?? resolveAgentOf(scope, pane),
+      resolveSession: (pane) => remote?.sessionOf(pane) ?? resolveSessionOf(scope, pane),
       ...(ctx.cfg.topics || ctx.cfg.privateTopics ? { resolveTopic: (threadId: number) => resolveTopicOf(scope, threadId) } : {}),
     }),
   )

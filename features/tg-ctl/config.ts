@@ -25,84 +25,91 @@ const unquote = (s: string): string => s.replace(/^["']|["']$/g, '');
 // '0x10', '-5' and ''. Positivity is resolve's job, not the parser's.
 const INT_RE = /^\d+$/;
 
-export function parseControlConfig(yaml: string): Partial<ControlConfig> {
-  const out: Partial<ControlConfig> = {};
+// Static key → field tables. A Map, not an object literal: `constructor`/`toString` in a config
+// file must stay "unknown key", never resolve to an inherited Object.prototype member.
+const BOOLEAN_KEYS = new Map<string, 'enabled' | 'topics' | 'privateTopics' | 'gitStateBanner'>([
+  ['enabled', 'enabled'],
+  ['topics', 'topics'],
+  ['private_topics', 'privateTopics'],
+  ['git_state_banner', 'gitStateBanner'],
+]);
+const INT_KEYS = new Map<string, 'stalenessSec' | 'idleExitMin'>([
+  ['staleness_sec', 'stalenessSec'],
+  ['idle_exit_min', 'idleExitMin'],
+]);
+const TEXT_KEYS = new Map<string, 'session' | 'injectWrap'>([
+  ['session', 'session'],
+  ['inject_wrap', 'injectWrap'],
+]);
+// Remote ctl server keys stay RAW (trimmed, quotes stripped; empty = unset). Their rules live
+// once, in `tg-remote config check` (remote-config.ts), not in a second TS validator.
+const REMOTE_KEYS = new Map<string, 'server' | 'machine' | 'remoteMachines'>([
+  ['server', 'server'],
+  ['machine', 'machine'],
+  ['remote_machines', 'remoteMachines'],
+]);
+
+// `key: value` pairs of the top-level `control:` block (one-level scalars only). Anything outside
+// that exact shape — other blocks, comments, empty values — yields nothing.
+function* controlEntries(yaml: string): Generator<[string, string]> {
   let inControl = false;
   for (const rawLine of yaml.split('\n')) {
     // Strip trailing comments (only when clearly a comment, not inside a value).
     const line = rawLine.replace(/\s+#.*$/, '');
-    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
 
-    const indent = line.length - line.trimStart().length;
-    if (indent === 0) {
+    if (line.length === line.trimStart().length) {
       // A top-level key. We only care about `control:`.
-      inControl = line.trim().replace(/:.*$/, '') === 'control';
+      inControl = trimmed.replace(/:.*$/, '') === 'control';
       continue;
     }
-    if (!inControl) continue;
-
-    const trimmed = line.trim();
     const colon = trimmed.indexOf(':');
-    if (colon === -1) continue;
-    const key = unquote(trimmed.slice(0, colon).trim());
     const value = trimmed.slice(colon + 1).trim();
-    if (!value) continue;
-
-    switch (key) {
-      case 'enabled': {
-        const v = value.toLowerCase();
-        if (TRUE_TOKENS.has(v)) out.enabled = true;
-        else if (FALSE_TOKENS.has(v)) out.enabled = false;
-        // unrecognized value → ignore (don't guess)
-        break;
-      }
-      case 'topics': {
-        const v = value.toLowerCase();
-        if (TRUE_TOKENS.has(v)) out.topics = true;
-        else if (FALSE_TOKENS.has(v)) out.topics = false;
-        // unrecognized value → ignore (don't guess)
-        break;
-      }
-      case 'private_topics': {
-        const v = value.toLowerCase();
-        if (TRUE_TOKENS.has(v)) out.privateTopics = true;
-        else if (FALSE_TOKENS.has(v)) out.privateTopics = false;
-        // unrecognized value → ignore (don't guess)
-        break;
-      }
-      case 'git_state_banner': {
-        const v = value.toLowerCase();
-        if (TRUE_TOKENS.has(v)) out.gitStateBanner = true;
-        else if (FALSE_TOKENS.has(v)) out.gitStateBanner = false;
-        // unrecognized value → ignore (don't guess)
-        break;
-      }
-      case 'transport':
-        // Raw string passthrough — resolveControlConfig normalizes garbage.
-        out.transport = unquote(value) as ControlConfig['transport'];
-        break;
-      case 'session':
-        out.session = unquote(value);
-        break;
-      case 'inject_wrap':
-        out.injectWrap = unquote(value);
-        break;
-      case 'staleness_sec':
-        if (INT_RE.test(value)) out.stalenessSec = Number(value);
-        break;
-      case 'idle_exit_min':
-        if (INT_RE.test(value)) out.idleExitMin = Number(value);
-        break;
-      case 'allowed_senders':
-        out.allowedSenders = unquote(value)
-          .split(',')
-          .map((s) => s.trim())
-          .filter((s) => INT_RE.test(s))
-          .map(Number);
-        break;
-      // unknown key → ignore
-    }
+    if (inControl && colon !== -1 && value) yield [unquote(trimmed.slice(0, colon).trim()), value];
   }
+}
+
+function applyControlKey(out: Partial<ControlConfig>, key: string, value: string): void {
+  const flag = BOOLEAN_KEYS.get(key);
+  if (flag) {
+    // unrecognized value → ignore (don't guess)
+    const token = value.toLowerCase();
+    if (TRUE_TOKENS.has(token)) out[flag] = true;
+    else if (FALSE_TOKENS.has(token)) out[flag] = false;
+    return;
+  }
+  const count = INT_KEYS.get(key);
+  if (count) {
+    if (INT_RE.test(value)) out[count] = Number(value);
+    return;
+  }
+  const text = TEXT_KEYS.get(key);
+  if (text) {
+    out[text] = unquote(value);
+    return;
+  }
+  const remote = REMOTE_KEYS.get(key);
+  if (remote) {
+    const raw = unquote(value).trim();
+    if (raw) out[remote] = raw;
+    return;
+  }
+  // Raw string passthrough — resolveControlConfig normalizes garbage.
+  if (key === 'transport') out.transport = unquote(value) as ControlConfig['transport'];
+  else if (key === 'allowed_senders') {
+    out.allowedSenders = unquote(value)
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => INT_RE.test(s))
+      .map(Number);
+  }
+  // unknown key → ignore
+}
+
+export function parseControlConfig(yaml: string): Partial<ControlConfig> {
+  const out: Partial<ControlConfig> = {};
+  for (const [key, value] of controlEntries(yaml)) applyControlKey(out, key, value);
   return out;
 }
 
@@ -130,5 +137,8 @@ export function resolveControlConfig(partial: Partial<ControlConfig>): ControlCo
     gitStateBanner: partial.gitStateBanner ?? DEFAULT_CONTROL.gitStateBanner,
   };
   if (partial.session !== undefined) cfg.session = partial.session;
+  if (partial.server !== undefined) cfg.server = partial.server;
+  if (partial.machine !== undefined) cfg.machine = partial.machine;
+  if (partial.remoteMachines !== undefined) cfg.remoteMachines = partial.remoteMachines;
   return cfg;
 }

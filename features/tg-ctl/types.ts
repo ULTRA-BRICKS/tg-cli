@@ -37,6 +37,13 @@ export interface ControlConfig {
   // pane. An agent that always works on a feature branch sees this on every delivery to that
   // pane; opt out per machine with `control.git_state_banner: false` if that's too noisy.
   gitStateBanner: boolean;
+  // Remote ctl server (docs/specs/2026-10-28-remote-ctl-server.md §3). RAW trimmed strings: the
+  // rules live once, in `tg-remote config check` (see remote-config.ts). Unset = a plain local
+  // machine. `server`+`machine` make this a ctl CLIENT (never polls Telegram); `remoteMachines`
+  // ("name=ssh-target, …") makes it the daemon host of such clients.
+  server?: string;
+  machine?: string;
+  remoteMachines?: string;
 }
 
 // enabled defaults ON (user decision 2026-06-10, post-review): inbound is armed
@@ -248,7 +255,9 @@ export type Action =
   // stays at column 0 for the harness passthrough while still routing to origin.
   // threadId: the forum topic the reply was written in — the fallback picker and notices are
   // answered there (a reply in a gone session's topic, tg-cli#709); absent = General.
-  | { kind: 'reply-route'; replyToMessageId: number; injectText: string; from: string; messageId: number; threadId?: number }
+  // `media`: the text is the receipt of a downloaded photo/file — a path local to THIS host, which a
+  // reply forwarded to another machine could not open (remote routes refuse it, spec §4.2).
+  | { kind: 'reply-route'; replyToMessageId: number; injectText: string; from: string; messageId: number; threadId?: number; media?: true }
   | { kind: 'reply'; text: string; threadId?: number | null } // sendMessage back to the chat (threadId: reply inside a bound topic)
   | { kind: 'answer-callback'; callbackQueryId: string; text: string }
   // messageId is the Telegram message the tapped button belongs to (null when
@@ -543,6 +552,12 @@ export interface CtlPaths {
   alertThrottle: string; // last `tg-ctl alert send` per (source,key,severity), for the dedup window (tg-cli#636)
   outbox: string; // dir of `tg` sends Telegram did not take, replayed by the daemon (tg-cli#710)
   chatgptRefs: string; // opaque one-use /chatgpt callback references (features/chatgpt/refs.ts; 0600)
+  // Remote ctl server (docs/specs/2026-10-28-remote-ctl-server.md): state of the clients this
+  // daemon host serves, kept apart from routes.json/sessions.json so a client machine's pane
+  // ids and pids can never be matched against local ones.
+  remoteDir: string; // <configDir>/remote — client journal + satellite delivery markers
+  remoteRoutes: string; // routes recorded by client machines (daemon host)
+  remoteStatus: string; // last record/deliver result per client, for `tg-ctl status`
 }
 
 // --- forum topics (docs/specs/session-registry-and-topics.md §4) ---

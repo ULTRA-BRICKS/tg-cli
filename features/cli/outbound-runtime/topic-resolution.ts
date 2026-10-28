@@ -13,6 +13,7 @@ import { threadOfMessageInBlob } from "../../replies/history"
 import { parseControlConfig, resolveControlConfig } from "../../tg-ctl/config"
 import { botIdFromToken, ctlPaths } from "../../tg-ctl/lock"
 import { parseInboxState } from "../../tg-ctl/question-inbox"
+import type { RemoteMode } from "../../tg-ctl/remote-config"
 import type { CtlPaths } from "../../tg-ctl/types"
 import { askDaemon, parseResolvedSession, tmuxServerPidFromEnv, type ResolvedSession } from "../session-topic"
 import { SESSION_LOOKUP_TIMEOUT_MS } from "./constants"
@@ -85,10 +86,13 @@ export async function resolveThread(
   sender: SenderContext,
   configYamlRaw: string,
   paths: RuntimePaths,
+  remote: RemoteMode = { mode: "local" },
 ): Promise<ThreadResolution> {
   const ctlCfg = resolveControlConfig(parseControlConfig(configYamlRaw))
   const ctlFiles = ctlPaths(paths.configDir, botIdFromToken(sender.botToken))
-  const topicsOn = ctlCfg.topics || ctlCfg.privateTopics
+  // A ctl client has no session topics (spec §3): no Inbox read, no reply-anchor read, no daemon ask;
+  // only an explicit --topic / TG_TOPIC (already in `prepared.thread`) picks a thread.
+  const topicsOn = remote.mode !== "client" && (ctlCfg.topics || ctlCfg.privateTopics)
   const inboxThread = inboxThreadOf(ctlFiles, topicsOn, sender.currentChatId)
   let { messageThreadId, threadIdAdvisory } = guardInboxSelection(prepared.thread, inboxThread)
   let resolvedSession: ResolvedSession | null = null

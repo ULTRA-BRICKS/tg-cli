@@ -23,7 +23,7 @@ import { pinnedSession } from "../../tg-ctl/session-registry-store"
 import { HARNESS_AGENT } from "../../tg-ctl/session-topics"
 import type { ParseResult } from "../args"
 import { readSessionRegistry } from "./session-helpers"
-import type { MergedEnv, SenderContext } from "./types"
+import type { MergedEnv, SenderContext, SessionNameParts } from "./types"
 
 /** The identity slice of `SenderContext` (everything that comes from the process / registry, not credentials). */
 export type SessionIdentity = Pick<
@@ -40,6 +40,7 @@ export type SessionIdentity = Pick<
   | "ownHost"
   | "harnessTitle"
   | "sessionNameFor"
+  | "remoteMachine"
 >
 
 type TmuxPane = { windowName: string; panePath: string }
@@ -170,13 +171,20 @@ interface NameSources {
   tmuxPane: TmuxPane | null
   ompSession: OmpSession
   ownHost: HostRecord | null
+  /** The ctl-client machine namespace (control.machine); undefined on every other machine. */
+  machine: string | undefined
+}
+
+/** `<machine>/<primary>`: a client's names live in their own namespace on the ctl server (spec §3). */
+export function namespacedPrimary(machine: string, primary: string): string {
+  return primary === "" ? primary : `${machine}/${primary}`
 }
 
 // A pinned session is named by its registry entry outright: an inherited $TMUX pane must not
 // put another window's name on its header (tg-cli#709).
 function makeSessionNameFor(src: NameSources): SenderContext["sessionNameFor"] {
-  const { pinned, hasSessionIdentity, sessionless, tmuxPane, ompSession, ownHost } = src
-  return (title) =>
+  const { pinned, hasSessionIdentity, sessionless, tmuxPane, ompSession, ownHost, machine } = src
+  const own = (title: string): SessionNameParts =>
     pinned
       ? { primary: pinned.name.primary, secondary: pinned.name.secondary }
       : hasSessionIdentity && !sessionless
@@ -187,11 +195,16 @@ function makeSessionNameFor(src: NameSources): SenderContext["sessionNameFor"] {
             hostLabel: ownHost?.label,
           })
         : { primary: "", secondary: null }
+  if (machine === undefined) return own
+  return (title) => {
+    const name = own(title)
+    return { primary: namespacedPrimary(machine, name.primary), secondary: name.secondary, bare: name.primary }
+  }
 }
 
 // Resolve the window label only when needed: the `--detect-agent` info action and the real send need
 // it, but the emoji/model info flags must NOT pay for ps/lsof/tmux subprocesses they never read.
-export function resolveSessionIdentity(parsed: ParseResult, env: MergedEnv, configDir: string): SessionIdentity {
+export function resolveSessionIdentity(parsed: ParseResult, env: MergedEnv, configDir: string, machine?: string): SessionIdentity {
   const { senderTree, pinId, sessionsPath, pinned, pinnedKey, ancestry } = resolvePin(parsed, env, configDir)
   warnSessionlessSend(parsed, pinId, pinnedKey, senderTree)
   // A send with NO session: a pin that named no live session, or an unpinned omp background
@@ -211,7 +224,7 @@ export function resolveSessionIdentity(parsed: ParseResult, env: MergedEnv, conf
   // A session identity exists inside tmux, under an agent ancestor or in a wrapper-hosted session.
   // A bare, non-agent invocation outside tmux (a cron job, a plain script) gets NO bracket.
   const hasSessionIdentity = tmuxPane !== null || Boolean(process.env.TMUX) || ancestor !== null || ownHost !== null
-  const sessionNameFor = makeSessionNameFor({ pinned, hasSessionIdentity, sessionless, tmuxPane, ompSession, ownHost })
+  const sessionNameFor = makeSessionNameFor({ pinned, hasSessionIdentity, sessionless, tmuxPane, ompSession, ownHost, machine })
   return {
     sessionsPath,
     pinId,
@@ -225,5 +238,6 @@ export function resolveSessionIdentity(parsed: ParseResult, env: MergedEnv, conf
     ownHost,
     harnessTitle,
     sessionNameFor,
+    ...(machine === undefined ? {} : { remoteMachine: machine }),
   }
 }

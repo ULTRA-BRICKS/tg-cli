@@ -8,7 +8,8 @@ import type { DictionaryField } from "../dict-gate"
 import { escalationFormatMessage, validateEscalationFormat } from "../escalation-format"
 import { formatUnattachedFileError, unattachedFileMentions } from "../file-mention-gate"
 import { classifyIntent, formatIntentVerdict, layaWorthAsking, type IntentVerdict } from "../intent-gate"
-import { layaAskProbability, layaProblemAssessment } from "../laya-socket"
+import { formatConfigFailure, formatRequiredFailure, layaAskProbability, layaProblemAssessment } from "../laya-socket"
+import type { LayaUnavailable, ProblemLayaAssessment } from "../problem-remediation"
 import { isEscalationTag } from "../../render/tag"
 import { enforceEscalationGate } from "./escalation-gate"
 import type { MergedEnv, SendAction, SenderContext } from "./types"
@@ -74,22 +75,59 @@ function passVerdict(): IntentVerdict {
 }
 
 /**
- * Laya uses the existing warm socket within TG_LAYA_TIMEOUT_MS: ask scores are hints, problem
- * negatives can block. Unavailable inference falls back to deterministic checks with an explicit
- * diagnostic. Dry-run never connects to either classifier.
+ * The policy half of "Laya did not answer" (the reason, attempt and remedy come from the Python
+ * caller, src/tgcli/laya). An invalid `laya:` config or environment stops the send (exit 78, the
+ * tg config-error code); `laya.required: true` stops it before any Bot API request (exit 1, the
+ * code every pre-send gate block uses; ESCALATION_GATE_ENFORCE=0 does not reach it). Otherwise
+ * the caller falls back to the deterministic checks and shows the reason as a hint.
+ */
+function enforceLayaPolicy(outcome: LayaUnavailable): void {
+  if (outcome.reason === "invalid-config") {
+    console.error(formatConfigFailure(outcome))
+    process.exit(78)
+  }
+  if (outcome.policy !== "required") return
+  console.error(formatRequiredFailure(outcome))
+  console.error("Blocked: nothing was sent. Make Laya available (or set laya.required: false) and resend.")
+  process.exit(1)
+}
+
+async function askLayaHint(caption: string, env: MergedEnv, configDir: string): Promise<{ probability: number | null; unavailable?: LayaUnavailable }> {
+  const result = await layaAskProbability(caption, env, configDir)
+  if (result.status === "ok") return { probability: result.probability }
+  enforceLayaPolicy(result)
+  return { probability: null, unavailable: result }
+}
+
+async function assessProblemWithLaya(caption: string, env: MergedEnv, configDir: string): Promise<ProblemLayaAssessment> {
+  const assessment = await layaProblemAssessment(caption, env, configDir)
+  if (assessment.status === "unavailable") enforceLayaPolicy(assessment)
+  return assessment
+}
+
+/**
+ * Laya goes through the Python caller (autostarting task-cli's classify server when none answers):
+ * ask scores are hints, problem negatives can block. Unavailable inference falls back to
+ * deterministic checks with an explicit diagnostic unless laya.required says otherwise. Dry-run
+ * never connects to, spawns or loads either classifier.
  */
 async function classifyWithLaya(
   send: SendAction,
   caption: string,
   env: MergedEnv,
+  configDir: string,
   intentInput: { body: string; tag: string | undefined; automated: boolean },
 ): Promise<IntentVerdict> {
   const { tag, dryRun } = send
+  const ask: { probability: number | null; unavailable?: LayaUnavailable } = !dryRun && tag !== "problem" && layaWorthAsking(intentInput)
+    ? await askLayaHint(caption, env, configDir)
+    : { probability: null }
   return classifyIntent({
     ...intentInput,
-    layaAskProbability: !dryRun && tag !== "problem" && layaWorthAsking(intentInput) ? await layaAskProbability(caption, env) : null,
+    layaAskProbability: ask.probability,
+    layaAskUnavailable: ask.unavailable,
     layaProblemAssessment: tag === "problem"
-      ? dryRun ? { status: "skipped", reason: "dry-run" } : await layaProblemAssessment(caption, env)
+      ? dryRun ? { status: "skipped", reason: "dry-run" } : await assessProblemWithLaya(caption, env, configDir)
       : undefined,
   })
 }
@@ -117,7 +155,7 @@ function reportIntentVerdict(intent: IntentVerdict, tag: string | undefined, env
  * the send). Every explicit problem also requires actual actions/results plus current recovery.
  * Scope: see `isAgentAuthored`.
  */
-export async function runIntentGate(send: SendAction, caption: string, env: MergedEnv, agentAuthored: boolean): Promise<IntentVerdict> {
+export async function runIntentGate(send: SendAction, caption: string, env: MergedEnv, configDir: string, agentAuthored: boolean): Promise<IntentVerdict> {
   const { tag } = send
   const automatedFlag = send.automated === true
   // A sender with no agent identity (cron, monitor) keeps only the remediation requirement; the
@@ -125,7 +163,7 @@ export async function runIntentGate(send: SendAction, caption: string, env: Merg
   const intentInput = { body: caption, tag, automated: automatedFlag || (tag === "problem" && !agentAuthored) }
   const nonAgentProblem = tag === "problem" && !agentAuthored && !automatedFlag
   const verdict: IntentVerdict =
-    agentAuthored || intentInput.automated || tag === "problem" ? await classifyWithLaya(send, caption, env, intentInput) : passVerdict()
+    agentAuthored || intentInput.automated || tag === "problem" ? await classifyWithLaya(send, caption, env, configDir, intentInput) : passVerdict()
   // Only a missing-remediation block applies to a sender with no agent identity: a cron's "threshold
   // reached?" must not record an obligation that fails every later `tg obligations --check`, nor
   // mail a classifier-unavailable hint on every run.

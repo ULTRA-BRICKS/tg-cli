@@ -92,7 +92,13 @@ function appendRouteLocked(routesPath: string, newRoute: Parameters<typeof appen
   )
 }
 
-export function createOutboundRecorder(ctx: { paths: RuntimePaths; sender: SenderContext; plan: SendPlan }): OutboundRecorder {
+export function createOutboundRecorder(ctx: {
+  paths: RuntimePaths
+  sender: SenderContext
+  plan: SendPlan
+  /** Sees the history rows of a plain (non-queued) send; the client-mode remote recorder's tap. */
+  onHistory?: (recs: HistoryRecord[]) => void
+}): OutboundRecorder {
   const { paths, sender, plan } = ctx
   const { home } = paths
   const { pinnedKey, sessionless, ancestor, currentChatId } = sender
@@ -184,6 +190,9 @@ export function createOutboundRecorder(ctx: { paths: RuntimePaths; sender: Sende
         // later `tg --reply-to` of any of these ids finds its topic from it (tg-cli#551).
         outboundThreads,
       )
+      // The remote recorder (client machines) takes the rows BEFORE the local file write: an
+      // unwritable local history must not cost the server its record of a delivered message.
+      if (!write) ctx.onHistory?.(recs)
       // Under the history lock shared with the daemon's inbound writer (tg-cli#136).
       if (write) write(recs)
       else appendHistoryFile(ctlFiles.history, recs)

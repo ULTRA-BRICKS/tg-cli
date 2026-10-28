@@ -49,9 +49,10 @@ size: a 32 KiB body of repeated actions validates in milliseconds.
 
 ## Laya and offline operation
 
-`laya-socket.ts` reuses task-cli's warm local classifier and the existing
-`TG_LAYA_SOCKET`/discovery, `TG_LAYA`, and `TG_LAYA_TIMEOUT_MS` settings. It does not select
-a provider/model, spawn a server, or call Telegram. Problem questions ask separately for
+`laya-socket.ts` is thin glue to the Python caller `src/tgcli/laya` (stdlib only; run as
+`python3 -I <repo>/tg-laya`), which talks to task-cli's classify server and starts it when
+nothing answers (design: `docs/specs/2026-10-28-laya-autostart.md`). It does not select a
+provider/model or call Telegram. Problem questions ask separately for
 completed action plus observed result (`has_done`) and current recovery or an exact hard
 dependency (`has_current`). A confident negative (probability at most 0.1) for either is a
 rejection. Probabilities between 0.1 and 0.9 are inconclusive: live probes returned
@@ -60,16 +61,39 @@ evidence check in charge. Positive scores never clear a deterministic failure:
 future-only statements can fool the model.
 This is a content check, not independent proof that an author's actions occurred.
 
-The default problem inference deadline is 3000 ms (the older ask hint remains 1200 ms).
-Disabled inference, no safe socket, timeout, connection errors, malformed replies, or an
-oversized request produce an explicit unavailable diagnostic. Deterministic valid reports
-still pass. The request is at most 16 KiB of serialized UTF-8, including both questions;
+The default warm inference deadline is 3000 ms for both the problem and the ask check
+(`laya.warm_timeout_ms`, `TG_LAYA_TIMEOUT_MS`; measured warm calls: 31-64 ms on a fast host,
+267-1395 ms on a CPU host). When no live server answers, tg runs `task classify-server start`
+once, within `laya.cold_timeout_sec` (default 75 s; measured cold start 6.4 s on a CPU host),
+and then asks with the warm deadline. A failed start is not retried for 300 s; run
+`task classify-server start` yourself to start Laya manually, a running server is used at once.
+A pinned socket (`laya.socket`, or `TG_LAYA_SOCKET` which wins) is the exception: it must be an absolute path
+in a private directory you own, `tg` uses exactly it and never runs `task` or any model for it. When it is
+unreachable the reason is `no-socket`, `connection-error` or `untrusted-socket`, and the remedy names the
+pinned path as an external service (fix or restart that supervisor); with `laya.required: true` the send
+fails as above. A relative, empty, NUL- or `..`-containing `laya.socket` exits 78.
+
+Every unavailable outcome is typed and shown: `disabled`, `invalid-config`, `no-socket`,
+`no-task`, `untrusted-socket`, `autostart-failed`, `autostart-skipped`, `cold-timeout`,
+`timeout`, `connection-error`, `invalid-response`, `payload-too-large`, `helper-failed`,
+`helper-timeout`. The hint (for the ask check too, except an explicit `disabled`) names the
+reason, what was tried and the next step, and the deterministic checks decide:
+`tg: hint: Laya ask check unavailable (timeout): tried …. Next: run: task classify-server start`.
+With `laya.required: true` (or `TG_LAYA_REQUIRED=1`) a consulted-but-unavailable Laya fails the
+send before any Bot API request, exit 1:
+`tg: Laya is required (laya.required: true) but unavailable: <reason>. Tried: <attempt>. Next: <remedy>.`
+An invalid `laya:` block or `TG_LAYA*` value exits 78 where Laya is consulted
+(`tg config validate` lists it with its line); `required: true` together with
+`enabled: false`/`TG_LAYA=0` is such an error, never a silent skip.
+The request is at most 16 KiB of serialized UTF-8, including both questions;
 the full action sections are selected even after the first 2000 characters. Oversized
 evidence is not truncated and then treated as missing. Only the author's own text is
 submitted: no synthetic action headings are added to a bare symptom. The classifier
-adapter persists neither the body nor a body hash.
+adapter persists neither the body nor a body hash. The failed-start state
+(`~/.local/state/tg-cli/laya-autostart.json`, 0600) holds only the reason, a short error
+text and a time.
 
-`--dry-run` makes no classifier/socket/network call and needs no credentials. It checks
+`--dry-run` makes no classifier/socket/network call, never starts Laya and needs no credentials. It checks
 the deterministic contract and explicitly reports that semantic inference was skipped.
 `ESCALATION_GATE_ENFORCE=0` cannot bypass this requirement. A rejected message exits 1
 before the Bot API; the error names the missing evidence without fabricating a remedy.

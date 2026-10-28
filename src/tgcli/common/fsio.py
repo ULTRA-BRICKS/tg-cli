@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 
-def _fsync_dir(directory: Path) -> None:
+def fsync_dir(directory: Path) -> None:
     fd = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -25,11 +25,11 @@ def _write_all(fd: int, payload: bytes) -> None:
         view = view[written:]
 
 
-def atomic_write(path: Path, data: str | bytes, mode: int = 0o600) -> None:
-    """tmp file in the same directory, fsync, rename, fsync the directory.
+def _write_tmp(path: Path, data: str | bytes, mode: int) -> Path:
+    """Write `data` to a fresh, fsynced temp file beside `path`; the caller publishes it.
 
     The temp name is unique per call and created exclusively without following symlinks, so
-    concurrent writers of one path never share a temp file.
+    concurrent writers of one path never share a temp file. A failed write removes it.
     """
     payload = data.encode("utf-8") if isinstance(data, str) else data
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
@@ -41,12 +41,41 @@ def atomic_write(path: Path, data: str | bytes, mode: int = 0o600) -> None:
             os.fsync(fd)
         finally:
             os.close(fd)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    return tmp
+
+
+def atomic_write(path: Path, data: str | bytes, mode: int = 0o600) -> None:
+    """tmp file in the same directory, fsync, rename, fsync the directory."""
+    tmp = _write_tmp(path, data, mode)
+    try:
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             tmp.unlink()
         raise
-    _fsync_dir(path.parent)
+    fsync_dir(path.parent)
+
+
+def atomic_create(path: Path, data: str | bytes, mode: int = 0o600) -> bool:
+    """Publish `data` at `path` complete and fsynced, never replacing an existing file.
+
+    Like `atomic_write`, but the final step is a hard link, which fails when `path` exists: the
+    file is either absent or whole, and exactly one concurrent creator wins. True = created.
+    """
+    tmp = _write_tmp(path, data, mode)
+    try:
+        os.link(tmp, path)
+    except FileExistsError:
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+    fsync_dir(path.parent)
+    return True
 
 
 def append_lines(path: Path, lines: Sequence[str], *, fsync: bool, mode: int = 0o600) -> None:

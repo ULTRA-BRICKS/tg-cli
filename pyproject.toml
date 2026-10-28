@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tg-cli"
-version = "1.73.1"
+version = "1.74.0"
 description = "Telegram CLI for agents: Python port of tg, tg-ctl and call-cli"
 requires-python = ">=3.12"
 dependencies = ["httpx>=0.28,<1", "tg-call-lib"]
@@ -13,6 +13,7 @@ dependencies = ["httpx>=0.28,<1", "tg-call-lib"]
 tg = "tgcli.entry:tg"
 tg-ctl = "tgcli.entry:tg_ctl"
 call-cli = "tgcli.entry:call_cli"
+tg-remote = "tgcli.remote.cli:run"
 
 [dependency-groups]
 dev = ["pytest>=8,<9", "ruff>=0.7", "mypy>=1.13,<2"]

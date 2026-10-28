@@ -218,3 +218,41 @@ def test_resolve_control_programmatic_number_uses_js_double():
         == 9007199254740992
     )
     assert resolve_control_config({"staleness_sec": 10**5000}).staleness_sec == 300
+
+
+def test_parse_remote_keys_are_raw_scalars_like_the_ts_twin():
+    assert parse_control_config(
+        "control:\n  server: ssh://tg-ctl-ubuntu\n  machine: 'clvm'\n"
+        '  remote_machines: "clvm=ultra@65.21.40.51, lab=lab.example"\n'
+    ) == {
+        "server": "ssh://tg-ctl-ubuntu",
+        "machine": "clvm",
+        "remote_machines": "clvm=ultra@65.21.40.51, lab=lab.example",
+    }
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "control:\n  server: ssh://-oProxyCommand=x\n",
+        "control:\n  machine: Not A Machine\n",
+        "control:\n  remote_machines: =,,\n",
+    ],
+)
+def test_parse_remote_keys_do_not_validate(text):
+    assert len(parse_control_config(text)) == 1
+
+
+def test_parse_remote_keys_ignore_empty_values_and_other_blocks():
+    assert parse_control_config("control:\n  server:\n  machine:   \nother:\n  server: x\n") == {}
+
+
+def test_resolve_control_keeps_remote_keys_none_unless_set():
+    cfg = resolve_control_config(parse_control_config("control:\n  server: ssh://h\n"))
+    assert (cfg.server, cfg.machine, cfg.remote_machines) == ("ssh://h", None, None)
+    assert resolve_control_config({}) == DEFAULT_CONTROL
+    assert (DEFAULT_CONTROL.server, DEFAULT_CONTROL.machine, DEFAULT_CONTROL.remote_machines) == (
+        None,
+        None,
+        None,
+    )
