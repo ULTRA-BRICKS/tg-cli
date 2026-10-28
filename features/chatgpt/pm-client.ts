@@ -10,6 +10,8 @@
 // killed for oversize output, or answers with garbage may already have queued a request inside pm,
 // so it is NEVER retried and the user is pointed at `tg chatgpt requests`.
 
+import { describeDependencyProblem, type DependencyProblem } from '../tg-ctl/dependency-problem';
+
 export const PM_READ_METHODS = ['accounts.list', 'sessions.list', 'sessions.get', 'requests.list', 'requests.get', 'connectors.list'] as const;
 export const PM_MUTATING_METHODS = ['actions.request', 'connectors.request'] as const;
 export type PmMethod = (typeof PM_READ_METHODS)[number] | (typeof PM_MUTATING_METHODS)[number];
@@ -33,13 +35,15 @@ export type RunnerResult =
   | { kind: 'exit'; code: number | null; stdout: string; stderr: string }
   | { kind: 'timeout' }
   | { kind: 'oversize' }
-  | { kind: 'spawn-error' };
+  // `problem` classifies WHY pm could not run (not found vs found-but-unstartable); absent for a fake runner.
+  | { kind: 'spawn-error'; problem?: DependencyProblem };
 
 export type PmRunner = (argv: readonly string[], opts: RunnerOptions) => Promise<RunnerResult>;
 
 export type PmOutcome =
   | { kind: 'ok'; result: unknown }
-  | { kind: 'pm-unavailable'; message: string }
+  // `problem` (when known) lets a Telegram surface word the fix for the daemon instead of the shell.
+  | { kind: 'pm-unavailable'; message: string; problem?: DependencyProblem }
   | { kind: 'pm-error'; code: string; message: string }
   | { kind: 'invalid-response'; message: string }
   | { kind: 'uncertain'; message: string };
@@ -81,23 +85,28 @@ export function parseEnvelope(stdout: string): ParsedEnvelope {
   return { kind: 'error', code: code.slice(0, MAX_ERROR_CODE), message: message.slice(0, MAX_ERROR_MESSAGE) };
 }
 
-export async function callPm(run: PmRunner, method: PmMethod, params: PmParams): Promise<PmOutcome> {
-  if (!isAllowedMethod(method)) return { kind: 'pm-error', code: 'method-not-allowed', message: `method ${String(method)} is not an allowed pm API method` };
-  const mutating = isMutatingMethod(method);
-  const argv = pmArgv(method, params);
-  if (Buffer.byteLength(argv[5]) > MAX_PARAMS_BYTES) return { kind: 'pm-error', code: 'params-too-large', message: 'request parameters exceed the size bound' };
-  const res = await run(argv, { timeoutMs: mutating ? PM_MUTATION_TIMEOUT_MS : PM_READ_TIMEOUT_MS, maxBytes: PM_MAX_STDOUT_BYTES });
-  if (res.kind === 'spawn-error') return { kind: 'pm-unavailable', message: 'could not start `pm` (is it installed and on PATH?)' };
+type NonExitRun = Exclude<RunnerResult, { kind: 'exit' }>;
+type ExitRun = Extract<RunnerResult, { kind: 'exit' }>;
+
+// The runner never got an answer: pm could not start, or it timed out / overflowed. A MUTATING call
+// may already have queued a request, so only that case is `uncertain`.
+function nonExitOutcome(res: NonExitRun, mutating: boolean): PmOutcome {
+  if (res.kind === 'spawn-error') {
+    return res.problem
+      ? { kind: 'pm-unavailable', message: describeDependencyProblem('pm', res.problem, 'shell'), problem: res.problem }
+      : { kind: 'pm-unavailable', message: 'could not start `pm` (is it installed and on PATH?)' };
+  }
   if (res.kind === 'timeout') {
     return mutating
       ? { kind: 'uncertain', message: `pm did not answer in time; the request may or may not have been queued. ${REQUESTS_HINT}` }
       : { kind: 'pm-error', code: 'timeout', message: 'pm did not answer in time' };
   }
-  if (res.kind === 'oversize') {
-    return mutating
-      ? { kind: 'uncertain', message: `pm output exceeded the size bound and was killed; the request may or may not have been queued. ${REQUESTS_HINT}` }
-      : { kind: 'invalid-response', message: 'pm output exceeded the size bound' };
-  }
+  return mutating
+    ? { kind: 'uncertain', message: `pm output exceeded the size bound and was killed; the request may or may not have been queued. ${REQUESTS_HINT}` }
+    : { kind: 'invalid-response', message: 'pm output exceeded the size bound' };
+}
+
+function exitOutcome(res: ExitRun, mutating: boolean): PmOutcome {
   const parsed = parseEnvelope(res.stdout);
   if (parsed.kind === 'error') return { kind: 'pm-error', code: parsed.code, message: parsed.message };
   if (parsed.kind === 'invalid' || res.code !== 0) {
@@ -105,4 +114,13 @@ export async function callPm(run: PmRunner, method: PmMethod, params: PmParams):
     return { kind: 'invalid-response', message: mutating ? `${detail}. The request may have been queued. ${REQUESTS_HINT}` : detail };
   }
   return { kind: 'ok', result: parsed.result };
+}
+
+export async function callPm(run: PmRunner, method: PmMethod, params: PmParams): Promise<PmOutcome> {
+  if (!isAllowedMethod(method)) return { kind: 'pm-error', code: 'method-not-allowed', message: `method ${String(method)} is not an allowed pm API method` };
+  const mutating = isMutatingMethod(method);
+  const argv = pmArgv(method, params);
+  if (Buffer.byteLength(argv[5]) > MAX_PARAMS_BYTES) return { kind: 'pm-error', code: 'params-too-large', message: 'request parameters exceed the size bound' };
+  const res = await run(argv, { timeoutMs: mutating ? PM_MUTATION_TIMEOUT_MS : PM_READ_TIMEOUT_MS, maxBytes: PM_MAX_STDOUT_BYTES });
+  return res.kind === 'exit' ? exitOutcome(res, mutating) : nonExitOutcome(res, mutating);
 }

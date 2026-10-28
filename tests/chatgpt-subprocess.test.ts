@@ -4,6 +4,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { chmodSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { hostHasSystemCli } from './helpers/system-cli';
 import { tempDir } from './helpers/test-temp';
 
 const REPO = join(import.meta.dir, '..');
@@ -100,11 +101,12 @@ describe('tg chatgpt (real tg process)', () => {
     expect(r.code).toBe(1);
     expect(hits).toEqual([]);
   });
-  test('pm missing from PATH exits 69, no Telegram request', () => {
+  test.skipIf(hostHasSystemCli('pm'))('pm missing from PATH exits 69, no Telegram request', () => {
     hits = [];
-    // bun is addressed by absolute path so the stripped PATH only hides `pm`
+    // bun is addressed by absolute path so the stripped PATH only hides `pm`; HOME is an empty dir so
+    // the user-bin fallback (~/.local/bin, ~/.files/bin) cannot find the developer's real pm either
     const res = Bun.spawnSync([process.execPath, join(REPO, 'tg'), 'chatgpt', 'accounts'], {
-      env: { ...process.env, PATH: '/nonexistent-bin', TG_BOT_TOKEN: '1:POISONED', TG_CHAT_ID: '1', TG_API_BASE: `http://127.0.0.1:${server.port}`, TG_CTL_CONFIG_DIR: configDir },
+      env: { ...process.env, PATH: '/nonexistent-bin', HOME: tempDir('chatgpt-no-pm-home-'), TG_BOT_TOKEN: '1:POISONED', TG_CHAT_ID: '1', TG_API_BASE: `http://127.0.0.1:${server.port}`, TG_CTL_CONFIG_DIR: configDir },
       stdout: 'pipe',
       stderr: 'pipe',
       timeout: 20_000,

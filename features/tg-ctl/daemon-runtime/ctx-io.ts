@@ -6,6 +6,8 @@ import { type HistoryRecord } from "../../replies/history"
 import { appendHistoryFile } from "../../replies/history-file"
 import { type VoiceConfig } from "../voice"
 import type { ControlConfig, CtlPaths, TargetPane } from "../types"
+import { findKnownCli, serviceChildEnv } from "../dependency-path"
+import { interpreterFailureReason, isInterpreterMissing, spawnFailureReason, type DependencyProblem } from "../dependency-problem"
 
 // --- Pure helpers (exported for tests) ---
 
@@ -230,10 +232,25 @@ export async function spawnGuarded(
   argv: string[],
   timeoutMs: number,
   opts: { cwd?: string } = {},
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+): Promise<{ exitCode: number; stdout: string; stderr: string; problem?: DependencyProblem }> {
   let child: ReturnType<typeof Bun.spawn> | undefined
+  // The same service-PATH recovery is shared by /spend and /daily; no shell fallback or
+  // workspace-controlled executable is permitted. Looked up per call, so a rig installed or
+  // repaired while the daemon runs is found by the next command without a restart (tg-cli#804).
+  const isRig = argv[0] === "rig"
+  const binary = isRig ? findKnownCli("rig", process.env) : argv[0]
+  if (binary === null) {
+    const searchedPath = process.env.PATH ?? ""
+    return { exitCode: 127, stdout: "", stderr: `${argv[0]} was not found in the daemon PATH or the user's installed bin directories`, problem: { kind: "not-found", searchedPath } }
+  }
   try {
-    child = Bun.spawn(argv, { stdin: "ignore", stdout: "pipe", stderr: "pipe", ...(opts.cwd ? { cwd: opts.cwd } : {}) })
+    child = Bun.spawn([binary, ...argv.slice(1)], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      ...(isRig ? { env: serviceChildEnv(process.env, binary) } : {}),
+      ...(opts.cwd ? { cwd: opts.cwd } : {}),
+    })
     const proc = child
     let timedOut = false
     const timer = setTimeout(() => {
@@ -247,12 +264,23 @@ export async function spawnGuarded(
       ])
       await proc.exited
       if (timedOut) return { exitCode: 124, stdout, stderr: `${stderr}\ntimed out after ${timeoutMs}ms` }
-      return { exitCode: proc.exitCode ?? 1, stdout, stderr }
+      const exitCode = proc.exitCode ?? 1
+      // rig never ran because its `#!/usr/bin/env` interpreter is missing: found-but-unstartable. Any other
+      // 127 is rig's own answer and keeps its own output.
+      if (isRig && stdout === "" && isInterpreterMissing(exitCode, stderr)) {
+        return { exitCode, stdout, stderr, problem: { kind: "not-startable", path: binary, reason: interpreterFailureReason(stderr) } }
+      }
+      return { exitCode, stdout, stderr }
     } finally {
       clearTimeout(timer)
     }
   } catch (err) {
-    return { exitCode: 127, stdout: "", stderr: `spawn ${argv[0]} failed: ${err}` }
+    return {
+      exitCode: 127,
+      stdout: "",
+      stderr: `spawn ${argv[0]} failed: ${err}`,
+      ...(isRig ? { problem: { kind: "not-startable", path: binary, reason: spawnFailureReason(err) } satisfies DependencyProblem } : {}),
+    }
   }
 }
 

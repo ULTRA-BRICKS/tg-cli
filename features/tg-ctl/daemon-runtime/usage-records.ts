@@ -1,5 +1,6 @@
 // daemon-runtime/usage-records: extracted verbatim from tg-ctl (guardian-817 modular refactor).
 import { unlinkSync } from "fs"
+import { describeDependencyProblem } from "../dependency-problem"
 import { renderUsageReport } from "../usage-format"
 import { mergePendingDailyReport, undeliveredReportTail } from "../report-delivery"
 import { splitMessage } from "../../auto-attach/split"
@@ -355,7 +356,7 @@ export function composeLimitStatus(ctx: Ctx, agentFilter: string | null, now = D
 export async function composeDailyReport(): Promise<{ ok: boolean; text: string }> {
   const r = await spawnGuarded(["rig", "daily"], 30_000)
   if (r.exitCode === 127) {
-    return { ok: false, text: `daily: couldn't run \`rig\` (${r.stderr.trim() || "not found on PATH"}). Is rig-cli installed and on this daemon's PATH?` }
+    return { ok: false, text: `daily: ${r.problem ? describeDependencyProblem("rig", r.problem) : `couldn't run \`rig\` (${r.stderr.trim() || "not found on PATH"}).`}` }
   }
   if (r.exitCode === 124) {
     return { ok: false, text: "daily: `rig daily` timed out after 30s (GitHub API slow/rate-limited?) — try again shortly." }
@@ -438,7 +439,7 @@ export async function composeUsageReport(period: "day" | "week" | "month" | null
   const argv = period ? ["rig", "usage", "--json", "--period", period] : ["rig", "usage", "--json"]
   const r = await spawnGuarded(argv, 30_000)
   if (r.exitCode === 127) {
-    return { ok: false, text: `spend: couldn't run \`rig\` (${r.stderr.trim() || "not found on PATH"}). Is rig-cli installed and on this daemon's PATH?` }
+    return { ok: false, text: `spend: ${r.problem ? describeDependencyProblem("rig", r.problem) : `couldn't run \`rig\` (${r.stderr.trim() || "not found on PATH"}).`}` }
   }
   if (r.exitCode === 124) {
     return { ok: false, text: "spend: `rig usage` timed out after 30s — try again shortly." }

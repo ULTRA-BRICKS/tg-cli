@@ -445,6 +445,12 @@ Code's per-hook `timeout`). These keys are read by agent-tools at hook runtime; 
 | `/spend [day\|week\|month]` | Token/cost usage report (`rig usage`) — also pushed automatically weekly/monthly, see `tg-ctl usage-schedule enable` |
 | `/chatgpt [home\|glide.vc\|all]` | Owner-only ChatGPT session menu: sessions per account with Details / Pause / Resume / Watch / Continue buttons (each only queues an approval in pm), see [docs/chatgpt.md](docs/chatgpt.md) |
 
+`/chatgpt` (needs `pm`) and `/spend` / `/daily` (need `rig`) look for those CLIs in the daemon's `PATH`, then
+`~/.local/bin`, `~/.files/bin`, `/opt/homebrew/bin` and `/usr/local/bin` on every command, so a launchd/systemd
+`PATH` that hides them does not break the commands and a later install needs no restart. When a tool still
+cannot be run, the reply names the feature and the problem (not found / found but not startable) instead of a
+raw spawn error, see [docs/chatgpt.md](docs/chatgpt.md#the-daemons-environment-and-missing-prerequisites-tg-cli804).
+
 `/tasks` renders a rich task table for the resolved project. The default view is
 the attention view: blocked/stuck/problem tasks plus ready tasks, not every task.
 Each title cell starts with a compact status group emoji (green ready/done,

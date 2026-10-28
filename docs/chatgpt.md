@@ -47,7 +47,7 @@ Mapping to the frozen pm interface (`pm chatgpt api METHOD --params JSON`, one s
 | 0 | ok |
 | 1 | pm refused (error envelope), answered badly (invalid/oversize response), a read timed out, or `continue` could not learn the latest turn |
 | 2 | usage error (unknown subcommand/option, extra args, bad workspace/chat/request id, `all` for a mutation): stderr, never a Telegram send |
-| 69 | `pm` could not be started (not installed / not on PATH) |
+| 69 | `pm` could not be started: not found in `PATH` or the fallback directories below, or found but not startable |
 | 75 | a MUTATING request timed out or was stopped for oversize output: it may or may not have been queued; check `tg chatgpt requests`, **never retried** |
 
 `tg chatgpt …` is dispatched before the generic send path and always exits with the CLI's code, so
@@ -127,4 +127,44 @@ Unknown keys are ignored; missing optional fields render as `—`; nothing is fa
 - `continue` needs pm to expose the latest turn in `sessions.get`; otherwise it refuses.
 - The list menu shows at most 10 sessions (`tg chatgpt list` shows all); Requests shows status buttons for the first 5.
 - Old menu buttons expire after 15 minutes; the ref store survives a daemon restart.
-- `tg chatgpt` needs `pm` on `PATH` for the invoking user; the daemon needs it on the daemon's `PATH`.
+- `tg chatgpt` and the daemon look for `pm` in `PATH` and a few fallback directories, see [the daemon's environment](#the-daemons-environment-and-missing-prerequisites-tg-cli804).
+
+## The daemon's environment, and missing prerequisites (tg-cli#804)
+
+`/chatgpt` (`pm`) and `/spend` / `/daily` (`rig`) run from the `tg-ctl` daemon, not from your shell.
+Under launchd the daemon's `PATH` is `/usr/bin:/bin:/usr/sbin:/sbin`; a tool that works in your
+terminal can be invisible there. The daemon therefore looks for exactly these two CLIs — by absolute
+path, no shell, never a relative `PATH` segment — in this order, **on every command**:
+
+1. the daemon's own `PATH`;
+2. `~/.local/bin`, `~/.files/bin` (only with an absolute, non-root `$HOME`);
+3. `/opt/homebrew/bin`, `/usr/local/bin`.
+
+The child gets the daemon's `PATH` unchanged with the tool's directory and the directories above
+appended, so the tool's own helpers (`gh`, `git`) are found as well. Because the lookup is repeated per
+command, installing or repairing `pm`/`rig` while the daemon runs needs **no restart**: send the command
+again and it shows the real result. (`tg-ctl restart --if-stale` is only for picking up new tg-cli code.)
+
+When the tool cannot be run, the Telegram reply names the feature and the classified problem instead of a
+raw spawn error:
+
+| Class | Reply says | Meaning |
+|---|---|---|
+| not found | "needs the `pm` CLI, but the tg-ctl daemon cannot find it" + the searched `PATH` and directories | not installed, **or** installed somewhere the service cannot see (one lookup cannot tell these apart) |
+| found but not startable | "found at <path> but could not be started (<reason>)" | broken: the OS refused to start an executable, e.g. a missing interpreter (a file without the executable bit counts as not found) |
+| tool ran and failed | the tool's own typed error / `exit N` text | pm account or rig problems, never reworded as an install problem |
+| valid empty / unavailable metric | `(no sessions)`, `n/a (unpriced model)` | a real answer, not a failure; nothing is fabricated |
+
+### Not covered here
+
+- The shared one-button **Install and configure / Repair** action belongs to tg-cli#803; until that
+  installer exists the reply carries text only (no dead buttons) and does not invent an install command.
+- The autostart unit / plist still does not pin a `PATH` (that would change the byte-identical lib
+  shape); the per-command fallback above makes `pm`/`rig` work under the default launchd `PATH` instead.
+  Other tools the daemon spawns still see the service `PATH` (tg-cli#767).
+- An OMP session connected through the original-process bridge needs no tmux pane for these commands:
+  the daemon integration test runs with a tmux that has no server, and the live bridge state is read
+  from `tg-ctl status` (`bridge` vs `NO bridge`) before and after a deploy.
+- **macOS launchd host proof is not available** on the development hosts: the launchd default `PATH` is
+  reproduced by the platform-independent tests (`tests/daemon-cli-resolution.test.ts`,
+  `tests/chatgpt-daemon-integration.test.ts` with `PATH=…:/usr/bin:/bin`), not by a real launchd job.

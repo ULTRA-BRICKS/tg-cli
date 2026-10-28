@@ -22,6 +22,7 @@ import {
   requestLine,
 } from './format';
 import { accountHealthOf, latestTurnOf, requestOf, requestsOf, sessionOf, sessionRowsOf, isWorkspace, type SessionRow, type Workspace, type WorkspaceScope } from './model';
+import { describeDependencyProblem } from '../tg-ctl/dependency-problem';
 import { callPm, type PmMethod, type PmOutcome, type PmParams, type PmRunner } from './pm-client';
 import {
   REF_TTL_MS,
@@ -81,8 +82,21 @@ function esc(value: string | null, max: number): string {
   return escapeHtml(display(value, max));
 }
 
-function errorReply(prefix: string, message: string): BotReply {
-  return { html: `${escapeHtml(prefix)}: ${esc(message, REASON_MAX)}` };
+// pm's own error text is untrusted and kept short; a pm-unavailable message is written by tg and
+// carries the fix, so cutting it at REASON_MAX would drop exactly the part the owner needs.
+const SETUP_MESSAGE_MAX = 900;
+
+function errorReply(prefix: string, message: string, max = REASON_MAX): BotReply {
+  return { html: `${escapeHtml(prefix)}: ${esc(message, max)}` };
+}
+
+// The message a Telegram user sees: a classified pm problem is worded for the daemon, not the shell.
+function telegramMessage(outcome: Exclude<PmOutcome, { kind: 'ok' }>): string {
+  return outcome.kind === 'pm-unavailable' && outcome.problem ? describeDependencyProblem('pm', outcome.problem, 'telegram') : outcome.message;
+}
+
+function replyFor(prefix: string, outcome: Exclude<PmOutcome, { kind: 'ok' }>): BotReply {
+  return errorReply(prefix, telegramMessage(outcome), outcome.kind === 'pm-unavailable' ? SETUP_MESSAGE_MAX : REASON_MAX);
 }
 
 type MintSpec = { kind: RefKind; workspace: WorkspaceScope; chat?: string | null; expectedTurn?: string | null; requestId?: string | null };
@@ -143,10 +157,27 @@ function countsText(workspace: string, row: { enrolled: number | null; present: 
   return `<b>${escapeHtml(workspace)}</b> — ${parts.length ? parts.join(', ') : DASH}${fresh}`;
 }
 
+// Adds the session rows of ONE account to the menu; returns the running count of rows shown.
+function appendSessionRows(deps: BotDeps, store: RefStore, own: readonly SessionRow[], shownBefore: number, lines: string[], keyboard: InlineButton[][]): number {
+  let shown = shownBefore;
+  for (const row of own) {
+    // Telegram caps a message at 4096 chars; escaping can inflate a row ~5x, so stop early (rest -> "+N more").
+    if (shown >= MENU_SESSION_LIMIT || lines.join('\n').length > MENU_TEXT_BUDGET) break;
+    shown++;
+    lines.push(
+      `${shown}. <b>${esc(row.title, TITLE_MAX)}</b>`,
+      `   <code>${escapeHtml(row.chat)}</code> · ${esc(row.status, 24)} · continuation ${esc(row.continuation, 24)}`,
+    );
+    if (row.reason !== null) lines.push(`   ${esc(row.reason, REASON_MAX)}`);
+    keyboard.push(...sessionRows(deps, store, row, String(shown), true));
+  }
+  return shown;
+}
+
 export async function buildMenu(deps: BotDeps, scope: WorkspaceScope): Promise<BotReply> {
   if (!hasOwner(deps)) return { html: 'ChatGPT control is unavailable: no owner chat is configured.' };
   const outcome = await callPm(deps.run, 'sessions.list', { workspace: scope });
-  if (outcome.kind !== 'ok') return errorReply('ChatGPT sessions unavailable', outcome.message);
+  if (outcome.kind !== 'ok') return replyFor('ChatGPT sessions unavailable', outcome);
   const rows = sessionRowsOf(outcome.result, scope);
   const health = accountHealthOf(outcome.result);
   const accounts = health.length ? health.map((h) => h.workspace) : [...new Set(rows.map((r) => r.account ?? DASH))];
@@ -159,17 +190,7 @@ export async function buildMenu(deps: BotDeps, scope: WorkspaceScope): Promise<B
     lines.push('', h ? countsText(account, h) : `<b>${escapeHtml(account)}</b>`);
     const own = rows.filter((r) => (r.account ?? DASH) === account);
     if (own.length === 0 && h?.ok !== false) lines.push('(no sessions)');
-    for (const row of own) {
-      // Telegram caps a message at 4096 chars; escaping can inflate a row ~5x, so stop early (rest -> "+N more").
-      if (shown >= MENU_SESSION_LIMIT || lines.join('\n').length > MENU_TEXT_BUDGET) break;
-      shown++;
-      lines.push(
-        `${shown}. <b>${esc(row.title, TITLE_MAX)}</b>`,
-        `   <code>${escapeHtml(row.chat)}</code> · ${esc(row.status, 24)} · continuation ${esc(row.continuation, 24)}`,
-      );
-      if (row.reason !== null) lines.push(`   ${esc(row.reason, REASON_MAX)}`);
-      keyboard.push(...sessionRows(deps, store, row, String(shown), true));
-    }
+    shown = appendSessionRows(deps, store, own, shown, lines, keyboard);
   }
   if (rows.length > shown) lines.push('', `+${rows.length - shown} more — see <code>tg chatgpt list</code>`);
   keyboard.push([button('Requests', mint(deps, store, { kind: 'requests', workspace: 'all' })), button('Refresh', mint(deps, store, { kind: 'refresh', workspace: scope }))]);
@@ -186,8 +207,7 @@ function toastOf(text: string): string {
 }
 
 function failure(prefix: string, outcome: Exclude<PmOutcome, { kind: 'ok' }>): CallbackResult {
-  const message = outcome.message;
-  return { toast: toastOf(`${prefix}: ${message}`), reply: errorReply(prefix, message) };
+  return { toast: toastOf(`${prefix}: ${telegramMessage(outcome)}`), reply: replyFor(prefix, outcome) };
 }
 
 async function pm(deps: BotDeps, method: PmMethod, params: PmParams): Promise<PmOutcome> {

@@ -3,6 +3,17 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.73.1
+
+- **/chatgpt, /spend and /daily find `pm` / `rig` from the daemon environment (#804).** The daemon looks for the
+  two CLIs by absolute path in its own `PATH`, then `~/.local/bin`, `~/.files/bin`, `/opt/homebrew/bin` and
+  `/usr/local/bin`, on every command (a tool installed or repaired while the daemon runs works on the next
+  command, no restart), and runs them with those directories appended to the child `PATH`. A tool that cannot
+  be run now yields a Telegram reply naming the feature and the class of problem (not found / found but not
+  startable) with the `tg-ctl restart --if-stale` hint, instead of `spawn rig failed` / `could not start pm`.
+  Not included: the one-button Install/Repair action (#803), pinning `PATH` in the autostart unit (#767) and
+  a real macOS launchd host proof.
+
 ## 1.73.0
 
 - **Problem reports state actual actions and results (tg-cli#800, subset).** Every explicit

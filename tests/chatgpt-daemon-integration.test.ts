@@ -3,12 +3,13 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, wri
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 import { PS_NO_AGENTS_SHIM, TMUX_NO_SERVER_SHIM } from './helpers/hermetic-host';
+import { hostHasSystemCli } from './helpers/system-cli';
 import { tempDir } from './helpers/test-temp';
 
 // End to end through the real tg-ctl daemon: a fake Bot API serves /chatgpt and the button taps,
-// a fake `pm` on PATH answers the frozen API and logs every call. Proves the wiring (not just the
-// pure modules): the menu is sent as escaped HTML with a keyboard, one tap queues exactly one
-// request, a replay / foreign-chat tap / forged ref does nothing, and the ref store is 0600.
+// fake `pm` and `rig` installed outside a service PATH answer the commands. Proves the wiring
+// (not just the pure modules): the owner menu escapes HTML, one tap queues exactly one request,
+// replay/foreign chat/forged refs do nothing, /spend works, and the ref store is 0600.
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const reg = createDaemonRegistry();
@@ -35,9 +36,20 @@ const bin = join(cfgDir, 'bin');
 mkdirSync(bin);
 writeFileSync(join(bin, 'tmux'), TMUX_NO_SERVER_SHIM, { mode: 0o755 });
 writeFileSync(join(bin, 'ps'), PS_NO_AGENTS_SHIM, { mode: 0o755 });
+// Simulate a launchd user install: the CLI is present, but outside the daemon PATH.
+const userBin = join(cfgDir, '.files', 'bin');
+mkdirSync(userBin, { recursive: true });
+// rig is installed LATER (mid-test) into the same user bin, to prove the running daemon sees a
+// repair without a restart.
+function installRig(): void {
+  writeFileSync(join(userBin, 'rig'), `#!/bin/sh
+[ "$1" = "usage" ] || exit 3
+printf '%s\n' '{"periods":{"week":{"period":"week","label":"Current Week","totals":{"input_tokens":1,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"total_tokens":1},"estimated_cost_usd":null,"all_models_unpriced":true,"by_model":{}}},"disclaimer":"Synthetic test data"}'
+`, { mode: 0o755 });
+}
 const pmLog = join(cfgDir, 'pm-calls.txt');
 writeFileSync(
-  join(bin, 'pm'),
+  join(userBin, 'pm'),
   `#!/bin/sh
 printf '%s\\n' "$*" >> '${pmLog}'
 case "$3" in
@@ -91,13 +103,14 @@ function tapUpdate(data: string, chat: number) {
   return { update_id: nextUpdateId++, callback_query: { id: `q${nextUpdateId}`, from: { id: 1, first_name: 'Alex' }, data, message: { message_id: 7, chat: { id: chat }, date: Math.floor(Date.now() / 1000) } } };
 }
 
-test('/chatgpt menu, one-tap request, replay / foreign chat / forged ref do nothing', async () => {
+// A system-wide pm/rig would win over the test's user-bin copies, so such a host skips it.
+test.skipIf(hostHasSystemCli('pm') || hostHasSystemCli('rig'))('/chatgpt and /spend work with service PATH; menu protects replay and foreign taps', async () => {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
   try {
     await spawnDaemon(reg, {
       tgCtlPath: TG_CTL,
       cfgDir,
-      env: { PATH: `${bin}:${process.env.PATH ?? ''}`, HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: `http://127.0.0.1:${server.port}` },
+      env: { PATH: `${bin}:/usr/bin:/bin`, HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: `http://127.0.0.1:${server.port}` },
       logFd,
       socketWaitMs: 8000,
     });
@@ -135,7 +148,37 @@ test('/chatgpt menu, one-tap request, replay / foreign chat / forged ref do noth
   const store = join(cfgDir, readdirStore());
   expect(statSync(store).mode & 0o777).toBe(0o600);
   expect(readFileSync(store, 'utf8')).not.toContain('Plan');
-});
+
+  // rig is not installed yet: /spend names the feature and the fix instead of a raw spawn error.
+  pending.push({ update_id: nextUpdateId++, message: { message_id: 12, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: '/spend' } });
+  expect(await waitFor(() => sent.some((m) => m.text.includes('needs the `rig` CLI, but the tg-ctl daemon cannot find it')))).toBe(true);
+  const missing = sent.find((m) => m.text.includes('needs the `rig` CLI'))!;
+  expect(missing.text).toContain('/spend');
+  expect(missing.text).toContain('no restart is needed');
+  expect(missing.text).not.toMatch(/spawn rig failed|Executable not found/);
+
+  // A rig whose interpreter is missing is classified as found-but-unstartable, not as absent.
+  writeFileSync(join(userBin, 'rig'), '#!/usr/bin/env definitely-missing-interpreter-804\n', { mode: 0o755 });
+  pending.push({ update_id: nextUpdateId++, message: { message_id: 14, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: '/spend' } });
+  expect(await waitFor(() => sent.some((m) => m.text.includes('could not be started')))).toBe(true);
+  const broken = sent.find((m) => m.text.includes('could not be started'))!;
+  expect(broken.text).toContain(join(userBin, 'rig'));
+  expect(broken.text).not.toContain('cannot find it');
+
+  // A rig that ran and exited 127 itself (e.g. its own helper is missing) keeps its real output.
+  writeFileSync(join(userBin, 'rig'), "#!/bin/sh\necho 'rig: gh not found' >&2\necho partial-output\nexit 127\n", { mode: 0o755 });
+  pending.push({ update_id: nextUpdateId++, message: { message_id: 15, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: '/spend' } });
+  expect(await waitFor(() => sent.some((m) => m.text.includes('rig: gh not found')))).toBe(true);
+  expect(sent.filter((m) => m.text.includes('rig: gh not found')).every((m) => !m.text.includes('could not be started'))).toBe(true);
+  // Repair while the daemon keeps running: the very next /spend runs the real rig.
+  installRig();
+  pending.push({ update_id: nextUpdateId++, message: { message_id: 13, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: '/spend' } });
+  expect(await waitFor(() => sent.some((m) => m.text.includes('Current Week')))).toBe(true);
+  const report = sent.find((m) => m.text.includes('Current Week'))!;
+  expect(report.text).toContain('1 tokens');
+  expect(report.text).toContain('Synthetic test data');
+  expect(report.text).not.toContain('couldn\'t run `rig`');
+}, 60_000);
 
 function readdirStore(): string {
   const entry = Bun.spawnSync(['ls', cfgDir]).stdout.toString().split('\n').find((f) => f.endsWith('.chatgpt-refs.json'));

@@ -50,6 +50,24 @@ function find(kb: InlineKeyboard | undefined, label: RegExp) {
 }
 
 describe('/chatgpt menu rendering', () => {
+  test('a valid empty session list is "(no sessions)", never an execution failure (tg-cli#804)', async () => {
+    const h = harness({
+      ...baseHandlers(),
+      'sessions.list': () => ({ workspace: 'all', accounts: [{ workspace: 'home', ok: true, stale: false, summary: { enrolled: 0, present: 0, running: 0, blocked: 0 } }], sessions: [], events: [] }),
+    });
+    const view = await buildMenu(h.deps, 'all');
+    expect(view.html).toContain('(no sessions)');
+    expect(view.html).not.toContain('unavailable');
+  });
+  test('an unrunnable pm is a classified setup message with no fabricated sessions and no session buttons', async () => {
+    const h = harness({}, { run: async () => ({ kind: 'spawn-error', problem: { kind: 'not-found', searchedPath: '/usr/bin:/bin:/usr/sbin:/sbin' } }) });
+    const view = await buildMenu(h.deps, 'all');
+    expect(view.html).toContain('ChatGPT sessions unavailable');
+    expect(view.html).toContain('needs the');
+    expect(view.html).toContain('no restart is needed');
+    expect(view.html).not.toContain('(no sessions)');
+    expect(buttons(view.keyboard)).toHaveLength(0);
+  });
   test('lists sessions per account with Details/Pause/Resume/Watch/Continue buttons and Requests/Refresh', async () => {
     const h = harness(baseHandlers());
     const view = await buildMenu(h.deps, 'all');
@@ -126,6 +144,20 @@ async function tap(h: Harness, label: RegExp, view?: { keyboard?: InlineKeyboard
 }
 
 describe('state-changing taps', () => {
+  test('a tap while pm cannot be found words the toast and reply for the daemon, never "add it to PATH"', async () => {
+    let missing = false;
+    const ok = harness(baseHandlers());
+    const h = harness(baseHandlers(), {
+      run: async (argv, opts) => (missing ? { kind: 'spawn-error', problem: { kind: 'not-found', searchedPath: '/usr/bin:/bin' } } : ok.deps.run(argv, opts)),
+    });
+    const { data } = await tap(h, /Details/, undefined, 0);
+    missing = true;
+    const res = await handleCallback(h.deps, { data, chatId: OWNER });
+    const text = `${res.toast} ${res.reply?.html ?? ''}`;
+    expect(res.toast).toContain('tg-ctl daemon');
+    expect(text).not.toMatch(/add it to PATH|run the command again/);
+    expect(res.reply?.html).toContain('no restart is needed');
+  });
   test('Pause queues exactly one owner-approval request bound to account+chat', async () => {
     const h = harness(baseHandlers());
     const { data } = await tap(h, /Pause/, undefined, 1); // glide.vc Canvas row (second session)
