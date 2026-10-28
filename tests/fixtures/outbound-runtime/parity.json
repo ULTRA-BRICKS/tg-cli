@@ -11,7 +11,7 @@
   },
   "version flag": {
     "code": 0,
-    "out": "tg 1.73.1 (<COMMIT>)\n\n## 1.73.1\n\n- **/chatgpt, /spend and /daily find `pm` / `rig` from the daemon environment (#804).** The daemon looks for the\n  two CLIs by absolute path in its own `PATH`, then `~/.local/bin`, `~/.files/bin`, `/opt/homebrew/bin` and\n  `/usr/local/bin`, on every command (a tool installed or repaired while the daemon runs works on the next\n  command, no restart), and runs them with those directories appended to the child `PATH`. A tool that cannot\n  be run now yields a Telegram reply naming the feature and the class of problem (not found / found but not\n  startable) with the `tg-ctl restart --if-stale` hint, instead of `spawn rig failed` / `could not start pm`.\n  Not included: the one-button Install/Repair action (#803), pinning `PATH` in the autostart unit (#767) and\n  a real macOS launchd host proof.\n",
+    "out": "tg 1.73.2 (<COMMIT>)\n\n## 1.73.2\n\n- **The owner can use `/chatgpt` inside a Telegram topic (#829).** Control commands\n  are derived from the published daemon command list instead of a second list that\n  omitted the menu. Bound and unbound topics now receive the menu in the same topic,\n  without forwarding the command to a coding agent. Sender and private-chat checks\n  stay in place; `/stop` and `/kill` still target the topic's session.\n- Split update routing into small pure helpers while preserving callback-first versus\n  ordered actions, reply anchors, dangerous-command checks, media limits and offsets.\n",
     "err": ""
   },
   "help topic format": {

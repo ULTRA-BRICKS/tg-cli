@@ -146,318 +146,289 @@ function isChatgptCommand(text: string | undefined): boolean {
   return typeof text === 'string' && /^\/chatgpt(@\w+)?(\s|$)/.test(text);
 }
 
+type Callback = NonNullable<TgUpdate['callback_query']>;
+type CallbackRoute = { ordered: boolean; action: Action };
+
+function chatgptCallback(cb: Callback, opts: StepOpts): CallbackRoute | null {
+  if (!cb.data?.startsWith(REF_PREFIX)) return null;
+  const ownerOk = isPrivateOwnerChatId(opts.chatId) && cb.from?.id === opts.chatId && cb.message?.chat?.id === opts.chatId;
+  if (!ownerOk) return { ordered: false, action: { kind: 'answer-callback', callbackQueryId: cb.id, text: 'not allowed' } };
+  if (idOfRefData(cb.data) === null) return { ordered: false, action: { kind: 'answer-callback', callbackQueryId: cb.id, text: 'expired' } };
+  return { ordered: false, action: { kind: 'chatgpt-callback', callbackQueryId: cb.id, data: cb.data, chatId: opts.chatId, messageId: cb.message?.message_id ?? null, threadId: cb.message?.message_thread_id ?? null } };
+}
+
+function questionCallback(cb: Callback): CallbackRoute {
+  const parsed = parseButtonCallback(cb.data);
+  if (!parsed) return { ordered: false, action: { kind: 'answer-callback', callbackQueryId: cb.id, text: 'expired' } };
+  return { ordered: false, action: { kind: 'answer-question', callbackQueryId: cb.id, requestId: parsed.requestId, value: parsed.value,
+    messageId: cb.message?.message_id ?? null, actor: { userId: cb.from?.id ?? null, chatId: cb.message?.chat?.id ?? null } } };
+}
+
+function attachCallback(cb: Callback, opts: StepOpts): CallbackRoute | null {
+  const attachCb = opts.topicsEnabled ? parseTopicAttachCallback(cb.data) : null;
+  if (attachCb) {
+    return { ordered: true, action: {
+      kind: 'topic-attach',
+      callbackQueryId: cb.id,
+      threadId: attachCb.threadId,
+      paneId: attachCb.paneId,
+      messageId: cb.message?.message_id ?? null,
+    } };
+  }
+  return null;
+}
+
+function newSessionCallback(cb: Callback, opts: StepOpts): CallbackRoute | null {
+  const newSessionCb = opts.topicsEnabled ? parseTopicNewSessionCallback(cb.data) : null;
+  if (newSessionCb) {
+    return { ordered: true, action: {
+      kind: 'topic-new-session',
+      callbackQueryId: cb.id,
+      threadId: newSessionCb.threadId,
+      messageId: cb.message?.message_id ?? null,
+    } };
+  }
+  return null;
+}
+
+function newHarnessCallback(cb: Callback): CallbackRoute | null {
+  const newHarnessCb = parseNewHarnessCallback(cb.data);
+  if (newHarnessCb) {
+    return { ordered: false, action: {
+      kind: 'new-harness',
+      callbackQueryId: cb.id,
+      token: newHarnessCb.token,
+      harness: newHarnessCb.harness,
+      messageId: cb.message?.message_id ?? null,
+    } };
+  }
+  return null;
+}
+
+function newModelCallback(cb: Callback): CallbackRoute | null {
+  const newModelCb = parseNewModelCallback(cb.data);
+  if (newModelCb) {
+    return { ordered: false, action: {
+      kind: 'new-model',
+      callbackQueryId: cb.id,
+      token: newModelCb.token,
+      modelId: newModelCb.modelId,
+      messageId: cb.message?.message_id ?? null,
+    } };
+  }
+  return null;
+}
+
+function newDirCallback(cb: Callback): CallbackRoute | null {
+  const newDirCb = parseNewDirCallback(cb.data);
+  if (newDirCb) {
+    return { ordered: false, action: {
+      kind: 'new-dir',
+      callbackQueryId: cb.id,
+      token: newDirCb.token,
+      index: newDirCb.index,
+      messageId: cb.message?.message_id ?? null,
+    } };
+  }
+  return null;
+}
+
+function newPrivateTopicFallbackCallback(cb: Callback): CallbackRoute | null {
+  const newPrivateTopicFallbackCb = parseNewPrivateTopicFallbackCallback(cb.data);
+  if (newPrivateTopicFallbackCb) {
+    return { ordered: true, action: {
+      kind: 'new-private-topic-fallback',
+      callbackQueryId: cb.id,
+      token: newPrivateTopicFallbackCb.token,
+      choice: newPrivateTopicFallbackCb.choice,
+      messageId: cb.message?.message_id ?? null,
+    } };
+  }
+  return null;
+}
+
+function newRetryCallback(cb: Callback): CallbackRoute | null {
+  const newRetryCb = parseNewRetryCallback(cb.data);
+  if (newRetryCb) {
+    return { ordered: false, action: {
+      kind: 'new-retry',
+      callbackQueryId: cb.id,
+      token: newRetryCb.token,
+      messageId: cb.message?.message_id ?? null,
+    } };
+  }
+  return null;
+}
+
+function tasksCallback(cb: Callback): CallbackRoute | null {
+  const tasksCb = parseTasksCallback(cb.data);
+  if (tasksCb) {
+    return { ordered: false, action: {
+      kind: 'tasks',
+      agent: null,
+      status: null,
+      replyToMessageId: null,
+      view: tasksCb.view,
+      page: tasksCb.page,
+      callbackKind: tasksCb.kind,
+      callbackQueryId: cb.id,
+      messageId: cb.message?.message_id ?? null,
+      chatId: cb.message?.chat?.id ?? null,
+      threadId: cb.message?.message_thread_id ?? null,
+    } };
+  }
+  return null;
+}
+
+function agentCancelCallback(cb: Callback): CallbackRoute | null {
+  const agentCancelCb = parseAgentCancelCallback(cb.data);
+  if (agentCancelCb) {
+    return { ordered: true, action: {
+      kind: 'agent-cancel',
+      callbackQueryId: cb.id,
+      token: agentCancelCb.token,
+      messageId: cb.message?.message_id ?? null,
+    } };
+  }
+  return null;
+}
+
+function agentCallback(cb: Callback): CallbackRoute | null {
+  const agentCb = parseAgentCallback(cb.data);
+  if (agentCb) {
+    return { ordered: true, action: {
+      kind: 'agent-callback',
+      callbackQueryId: cb.id,
+      token: agentCb.token,
+      index: agentCb.index,
+      from: cb.from?.first_name || cb.from?.username || 'tg',
+      messageId: cb.message?.message_id ?? null,
+    } };
+  }
+  return null;
+}
+
+function contCallback(cb: Callback): CallbackRoute | null {
+  const contCb = cb.data ? parseContinueCallback(cb.data) : null;
+  if (contCb) {
+    return { ordered: false, action: {
+      kind: 'limit-continue',
+      callbackQueryId: cb.id,
+      paneId: contCb.paneId,
+      resetAt: contCb.resetAt,
+      sourceMessageId: contCb.sourceMessageId,
+      messageId: cb.message?.message_id ?? null,
+    } };
+  }
+  return null;
+}
+
+function closeQuestionCallback(cb: Callback): CallbackRoute | null {
+  const closeQuestionCb = parseQuestionCloseCallback(cb.data);
+  if (closeQuestionCb) {
+    return { ordered: false, action: {
+      kind: 'close-question-card',
+      callbackQueryId: cb.id,
+      requestId: closeQuestionCb.requestId,
+      messageId: cb.message?.message_id ?? null,
+      actor: { userId: cb.from?.id ?? null, chatId: cb.message?.chat?.id ?? null },
+    } };
+  }
+  return null;
+}
+
+// Precedence is part of the delivery contract; topic/session taps stay ordered.
+const CALLBACK_PARSERS: Array<(cb: Callback, opts: StepOpts) => CallbackRoute | null> = [
+  chatgptCallback,
+  attachCallback,
+  newSessionCallback,
+  newHarnessCallback,
+  newModelCallback,
+  newDirCallback,
+  newPrivateTopicFallbackCallback,
+  newRetryCallback,
+  tasksCallback,
+  agentCancelCallback,
+  agentCallback,
+  contCallback,
+  closeQuestionCallback,
+];
+
+// Preserve parser precedence and the separate callback-first / ordered delivery lanes.
+function callbackRoute(cb: Callback, opts: StepOpts): CallbackRoute {
+  if (!senderAllowed(cb.from?.id, opts)) return { ordered: false, action: { kind: 'answer-callback', callbackQueryId: cb.id, text: 'not allowed' } };
+  for (const parse of CALLBACK_PARSERS) {
+    const found = parse(cb, opts);
+    if (found) return found;
+  }
+  return questionCallback(cb);
+}
+
+function flatReplyAction(m: TgMessage & { text: string }, name: string, opts: StepOpts): Action | null {
+  const text = m.text;
+  const verbatim = text.startsWith('/') || text.startsWith('!');
+  const bangReply = !!m.reply_to_message && text.startsWith('!');
+  const gate = bangReply ? shellPassthroughGate(text) : null;
+  if (gate?.warning) return { kind: 'reply', text: gate.warning };
+  const card = cardReplyAction(m, name, opts);
+  if (card) return card;
+  const reply = m.reply_to_message;
+  if (reply && (!verbatim || bangReply)) return {
+    kind: 'reply-route', replyToMessageId: reply.message_id,
+    injectText: bangReply && gate ? gate.injectText : buildReplyInject(m, name, opts), from: name, messageId: m.message_id,
+  };
+  return null;
+}
+
+function flatTextAction(m: TgMessage & { text: string }, name: string, opts: StepOpts): Action {
+  const text = m.text;
+  const dirAnswer = !m.reply_to_message && text.startsWith('/') && !isDaemonSlashCommand(text);
+  if (dirAnswer && (opts.newSessionAwaitingDir?.() ?? false)) return { kind: 'new-answer', text, from: name, messageId: m.message_id };
+  const replyAction = flatReplyAction(m, name, opts);
+  if (replyAction) return replyAction;
+  const reply = m.reply_to_message;
+  const threadId = opts.topicsEnabled && m.is_topic_message ? (m.message_thread_id ?? null) : null;
+  return textAction(text, name, opts, m.message_id, m.chat.id, reply?.message_id ?? null, threadId);
+}
+
+function flatMessageAction(updateId: number, m: TgMessage, name: string, opts: StepOpts): Action | null {
+  if (m.text) return flatTextAction({ ...m, text: m.text }, name, opts);
+  if (m.voice ?? m.audio) return voiceAction(updateId, m, name, opts);
+  if (m.photo?.length) return photoAction(updateId, m, name, opts);
+  if (m.document) return documentAction(updateId, m, name, opts);
+  return null;
+}
+
+function messageActions(u: TgUpdate, opts: StepOpts): Action[] {
+  const m = u.message;
+  if (!m || !senderAllowed(m.from?.id, opts) || m.chat.id !== opts.chatId) return [];
+  if (isChatgptCommand(m.text) && !(isPrivateOwnerChatId(opts.chatId) && m.from?.id === opts.chatId)) return [];
+  const name = m.from?.first_name || m.from?.username || 'tg';
+  const topic = opts.topicsEnabled ? topicActionFor(u.update_id, m, name, opts) : null;
+  if (topic) {
+    const ack = topic.some(a => a.kind !== 'reply' && a.kind !== 'topic-event');
+    return ack ? [...topic, { kind: 'ack', messageId: m.message_id }] : topic;
+  }
+  const action = flatMessageAction(u.update_id, m, name, opts);
+  if (!action) return [];
+  return action.kind === 'reply' ? [action] : [action, { kind: 'ack', messageId: m.message_id }];
+}
+
 export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
   const callbackActions: Action[] = [];
   const actions: Action[] = [];
   let maxId = -1;
-
   for (const u of updates) {
     if (u.update_id > maxId) maxId = u.update_id;
-    const cb = u.callback_query;
-    if (cb) {
-      if (!senderAllowed(cb.from?.id, opts)) {
-        callbackActions.push({ kind: 'answer-callback', callbackQueryId: cb.id, text: 'not allowed' });
-        continue;
-      }
-      // /chatgpt menu taps (cgp:<opaque ref>). The configured owner chat is the ONLY place such a
-      // button may be tapped from: the tapped message must sit in opts.chatId, and a missing /
-      // zero / non-integer owner fails closed — on top of the sender allowlist above. A malformed
-      // ref is answered "expired"; the daemon resolves the rest from its durable ref store.
-      if (cb.data?.startsWith(REF_PREFIX)) {
-        const tappedChat = cb.message?.chat?.id;
-        const ownerOk = isPrivateOwnerChatId(opts.chatId) && cb.from?.id === opts.chatId && tappedChat === opts.chatId;
-        if (!ownerOk) {
-          callbackActions.push({ kind: 'answer-callback', callbackQueryId: cb.id, text: 'not allowed' });
-        } else if (idOfRefData(cb.data) === null) {
-          callbackActions.push({ kind: 'answer-callback', callbackQueryId: cb.id, text: 'expired' });
-        } else {
-          callbackActions.push({ kind: 'chatgpt-callback', callbackQueryId: cb.id, data: cb.data, chatId: opts.chatId, messageId: cb.message?.message_id ?? null, threadId: cb.message?.message_thread_id ?? null });
-        }
-        continue;
-      }
-      // Attach-picker taps (tgt:<thread>:<pane>) deliver a held topic queue. Appended to the
-      // ordered action stream, not callbackActions: a same-batch message to that topic must join
-      // the queue BEFORE the tap drains it. With topics mode off a stray tap falls through to the
-      // question parser, which answers it as expired.
-      const attachCb = opts.topicsEnabled ? parseTopicAttachCallback(cb.data) : null;
-      if (attachCb) {
-        actions.push({
-          kind: 'topic-attach',
-          callbackQueryId: cb.id,
-          threadId: attachCb.threadId,
-          paneId: attachCb.paneId,
-          messageId: cb.message?.message_id ?? null,
-        });
-        continue;
-      }
-      // The picker's ➕ New session tap, ordered the same way: a same-batch message joins the hold
-      // before the tap reads it.
-      const newSessionCb = opts.topicsEnabled ? parseTopicNewSessionCallback(cb.data) : null;
-      if (newSessionCb) {
-        actions.push({
-          kind: 'topic-new-session',
-          callbackQueryId: cb.id,
-          threadId: newSessionCb.threadId,
-          messageId: cb.message?.message_id ?? null,
-        });
-        continue;
-      }
-      // Flat-chat /new taps (tnh: harness, tnm: model, tnp: recent-dir) route the new-session flow. NOT gated by
-      // topics mode — /new is a flat-chat command. A stale tap whose session expired is rejected by
-      // the entrypoint (no pending session → "expired"), never spawns.
-      const newHarnessCb = parseNewHarnessCallback(cb.data);
-      if (newHarnessCb) {
-        callbackActions.push({
-          kind: 'new-harness',
-          callbackQueryId: cb.id,
-          token: newHarnessCb.token,
-          harness: newHarnessCb.harness,
-          messageId: cb.message?.message_id ?? null,
-        });
-        continue;
-      }
-      const newModelCb = parseNewModelCallback(cb.data);
-      if (newModelCb) {
-        callbackActions.push({
-          kind: 'new-model',
-          callbackQueryId: cb.id,
-          token: newModelCb.token,
-          modelId: newModelCb.modelId,
-          messageId: cb.message?.message_id ?? null,
-        });
-        continue;
-      }
-      const newDirCb = parseNewDirCallback(cb.data);
-      if (newDirCb) {
-        callbackActions.push({
-          kind: 'new-dir',
-          callbackQueryId: cb.id,
-          token: newDirCb.token,
-          index: newDirCb.index,
-          messageId: cb.message?.message_id ?? null,
-        });
-        continue;
-      }
-      const newPrivateTopicFallbackCb = parseNewPrivateTopicFallbackCallback(cb.data);
-      if (newPrivateTopicFallbackCb) {
-        actions.push({
-          kind: 'new-private-topic-fallback',
-          callbackQueryId: cb.id,
-          token: newPrivateTopicFallbackCb.token,
-          choice: newPrivateTopicFallbackCb.choice,
-          messageId: cb.message?.message_id ?? null,
-        });
-        continue;
-      }
-      const newRetryCb = parseNewRetryCallback(cb.data);
-      if (newRetryCb) {
-        callbackActions.push({
-          kind: 'new-retry',
-          callbackQueryId: cb.id,
-          token: newRetryCb.token,
-          messageId: cb.message?.message_id ?? null,
-        });
-        continue;
-      }
-      const tasksCb = parseTasksCallback(cb.data);
-      if (tasksCb) {
-        callbackActions.push({
-          kind: 'tasks',
-          agent: null,
-          status: null,
-          replyToMessageId: null,
-          view: tasksCb.view,
-          page: tasksCb.page,
-          callbackKind: tasksCb.kind,
-          callbackQueryId: cb.id,
-          messageId: cb.message?.message_id ?? null,
-          chatId: cb.message?.chat?.id ?? null,
-          threadId: cb.message?.message_thread_id ?? null,
-        });
-        continue;
-      }
-      // /agent selection taps (tgac:/tga:…) are appended to the normal action
-      // stream, not callbackActions: a same-batch earlier message must not be
-      // consumed by a later picker tap. Question callbacks still stay
-      // callback-first below so they can unblock slower same-batch message work.
-      const agentCancelCb = parseAgentCancelCallback(cb.data);
-      if (agentCancelCb) {
-        actions.push({
-          kind: 'agent-cancel',
-          callbackQueryId: cb.id,
-          token: agentCancelCb.token,
-          messageId: cb.message?.message_id ?? null,
-        });
-        continue;
-      }
-      const agentCb = parseAgentCallback(cb.data);
-      if (agentCb) {
-        actions.push({
-          kind: 'agent-callback',
-          callbackQueryId: cb.id,
-          token: agentCb.token,
-          index: agentCb.index,
-          from: cb.from?.first_name || cb.from?.username || 'tg',
-          messageId: cb.message?.message_id ?? null,
-        });
-        continue;
-      }
-      // Auto-continue taps (lc:<pane>:<resetAt>) arm the reset-time injection.
-      const contCb = cb.data ? parseContinueCallback(cb.data) : null;
-      if (contCb) {
-        callbackActions.push({
-          kind: 'limit-continue',
-          callbackQueryId: cb.id,
-          paneId: contCb.paneId,
-          resetAt: contCb.resetAt,
-          sourceMessageId: contCb.sourceMessageId,
-          messageId: cb.message?.message_id ?? null,
-        });
-        continue;
-      }
-      const closeQuestionCb = parseQuestionCloseCallback(cb.data);
-      if (closeQuestionCb) {
-        callbackActions.push({
-          kind: 'close-question-card',
-          callbackQueryId: cb.id,
-          requestId: closeQuestionCb.requestId,
-          messageId: cb.message?.message_id ?? null,
-          actor: { userId: cb.from?.id ?? null, chatId: cb.message?.chat?.id ?? null },
-        });
-        continue;
-      }
-      const parsed = parseButtonCallback(cb.data);
-      callbackActions.push(
-        parsed
-          ? {
-              kind: 'answer-question',
-              callbackQueryId: cb.id,
-              requestId: parsed.requestId,
-              value: parsed.value,
-              messageId: cb.message?.message_id ?? null,
-              actor: { userId: cb.from?.id ?? null, chatId: cb.message?.chat?.id ?? null },
-            }
-          : { kind: 'answer-callback', callbackQueryId: cb.id, text: 'expired' },
-      );
-      continue;
-    }
-
-    const m = u.message;
-    if (!m) continue; // non-message/callback update → advance silently
-
-    // Sender allowlist FIRST (spec §9: from.id, not chat id — a group member
-    // must not inject prompts).
-    if (!senderAllowed(m.from?.id, opts)) continue;
-    // Only the configured chat: every reply, ack and delivery-ledger key (tg-cli#299) is that
-    // chat's, and Telegram message ids are unique per chat only — an allowed sender writing
-    // from another chat would collide with, and be suppressed as, an earlier message here.
-    if (m.chat.id !== opts.chatId) continue;
-    // /chatgpt is owner-only: in the owner's private chat the sender must be the owner itself.
-    if (isChatgptCommand(m.text) && !(isPrivateOwnerChatId(opts.chatId) && m.from?.id === opts.chatId)) continue;
-
-    // Owner text/media inbound is NOT dropped by age (#183): a message Telegram
-    // delivered after daemon downtime or while agents were busy is still a real
-    // request and must reach the agent, not vanish behind a "skipped N stale"
-    // notice.
-    const name = m.from?.first_name || m.from?.username || 'tg';
-
-    // Forum-topics mode: a topic service message or ANY message inside a forum topic is
-    // triaged here and the flat dispatch is skipped (§4.4). topicActionFor returns null ONLY
-    // when this is not a topic message (General, or a non-forum reply-thread) → the normal
-    // flat handling, unchanged. Every topic message either delivers or answers in its topic.
-    if (opts.topicsEnabled) {
-      const topicActions = topicActionFor(u.update_id, m, name, opts);
-      if (topicActions) {
-        actions.push(...topicActions);
-        // Delivery receipt, as in the flat path: not for a service message (nothing was sent)
-        // nor for a pure error reply (the reply IS the "did not land" signal).
-        if (topicActions.some((a) => a.kind !== 'reply' && a.kind !== 'topic-event')) {
-          actions.push({ kind: 'ack', messageId: m.message_id });
-        }
-        continue;
-      }
-    }
-
-    let action: Action | null = null;
-    if (m.text) {
-      // POSITIVE gate (review #1): a flat-`/new` dir answer is an ABSOLUTE PATH — `startsWith('/')` —
-      // that is NOT one of the daemon's own slash-commands, and is not a reply. Gating on the path
-      // FORM (not `!isLikelySlashCommand`) fixes two inversions: (a) ordinary prose to the agent
-      // (`fix the bug`) is NOT swallowed while a /new is pending — it falls through to the normal
-      // inject, so a forgotten /new can't mute 1:1 routing; (b) a single-component path (`/tmp`,
-      // `/srv`) IS accepted (it starts with `/` and isn't a command), where the old
-      // isLikelySlashCommand test wrongly rejected it. A real /command (`/status`, a second `/new`)
-      // or a reply is never consumed as the answer. Topic messages (control.topics on) are already
-      // routed + `continue`d by the topics block above, so they never reach this gate. (issue #27)
-      const isDirAnswerCandidate = !m.reply_to_message && m.text.startsWith('/') && !isDaemonSlashCommand(m.text);
-      if (isDirAnswerCandidate && (opts.newSessionAwaitingDir?.() ?? false)) {
-        action = { kind: 'new-answer', text: m.text, from: name, messageId: m.message_id };
-      } else {
-        // A reply carrying prose forwards the quote anchor (items 2,3) via
-        // reply-route — the daemon picks the recognized origin pane or a LRU/MRU
-        // picker. A reply whose text is a /command still runs the command verbatim.
-        // A `!` shell-command reply ALSO routes to the origin pane via reply-route
-        // (codex #192: otherwise it falls to the default/last-message pane), but
-        // with the RAW `!…` as injectText and NO quote anchor — a prepended anchor
-        // would knock the `!` off column 0 and defeat the harness passthrough.
-        const isVerbatimText = m.text.startsWith('/') || m.text.startsWith('!');
-        const isBangReply = !!m.reply_to_message && m.text.startsWith('!');
-        // Gate a `!` shell-command reply the same as the flat/topic bang paths — a
-        // catastrophic shape must not reach the origin pane just because it arrived
-        // as a reply. Computed once here (not inside the ternary below) so both the
-        // warning short-circuit and the injectText line below read the same result.
-        const bangGate = isBangReply ? shellPassthroughGate(m.text) : null;
-        // Bound once so every branch below narrows against the SAME reference —
-        // a decoupled `m.reply_to_message!` non-null assertion (one expression
-        // asserting non-null based on an entirely separate expression's truthy
-        // check) is exactly the kind of coupling a future edit can silently
-        // desync into a runtime TypeError (review finding).
-        const reply = m.reply_to_message;
-        const cardReply = cardReplyAction(m, name, opts);
-        // bangGate?.warning is checked FIRST: isBangReply implies isVerbatimText, and a card
-        // reply is never verbatim text, so cardReply is already null for a bang reply — this only
-        // intercepts the reply-route branch a blocked bang reply would otherwise take.
-        action = bangGate?.warning
-          ? { kind: 'reply', text: bangGate.warning }
-          : cardReply
-          ? cardReply
-          : reply && (!isVerbatimText || isBangReply)
-            ? {
-                kind: 'reply-route',
-                replyToMessageId: reply.message_id,
-                // A `!` reply keeps its raw text (verbatim, `!` at column 0); a
-                // prose reply gets the quote anchor + wrap.
-                injectText: isBangReply && bangGate ? bangGate.injectText : buildReplyInject(m, name, opts),
-                from: name,
-                messageId: m.message_id,
-              }
-            : textAction(
-                m.text,
-                name,
-                opts,
-                m.message_id,
-                m.chat.id,
-                reply?.message_id ?? null,
-                opts.topicsEnabled && m.is_topic_message ? (m.message_thread_id ?? null) : null,
-              );
-      }
-    } else if (m.voice ?? m.audio) action = voiceAction(u.update_id, m, name, opts);
-    else if (m.photo?.length) action = photoAction(u.update_id, m, name, opts);
-    else if (m.document) action = documentAction(u.update_id, m, name, opts);
-    // Anything else (sticker, …) → advance silently.
-    if (action) {
-      actions.push(action);
-      // Delivery receipt (👀 reaction) follows every action that represents
-      // handling the message — but NOT a pure error reply (e.g. the too-large
-      // verdict): there the reply itself is the "did not land" signal.
-      if (action.kind !== 'reply') actions.push({ kind: 'ack', messageId: m.message_id });
-    }
+    if (u.callback_query) {
+      const route = callbackRoute(u.callback_query, opts);
+      (route.ordered ? actions : callbackActions).push(route.action);
+    } else actions.push(...messageActions(u, opts));
   }
-
   return {
     actions: [...callbackActions, ...actions],
     newOffset: updates.length ? maxId + 1 : opts.currentOffset,
-    skippedStale: 0, // legacy field; owner inbound is no longer skipped by age (#183)
+    skippedStale: 0, // Legacy field: owner inbound is never discarded merely by age.
   };
 }
 
@@ -502,6 +473,39 @@ function isDaemonSlashCommand(text: string): boolean {
 // Command-vs-prompt split (spec §13). Verbs match on the first whitespace
 // token; unknown slash commands pass through VERBATIM so the harness
 // interprets its own (/compact, /clear, …) — no wrap on those.
+function slashTextAction(text: string, name: string, opts: StepOpts, messageId: number, chatId: number, replyToMessageId: number | null, threadId: number | null): Action {
+  const verb = text.split(/\s+/, 1)[0];
+  const cmd = verb.replace(/@\w+$/, ''); // tolerate /cmd@botname in groups
+  const topic = typeof threadId === 'number' ? { threadId } : {};
+  if (cmd === '/stop') return { kind: 'inject-key', key: 'Escape' };
+  if (cmd === '/kill') return { kind: 'kill-agent' };
+  if (cmd === '/status') return { kind: 'status', ...topic };
+  if (cmd === '/limit') {
+    const rest = text.slice(verb.length).trim();
+    return { kind: 'limit-status', agent: rest || null, ...topic };
+  }
+  if (cmd === '/tasks') {
+    const p = parseTasksCommand(text);
+    return { kind: 'tasks', agent: p.agent, status: p.status, replyToMessageId, threadId };
+  }
+  if (cmd === '/chatgpt') return { kind: 'chatgpt-menu', workspace: parseChatgptMenuArg(text.slice(verb.length)), ...topic };
+  if (cmd === '/daily') return { kind: 'daily-report', ...topic };
+  if (cmd === '/spend') {
+    const rest = text.slice(verb.length).trim().toLowerCase();
+    const period = rest === 'day' || rest === 'week' || rest === 'month' ? rest : null;
+    return { kind: 'usage-report', period, ...topic };
+  }
+  if (cmd === '/agent') {
+    const p = parseAgentCommand(text);
+    return { kind: 'agent-route', selector: p.selector, rest: p.rest, all: p.all, from: name, messageId, ...topic };
+  }
+  if (cmd === '/new') {
+    const p = parseNewCommand(text);
+    return { kind: 'new-command', harness: p.harness, model: p.model, dir: p.dir, name: p.name, task: p.task, dirAfterName: p.dirAfterName, from: name, messageId, chatId, ...topic };
+  }
+  return { kind: 'inject-text', text, messageId };
+}
+
 function textAction(
   text: string,
   name: string,
@@ -524,38 +528,7 @@ function textAction(
     if (shellGate.warning) return { kind: 'reply', text: shellGate.warning, threadId };
     return { kind: 'inject-text', text: shellGate.injectText, messageId };
   }
-  if (text.startsWith('/')) {
-    const verb = text.split(/\s+/, 1)[0];
-    const cmd = verb.replace(/@\w+$/, ''); // tolerate /cmd@botname in groups
-    const topic = typeof threadId === 'number' ? { threadId } : {};
-    if (cmd === '/stop') return { kind: 'inject-key', key: 'Escape' };
-    if (cmd === '/kill') return { kind: 'kill-agent' };
-    if (cmd === '/status') return { kind: 'status', ...topic };
-    if (cmd === '/limit') {
-      const rest = text.slice(verb.length).trim();
-      return { kind: 'limit-status', agent: rest || null, ...topic };
-    }
-    if (cmd === '/tasks') {
-      const p = parseTasksCommand(text);
-      return { kind: 'tasks', agent: p.agent, status: p.status, replyToMessageId, threadId };
-    }
-    if (cmd === '/chatgpt') return { kind: 'chatgpt-menu', workspace: parseChatgptMenuArg(text.slice(verb.length)), ...topic };
-    if (cmd === '/daily') return { kind: 'daily-report', ...topic };
-    if (cmd === '/spend') {
-      const rest = text.slice(verb.length).trim().toLowerCase();
-      const period = rest === 'day' || rest === 'week' || rest === 'month' ? rest : null;
-      return { kind: 'usage-report', period, ...topic };
-    }
-    if (cmd === '/agent') {
-      const p = parseAgentCommand(text);
-      return { kind: 'agent-route', selector: p.selector, rest: p.rest, all: p.all, from: name, messageId, ...topic };
-    }
-    if (cmd === '/new') {
-      const p = parseNewCommand(text);
-      return { kind: 'new-command', harness: p.harness, model: p.model, dir: p.dir, name: p.name, task: p.task, dirAfterName: p.dirAfterName, from: name, messageId, chatId, ...topic };
-    }
-    return { kind: 'inject-text', text, messageId };
-  }
+  if (text.startsWith('/')) return slashTextAction(text, name, opts, messageId, chatId, replyToMessageId, threadId);
   // A plain inbound message: surface its message_id in the wrap so the agent can
   // thread its answer with `tg --reply-to <id>` (threaded replies).
   // `plain` keeps the unwrapped words: if the target session has exactly one open card, the
@@ -596,7 +569,7 @@ function cardReplyAction(m: TgMessage, name: string, opts: StepOpts, threadId?: 
 // Daemon verbs answered in ANY forum topic, bound or not (§4.4 row 1). `/stop` and `/kill` are
 // deliberately absent: in a bound topic they reach that topic's session, and in an unknown topic
 // they are held like any other message.
-const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks', '/limit', '/daily', '/spend']);
+const TOPIC_GLOBAL_CMDS = new Set([...DAEMON_SLASH_COMMANDS].filter((cmd) => cmd !== '/stop' && cmd !== '/kill'));
 
 // Inbound topic triage (docs/specs/session-registry-and-topics.md §4.4). Returns the actions for
 // a topic service message or a message inside a forum topic, else null ("not a topic message":
@@ -633,41 +606,31 @@ function topicActionFor(updateId: number, m: TgMessage, name: string, opts: Step
 }
 
 // The deliverable form of a topic message, or the reply text when it cannot be delivered.
-function topicPayloadOf(updateId: number, m: TgMessage, name: string, opts: StepOpts): TopicPayload | string {
+function topicTextPayload(m: TgMessage & { text: string }, name: string, opts: StepOpts, replyTo: { replyTo?: number }): TopicPayload | string {
   const messageId = m.message_id;
-  // A real reply (not the topic's own creation message) keeps its anchor id: a prose, voice or
-  // media reply in a gone session's topic takes the flat reply fallback (tg-cli#709). A `!shell`
-  // or `/command` reply does not: it is a verbatim harness verb for THIS topic's session, and the
-  // fallback picker would type it into another agent.
-  const rtm = m.reply_to_message;
-  const replyTo = rtm && !rtm.forum_topic_created ? { replyTo: rtm.message_id } : {};
-  if (m.text) {
-    const text = m.text;
-    // A `!shell` passthrough is VERBATIM (harness `!` convention): no wrap and no quote-anchor,
-    // so the `!` stays at column 0 — same rule as the flat path. Checked before the reply-anchor
-    // branch so a `!` reply is verbatim too. A catastrophic shape is answered instead.
-    if (text.startsWith('!')) {
-      const shellGate = shellPassthroughGate(text);
-      return shellGate.warning ?? { type: 'text', text: shellGate.injectText, from: name, messageId };
-    }
-    // A prose reply carries the same ↩ «…» quote-anchor as a flat-chat reply; a /command reply
-    // stays verbatim.
-    if (m.reply_to_message && !text.startsWith('/')) {
-      return { type: 'text', text: buildReplyInject(m, name, opts), from: name, messageId, ...replyTo };
-    }
-    // The command test is narrow (`/word` …, no second slash) so a path-like message —
-    // `/etc/hosts is broken` — is prose and gets wrapped, not injected as a command. A
-    // group-chat `@botname` suffix is Telegram's addressing, not part of the harness verb:
-    // `/compact@my_bot` reaches the harness as `/compact` (#298).
-    if (isLikelySlashCommand(text)) return { type: 'text', text: text.replace(/^(\/[a-zA-Z][\w-]*)@\w+/, '$1'), from: name, messageId };
-    return { type: 'text', text: opts.wrap(name, text, messageId), from: name, messageId, plain: text };
+  const text = m.text;
+  // A `!shell` passthrough is VERBATIM (harness `!` convention): no wrap and no quote-anchor,
+  // so the `!` stays at column 0 — same rule as the flat path. Checked before the reply-anchor
+  // branch so a `!` reply is verbatim too. A catastrophic shape is answered instead.
+  if (text.startsWith('!')) {
+    const shellGate = shellPassthroughGate(text);
+    return shellGate.warning ?? { type: 'text', text: shellGate.injectText, from: name, messageId };
   }
-  const anchor = m.reply_to_message ? { anchor: buildReplyAnchor(m, opts) } : {};
-  const voice = m.voice ?? m.audio;
-  if (voice) {
-    if ((voice.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return TOO_LARGE_REPLY;
-    return { type: 'voice', fileId: voice.file_id, suggestedName: `${updateId}.ogg`, ...anchor, from: name, messageId, ...replyTo };
+  // A prose reply carries the same ↩ «…» quote-anchor as a flat-chat reply; a /command reply
+  // stays verbatim.
+  if (m.reply_to_message && !text.startsWith('/')) {
+    return { type: 'text', text: buildReplyInject(m, name, opts), from: name, messageId, ...replyTo };
   }
+  // The command test is narrow (`/word` …, no second slash) so a path-like message —
+  // `/etc/hosts is broken` — is prose and gets wrapped, not injected as a command. A
+  // group-chat `@botname` suffix is Telegram's addressing, not part of the harness verb:
+  // `/compact@my_bot` reaches the harness as `/compact` (#298).
+  if (isLikelySlashCommand(text)) return { type: 'text', text: text.replace(/^(\/[a-zA-Z][\w-]*)@\w+/, '$1'), from: name, messageId };
+  return { type: 'text', text: opts.wrap(name, text, messageId), from: name, messageId, plain: text };
+}
+
+function topicFilePayload(updateId: number, m: TgMessage, name: string, anchor: { anchor?: string }, replyTo: { replyTo?: number }): TopicPayload | string {
+  const messageId = m.message_id;
   const file = m.photo?.length ? largestPhoto(m.photo) : m.document;
   if (file) {
     if ((file.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return TOO_LARGE_REPLY;
@@ -685,6 +648,24 @@ function topicPayloadOf(updateId: number, m: TgMessage, name: string, opts: Step
     };
   }
   return UNSUPPORTED_TOPIC_MESSAGE_REPLY;
+}
+
+function topicPayloadOf(updateId: number, m: TgMessage, name: string, opts: StepOpts): TopicPayload | string {
+  const messageId = m.message_id;
+  // A real reply (not the topic's own creation message) keeps its anchor id: a prose, voice or
+  // media reply in a gone session's topic takes the flat reply fallback (tg-cli#709). A `!shell`
+  // or `/command` reply does not: it is a verbatim harness verb for THIS topic's session, and the
+  // fallback picker would type it into another agent.
+  const rtm = m.reply_to_message;
+  const replyTo = rtm && !rtm.forum_topic_created ? { replyTo: rtm.message_id } : {};
+  if (m.text) return topicTextPayload({ ...m, text: m.text }, name, opts, replyTo);
+  const anchor = m.reply_to_message ? { anchor: buildReplyAnchor(m, opts) } : {};
+  const voice = m.voice ?? m.audio;
+  if (voice) {
+    if ((voice.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return TOO_LARGE_REPLY;
+    return { type: 'voice', fileId: voice.file_id, suggestedName: `${updateId}.ogg`, ...anchor, from: name, messageId, ...replyTo };
+  }
+  return topicFilePayload(updateId, m, name, anchor, replyTo);
 }
 
 const UNSUPPORTED_TOPIC_MESSAGE_REPLY = 'not delivered — a session only receives text, voice, photos and files';

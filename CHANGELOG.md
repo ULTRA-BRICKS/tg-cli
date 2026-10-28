@@ -3,6 +3,16 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.73.2
+
+- **The owner can use `/chatgpt` inside a Telegram topic (#829).** Control commands
+  are derived from the published daemon command list instead of a second list that
+  omitted the menu. Bound and unbound topics now receive the menu in the same topic,
+  without forwarding the command to a coding agent. Sender and private-chat checks
+  stay in place; `/stop` and `/kill` still target the topic's session.
+- Split update routing into small pure helpers while preserving callback-first versus
+  ordered actions, reply anchors, dangerous-command checks, media limits and offsets.
+
 ## 1.73.1
 
 - **/chatgpt, /spend and /daily find `pm` / `rig` from the daemon environment (#804).** The daemon looks for the
