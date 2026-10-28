@@ -16,6 +16,46 @@ lives in `~/.config/tg-cli/mtproto/` (0600).
 
 ---
 
+## Autonomy, DND and call escalation
+
+Owner philosophy (tg#25310, tg#25313): agents work autonomously and the owner is not a
+synchronous worker. **No important decision may require an instant reaction from the owner.**
+An unanswered question never stops the agent: record the exact open question, keep doing every
+independent, reversible, authorized step, and report once. Never invent approval, delivery
+receipts, green checks or completion while waiting.
+
+**Status: the rules below are the target design. DND buffering, the critical flag and call
+escalation are NOT implemented yet** (queued behind the owner-visible backlog). Until a ticket
+ships, `tg` sends normally; do not behave as if sends are suppressed or calls will be placed.
+Tracking: DND buffer + flush + summary https://git.hyperide.ai/ultrabricks/tg-cli/issues/820, critical flag + call escalation https://git.hyperide.ai/ultrabricks/tg-cli/issues/821,
+call-cli shared session https://git.hyperide.ai/ultrabricks/tg-cli/issues/822, umbrella https://git.hyperide.ai/ultrabricks/tg-cli/issues/814, this note https://git.hyperide.ai/ultrabricks/tg-cli/issues/819.
+
+- **Escalation by phone.** If a task is urgent AND blocked on an owner decision AND DND is not
+  active, then 5 minutes without an answer to that blocking question means the agent places ONE phone call through
+  `call-cli`. "Urgent and blocked" is verified from the open decision obligation and the clock,
+  not self-declared. Ordinary messages never ring. `call-cli` must be able to share
+  the MTProto setup of `tg` / `tg-mtproto` when it has no login of its own: one client at a
+  time (shared `role_lock`), session files referenced never copied. Review finding: the
+  dialer must be the `caller` account, because the owner's `personal` session cannot ring
+  the owner (`CALL_RECIPIENT_IS_CALLER`); with no caller login the answer is `tg auth caller`.
+- **DND (do not disturb).** Default 23:00-08:00 in a configurable timezone. During DND `tg` does
+  not send agent messages: it accumulates them in a buffer and tells the SENDING agent so
+  (the message was buffered, not delivered). Inbound owner-to-agent delivery is unaffected.
+- **Critical exception.** A CRITICAL message (for example critical servers are down and a
+  password, sudo or a heavy decision is needed) may trigger a DOUBLE call (two rings, spaced) even during DND.
+  Projects are marked critical or not in `rig.yaml`; today only conloca.com is critical. A
+  critical claim from a non-critical project is downgraded to a normal buffered message.
+- **After DND.** `tg` tells the agent how to request everything accumulated and asks it for
+  ONE summary. The summary is posted for the owner and duplicated into the common topic
+  `final`. Problems, reports and decisions are separate messages (one kind per send). The
+  summary carries proofs (screenshots, links, quotes of the owner's original requests with
+  their tg#id) and lists every decision the agent took automatically.
+- **Laya is advisory.** It may propose (an invalidation, an answer, "looks urgent"); it never
+  sends, edits, rings or decides on its own (tg#25311). Unread-based staleness uses the owner's
+  MTProto read state when available, else the nearest answered message, else 5 days (not 72 h).
+
+---
+
 ## CRITICAL: The Install Clone Is the Live Binary
 
 On a Linux host set up by `install.sh`, `~/.local/bin/tg` and `~/.local/bin/tg-ctl` (on PATH)
